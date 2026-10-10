@@ -1,0 +1,740 @@
+{
+  "components": {
+    "schemas": {
+      "Orders": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "customer_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "shipment_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total": {
+            "format": "double",
+            "type": "number"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "customer_id",
+          "status",
+          "total",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "OrdersCreate": {
+        "properties": {
+          "customer_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "shipment_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "customer_id"
+        ],
+        "type": "object"
+      },
+      "Pagination": {
+        "properties": {
+          "current_page": {
+            "type": "integer"
+          },
+          "per_page": {
+            "type": "integer"
+          },
+          "total_pages": {
+            "type": "integer"
+          },
+          "total_records": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "Shipments": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "tracking": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ShipmentsCreate": {
+        "properties": {
+          "tracking": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "orders-service",
+    "version": "0.4.2"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/svc/acme/orders-service/_fn/export_orders": {
+      "post": {
+        "operationId": "export_orders",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "summary": "Custom: export_orders",
+        "tags": [
+          "custom"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/_fn/my_orders": {
+      "get": {
+        "operationId": "my_orders",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "summary": "Custom: my_orders",
+        "tags": [
+          "custom"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/_fn/orders_summary": {
+      "get": {
+        "operationId": "orders_summary",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "summary": "Custom: orders_summary",
+        "tags": [
+          "custom"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/_fn/proxy_orders": {
+      "post": {
+        "operationId": "proxy_orders",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "summary": "Custom: proxy_orders",
+        "tags": [
+          "custom"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/_fn/stripe_webhook": {
+      "post": {
+        "operationId": "stripe_webhook",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "summary": "Custom: stripe_webhook",
+        "tags": [
+          "custom"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/orders": {
+      "get": {
+        "operationId": "list_orders",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default: 50, max: 200)",
+            "in": "query",
+            "name": "per_page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort by column (prefix - for DESC)",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON filter array",
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by id",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by customer_id",
+            "in": "query",
+            "name": "customer_id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by status",
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by total",
+            "in": "query",
+            "name": "total",
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
+            "description": "Filter by shipment_id",
+            "in": "query",
+            "name": "shipment_id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by created_at",
+            "in": "query",
+            "name": "created_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by updated_at",
+            "in": "query",
+            "name": "updated_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    },
+                    "results": {
+                      "items": {
+                        "$ref": "#/components/schemas/Orders"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Paginated list"
+          }
+        },
+        "summary": "List orders",
+        "tags": [
+          "orders"
+        ]
+      },
+      "post": {
+        "operationId": "create_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrdersCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Orders"
+                }
+              }
+            },
+            "description": "Created"
+          }
+        },
+        "summary": "Create order",
+        "tags": [
+          "orders"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/orders/:id": {
+      "delete": {
+        "operationId": "delete_order",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        },
+        "summary": "Delete order",
+        "tags": [
+          "orders"
+        ]
+      },
+      "get": {
+        "operationId": "get_order",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Orders"
+                }
+              }
+            },
+            "description": "Found"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get order by ID",
+        "tags": [
+          "orders"
+        ]
+      },
+      "put": {
+        "operationId": "update_order",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrdersCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Orders"
+                }
+              }
+            },
+            "description": "Updated"
+          }
+        },
+        "summary": "Update order",
+        "tags": [
+          "orders"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/shipments": {
+      "get": {
+        "operationId": "list_shipments",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default: 50, max: 200)",
+            "in": "query",
+            "name": "per_page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort by column (prefix - for DESC)",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON filter array",
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by id",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by tracking",
+            "in": "query",
+            "name": "tracking",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by created_at",
+            "in": "query",
+            "name": "created_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    },
+                    "results": {
+                      "items": {
+                        "$ref": "#/components/schemas/Shipments"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Paginated list"
+          }
+        },
+        "summary": "List shipments",
+        "tags": [
+          "shipments"
+        ]
+      },
+      "post": {
+        "operationId": "create_shipment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShipmentsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Shipments"
+                }
+              }
+            },
+            "description": "Created"
+          }
+        },
+        "summary": "Create shipment",
+        "tags": [
+          "shipments"
+        ]
+      }
+    },
+    "/svc/acme/orders-service/shipments/:id": {
+      "delete": {
+        "operationId": "delete_shipment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        },
+        "summary": "Delete shipment",
+        "tags": [
+          "shipments"
+        ]
+      },
+      "get": {
+        "operationId": "get_shipment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Shipments"
+                }
+              }
+            },
+            "description": "Found"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get shipment by ID",
+        "tags": [
+          "shipments"
+        ]
+      },
+      "put": {
+        "operationId": "update_shipment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShipmentsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Shipments"
+                }
+              }
+            },
+            "description": "Updated"
+          }
+        },
+        "summary": "Update shipment",
+        "tags": [
+          "shipments"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,330 @@
+{
+  "name": "loan-service",
+  "version": "0.0.0",
+  "tables": [
+    {
+      "name": "loans",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "book_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "title",
+          "column_type": {
+            "varchar": {
+              "length": 120
+            }
+          },
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "body",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "fee",
+          "column_type": {
+            "numeric": {
+              "precision": 12,
+              "scale": 2
+            }
+          },
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "kind",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false,
+          "validations": [
+            {
+              "rule": "one_of",
+              "values": [
+                "call",
+                "email",
+                "meeting"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "tags",
+          "column_type": "text_array",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "attachment",
+          "column_type": "bytea",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "deleted_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_loans_book_id",
+          "columns": [
+            "book_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "uq_loans_book_title",
+          "columns": [
+            "book_id",
+            "title"
+          ],
+          "unique": true,
+          "predicate": "deleted_at IS NULL"
+        },
+        {
+          "name": "loans_tags_gin",
+          "columns": [
+            "tags"
+          ],
+          "unique": false,
+          "method": "gin"
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": true,
+      "permission_area": "loans",
+      "owner_self_service": false,
+      "managed": false,
+      "checks": [
+        {
+          "name": "title_present",
+          "expr": "length(title) > 0"
+        }
+      ],
+      "search": {
+        "columns": [
+          "title",
+          "body"
+        ],
+        "config": "english"
+      },
+      "audit_redact": [
+        "body",
+        "bank_*"
+      ],
+      "sensitive": true,
+      "pagination": "keyset"
+    }
+  ],
+  "cells": [],
+  "events": [],
+  "subscriptions": [
+    {
+      "subject": "books.renewal.set",
+      "handler": "on_book_event",
+      "handler_type": "wasm",
+      "config": {},
+      "stream": "BOOKS",
+      "ack": "on_success",
+      "consumer": {
+        "durable_name": "loan-service-book-consumer",
+        "ack_wait_secs": 30,
+        "max_deliver": 3,
+        "max_ack_pending": 1000,
+        "filter_subjects": [
+          "books.deleted.loans"
+        ]
+      }
+    },
+    {
+      "subject": "dw.{tenant}.loans.archived",
+      "handler": "on_archived",
+      "handler_type": "wasm",
+      "config": {},
+      "ack": "on_success",
+      "consumer": {
+        "max_deliver": -1,
+        "backoff_secs": [
+          5,
+          30,
+          300
+        ],
+        "batch": 16,
+        "deliver_policy": "new",
+        "concurrency": 4,
+        "dead_letter": false
+      },
+      "timeout_secs": 120
+    },
+    {
+      "subject": "cufflink.tick.hourly",
+      "handler": "sweep",
+      "handler_type": "wasm",
+      "config": {},
+      "stream": "CUFFLINK_TICKS"
+    },
+    {
+      "subject": "dw.{tenant}.books.deleted",
+      "handler": "cascade",
+      "handler_type": "delete_cascade",
+      "config": {}
+    }
+  ],
+  "custom_routes": [
+    {
+      "method": "POST",
+      "path": "/loans/export",
+      "handler": "export_loans",
+      "job": {
+        "timeout_secs": 900,
+        "max_attempts": 5,
+        "retry_on": [
+          "error"
+        ]
+      },
+      "posture": {
+        "kind": "permission",
+        "area": "loans",
+        "operation": "view"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/loans/pay",
+      "handler": "pay",
+      "posture": {
+        "kind": "authenticated"
+      },
+      "audit_redact": [
+        "card.number",
+        "lines[].sku"
+      ]
+    }
+  ],
+  "mode": "wasm",
+  "publishes": [],
+  "required_platform_features": [
+    "audit_redaction",
+    "column_types_v2",
+    "jobs_v2",
+    "keyset_lists",
+    "nats_consumer_config",
+    "route_posture",
+    "schedules",
+    "schema_adopted",
+    "streams"
+  ],
+  "consumers": "scoped",
+  "streams": [
+    {
+      "name": "LOANS",
+      "subjects": [
+        "loans.created",
+        "loans.updated",
+        "loans.deleted",
+        "loans.renewal.deleted"
+      ],
+      "retention": "limits",
+      "max_age_secs": 2592000,
+      "max_msgs": 100000,
+      "max_bytes": 268435456
+    },
+    {
+      "name": "LOAN_JOBS",
+      "subjects": [
+        "loans.jobs.>"
+      ],
+      "retention": "work_queue",
+      "storage": "memory",
+      "duplicate_window_secs": 120,
+      "discard": "new",
+      "description": "loan jobs"
+    }
+  ],
+  "schedules": [
+    {
+      "name": "order_retry",
+      "handler": "retry_orders",
+      "spec": {
+        "kind": "every",
+        "secs": 30
+      }
+    },
+    {
+      "name": "payment_reminders",
+      "handler": "run_payment_reminders",
+      "spec": {
+        "kind": "cron",
+        "expr": "0 * * * *"
+      },
+      "timezone": "Europe/London",
+      "job": {
+        "timeout_secs": 900,
+        "max_attempts": 3,
+        "retry_on": [
+          "error",
+          "timeout"
+        ],
+        "backoff": {
+          "base_secs": 10,
+          "max_secs": 600
+        }
+      }
+    },
+    {
+      "name": "nightly",
+      "handler": "nightly",
+      "spec": {
+        "kind": "cron",
+        "expr": "0 30 2 * * *"
+      },
+      "overlap": "allow",
+      "catch_up": "all",
+      "timeout_secs": 120
+    }
+  ],
+  "schema": "adopted",
+  "schema_name": "loan_service"
+}

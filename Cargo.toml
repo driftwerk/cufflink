@@ -1,0 +1,124 @@
+[workspace]
+resolver = "2"
+members = [
+    "platform",
+    "worker",
+    "storage",
+    "db",
+    "settings",
+    "shutdown",
+    "telemetry",
+    "nats",
+    "native",
+    "types",
+    "migrate",
+    "pgcodec",
+    "secrets",
+    "sdk",
+    "sdk-macros",
+    "cli",
+    "cufflink-fn",
+    "supervisor",
+    "web-runner",
+    "ext-runner",
+    "test-guests",
+    "testkit",
+    "examples/todo-service",
+    "examples/blog-service",
+    "examples/ext-echo",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.49", features = ["full"] }
+
+axum = { version = "0.8.8", features = ["macros", "multipart"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.11", features = ["cors", "trace", "request-id"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = "0.14.1"
+postgres-protocol = "0.6"
+refinery = { version = "0.8", features = ["tokio-postgres"] }
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+cufflink-db = { path = "db" }
+
+async-nats = "0.50"
+
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+jsonwebtoken = "9"
+argon2 = "0.5.3"
+
+uuid = { version = "1.21", features = ["v4", "serde"] }
+chrono = { version = "0.4.43", features = ["serde"] }
+
+eyre = "0.6.12"
+thiserror = "2.0.18"
+
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+tracing-log = "0.2"
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false }
+
+clap = { version = "4.5", features = ["derive"] }
+
+sha2 = "0.10.9"
+
+ring = "0.17"
+zeroize = "1"
+
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation", "wat"] }
+
+config = "0.15"
+
+cufflink-types = { version = "0.15.0", path = "types" }
+cufflink-sdk-macros = { version = "0.15.0", path = "sdk-macros" }
+cufflink-migrate = { version = "0.15.0", path = "migrate" }
+cufflink-pgcodec = { version = "0.15.0", path = "pgcodec" }
+cufflink-secrets = { path = "secrets" }
+hex = "0.4.3"
+base64 = "0.22.1"
+percent-encoding = "2.3"
+futures-util = "0.3.32"
+tokio-stream = "0.1.18"
+metrics = "0.24.3"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+governor = "0.8"
+ipnet = "2.11"
+object_store = { version = "0.14", features = ["aws", "gcp"] }
+async-trait = "0.1"
+bytes = "1"
+cufflink-storage = { path = "storage" }
+cufflink-telemetry = { path = "telemetry" }
+cufflink-settings = { path = "settings" }
+cufflink-shutdown = { path = "shutdown" }
+cufflink-supervisor = { path = "supervisor" }
+cufflink-test-guests = { path = "test-guests" }
+cufflink-testkit = { path = "testkit" }
+cufflink-nats = { version = "0.3.0", path = "nats" }
+cufflink-native = { version = "0.3.0", path = "native" }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.28", features = ["logs", "trace", "http-proto"] }
+opentelemetry-appender-tracing = "0.28"
+tracing-opentelemetry = "0.29"
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
+prost = "0.13"
+regex = "1"
+tempfile = "3"
+
+postgresql_embedded = { version = "0.20.2", default-features = false, features = ["theseus", "tokio", "rustls"] }
+wat = "1"
+libc = "0.2"
+trybuild = "1"

@@ -1,0 +1,5 @@
+error: unknown subscription keyword 'retries'; expected durable, ack, ack_wait, max_deliver, backoff, max_ack_pending, batch, deliver, filters, concurrency, dead_letter or timeout
+ --> tests/ui/fail/subscription_unknown_keyword.rs:4:52
+  |
+4 |     subscriptions: [("dw.{tenant}.a.b", "h", wasm, retries = 3)],
+  |                                                    ^^^^^^^

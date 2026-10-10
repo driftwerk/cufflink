@@ -1,0 +1,126 @@
+{
+  "name": "loan-service",
+  "version": "0.0.0",
+  "tables": [
+    {
+      "name": "labels",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "name",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    }
+  ],
+  "private_tables": [
+    {
+      "name": "loans",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "book_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "body",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": true,
+      "auth_required": false,
+      "owner_self_service": false
+    },
+    {
+      "name": "loan_tags",
+      "columns": [
+        {
+          "name": "loan_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "tag",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    }
+  ],
+  "cells": [],
+  "events": [],
+  "subscriptions": [],
+  "custom_routes": [
+    {
+      "method": "GET",
+      "path": "/loans",
+      "handler": "list_loans",
+      "posture": {
+        "kind": "authenticated"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/loans/{id}",
+      "handler": "get_loan",
+      "posture": {
+        "kind": "authenticated"
+      }
+    }
+  ],
+  "mode": "wasm",
+  "publishes": [],
+  "required_platform_features": [
+    "private_tables",
+    "route_matching",
+    "route_posture",
+    "schema_adopted"
+  ],
+  "routing": "strict",
+  "schema": "adopted"
+}

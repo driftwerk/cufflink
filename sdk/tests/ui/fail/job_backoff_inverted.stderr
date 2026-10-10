@@ -1,0 +1,5 @@
+error: unexpected end of input, job.backoff.max_secs: 60 is below base_secs 600
+ --> tests/ui/fail/job_backoff_inverted.rs:4:85
+  |
+4 |     custom_routes: [("POST", "/run", "run", auth, job(backoff(base = 600, max = 60)))],
+  |                                                                                     ^

@@ -1,0 +1,9 @@
+error: unexpected end of input, service! requires a 'name' field
+ --> tests/ui/fail/missing_name.rs:1:1
+  |
+1 | / cufflink::service! {
+2 | |     tables: [],
+3 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `cufflink::service` (in Nightly builds, run with -Z macro-backtrace for more info)

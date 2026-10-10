@@ -1,0 +1,5 @@
+error: duplicate read keyword
+ --> tests/ui/fail/restricted_duplicate_option.rs:8:37
+  |
+8 |     #[restricted(read = "internal", read = "staff")]
+  |                                     ^^^^

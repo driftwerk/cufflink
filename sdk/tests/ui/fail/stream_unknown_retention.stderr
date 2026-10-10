@@ -1,0 +1,5 @@
+error: unknown stream retention 'forever'; expected limits, work_queue or interest
+ --> tests/ui/fail/stream_unknown_retention.rs:4:44
+  |
+4 |     streams: [("LOANS", ["loans.created"], forever)],
+  |                                            ^^^^^^^

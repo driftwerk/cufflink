@@ -1,0 +1,579 @@
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cufflink-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cufflink-clippy-
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cufflink
+          POSTGRES_PASSWORD: cufflink
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cufflink"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CUFFLINK_TEST_DATABASE_URL: postgres://cufflink:cufflink@127.0.0.1:5432/postgres
+      CUFFLINK_TEST_NATS_URL: nats://127.0.0.1:4222
+      CUFFLINK_TEST_SPARE_NATS_URL: nats://127.0.0.1:4223
+      CUFFLINK_TEST_REDIS_URL: redis://127.0.0.1:6379
+      CUFFLINK_CI: "1"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 nats:2.10 -js
+          docker run -d --name nats-spare -p 4223:4222 nats:2.10 -js
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cufflink-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cufflink-test-
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  test-pgbouncer:
+    name: Test (PgBouncer)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cufflink
+          POSTGRES_PASSWORD: cufflink
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cufflink"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CUFFLINK_TEST_DATABASE_URL: postgres://cufflink:cufflink@127.0.0.1:5432/postgres
+      CUFFLINK_TEST_PGBOUNCER_URL: postgres://cufflink:cufflink@127.0.0.1:6432/postgres
+      CUFFLINK_TEST_REQUIRE_PGBOUNCER: "1"
+      CUFFLINK_TEST_NATS_URL: nats://127.0.0.1:4222
+      CUFFLINK_CI: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set the role-level statement timeout
+        run: PGPASSWORD=cufflink psql -h 127.0.0.1 -U cufflink -d postgres -c "ALTER ROLE cufflink SET statement_timeout = '30s'"
+
+      - name: Start PgBouncer in transaction mode
+        run: |
+          docker run -d --name pgbouncer --network host \
+            -e DB_HOST=127.0.0.1 -e DB_PORT=5432 -e DB_USER=cufflink -e DB_PASSWORD=cufflink \
+            -e AUTH_TYPE=scram-sha-256 -e LISTEN_PORT=6432 -e POOL_MODE=transaction \
+            -e DEFAULT_POOL_SIZE=2 -e MAX_CLIENT_CONN=500 -e MAX_PREPARED_STATEMENTS=200 \
+            edoburu/pgbouncer:v1.25.2-p0
+
+      - name: Start NATS with JetStream
+        run: docker run -d --name nats -p 4222:4222 nats:2.10 -js
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cufflink-pgbouncer-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cufflink-pgbouncer-
+
+      - name: Run the PgBouncer tier
+        run: cargo test -p cufflink-platform --test pgbouncer
+
+  observability:
+    name: Observability
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cufflink
+          POSTGRES_PASSWORD: cufflink
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cufflink"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CUFFLINK_TEST_DATABASE_URL: postgres://cufflink:cufflink@127.0.0.1:5432/postgres
+      CUFFLINK_TEST_NATS_URL: nats://127.0.0.1:4222
+      CUFFLINK_TEST_OTLP_ENDPOINT: http://127.0.0.1:4318
+      CUFFLINK_TEST_PINNED_OTLP_ENDPOINT: http://127.0.0.1:4319
+      CUFFLINK_TEST_LOKI_URL: http://127.0.0.1:3100
+      CUFFLINK_TEST_TEMPO_URL: http://127.0.0.1:3200
+      CUFFLINK_TEST_PROMETHEUS_URL: http://127.0.0.1:9090
+      CUFFLINK_TEST_REQUIRE_OBSERVABILITY: "1"
+      CUFFLINK_CI: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the monitoring configuration
+        run: .github/scripts/observability-stack.sh validate
+
+      - name: Start the collectors, Loki, Tempo and Prometheus
+        run: .github/scripts/observability-stack.sh up
+
+      - name: Start NATS with JetStream
+        run: docker run -d --name nats -p 4222:4222 nats:2.10 -js
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cufflink-observability-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cufflink-observability-
+
+      - name: Build the worker
+        run: cargo build -p cufflink-worker
+
+      - name: Run the observability tier
+        run: cargo test -p cufflink-platform --test observability
+
+      - name: Show what the stack logged
+        if: failure()
+        run: |
+          for service in otel-collector otel-collector-tenant loki tempo prometheus; do
+            docker logs --tail 200 "cufflink-observability-$service" || true
+          done
+
+  sdk-features:
+    name: SDK features (host + wasm32)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cufflink
+          POSTGRES_PASSWORD: cufflink
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cufflink"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CUFFLINK_TEST_DATABASE_URL: postgres://cufflink:cufflink@127.0.0.1:5432/postgres
+      CUFFLINK_CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cufflink-sdk-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cufflink-sdk-
+
+      - name: List the features of cufflink-fn
+        run: |
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cufflink-fn") | .features | keys[] | select(. != "default")' \
+            > "$RUNNER_TEMP/sdk-features"
+          test -s "$RUNNER_TEMP/sdk-features"
+
+      - name: Test cufflink-fn per feature
+        run: |
+          while read -r feature; do
+            cargo test -p cufflink-fn --features "$feature"
+          done < "$RUNNER_TEMP/sdk-features"
+          cargo test -p cufflink-fn --all-features
+
+      - name: Clippy cufflink-fn per feature, host and wasm32
+        run: |
+          for target in "" "--target wasm32-unknown-unknown"; do
+            cargo clippy -p cufflink-fn $target -- -D warnings
+            while read -r feature; do
+              cargo clippy -p cufflink-fn $target --features "$feature" -- -D warnings
+            done < "$RUNNER_TEMP/sdk-features"
+            cargo clippy -p cufflink-fn $target --all-features -- -D warnings
+          done
+
+      - name: Clippy the guest-facing SDK for wasm32
+        run: cargo clippy -p cufflink -p cufflink-types --target wasm32-unknown-unknown -- -D warnings
+
+  publish-script:
+    name: Publish script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Test the publish script
+        run: .github/scripts/publish-crate.test.sh
+
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: cargo audit
+
+  build:
+    name: Build Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cufflink-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cufflink-release-
+
+      - name: Build release binaries
+        env:
+          CUFFLINK_VERSION: sha-${{ github.sha }}
+        run: cargo build --release -p cufflink-platform -p cufflink-web-runner -p cufflink-worker -p cufflink-ext-runner
+
+      - name: Upload platform binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cufflink-platform
+          path: target/release/cufflink-platform
+          retention-days: 1
+
+      - name: Upload web-runner binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cufflink-web-runner
+          path: target/release/cufflink-web-runner
+          retention-days: 1
+
+      - name: Upload worker binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cufflink-worker
+          path: target/release/cufflink-worker
+          retention-days: 1
+
+      - name: Upload ext-runner binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cufflink-ext-runner
+          path: target/release/cufflink-ext-runner
+          retention-days: 1
+
+  push_platform:
+    name: Push Platform Image
+    needs: [fmt, clippy, test, test-pgbouncer, observability, sdk-features, publish-script, audit, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cufflink-platform
+
+      - name: Make binary executable
+        run: chmod +x cufflink-platform
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract Metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: kingsleyh/cufflink-platform
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.platform.ci
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  push_web_runner:
+    name: Push Web Runner Image
+    needs: [fmt, clippy, test, test-pgbouncer, observability, sdk-features, publish-script, audit, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download web-runner binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cufflink-web-runner
+
+      - name: Make binary executable
+        run: chmod +x cufflink-web-runner
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract Metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: kingsleyh/cufflink-web-runner
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.web-runner.ci
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  push_worker:
+    name: Push Worker Image
+    needs: [fmt, clippy, test, test-pgbouncer, observability, sdk-features, publish-script, audit, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download worker binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cufflink-worker
+
+      - name: Make binary executable
+        run: chmod +x cufflink-worker
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract Metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: kingsleyh/cufflink-worker
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.worker.ci
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  push_ext_runner:
+    name: Push Ext Runner Image
+    needs: [fmt, clippy, test, test-pgbouncer, observability, sdk-features, publish-script, audit, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ext-runner binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cufflink-ext-runner
+
+      - name: Make binary executable
+        run: chmod +x cufflink-ext-runner
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract Metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: kingsleyh/cufflink-ext-runner
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.ext-runner.ci
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

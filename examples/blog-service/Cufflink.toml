@@ -1,0 +1,8 @@
+[service]
+default_env = "local"
+
+[environments.local]
+api_url = "http://localhost:8080"
+tenant = "acme"
+keycloak_url = "http://localhost:8180"
+keycloak_realm = "acme"

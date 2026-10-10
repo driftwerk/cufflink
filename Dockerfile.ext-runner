@@ -1,0 +1,49 @@
+FROM rust:1.93.1-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock* ./
+COPY types/ types/
+COPY migrate/ migrate/
+COPY pgcodec/ pgcodec/
+COPY secrets/ secrets/
+COPY storage/ storage/
+COPY db/ db/
+COPY settings/ settings/
+COPY shutdown/ shutdown/
+COPY telemetry/ telemetry/
+COPY nats/ nats/
+COPY native/ native/
+COPY platform/ platform/
+COPY worker/ worker/
+COPY sdk/ sdk/
+COPY sdk-macros/ sdk-macros/
+COPY cli/ cli/
+COPY cufflink-fn/ cufflink-fn/
+COPY supervisor/ supervisor/
+COPY web-runner/ web-runner/
+COPY ext-runner/ ext-runner/
+COPY test-guests/ test-guests/
+COPY testkit/ testkit/
+COPY examples/ examples/
+
+RUN cargo build --release -p cufflink-ext-runner
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates tini && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/cufflink-ext-runner /usr/local/bin/cufflink-ext-runner
+
+RUN mkdir -p /apps /tmp/cufflink-ext && chown 10001:10001 /apps /tmp/cufflink-ext
+
+ENV APPS_DIR=/apps EXT_SOCKET_DIR=/tmp/cufflink-ext
+
+EXPOSE 3200
+
+USER 10001:10001
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["cufflink-ext-runner"]

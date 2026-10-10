@@ -1,0 +1,479 @@
+{
+  "batch": {
+    "answer": "{\"results\":[{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:6}\",\"paid\":null,\"qty\":10,\"tags\":null,\"title\":\"first\",\"total\":null,\"units\":null},{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:7}\",\"paid\":null,\"qty\":20,\"tags\":null,\"title\":\"second\",\"total\":null,\"units\":null},{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:1}\",\"paid\":null,\"qty\":5,\"tags\":null,\"title\":\"to update\",\"total\":null,\"units\":null},{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:8}\",\"paid\":null,\"qty\":30,\"tags\":null,\"title\":\"third\",\"total\":null,\"units\":null}],\"summary\":{\"created\":3,\"deleted\":1,\"total\":5,\"updated\":1}}",
+    "deliveries": [],
+    "messages": [],
+    "status": 200,
+    "step": "batch"
+  },
+  "single_writes": [
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:1}\",\"paid\":null,\"qty\":null,\"tags\":null,\"title\":\"anonymous\",\"total\":null,\"units\":null}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:1}\",\"paid\":null,\"qty\":null,\"tags\":null,\"title\":\"anonymous\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:3}",
+            "x-cufflink-event": "create",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:1}\",\"paid\":null,\"qty\":null,\"tags\":null,\"title\":\"anonymous\",\"total\":null,\"units\":null},\"previous\":null,\"record_id\":\"{uuid:1}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"anonymous\",\"user_name\":\"\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:1}\",\"paid\":null,\"qty\":null,\"tags\":null,\"title\":\"anonymous\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.created"
+        }
+      ],
+      "status": 200,
+      "step": "create by nobody"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":1,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":1,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:5}",
+            "x-cufflink-event": "create",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":1,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null},\"previous\":null,\"record_id\":\"{uuid:4}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":1,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.created"
+        }
+      ],
+      "status": 200,
+      "step": "create by an api key"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":2,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"updated\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":2,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:6}",
+            "x-cufflink-event": "update",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"update\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":2,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null},\"previous\":null,\"record_id\":\"{the id in capitals}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"updated\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:4}\",\"paid\":null,\"qty\":2,\"tags\":null,\"title\":\"keyed\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.updated"
+        }
+      ],
+      "status": 200,
+      "step": "update by an id in capitals"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":false,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":12.5,\"units\":9007199254740993}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":false,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":12.5,\"units\":9007199254740993},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:8}",
+            "x-cufflink-event": "create",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":false,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":12.5,\"units\":9007199254740993},\"previous\":null,\"record_id\":\"{uuid:7}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"clerk-1\",\"user_name\":\"Clara Clerk\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":false,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":12.5,\"units\":9007199254740993},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.created"
+        }
+      ],
+      "status": 200,
+      "step": "create by a user"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"updated\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:9}",
+            "x-cufflink-event": "update",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"update\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993},\"previous\":null,\"record_id\":\"{uuid:7}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"clerk-1\",\"user_name\":\"Clara Clerk\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"updated\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.updated"
+        }
+      ],
+      "status": 200,
+      "step": "update by a user"
+    },
+    {
+      "answer": "{\"deleted\":true}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"deleted\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:10}",
+            "x-cufflink-event": "delete",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"delete\",\"data\":null,\"previous\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993},\"record_id\":\"{uuid:7}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"clerk-1\",\"user_name\":\"Clara Clerk\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"deleted\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":\"2026-10-01\",\"id\":\"{uuid:7}\",\"paid\":true,\"qty\":3,\"tags\":{\"gift\":true,\"lines\":[1,2.5,null,\"x\"]},\"title\":\"Tea, \\\"loose\\\" — 2 kg\",\"total\":13.0,\"units\":9007199254740993},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.deleted"
+        }
+      ],
+      "status": 200,
+      "step": "delete by a user"
+    },
+    {
+      "answer": "{\"error\":\"orders not found\"}",
+      "deliveries": [],
+      "messages": [],
+      "status": 404,
+      "step": "update of nothing"
+    },
+    {
+      "answer": "{\"error\":\"orders not found\"}",
+      "deliveries": [],
+      "messages": [],
+      "status": 404,
+      "step": "delete of nothing"
+    },
+    {
+      "answer": "{\"error\":\"Request body must be a JSON object\"}",
+      "deliveries": [],
+      "messages": [],
+      "status": 400,
+      "step": "create refused"
+    },
+    {
+      "answer": "{\"body\":\"kept\",\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:11}\"}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"body\":\"kept\",\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:11}\"},\"previous\":null,\"record_id\":\"{uuid:11}\",\"service\":\"shop\",\"table\":\"notes\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"body\":\"kept\",\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:11}\"},\"service\":\"shop\",\"table\":\"notes\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.notes.created"
+        }
+      ],
+      "status": 200,
+      "step": "create of a row that is soft-deleted"
+    },
+    {
+      "answer": "{\"deleted\":true}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"delete\",\"data\":null,\"previous\":{\"body\":\"kept\",\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:11}\"},\"record_id\":\"{uuid:11}\",\"service\":\"shop\",\"table\":\"notes\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"deleted\",\"data\":{\"body\":\"kept\",\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:11}\"},\"service\":\"shop\",\"table\":\"notes\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.notes.deleted"
+        }
+      ],
+      "status": 200,
+      "step": "soft delete"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:12}\",\"org_no\":7,\"title\":\"global\",\"user_id\":null}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:12}\",\"org_no\":7,\"title\":\"global\",\"user_id\":null},\"previous\":null,\"record_id\":\"{uuid:12}\",\"scope\":\"all\",\"service\":\"shop\",\"table\":\"accounts\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"gina\",\"user_name\":\"Gina Global\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:12}\",\"org_no\":7,\"title\":\"global\",\"user_id\":null},\"service\":\"shop\",\"table\":\"accounts\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.accounts.created"
+        }
+      ],
+      "status": 200,
+      "step": "create in the scope all"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:13}\",\"org_no\":5,\"title\":\"of org 5\",\"user_id\":null}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:13}\",\"org_no\":5,\"title\":\"of org 5\",\"user_id\":null},\"previous\":null,\"record_id\":\"{uuid:13}\",\"scope\":\"field\",\"service\":\"shop\",\"table\":\"accounts\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"ina\",\"user_name\":\"\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:13}\",\"org_no\":5,\"title\":\"of org 5\",\"user_id\":null},\"service\":\"shop\",\"table\":\"accounts\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.accounts.created"
+        }
+      ],
+      "status": 200,
+      "step": "create in a field scope"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:13}\",\"org_no\":5,\"title\":\"still of org 5\",\"user_id\":null}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"update\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:13}\",\"org_no\":5,\"title\":\"still of org 5\",\"user_id\":null},\"previous\":null,\"record_id\":\"{uuid:13}\",\"scope\":\"field\",\"service\":\"shop\",\"table\":\"accounts\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"ina\",\"user_name\":\"\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"updated\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:13}\",\"org_no\":5,\"title\":\"still of org 5\",\"user_id\":null},\"service\":\"shop\",\"table\":\"accounts\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.accounts.updated"
+        }
+      ],
+      "status": 200,
+      "step": "update in a field scope"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:14}\",\"org_no\":null,\"title\":\"mine\",\"user_id\":\"owen\"}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:14}\",\"org_no\":null,\"title\":\"mine\",\"user_id\":\"owen\"},\"previous\":null,\"record_id\":\"{uuid:14}\",\"scope\":\"own\",\"service\":\"shop\",\"table\":\"accounts\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"owen\",\"user_name\":\"\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:14}\",\"org_no\":null,\"title\":\"mine\",\"user_id\":\"owen\"},\"service\":\"shop\",\"table\":\"accounts\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.accounts.created"
+        }
+      ],
+      "status": 200,
+      "step": "create in the scope own"
+    },
+    {
+      "answer": "{\"deleted\":true}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"delete\",\"data\":null,\"previous\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:14}\",\"org_no\":null,\"title\":\"mine\",\"user_id\":\"owen\"},\"record_id\":\"{uuid:14}\",\"scope\":\"own\",\"service\":\"shop\",\"table\":\"accounts\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"owen\",\"user_name\":\"\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"deleted\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:14}\",\"org_no\":null,\"title\":\"mine\",\"user_id\":\"owen\"},\"service\":\"shop\",\"table\":\"accounts\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.accounts.deleted"
+        }
+      ],
+      "status": 200,
+      "step": "delete in the scope own"
+    },
+    {
+      "answer": "{\"deleted\":true}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"delete\",\"data\":null,\"previous\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:12}\",\"org_no\":7,\"title\":\"global\",\"user_id\":null},\"record_id\":\"{uuid:12}\",\"scope\":\"all\",\"service\":\"shop\",\"table\":\"accounts\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"gina\",\"user_name\":\"Gina Global\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"deleted\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:12}\",\"org_no\":7,\"title\":\"global\",\"user_id\":null},\"service\":\"shop\",\"table\":\"accounts\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.accounts.deleted"
+        }
+      ],
+      "status": 200,
+      "step": "delete in the scope all"
+    },
+    {
+      "answer": "{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"created by the hook\"}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"created by the hook\"},\"previous\":null,\"record_id\":\"{uuid:15}\",\"service\":\"shop\",\"table\":\"tickets\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"created by the hook\"},\"service\":\"shop\",\"table\":\"tickets\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.tickets.created"
+        }
+      ],
+      "status": 200,
+      "step": "create through a hook that changes it"
+    },
+    {
+      "answer": "{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"updated by the hook\"}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"update\",\"data\":{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"updated by the hook\"},\"previous\":null,\"record_id\":\"{uuid:15}\",\"service\":\"shop\",\"table\":\"tickets\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"anonymous\",\"user_name\":\"\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"updated\",\"data\":{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"updated by the hook\"},\"service\":\"shop\",\"table\":\"tickets\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.tickets.updated"
+        }
+      ],
+      "status": 200,
+      "step": "update through a hook that changes it"
+    },
+    {
+      "answer": "{\"deleted\":true}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"delete\",\"data\":null,\"previous\":{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"updated by the hook\"},\"record_id\":\"{uuid:15}\",\"service\":\"shop\",\"table\":\"tickets\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"deleted\",\"data\":{\"body\":null,\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:15}\",\"title\":\"updated by the hook\"},\"service\":\"shop\",\"table\":\"tickets\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.tickets.deleted"
+        }
+      ],
+      "status": 200,
+      "step": "delete through a hook that lets it"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:16}\",\"title\":\"kept\"}",
+      "deliveries": [],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:16}\",\"title\":\"kept\"},\"previous\":null,\"record_id\":\"{uuid:16}\",\"service\":\"shop\",\"table\":\"vaults\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"integration\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"id\":\"{uuid:16}\",\"title\":\"kept\"},\"service\":\"shop\",\"table\":\"vaults\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.vaults.created"
+        }
+      ],
+      "status": 200,
+      "step": "create of a row a hook keeps"
+    },
+    {
+      "answer": "{\"error\":\"Hook error: the hook keeps the row\"}",
+      "deliveries": [],
+      "messages": [],
+      "status": 400,
+      "step": "delete refused by a hook"
+    },
+    {
+      "answer": "{\"pagination\":{\"current_page\":1,\"per_page\":50,\"total_pages\":1,\"total_records\":3},\"results\":[{\"created_at\":\"{time}+00:00\",\"envelope\":\"{\\\"auth\\\":{\\\"claims\\\":{},\\\"email\\\":null,\\\"is_service_account\\\":false,\\\"name\\\":\\\"integration\\\",\\\"permissions\\\":[],\\\"realm_roles\\\":[],\\\"role_names\\\":[],\\\"sub\\\":\\\"platform-{tenant}\\\"},\\\"body\\\":{\\\"data\\\":{\\\"title\\\":\\\"created by the hook\\\"},\\\"hook\\\":\\\"after_create\\\",\\\"result\\\":{\\\"body\\\":null,\\\"created_at\\\":\\\"{time}+00:00\\\",\\\"id\\\":\\\"{uuid:15}\\\",\\\"title\\\":\\\"created by the hook\\\"},\\\"table\\\":\\\"tickets\\\"},\\\"handler\\\":\\\"seen\\\",\\\"headers\\\":{},\\\"method\\\":\\\"HOOK\\\",\\\"service\\\":\\\"shop\\\",\\\"tenant\\\":\\\"{tenant}\\\"}\",\"id\":\"{uuid:17}\"},{\"created_at\":\"{time}+00:00\",\"envelope\":\"{\\\"auth\\\":null,\\\"body\\\":{\\\"data\\\":{\\\"title\\\":\\\"updated by the hook\\\"},\\\"hook\\\":\\\"after_update\\\",\\\"id\\\":\\\"{uuid:15}\\\",\\\"result\\\":{\\\"body\\\":null,\\\"created_at\\\":\\\"{time}+00:00\\\",\\\"id\\\":\\\"{uuid:15}\\\",\\\"title\\\":\\\"updated by the hook\\\"},\\\"table\\\":\\\"tickets\\\"},\\\"handler\\\":\\\"seen\\\",\\\"headers\\\":{},\\\"method\\\":\\\"HOOK\\\",\\\"service\\\":\\\"shop\\\",\\\"tenant\\\":\\\"{tenant}\\\"}\",\"id\":\"{uuid:18}\"},{\"created_at\":\"{time}+00:00\",\"envelope\":\"{\\\"auth\\\":{\\\"claims\\\":{},\\\"email\\\":null,\\\"is_service_account\\\":false,\\\"name\\\":\\\"integration\\\",\\\"permissions\\\":[],\\\"realm_roles\\\":[],\\\"role_names\\\":[],\\\"sub\\\":\\\"platform-{tenant}\\\"},\\\"body\\\":{\\\"hook\\\":\\\"after_delete\\\",\\\"id\\\":\\\"{uuid:15}\\\",\\\"table\\\":\\\"tickets\\\"},\\\"handler\\\":\\\"seen\\\",\\\"headers\\\":{},\\\"method\\\":\\\"HOOK\\\",\\\"service\\\":\\\"shop\\\",\\\"tenant\\\":\\\"{tenant}\\\"}\",\"id\":\"{uuid:19}\"}]}",
+      "deliveries": [],
+      "messages": [],
+      "status": 200,
+      "step": "what the hooks were given once their writes were made"
+    },
+    {
+      "answer": "{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:20}\",\"paid\":null,\"qty\":4,\"tags\":null,\"title\":\"minted\",\"total\":null,\"units\":null}",
+      "deliveries": [
+        {
+          "body": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:20}\",\"paid\":null,\"qty\":4,\"tags\":null,\"title\":\"minted\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "headers": {
+            "accept": "*/*",
+            "content-length": "{n}",
+            "content-type": "application/json",
+            "x-cufflink-delivery": "{uuid:21}",
+            "x-cufflink-event": "create",
+            "x-cufflink-signature": "sha256={hex}",
+            "x-cufflink-signature-256": "t={n},v1={hex}"
+          }
+        }
+      ],
+      "messages": [
+        {
+          "headers": [],
+          "payload": "{\"action\":\"create\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:20}\",\"paid\":null,\"qty\":4,\"tags\":null,\"title\":\"minted\",\"total\":null,\"units\":null},\"previous\":null,\"record_id\":\"{uuid:20}\",\"service\":\"shop\",\"table\":\"orders\",\"tenant\":\"{tenant}\",\"timestamp\":\"{time}+00:00\",\"user_id\":\"platform-{tenant}\",\"user_name\":\"cli-devi\"}",
+          "subject": "dw.{tenant}.logs"
+        },
+        {
+          "headers": [],
+          "payload": "{\"action\":\"created\",\"data\":{\"created_at\":\"{time}+00:00\",\"due\":null,\"id\":\"{uuid:20}\",\"paid\":null,\"qty\":4,\"tags\":null,\"title\":\"minted\",\"total\":null,\"units\":null},\"service\":\"shop\",\"table\":\"orders\",\"tenant_id\":\"{uuid:2}\"}",
+          "subject": "dw.{tenant}.shop.orders.created"
+        }
+      ],
+      "status": 200,
+      "step": "create by an api key minted for a user"
+    }
+  ]
+}

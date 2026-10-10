@@ -1,0 +1,5 @@
+error: expected square brackets
+  --> tests/ui/fail/private_tables_not_a_list.rs:12:21
+   |
+12 |     private_tables: Loan,
+   |                     ^^^^

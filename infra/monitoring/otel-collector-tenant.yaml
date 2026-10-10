@@ -1,0 +1,69 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  filter/unpinned:
+    error_mode: propagate
+    logs:
+      log_record: &unpinned
+        - '"${env:CUFFLINK_TENANT}" == ""'
+    traces:
+      span: *unpinned
+
+  transform/pin-tenant:
+    error_mode: propagate
+    log_statements:
+      - context: resource
+        statements: &resource
+          - &unclaimed delete_matching_keys(attributes, "^(cufflink\\.tenant|service\\.namespace)$")
+          - set(attributes["cufflink.tenant"], "${env:CUFFLINK_TENANT}")
+          - set(attributes["service.namespace"], "${env:CUFFLINK_TENANT}")
+          - set(cache["name"], attributes["service.name"])
+          - delete_matching_keys(attributes, "^service\\.name$")
+          - set(attributes["service.name"], cache["name"]) where cache["name"] != nil
+          - set(attributes["service.name"], Concat(["runner", attributes["service.name"]], "-")) where IsMatch(attributes["service.name"], "^cufflink-(platform|worker)$")
+          - &not-the-platform set(attributes["cufflink.service"], Concat(["runner", attributes["cufflink.service"]], "-")) where IsMatch(attributes["cufflink.service"], "^cufflink-(platform|worker)$")
+      - context: scope
+        statements: &scope
+          - *unclaimed
+      - context: log
+        statements: &record
+          - *unclaimed
+          - *not-the-platform
+    trace_statements:
+      - context: resource
+        statements: *resource
+      - context: scope
+        statements: *scope
+      - context: span
+        statements: *record
+      - context: spanevent
+        statements: *scope
+
+exporters:
+  otlphttp:
+    endpoint: http://otel-collector:4318
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/unpinned, transform/pin-tenant]
+      exporters: [otlphttp]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/unpinned, transform/pin-tenant]
+      exporters: [otlphttp]

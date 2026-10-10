@@ -1,0 +1,5 @@
+error: schema_name: schema 'pg_catalog' is reserved
+ --> tests/ui/fail/schema_name_reserved.rs:4:18
+  |
+4 |     schema_name: "pg_catalog",
+  |                  ^^^^^^^^^^^^

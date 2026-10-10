@@ -1,0 +1,5 @@
+error: unknown route modifier 'authenticated'; expected one of public("reason"), auth, perm("area","op"), owner("field"), scoped("area","op"[, owner = "field"]), internal("service", ...), api_key("scope"), job(...), forward_auth, body_limit = N, timeout = N, multipart, sse(subject = "..."), audit_redact = [...], request = T, response(s) = ..., query = T, path = T, tags = [...], operation_id = "...", summary = "...", description = "...", deprecated, security = [...]
+ --> tests/ui/fail/unknown_modifier.rs:4:42
+  |
+4 |     custom_routes: [("GET", "/me", "me", authenticated)],
+  |                                          ^^^^^^^^^^^^^

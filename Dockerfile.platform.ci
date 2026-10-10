@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini && rm -rf /var/lib/apt/lists/*
+
+COPY cufflink-platform /usr/local/bin/cufflink-platform
+
+EXPOSE 8080
+
+USER 10001:10001
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["cufflink-platform"]

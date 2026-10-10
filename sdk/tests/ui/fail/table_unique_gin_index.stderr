@@ -1,0 +1,5 @@
+error: index.method: a unique index is a btree index, not gin
+ --> tests/ui/fail/table_unique_gin_index.rs:4:25
+  |
+4 | #[table(name = "loans", index(name = "i", columns = ["tags"], unique, using = "gin"))]
+  |                         ^^^^^

@@ -1,0 +1,5 @@
+error: tables.loans.columns.body.access.write: every create sets the column (it is neither nullable nor has a default), so a caller without the grant could create no row
+ --> tests/ui/fail/restricted_required_write.rs:4:1
+  |
+4 | #[table(name = "loans", permission_area = "loans")]
+  | ^

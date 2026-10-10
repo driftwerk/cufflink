@@ -1,0 +1,5 @@
+error: Unknown authorization field: 'roles'
+ --> tests/ui/fail/unknown_authorization_field.rs:4:21
+  |
+4 |     authorization: [roles: []],
+  |                     ^^^^^

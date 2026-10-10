@@ -1,0 +1,5 @@
+error: duplicate private_tables keyword
+  --> tests/ui/fail/private_tables_declared_twice.rs:13:5
+   |
+13 |     private_tables: [Loan],
+   |     ^^^^^^^^^^^^^^

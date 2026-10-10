@@ -1,0 +1,5 @@
+error: index names 'book', which is not a field of the table
+ --> tests/ui/fail/table_index_unknown_column.rs:4:25
+  |
+4 | #[table(name = "loans", index(name = "loans_by_book", columns = ["book"]))]
+  |                         ^^^^^

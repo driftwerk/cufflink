@@ -1,0 +1,5 @@
+error: tables.loans.search.columns: 'body' is read only with a grant, and the declared search matches it for every caller
+ --> tests/ui/fail/restricted_searched_column.rs:4:1
+  |
+4 | #[table(name = "loans", permission_area = "loans", search = ["body"])]
+  | ^

@@ -1,0 +1,12 @@
+[package]
+name = "ext-echo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cufflink-native = { workspace = true }
+
+[dev-dependencies]
+cufflink-types = { workspace = true }
+serde_json = { workspace = true }

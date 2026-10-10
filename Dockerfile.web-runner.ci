@@ -1,0 +1,20 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl tini xz-utils && \
+    curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.xz | \
+      tar -xJ -C /usr/local --strip-components=1 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY cufflink-web-runner /usr/local/bin/cufflink-web-runner
+
+RUN mkdir -p /apps && chown 10001:10001 /apps
+
+ENV APPS_DIR=/apps
+
+EXPOSE 3100
+
+USER 10001:10001
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["cufflink-web-runner"]

@@ -1,0 +1,223 @@
+# Written by `cufflink dev up`; changes are overwritten by the next one.
+#
+# A stack for this machine alone: every port is published on 127.0.0.1,
+# and every credential below is the local development stack's, public in
+# the CLI's source. Never reuse one anywhere else.
+name: cufflink-dev
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      # Local development stack only; never reuse.
+      POSTGRES_USER: cufflink
+      POSTGRES_PASSWORD: cufflink
+      POSTGRES_DB: cufflink
+    ports:
+      - "127.0.0.1:{{postgres_port}}:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cufflink"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:{{nats_port}}:4222"
+    volumes:
+      - nats:/data
+    networks: [default, runner]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  storage:
+    image: rustfs/rustfs:1.0.0
+    environment:
+      # Local development stack only; never reuse.
+      RUSTFS_ACCESS_KEY: cufflinkdev
+      RUSTFS_SECRET_KEY: cufflinkdev
+    volumes:
+      - storage:/data
+
+  bucket-init:
+    image: amazon/aws-cli:2.37.5
+    environment:
+      # Local development stack only; never reuse.
+      AWS_ACCESS_KEY_ID: cufflinkdev
+      AWS_SECRET_ACCESS_KEY: cufflinkdev
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on:
+      storage:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 30); do
+        aws --endpoint-url http://storage:9000 s3 mb s3://cufflink 2>/dev/null && exit 0;
+        aws --endpoint-url http://storage:9000 s3 ls s3://cufflink >/dev/null 2>&1 && exit 0;
+        sleep 2;
+      done;
+      echo 'bucket-init: could not create the bucket'; exit 1;
+      "
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev --import-realm
+    environment:
+      # Local development stack only; never reuse.
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Tokens carry the address a browser and the CLI reach Keycloak at,
+      # whichever address they were asked for at.
+      KC_HOSTNAME: http://localhost:{{keycloak_port}}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    volumes:
+      - ./realm:/opt/keycloak/data/import:ro
+    ports:
+      - "127.0.0.1:{{keycloak_port}}:8080"
+
+  platform:
+    image: {{platform_image}}
+    # The key the platform writes is read by the user who ran the CLI.
+    user: "{{user}}"
+    stop_grace_period: 50s
+    environment:
+      # Local development stack only; never reuse any credential below.
+      RUN_ENV: development
+      DATABASE_URL: postgres://cufflink:cufflink@postgres:5432/cufflink
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis://redis:6379
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: {{realm}}
+      KEYCLOAK_ISSUER: http://localhost:{{keycloak_port}}
+      PLATFORM_HOST: 0.0.0.0
+      PLATFORM_PORT: "8080"
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://storage:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: cufflinkdev
+      S3_SECRET_KEY: cufflinkdev
+      S3_BUCKET: cufflink
+      CUFFLINK_DEV_BOOTSTRAP: tenant={{tenant}},realm={{realm}},key_file=/run/cufflink/{{key_file}},runner_key_file=/run/cufflink/ext-runner/{{runner_key_file}}
+      CUFFLINK_EXTENSIONS: "{{extensions}}"
+      RUST_LOG: info,cufflink_platform=debug
+    volumes:
+      - ./run:/run/cufflink
+    ports:
+      - "127.0.0.1:{{platform_port}}:8080"
+    networks: [default, runner]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      bucket-init:
+        condition: service_completed_successfully
+
+  worker:
+    image: {{worker_image}}
+    stop_grace_period: 50s
+    environment:
+      # Local development stack only; never reuse any credential below.
+      RUN_ENV: development
+      DATABASE_URL: postgres://cufflink:cufflink@postgres:5432/cufflink
+      NATS_URL: nats://nats:4222
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://storage:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: cufflinkdev
+      S3_SECRET_KEY: cufflinkdev
+      S3_BUCKET: cufflink
+      MAX_TENANT_POOLS: "32"
+      MAX_CONNS_PER_TENANT: "2"
+      RUST_LOG: info,cufflink_worker=debug
+    depends_on:
+      platform:
+        condition: service_started
+
+  web-runner:
+    image: {{web_runner_image}}
+    profiles: ["web-runner"]
+    stop_grace_period: 50s
+    environment:
+      # Local development stack only; never reuse any credential below.
+      DATABASE_URL: postgres://cufflink:cufflink@postgres:5432/cufflink
+      NATS_URL: nats://nats:4222
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://storage:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: cufflinkdev
+      S3_SECRET_KEY: cufflinkdev
+      S3_BUCKET: cufflink
+      RUNNER_PORT: "3100"
+      APPS_DIR: /apps
+      CUFFLINK_BASE_DOMAIN: localhost
+      CUFFLINK_PUBLIC_SCHEME: http
+      RUST_LOG: info,cufflink_web_runner=debug
+    ports:
+      - "127.0.0.1:{{web_runner_port}}:3100"
+    volumes:
+      - apps:/apps
+    depends_on:
+      platform:
+        condition: service_started
+
+  ext-runner:
+    image: {{ext_runner_image}}
+    profiles: ["ext-runner"]
+    # The runner key the platform writes is read by the user who ran the
+    # CLI, as the platform runs; the runner sees that key's directory
+    # alone, never the tenant's API key beside it.
+    user: "{{user}}"
+    stop_grace_period: 50s
+    environment:
+      # The development tenant's runner: its runner key and NATS, no
+      # database, secrets or storage credentials.
+      EXT_TENANT: {{tenant}}
+      PLATFORM_URL: http://platform:8080
+      CUFFLINK_RUNNER_KEY_FILE: /run/cufflink/{{runner_key_file}}
+      NATS_URL: nats://nats:4222
+      RUNNER_PORT: "3200"
+      APPS_DIR: /apps
+      EXT_SOCKET_DIR: /tmp/cufflink-dev-ext
+      RUST_LOG: info,cufflink_ext_runner=debug
+    ports:
+      - "127.0.0.1:{{ext_runner_port}}:3200"
+    volumes:
+      - ./run/ext-runner:/run/cufflink:ro
+      - ./native:/apps
+    # The runner and the native code it runs reach the platform and NATS
+    # alone: no route to Postgres, Redis or object storage.
+    networks: [runner]
+    depends_on:
+      platform:
+        condition: service_started
+
+networks:
+  default:
+  runner:
+
+volumes:
+  postgres:
+  nats:
+  storage:
+  apps:

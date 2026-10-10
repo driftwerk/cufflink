@@ -1,0 +1,5 @@
+error: column(varchar(..)) is for a String field
+ --> tests/ui/fail/column_varchar_on_integer.rs:8:5
+  |
+8 |     #[column(varchar(10))]
+  |     ^

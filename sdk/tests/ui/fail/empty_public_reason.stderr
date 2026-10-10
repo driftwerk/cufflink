@@ -1,0 +1,5 @@
+error: public("...") requires a non-empty reason
+ --> tests/ui/fail/empty_public_reason.rs:4:54
+  |
+4 |     custom_routes: [("POST", "/hook", "hook", public("  "))],
+  |                                                      ^^^^

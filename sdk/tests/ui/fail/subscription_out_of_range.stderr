@@ -1,0 +1,5 @@
+error: subscription.consumer.max_deliver: 0 is outside 1..=100 (or -1 for no limit)
+ --> tests/ui/fail/subscription_out_of_range.rs:4:41
+  |
+4 |     subscriptions: [("dw.{tenant}.a.b", "h", wasm, max_deliver = 0)],
+  |                                         ^^^

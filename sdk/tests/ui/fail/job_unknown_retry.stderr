@@ -1,0 +1,5 @@
+error: unknown retry_on failure 'panic'; expected error or timeout
+ --> tests/ui/fail/job_unknown_retry.rs:4:67
+  |
+4 |     custom_routes: [("POST", "/run", "run", auth, job(retry_on = [panic]))],
+  |                                                                   ^^^^^

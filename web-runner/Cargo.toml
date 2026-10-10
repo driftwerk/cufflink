@@ -1,0 +1,51 @@
+[package]
+name = "cufflink-web-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+description = "Cufflink web runner — manages Next.js app deployments"
+publish = false
+
+[[bin]]
+name = "cufflink-web-runner"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+async-nats = { workspace = true }
+deadpool-postgres = { workspace = true }
+tokio-postgres = { workspace = true }
+cufflink-db = { workspace = true }
+cufflink-secrets = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+eyre = { workspace = true }
+tracing = { workspace = true }
+cufflink-storage = { workspace = true }
+cufflink-telemetry = { workspace = true }
+cufflink-shutdown = { workspace = true }
+cufflink-settings = { workspace = true }
+cufflink-supervisor = { workspace = true }
+cufflink-nats = { workspace = true }
+cufflink-types = { workspace = true, features = ["protocol"] }
+tokio-util = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+flate2 = "1"
+tar = "0.4.46"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+cufflink-testkit = { workspace = true }
+libc = { workspace = true }
+tempfile = { workspace = true }

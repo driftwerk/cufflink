@@ -1,0 +1,17 @@
+[package]
+name = "cufflink-nats"
+version = "0.3.0"
+edition = "2021"
+description = "NATS connections for Cufflink components: server lists, credentials and connect options"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["nats", "microservice", "messaging"]
+categories = ["network-programming"]
+readme = "../README.md"
+
+[dependencies]
+async-nats = { workspace = true }
+eyre = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

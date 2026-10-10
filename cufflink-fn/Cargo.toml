@@ -1,0 +1,52 @@
+[package]
+name = "cufflink-fn"
+version = "0.31.0"
+edition = "2021"
+description = "Write custom Cufflink handlers in Rust — compiles to WASM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["crud", "microservice", "wasm", "handler", "functions"]
+categories = ["wasm", "web-programming"]
+readme = "../README.md"
+
+[features]
+stripe = ["dep:hmac", "dep:sha2", "dep:hex", "dep:chrono"]
+db-v2 = ["dep:chrono"]
+cache = []
+service-call = []
+response-v2 = []
+delivery-control = ["response-v2"]
+nats-publish-v2 = []
+http-v2 = []
+storage-v2 = []
+util-v2 = []
+ext-call = []
+test-host = [
+    "dep:postgres",
+    "dep:postgresql_embedded",
+    "dep:cufflink-pgcodec",
+    "dep:cufflink-migrate",
+    "dep:libc",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+cufflink-types = { workspace = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+serde_urlencoded = "0.7"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uuid = { version = "1", features = ["v4"] }
+postgres = { version = "0.19", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"], optional = true }
+postgresql_embedded = { version = "0.20.2", default-features = false, features = ["theseus", "blocking", "rustls"], optional = true }
+cufflink-pgcodec = { workspace = true, optional = true }
+cufflink-migrate = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1.49", features = ["macros", "rt", "rt-multi-thread"] }

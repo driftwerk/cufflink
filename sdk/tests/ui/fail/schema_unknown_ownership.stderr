@@ -1,0 +1,5 @@
+error: unknown schema ownership 'borrowed'; expected managed or adopted
+ --> tests/ui/fail/schema_unknown_ownership.rs:4:13
+  |
+4 |     schema: borrowed,
+  |             ^^^^^^^^

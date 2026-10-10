@@ -1,0 +1,1 @@
+ALTER TABLE loans ADD COLUMN kind TEXT;

@@ -1,0 +1,592 @@
+{
+  "name": "Order-Desk_2",
+  "version": "1.4.0",
+  "tables": [
+    {
+      "name": "OrderLines",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "Title",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false,
+          "validations": [
+            {
+              "rule": "min_length",
+              "value": 1
+            },
+            {
+              "rule": "max_length",
+              "value": 200
+            },
+            {
+              "rule": "regex",
+              "pattern": "^[^<>]*$"
+            }
+          ]
+        },
+        {
+          "name": "sku",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": true
+        },
+        {
+          "name": "status",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": "'open'",
+          "unique": false,
+          "validations": [
+            {
+              "rule": "one_of",
+              "values": [
+                "open",
+                "held",
+                "closed"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "quantity",
+          "column_type": "integer",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": "1",
+          "unique": false,
+          "validations": [
+            {
+              "rule": "min",
+              "value": 0.0
+            },
+            {
+              "rule": "max",
+              "value": 10000.0
+            }
+          ]
+        },
+        {
+          "name": "total_pence",
+          "column_type": "biginteger",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "weight",
+          "column_type": "float",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "ratio",
+          "column_type": "double",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "urgent",
+          "column_type": "boolean",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": "false",
+          "unique": false
+        },
+        {
+          "name": "due_on",
+          "column_type": "date",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "details",
+          "column_type": "jsonb",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "owner_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "branch_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "customer_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "references": "customers.id",
+          "on_delete": "set_null",
+          "unique": false
+        },
+        {
+          "name": "created_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": "now()",
+          "unique": false
+        },
+        {
+          "name": "updated_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "deleted_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_orderlines_status",
+          "columns": [
+            "status"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_orderlines_owner_status",
+          "columns": [
+            "owner_id",
+            "status"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_orderlines_branch_sku",
+          "columns": [
+            "branch_id",
+            "sku"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_orderlines_sku",
+          "columns": [
+            "sku"
+          ],
+          "unique": true
+        }
+      ],
+      "soft_delete": true,
+      "owner_field": "owner_id",
+      "auth_required": true,
+      "permission_area": "orders",
+      "owner_self_service": true,
+      "hooks": {
+        "before_create": "before_create_line",
+        "after_create": "after_create_line",
+        "before_update": "before_update_line",
+        "after_update": "after_update_line",
+        "before_delete": "before_delete_line",
+        "after_delete": "after_delete_line"
+      },
+      "scoped_by": "orders"
+    },
+    {
+      "name": "customers",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": "gen_random_uuid()",
+          "unique": false
+        },
+        {
+          "name": "name",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    },
+    {
+      "name": "order_stats",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "customer_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "references": "customers.id",
+          "on_delete": "cascade",
+          "unique": false
+        },
+        {
+          "name": "lines",
+          "column_type": "integer",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": "0",
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    }
+  ],
+  "cells": [
+    {
+      "name": "eu"
+    }
+  ],
+  "events": [
+    {
+      "name": "line_created",
+      "table": "OrderLines",
+      "action": "create"
+    },
+    {
+      "name": "line_updated",
+      "table": "OrderLines",
+      "action": "update"
+    },
+    {
+      "name": "line_deleted",
+      "table": "OrderLines",
+      "action": "delete"
+    }
+  ],
+  "subscriptions": [
+    {
+      "subject": "dw.{tenant}.customers.deleted",
+      "handler": "drop_lines",
+      "handler_type": "delete_cascade",
+      "config": {
+        "table": "OrderLines",
+        "foreign_key": "customer_id"
+      }
+    },
+    {
+      "subject": "dw.{tenant}.Order-Desk_2.OrderLines.created",
+      "handler": "count_lines",
+      "handler_type": "update_field",
+      "config": {
+        "set_column": "lines",
+        "table": "order_stats",
+        "where_column": "customer_id",
+        "set_value": "lines + 1"
+      }
+    },
+    {
+      "subject": "dw.{tenant}.Order-Desk_2.OrderLines.updated",
+      "handler": "notify_partner",
+      "handler_type": "webhook",
+      "config": {
+        "method": "PUT",
+        "url": "https://partner.example.com/hooks/orders"
+      }
+    },
+    {
+      "subject": "dw.{tenant}.payments.settled",
+      "handler": "on_payment_settled",
+      "handler_type": "wasm",
+      "config": {}
+    },
+    {
+      "subject": "cufflink.tick.5min",
+      "handler": "handle_tick_resync",
+      "handler_type": "wasm",
+      "config": {},
+      "stream": "CUFFLINK_TICKS"
+    }
+  ],
+  "custom_routes": [
+    {
+      "method": "POST",
+      "path": "/checkout",
+      "handler": "handle_checkout",
+      "posture": {
+        "kind": "authenticated"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/orders/{id}/summary",
+      "handler": "order_summary",
+      "posture": {
+        "kind": "authenticated"
+      },
+      "timeout_secs": 45
+    },
+    {
+      "method": "POST",
+      "path": "/orders/{id}/hold",
+      "handler": "hold_order",
+      "posture": {
+        "kind": "permission",
+        "area": "orders",
+        "operation": "edit"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/mine",
+      "handler": "my_orders",
+      "posture": {
+        "kind": "owner",
+        "field": "owner_id"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/scoped",
+      "handler": "scoped_orders",
+      "posture": {
+        "kind": "scoped",
+        "area": "orders",
+        "operation": "view",
+        "owner_field": "owner_id"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/internal/recount",
+      "handler": "recount",
+      "posture": {
+        "kind": "internal",
+        "callers": [
+          "billing-service"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/partner/orders",
+      "handler": "partner_order",
+      "posture": {
+        "kind": "api_key",
+        "scope": "orders:create"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/webhooks/stripe",
+      "handler": "stripe_webhook",
+      "posture": {
+        "kind": "public",
+        "reason": "third-party webhook, verified by signature"
+      },
+      "forward_auth": true,
+      "body_limit_bytes": 1048576
+    },
+    {
+      "method": "POST",
+      "path": "/import",
+      "handler": "import_orders",
+      "posture": {
+        "kind": "authenticated"
+      },
+      "body_limit_bytes": 33554432,
+      "multipart": true
+    },
+    {
+      "method": "POST",
+      "path": "/reports/run",
+      "handler": "run_report",
+      "job": {
+        "timeout_secs": 900,
+        "max_attempts": 2
+      },
+      "posture": {
+        "kind": "authenticated"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/orders/{id}/events",
+      "handler": "order_events",
+      "posture": {
+        "kind": "authenticated"
+      },
+      "sse": {
+        "subject": "dw.{tenant}.orders.{id}.events",
+        "reducer": "reduce_order_event"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/documented",
+      "handler": "documented",
+      "posture": {
+        "kind": "authenticated"
+      },
+      "doc": {
+        "operation_id": "getDocumented",
+        "summary": "A documented route",
+        "tags": [
+          "orders"
+        ],
+        "query": {
+          "properties": {
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": [
+              {
+                "content_type": "application/json",
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "mode": "wasm",
+  "authorization": {
+    "areas": [
+      {
+        "name": "orders",
+        "operations": [
+          "view",
+          "create",
+          "edit",
+          "delete"
+        ]
+      }
+    ],
+    "default_roles": [
+      {
+        "name": "order-admin",
+        "description": "Everything on orders",
+        "permissions": [
+          "orders:*"
+        ]
+      },
+      {
+        "name": "order-viewer",
+        "permissions": [
+          "orders:view@own"
+        ]
+      }
+    ]
+  },
+  "on_migrate": "handle_on_migrate",
+  "publishes": [
+    "payments.refund.requested",
+    "audit.>"
+  ],
+  "required_platform_features": [
+    "route_posture"
+  ],
+  "graphql": true,
+  "routing": "strict",
+  "errors": {
+    "key": "error_message"
+  },
+  "openapi": {
+    "title": "Order desk",
+    "servers": [
+      {
+        "url": "/api/orders"
+      }
+    ],
+    "tags": [
+      {
+        "name": "orders",
+        "description": "Orders"
+      }
+    ]
+  },
+  "components": {
+    "Order": {
+      "properties": {
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

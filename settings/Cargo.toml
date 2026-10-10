@@ -1,0 +1,11 @@
+[package]
+name = "cufflink-settings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+description = "Settings of Cufflink's processes, read from their environment"
+publish = false
+
+[dependencies]
+eyre = { workspace = true }

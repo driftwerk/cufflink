@@ -1,0 +1,74 @@
+{
+  "realm": "cufflink-dev",
+  "displayName": "Cufflink development",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 3600,
+  "roles": {
+    "realm": [
+      {
+        "name": "cufflink-deploy",
+        "description": "May deploy services and manage RBAC through the Cufflink CLI/API"
+      },
+      {
+        "name": "cufflink-platform-admin",
+        "description": "May administer the platform: tenants, platform API keys, extensions and native services"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "cufflink-cli",
+      "name": "Cufflink CLI",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "defaultClientScopes": ["basic", "profile", "email", "roles", "web-origins"],
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "claim.name": "realm_access.roles",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "email": "alice@cufflink.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Alice",
+      "lastName": "Developer",
+      "credentials": [{ "type": "password", "value": "alice", "temporary": false }],
+      "realmRoles": ["cufflink-deploy", "cufflink-platform-admin", "default-roles-cufflink-dev"]
+    },
+    {
+      "username": "bob",
+      "email": "bob@cufflink.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Bob",
+      "lastName": "User",
+      "credentials": [{ "type": "password", "value": "bob", "temporary": false }],
+      "realmRoles": ["default-roles-cufflink-dev"]
+    }
+  ]
+}

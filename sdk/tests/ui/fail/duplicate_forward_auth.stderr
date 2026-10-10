@@ -1,0 +1,5 @@
+error: duplicate forward_auth modifier
+ --> tests/ui/fail/duplicate_forward_auth.rs:4:61
+  |
+4 |     custom_routes: [("POST", "/p", "p", auth, forward_auth, forward_auth)],
+  |                                                             ^^^^^^^^^^^^

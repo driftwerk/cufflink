@@ -1,0 +1,5 @@
+error: unknown restricted option 'reads'; expected read or write
+ --> tests/ui/fail/restricted_unknown_option.rs:8:18
+  |
+8 |     #[restricted(reads = "internal")]
+  |                  ^^^^^

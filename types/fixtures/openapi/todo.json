@@ -1,0 +1,327 @@
+{
+  "components": {
+    "schemas": {
+      "Pagination": {
+        "properties": {
+          "current_page": {
+            "type": "integer"
+          },
+          "per_page": {
+            "type": "integer"
+          },
+          "total_pages": {
+            "type": "integer"
+          },
+          "total_records": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "Todos": {
+        "properties": {
+          "completed": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "title",
+          "completed",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "TodosCreate": {
+        "properties": {
+          "completed": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "title",
+          "completed"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "todo-service",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/svc/acme/todo-service/todos": {
+      "get": {
+        "operationId": "list_todos",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default: 50, max: 200)",
+            "in": "query",
+            "name": "per_page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort by column (prefix - for DESC)",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON filter array",
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by id",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by user_id",
+            "in": "query",
+            "name": "user_id",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by title",
+            "in": "query",
+            "name": "title",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by completed",
+            "in": "query",
+            "name": "completed",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter by created_at",
+            "in": "query",
+            "name": "created_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by updated_at",
+            "in": "query",
+            "name": "updated_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    },
+                    "results": {
+                      "items": {
+                        "$ref": "#/components/schemas/Todos"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Paginated list"
+          }
+        },
+        "summary": "List todos",
+        "tags": [
+          "todos"
+        ]
+      },
+      "post": {
+        "operationId": "create_todo",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TodosCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Todos"
+                }
+              }
+            },
+            "description": "Created"
+          }
+        },
+        "summary": "Create todo",
+        "tags": [
+          "todos"
+        ]
+      }
+    },
+    "/svc/acme/todo-service/todos/:id": {
+      "delete": {
+        "operationId": "delete_todo",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        },
+        "summary": "Delete todo",
+        "tags": [
+          "todos"
+        ]
+      },
+      "get": {
+        "operationId": "get_todo",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Todos"
+                }
+              }
+            },
+            "description": "Found"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get todo by ID",
+        "tags": [
+          "todos"
+        ]
+      },
+      "put": {
+        "operationId": "update_todo",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TodosCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Todos"
+                }
+              }
+            },
+            "description": "Updated"
+          }
+        },
+        "summary": "Update todo",
+        "tags": [
+          "todos"
+        ]
+      }
+    }
+  }
+}

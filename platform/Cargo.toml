@@ -1,0 +1,96 @@
+[package]
+name = "cufflink-platform"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio-util = { workspace = true }
+http-body-util = "0.1"
+matchit = "0.8"
+multer = "3"
+form_urlencoded = "1"
+
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+refinery = { workspace = true }
+cufflink-db = { workspace = true }
+cufflink-settings = { workspace = true }
+async-trait = { workspace = true }
+cufflink-migrate = { workspace = true }
+cufflink-pgcodec = { workspace = true }
+cufflink-secrets = { workspace = true }
+postgres-protocol = { workspace = true }
+
+async-nats = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+eyre = { workspace = true }
+thiserror = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+reqwest = { workspace = true }
+rustls = { workspace = true }
+percent-encoding = { workspace = true }
+url = "2"
+
+wasmtime = { workspace = true }
+
+config = { workspace = true }
+
+sha2 = { workspace = true }
+hex = { workspace = true }
+subtle = "2"
+getrandom = "0.3"
+cufflink-types = { workspace = true, features = ["wasm-inspect", "schedule-eval", "protocol"] }
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+governor = { workspace = true }
+ipnet = { workspace = true }
+ring = { workspace = true }
+cufflink-storage = { workspace = true }
+cufflink-telemetry = { workspace = true }
+cufflink-shutdown = { workspace = true }
+cufflink-nats = { workspace = true }
+redis = { workspace = true }
+regex = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp"] }
+zenwebp = "0.4"
+ravif = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+cufflink = { path = "../sdk", features = ["typed-routes"] }
+schemars = { version = "1", default-features = false, features = ["derive", "std"] }
+cufflink-test-guests = { workspace = true }
+cufflink-testkit = { workspace = true }
+cufflink-native = { workspace = true }
+wat = { workspace = true }
+tempfile = { workspace = true }

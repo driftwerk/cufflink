@@ -1,0 +1,5 @@
+error: Unknown service field: 'grapql'; expected one of name, tables, private_tables, mode, custom_routes, subscriptions, authorization, on_migrate, publishes, extensions, graphql, routing, errors, openapi, consumers, streams, schedules, schema, schema_name, migrations, migration_history
+ --> tests/ui/fail/unknown_service_field.rs:4:5
+  |
+4 |     grapql: true,
+  |     ^^^^^^

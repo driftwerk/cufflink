@@ -1,0 +1,5 @@
+error: unknown schedule keyword 'jitter'; expected timezone, overlap, catch_up, job or timeout
+ --> tests/ui/fail/schedule_unknown_keyword.rs:4:43
+  |
+4 |     schedules: [("sweep", every(30), "a", jitter = 5)],
+  |                                           ^^^^^^

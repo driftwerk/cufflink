@@ -1,0 +1,6 @@
+target
+web/node_modules
+web/.next
+.git
+*.pdb
+.DS_Store

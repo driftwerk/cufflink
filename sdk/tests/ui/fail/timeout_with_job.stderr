@@ -1,0 +1,5 @@
+error: timeout cannot be combined with job(...); set the job's own timeout
+ --> tests/ui/fail/timeout_with_job.rs:4:41
+  |
+4 |     custom_routes: [("POST", "/export", "export", auth, job, timeout = 60)],
+  |                                         ^^^^^^^^

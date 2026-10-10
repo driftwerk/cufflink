@@ -1,0 +1,5 @@
+error: tables.loans.columns.reference.access: the column is unique, so a caller that may write it learns the values other rows hold from the conflicts; restrict write as well
+ --> tests/ui/fail/restricted_unique_read.rs:4:1
+  |
+4 | #[table(name = "loans", permission_area = "loans")]
+  | ^

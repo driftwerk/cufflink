@@ -1,0 +1,5 @@
+error: unexpected end of input, job timeout must be > 0
+ --> tests/ui/fail/zero_job_timeout.rs:4:67
+  |
+4 |     custom_routes: [("POST", "/run", "run", auth, job(timeout = 0))],
+  |                                                                   ^

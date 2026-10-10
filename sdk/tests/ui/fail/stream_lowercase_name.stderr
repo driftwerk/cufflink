@@ -1,0 +1,5 @@
+error: stream.name: 'loans' is not a stream name (A-Z, 0-9 and '_', at most 64 characters)
+ --> tests/ui/fail/stream_lowercase_name.rs:4:16
+  |
+4 |     streams: [("loans", ["loans.created"], limits)],
+  |                ^^^^^^^

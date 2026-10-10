@@ -1,0 +1,5 @@
+error: schedule.spec.expr: '* * * * * *' fires 1 s apart, closer than the 10 second minimum
+ --> tests/ui/fail/schedule_too_frequent.rs:4:26
+  |
+4 |     schedules: [("busy", cron("* * * * * *"), "run")],
+  |                          ^^^^

@@ -1,0 +1,19 @@
+# Written by `cufflink dev up --from-source`: the images are built from
+# the checkout, for the machine they run on.
+services:
+  platform:
+    build:
+      context: {{source}}
+      dockerfile: Dockerfile.platform
+  worker:
+    build:
+      context: {{source}}
+      dockerfile: Dockerfile.worker
+  web-runner:
+    build:
+      context: {{source}}
+      dockerfile: Dockerfile.web-runner
+  ext-runner:
+    build:
+      context: {{source}}
+      dockerfile: Dockerfile.ext-runner

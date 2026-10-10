@@ -1,0 +1,5 @@
+error: schedule.spec.expr: '61 * * * *' is not a cron expression: Component error: Number out of bounds.
+ --> tests/ui/fail/schedule_bad_cron.rs:4:29
+  |
+4 |     schedules: [("nightly", cron("61 * * * *"), "run")],
+  |                             ^^^^

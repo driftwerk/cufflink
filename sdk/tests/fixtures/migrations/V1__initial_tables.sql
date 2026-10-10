@@ -1,0 +1,1 @@
+CREATE TABLE loans (id UUID PRIMARY KEY);

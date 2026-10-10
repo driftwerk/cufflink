@@ -1,0 +1,31 @@
+[package]
+name = "cufflink-native"
+version = "0.3.0"
+edition = "2021"
+description = "Write native Cufflink extensions in Rust, served to a runner's Unix socket or straight from NATS"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["cufflink", "extensions", "nats", "microservice"]
+categories = ["web-programming", "network-programming"]
+readme = "../README.md"
+
+[dependencies]
+cufflink-types = { workspace = true, features = ["protocol"] }
+cufflink-nats = { workspace = true }
+async-nats = { workspace = true }
+axum = { workspace = true }
+eyre = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+subtle = "2"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

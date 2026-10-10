@@ -1,0 +1,5 @@
+error: a native service is not declared with service!; build it with cufflink_native::service("...") in its own binary
+ --> tests/ui/fail/mode_native.rs:4:11
+  |
+4 |     mode: native,
+  |           ^^^^^^

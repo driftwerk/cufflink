@@ -1,0 +1,335 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cufflink
+      POSTGRES_PASSWORD: cufflink
+      POSTGRES_DB: cufflink
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cufflink"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - natsdata:/data
+    networks: [default, runner]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  keycloak-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+      POSTGRES_DB: keycloak
+    volumes:
+      - keycloakdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev --import-realm
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "8180:8080"
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+
+  redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfsdata:/data
+
+  bucket-init:
+    image: amazon/aws-cli:latest
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on:
+      rustfs:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 30); do
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://cufflink 2>/dev/null && exit 0;
+        aws --endpoint-url http://rustfs:9000 s3 ls s3://cufflink >/dev/null 2>&1 && exit 0;
+        sleep 2;
+      done;
+      echo 'bucket-init: could not create bucket'; exit 1;
+      "
+    restart: "no"
+
+  platform:
+    image: kingsleyh/cufflink-platform:latest
+    stop_grace_period: 50s
+    platform: linux/amd64
+    environment:
+      DATABASE_URL: postgres://cufflink:cufflink@postgres:5432/cufflink
+      NATS_URL: nats://nats:4222
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: cufflink
+      KEYCLOAK_ISSUER: http://localhost:8180
+      PLATFORM_HOST: 0.0.0.0
+      PLATFORM_PORT: 8080
+      RUST_LOG: info,cufflink_platform=debug
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://rustfs:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: rustfsadmin
+      S3_SECRET_KEY: rustfsadmin
+      S3_BUCKET: cufflink
+      REDIS_URL: redis://redis:6379
+      LOKI_URL: http://loki:3100
+      LOKI_LABEL_MODEL: scoped
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev
+    ports:
+      - "8080:8080"
+    networks: [default, runner]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      rustfs:
+        condition: service_started
+
+  wasm-worker:
+    image: kingsleyh/cufflink-worker:latest
+    stop_grace_period: 50s
+    platform: linux/amd64
+    environment:
+      DATABASE_URL: postgres://cufflink:cufflink@postgres:5432/cufflink
+      NATS_URL: nats://nats:4222
+      S3_ENDPOINT: http://rustfs:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: rustfsadmin
+      S3_SECRET_KEY: rustfsadmin
+      S3_BUCKET: cufflink
+      RUST_LOG: info,cufflink_worker=debug
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev
+      MAX_TENANT_POOLS: "32"
+      MAX_CONNS_PER_TENANT: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+      platform:
+        condition: service_started
+
+  tenant-init:
+    image: curlimages/curl:8.10.1
+    entrypoint: ["/bin/sh", "/bootstrap-tenant.sh"]
+    volumes:
+      - ./infra/compose/bootstrap-tenant.sh:/bootstrap-tenant.sh:ro
+    depends_on:
+      platform:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    restart: "no"
+
+  otel-collector:
+    image: &collector otel/opentelemetry-collector-contrib:0.128.0
+    volumes:
+      - ./infra/monitoring/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks: [default, runner]
+    depends_on:
+      - tempo
+      - loki
+
+  otel-collector-tenant:
+    image: *collector
+    profiles: ["tenant-collector"]
+    environment:
+      CUFFLINK_TENANT: ${EXT_TENANT:-}
+    volumes:
+      - ./infra/monitoring/otel-collector-tenant.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks: [runner]
+    depends_on:
+      - otel-collector
+
+  tempo:
+    image: grafana/tempo:2.7.0
+    volumes:
+      - ./infra/monitoring/tempo.yaml:/etc/tempo.yaml:ro
+      - tempodata:/var/tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+
+  loki:
+    image: grafana/loki:3.3.2
+    volumes:
+      - ./infra/monitoring/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - lokidata:/loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-remote-write-receiver'
+      - '--enable-feature=exemplar-storage'
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    volumes:
+      - ./infra/monitoring/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./infra/monitoring/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./infra/monitoring/dashboards:/etc/grafana/dashboards/cufflink:ro
+      - grafanadata:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  web-runner:
+    image: kingsleyh/cufflink-web-runner:latest
+    stop_grace_period: 50s
+    platform: linux/amd64
+    environment:
+      DATABASE_URL: postgres://cufflink:cufflink@postgres:5432/cufflink
+      NATS_URL: nats://nats:4222
+      S3_ENDPOINT: http://rustfs:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: rustfsadmin
+      S3_SECRET_KEY: rustfsadmin
+      S3_BUCKET: cufflink
+      RUNNER_PORT: "3100"
+      APPS_DIR: /apps
+      CUFFLINK_BASE_DOMAIN: localhost
+      CUFFLINK_PUBLIC_SCHEME: http
+      RUST_LOG: info,cufflink_web_runner=debug
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev
+      CUFFLINK_CHILD_TELEMETRY: scoped
+      CUFFLINK_CHILD_OUTPUT_LEVEL: info
+    ports:
+      - "3100:3100"
+    volumes:
+      - webrunnerdata:/apps
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+      platform:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+  ext-runner:
+    image: kingsleyh/cufflink-ext-runner:latest
+    profiles: ["ext-runner"]
+    stop_grace_period: 50s
+    platform: linux/amd64
+    environment:
+      EXT_TENANT: ${EXT_TENANT:-}
+      CUFFLINK_RUNNER_KEY: ${CUFFLINK_RUNNER_KEY:-}
+      PLATFORM_URL: http://platform:8080
+      NATS_URL: nats://nats:4222
+      RUNNER_PORT: "3200"
+      APPS_DIR: /apps
+      EXT_SOCKET_DIR: /tmp/cufflink-ext
+      RUST_LOG: info,cufflink_ext_runner=debug
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev
+      CUFFLINK_CHILD_TELEMETRY: scoped
+      CUFFLINK_CHILD_OUTPUT_LEVEL: info
+    ports:
+      - "3200:3200"
+    volumes:
+      - extrunnerdata:/apps
+    networks: [runner]
+    depends_on:
+      nats:
+        condition: service_healthy
+      platform:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+networks:
+  default:
+  runner:
+
+volumes:
+  pgdata:
+  natsdata:
+  keycloakdb:
+  rustfsdata:
+  tempodata:
+  lokidata:
+  prometheusdata:
+  grafanadata:
+  webrunnerdata:
+  extrunnerdata:

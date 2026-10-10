@@ -1,0 +1,5 @@
+error: unknown ack mode 'sometimes'; expected always or on_success
+ --> tests/ui/fail/subscription_unknown_ack.rs:4:58
+  |
+4 |     subscriptions: [("dw.{tenant}.a.b", "h", wasm, ack = sometimes)],
+  |                                                          ^^^^^^^^^

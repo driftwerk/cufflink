@@ -1,0 +1,5 @@
+error: subscription.consumer.durable_name: 'a.b' is not a consumer name (ASCII letters, digits, '-' and '_', at most 200 characters)
+ --> tests/ui/fail/subscription_bad_durable.rs:4:41
+  |
+4 |     subscriptions: [("dw.{tenant}.a.b", "h", wasm, durable = "a.b")],
+  |                                         ^^^

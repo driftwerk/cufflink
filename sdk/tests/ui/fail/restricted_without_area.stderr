@@ -1,0 +1,5 @@
+error: tables.loans.columns.body.access: a column permission names an operation of the table's permission_area, and the table declares none
+ --> tests/ui/fail/restricted_without_area.rs:4:1
+  |
+4 | #[table(name = "loans", auth_required)]
+  | ^

@@ -1,0 +1,5 @@
+error: unknown job option 'retries'; expected timeout, max_attempts, retry_on or backoff
+ --> tests/ui/fail/unknown_job_option.rs:4:55
+  |
+4 |     custom_routes: [("POST", "/run", "run", auth, job(retries = 2))],
+  |                                                       ^^^^^^^

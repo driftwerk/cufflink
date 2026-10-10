@@ -1,0 +1,45 @@
+[package]
+name = "cufflink-cli"
+version = "0.22.0"
+edition = "2021"
+description = "CLI for the Cufflink CRUD microservice platform — deploy, init, and manage services"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["crud", "microservice", "cli", "deploy"]
+categories = ["command-line-utilities", "web-programming"]
+readme = "../README.md"
+exclude = ["tests/"]
+
+[[bin]]
+name = "cufflink"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+uuid = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+eyre = "0.6"
+toml = "0.8"
+base64 = "0.22"
+flate2 = "1"
+urlencoding = "2"
+securestore = "0.100"
+tempfile = "3"
+cufflink-types = { workspace = true, features = ["wasm-inspect"] }
+cufflink-migrate = { workspace = true }
+comfy-table = "7"
+shellexpand = "3.1.2"
+chrono.workspace = true
+serde_yaml = "0.9"
+glob-match = "0.2"
+notify = "8"
+
+[dev-dependencies]
+cufflink-testkit = { workspace = true }
+wat = { workspace = true }

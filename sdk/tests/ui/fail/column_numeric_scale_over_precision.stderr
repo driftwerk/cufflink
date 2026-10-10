@@ -1,0 +1,5 @@
+error: column.scale: 5 is outside 0..=2
+ --> tests/ui/fail/column_numeric_scale_over_precision.rs:8:14
+  |
+8 |     #[column(numeric(2, 5))]
+  |              ^^^^^^^

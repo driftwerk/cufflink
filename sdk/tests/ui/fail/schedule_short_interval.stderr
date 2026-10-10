@@ -1,0 +1,5 @@
+error: schedule.spec.secs: 5 is below the 10 second minimum
+ --> tests/ui/fail/schedule_short_interval.rs:4:26
+  |
+4 |     schedules: [("busy", every(5), "run")],
+  |                          ^^^^^

@@ -1,0 +1,211 @@
+{
+  "name": "blog-service",
+  "version": "0.1.0",
+  "tables": [
+    {
+      "name": "posts",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "title",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "slug",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": true,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "body",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "author_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "published",
+          "column_type": "boolean",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "created_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "updated_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    },
+    {
+      "name": "comments",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "post_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "references": "posts.id",
+          "on_delete": "cascade",
+          "unique": false
+        },
+        {
+          "name": "author_name",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "body",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "created_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "updated_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    },
+    {
+      "name": "tags",
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "uuid",
+          "primary_key": true,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "name",
+          "column_type": "text",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "post_id",
+          "column_type": "uuid",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": false,
+          "default_value": null,
+          "references": "posts.id",
+          "on_delete": "cascade",
+          "unique": false
+        },
+        {
+          "name": "created_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        },
+        {
+          "name": "updated_at",
+          "column_type": "timestamp",
+          "primary_key": false,
+          "nullable": false,
+          "auto_generate": true,
+          "default_value": null,
+          "unique": false
+        }
+      ],
+      "soft_delete": false,
+      "auth_required": false,
+      "owner_self_service": false
+    }
+  ],
+  "cells": [],
+  "events": [],
+  "subscriptions": [],
+  "custom_routes": [],
+  "mode": "crud",
+  "publishes": []
+}

@@ -1,0 +1,54 @@
+[package]
+name = "cufflink-worker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+publish = false
+
+[[bin]]
+name = "cufflink-worker"
+path = "src/main.rs"
+
+[dependencies]
+cufflink-platform = { path = "../platform" }
+cufflink-settings = { workspace = true }
+cufflink-storage = { workspace = true }
+cufflink-telemetry = { workspace = true }
+cufflink-types = { workspace = true }
+
+tokio = { workspace = true }
+
+async-nats = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+uuid = { workspace = true }
+
+eyre = { workspace = true }
+thiserror = { workspace = true }
+
+tracing = { workspace = true }
+
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+cufflink-db = { workspace = true }
+
+tokio-util = { workspace = true }
+
+chrono = { workspace = true }
+
+futures-util = { workspace = true }
+
+axum = { workspace = true }
+metrics = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+cufflink-types = { workspace = true, features = ["protocol"] }
+cufflink-test-guests = { workspace = true }
+cufflink-testkit = { workspace = true }
+base64 = { workspace = true }

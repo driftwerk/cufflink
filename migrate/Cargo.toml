@@ -1,0 +1,20 @@
+[package]
+name = "cufflink-migrate"
+version = "0.15.0"
+edition = "2021"
+description = "SQL migration planning for Cufflink services: checksums, history and locks compatible with refinery"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["migrations", "sql", "refinery", "postgres"]
+categories = ["database"]
+readme = "../README.md"
+
+[dependencies]
+cufflink-types = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+siphasher = "1"
+thiserror = "2"
+
+[dev-dependencies]
+refinery-core = "0.8"
+tempfile = "3"

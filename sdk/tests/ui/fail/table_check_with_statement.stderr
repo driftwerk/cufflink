@@ -1,0 +1,5 @@
+error: check.expr: contains ';'
+ --> tests/ui/fail/table_check_with_statement.rs:4:25
+  |
+4 | #[table(name = "loans", check(name = "c", expr = "true; DROP TABLE loans"))]
+  |                         ^^^^^

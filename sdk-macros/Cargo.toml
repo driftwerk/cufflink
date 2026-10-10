@@ -1,0 +1,23 @@
+[package]
+name = "cufflink-sdk-macros"
+version = "0.15.0"
+edition = "2021"
+description = "Proc macros for the Cufflink SDK (#[derive(Table)], service!{})"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["crud", "microservice", "proc-macro", "derive"]
+categories = ["web-programming", "database"]
+readme = "../README.md"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+cufflink-types = { workspace = true, features = ["schedule-eval"] }
+cufflink-migrate = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

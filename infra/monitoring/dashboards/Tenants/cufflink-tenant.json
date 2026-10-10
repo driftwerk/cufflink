@@ -1,0 +1,769 @@
+{
+  "uid": "cufflink-tenant",
+  "title": "Tenant services",
+  "description": "A tenant's services: what each runs, how it answers, and its logs and traces.",
+  "tags": [
+    "cufflink"
+  ],
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "previews",
+        "label": "Preview tenants",
+        "type": "custom",
+        "query": "exclude : ^(?!preview-).+$,include : .+",
+        "options": [
+          {
+            "text": "exclude",
+            "value": "^(?!preview-).+$",
+            "selected": true
+          },
+          {
+            "text": "include",
+            "value": ".+",
+            "selected": false
+          }
+        ],
+        "current": {
+          "text": "exclude",
+          "value": "^(?!preview-).+$",
+          "selected": true
+        },
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "tenant",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "loki"
+        },
+        "query": "label_values({service_namespace=~\".+\"}, service_namespace)",
+        "regex": "/${previews:raw}/",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {}
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "loki"
+        },
+        "query": "label_values({service_namespace=\"$tenant\"}, service_name)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": {},
+        "allValue": ".+"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Services",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Mixed --"
+      },
+      "targets": [
+        {
+          "refId": "version",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service, version, commit) (cufflink_service_info{tenant=\"$tenant\", service=~\"$service\"})",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\"}[$__range]))",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "errors",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum by (service) (rate(traces_spanmetrics_calls_total{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\", status_code=\"STATUS_CODE_ERROR\"}[$__range])) or sum by (service) (rate(traces_spanmetrics_calls_total{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\"}[$__range])) * 0) / (sum by (service) (rate(traces_spanmetrics_calls_total{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\"}[$__range])) > 0)",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (service, le) (rate(traces_spanmetrics_latency_bucket{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\"}[$__range]))) >= 0",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "error_logs",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum by (service_name) (count_over_time({service_namespace=\"$tenant\", service_name=~\"$service\"} | detected_level=~\"error|critical|fatal\" [$__range])) or sum by (service_name) (count_over_time({service_namespace=\"$tenant\", service_name=~\"$service\"} [$__range])) * 0",
+          "editorMode": "code",
+          "queryType": "instant"
+        },
+        {
+          "refId": "dead_letters",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (service) (increase(cufflink_subscription_messages_total{tenant=\"$tenant\", service=~\"$service\", result=\"dead_letter\"}[$__range])) or max by (service) (cufflink_service_info{tenant=\"$tenant\", service=~\"$service\"}) * 0",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "refId": "lag",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (service) (cufflink_consumer_pending{tenant=\"$tenant\", service=~\"$service\"})",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "service"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Service"
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Logs",
+                    "url": "/explore?schemaVersion=1&orgId=1&panes={%22a%22:{%22datasource%22:%22loki%22%2C%22queries%22:%5B{%22refId%22:%22A%22%2C%22datasource%22:{%22type%22:%22loki%22%2C%22uid%22:%22loki%22}%2C%22expr%22:%22{service_namespace%3D%5C%22$tenant%5C%22%2C%20service_name%3D%5C%22${__data.fields.service}%5C%22}%22}%5D%2C%22range%22:{%22from%22:%22${__from}%22%2C%22to%22:%22${__to}%22}}}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Traces",
+                    "url": "/explore?schemaVersion=1&orgId=1&panes={%22a%22:{%22datasource%22:%22tempo%22%2C%22queries%22:%5B{%22refId%22:%22A%22%2C%22datasource%22:{%22type%22:%22tempo%22%2C%22uid%22:%22tempo%22}%2C%22query%22:%22{resource.service.namespace%3D%5C%22$tenant%5C%22%20%26%26%20resource.service.name%3D%5C%22${__data.fields.service}%5C%22}%22%2C%22queryType%22:%22traceql%22}%5D%2C%22range%22:{%22from%22:%22${__from}%22%2C%22to%22:%22${__to}%22}}}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Metrics",
+                    "url": "/d/cufflink-service?${previews:queryparam}&var-tenant=$tenant&var-service=${__data.fields.service}&${__url_time_range}"
+                  }
+                ]
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 180
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "version"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Version"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "commit"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Commit"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #rate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Requests / s"
+              },
+              {
+                "id": "unit",
+                "value": "reqps"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #errors"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Errors"
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.01
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.05
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #p95"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "p95"
+              },
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #error_logs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Error logs"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #dead_letters"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Dead-lettered messages"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value #lag"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Consumer lag"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "description": "One row for each of the tenant's services that is registered, has answered a request or has logged, over the dashboard's time range. Requests are the spans a service was entered by: a request or a message. Dead-lettered messages are the service's subscription messages given up on; the tenant's whole dead-letter queue is on the service's dashboard. Consumer lag is blank for a service without a consumer. While replicas disagree on a service's version, one of them is shown.",
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Service",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^service_name$",
+            "renamePattern": "service"
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "service",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(service|version|commit|Value #(rate|errors|p95|error_logs|dead_letters|lag))$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "renameByName": {},
+            "indexByName": {
+              "service": 0,
+              "version": 1,
+              "commit": 2,
+              "Value #rate": 3,
+              "Value #errors": 4,
+              "Value #p95": 5,
+              "Value #error_logs": 6,
+              "Value #dead_letters": 7,
+              "Value #lag": 8
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "$service",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "panels": [
+        {
+          "id": 101,
+          "type": "timeseries",
+          "title": "Requests / s",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 10
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (span_name) (rate(traces_spanmetrics_calls_total{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\"}[$__rate_interval]))",
+              "editorMode": "code",
+              "legendFormat": "{{span_name}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "auto",
+                "spanNulls": false
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 102,
+          "type": "timeseries",
+          "title": "Errors / s",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 10
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (span_name) (rate(traces_spanmetrics_calls_total{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\", status_code=\"STATUS_CODE_ERROR\"}[$__rate_interval]))",
+              "editorMode": "code",
+              "legendFormat": "{{span_name}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "auto",
+                "spanNulls": false
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 103,
+          "type": "timeseries",
+          "title": "p95 latency",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 10
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (span_name, le) (rate(traces_spanmetrics_latency_bucket{service_namespace=\"$tenant\", service=~\"$service\", span_kind=~\"SPAN_KIND_(SERVER|CONSUMER)\"}[$__rate_interval])))",
+              "editorMode": "code",
+              "legendFormat": "{{span_name}}",
+              "range": true,
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "auto",
+                "spanNulls": false
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "description": "A point on the line is a trace: select it to open the trace.",
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 104,
+          "type": "logs",
+          "title": "Logs",
+          "gridPos": {
+            "h": 10,
+            "w": 12,
+            "x": 0,
+            "y": 18
+          },
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "expr": "{service_namespace=\"$tenant\", service_name=~\"$service\"}",
+              "editorMode": "code",
+              "queryType": "range"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none",
+            "prettifyLogMessage": false,
+            "showLabels": false,
+            "showCommonLabels": false
+          }
+        },
+        {
+          "id": 105,
+          "type": "logs",
+          "title": "Error logs",
+          "gridPos": {
+            "h": 10,
+            "w": 12,
+            "x": 12,
+            "y": 18
+          },
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "expr": "{service_namespace=\"$tenant\", service_name=~\"$service\"} | detected_level=~\"error|critical|fatal\"",
+              "editorMode": "code",
+              "queryType": "range"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none",
+            "prettifyLogMessage": false,
+            "showLabels": false,
+            "showCommonLabels": false
+          }
+        },
+        {
+          "id": 106,
+          "type": "table",
+          "title": "Recent traces",
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 28
+          },
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "tempo",
+                "uid": "tempo"
+              },
+              "queryType": "traceql",
+              "query": "{resource.service.namespace=\"$tenant\" && resource.service.name=~\"$service\"}",
+              "limit": 20,
+              "tableType": "traces"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          }
+        }
+      ],
+      "repeat": "service"
+    }
+  ]
+}

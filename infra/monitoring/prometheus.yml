@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: cufflink
+
+scrape_configs:
+  - job_name: cufflink-platform
+    static_configs:
+      - targets: ['platform:8080']
+
+  - job_name: cufflink-worker
+    static_configs:
+      - targets: ['wasm-worker:8081']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

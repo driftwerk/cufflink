@@ -1,0 +1,5 @@
+error: schedule 'sweep' is declared twice
+ --> tests/ui/fail/schedule_declared_twice.rs:4:45
+  |
+4 |     schedules: [("sweep", every(30), "a"), ("sweep", every(60), "b")],
+  |                                             ^^^^^^^

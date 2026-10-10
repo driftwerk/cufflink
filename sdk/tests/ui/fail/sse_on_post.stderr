@@ -1,0 +1,5 @@
+error: sse(...) is only allowed on GET routes
+ --> tests/ui/fail/sse_on_post.rs:4:22
+  |
+4 |     custom_routes: [("POST", "/progress", "progress", auth, sse(subject = "dw.{tenant}.progress"))],
+  |                      ^^^^^^

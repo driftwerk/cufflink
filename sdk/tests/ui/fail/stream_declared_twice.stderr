@@ -1,0 +1,5 @@
+error: stream 'LOANS' is declared twice
+ --> tests/ui/fail/stream_declared_twice.rs:4:48
+  |
+4 |     streams: [("LOANS", ["loans.a"], limits), ("LOANS", ["loans.b"], limits)],
+  |                                                ^^^^^^^

@@ -1,0 +1,5 @@
+error: a route may declare at most one posture
+ --> tests/ui/fail/two_postures.rs:4:48
+  |
+4 |     custom_routes: [("GET", "/me", "me", auth, owner("customer_id"))],
+  |                                                ^^^^^

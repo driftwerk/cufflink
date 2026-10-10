@@ -1,0 +1,19 @@
+[package]
+name = "cufflink-db"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+publish = false
+
+[dependencies]
+cufflink-pgcodec = { workspace = true }
+cufflink-settings = { workspace = true }
+deadpool-postgres = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio = { workspace = true }
+eyre = { workspace = true }
+metrics = { workspace = true }
+native-tls = { workspace = true }
+postgres-native-tls = { workspace = true }
+tracing = { workspace = true }

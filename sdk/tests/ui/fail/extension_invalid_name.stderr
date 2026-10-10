@@ -1,0 +1,5 @@
+error: extensions[1]: 'Google.Token' is not an extension name (segments of a-z, 0-9 and '-' joined by '.', at most 128 bytes)
+ --> tests/ui/fail/extension_invalid_name.rs:4:34
+  |
+4 |     extensions: ["google.token", "Google.Token"],
+  |                                  ^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: unknown consumer naming 'tenant'; expected legacy or scoped
+ --> tests/ui/fail/consumers_unknown_naming.rs:4:16
+  |
+4 |     consumers: tenant,
+  |                ^^^^^^

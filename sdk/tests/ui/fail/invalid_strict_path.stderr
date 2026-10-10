@@ -1,0 +1,5 @@
+error: invalid strict route path: path parameter 'Book' must match [a-z_][a-z0-9_]*
+ --> tests/ui/fail/invalid_strict_path.rs:5:29
+  |
+5 |     custom_routes: [("GET", "/books/{Book}", "get_book", auth)],
+  |                             ^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: restricted is written once for a field
+ --> tests/ui/fail/restricted_twice.rs:9:5
+  |
+9 |     #[restricted(write = "internal")]
+  |     ^

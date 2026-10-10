@@ -1,0 +1,946 @@
+{
+  "components": {
+    "schemas": {
+      "Comments": {
+        "properties": {
+          "author_name": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "post_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "post_id",
+          "author_name",
+          "body",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "CommentsCreate": {
+        "properties": {
+          "author_name": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "post_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "post_id",
+          "author_name",
+          "body"
+        ],
+        "type": "object"
+      },
+      "Pagination": {
+        "properties": {
+          "current_page": {
+            "type": "integer"
+          },
+          "per_page": {
+            "type": "integer"
+          },
+          "total_pages": {
+            "type": "integer"
+          },
+          "total_records": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "Posts": {
+        "properties": {
+          "author_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "published": {
+            "type": "boolean"
+          },
+          "slug": {
+            "nullable": true,
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "body",
+          "author_id",
+          "published",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "PostsCreate": {
+        "properties": {
+          "author_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "published": {
+            "type": "boolean"
+          },
+          "slug": {
+            "nullable": true,
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "body",
+          "author_id",
+          "published"
+        ],
+        "type": "object"
+      },
+      "Tags": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "post_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "post_id",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "TagsCreate": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "post_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "post_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "blog-service",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/svc/acme/blog-service/comments": {
+      "get": {
+        "operationId": "list_comments",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default: 50, max: 200)",
+            "in": "query",
+            "name": "per_page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort by column (prefix - for DESC)",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON filter array",
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by id",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by post_id",
+            "in": "query",
+            "name": "post_id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by author_name",
+            "in": "query",
+            "name": "author_name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by body",
+            "in": "query",
+            "name": "body",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by created_at",
+            "in": "query",
+            "name": "created_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by updated_at",
+            "in": "query",
+            "name": "updated_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    },
+                    "results": {
+                      "items": {
+                        "$ref": "#/components/schemas/Comments"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Paginated list"
+          }
+        },
+        "summary": "List comments",
+        "tags": [
+          "comments"
+        ]
+      },
+      "post": {
+        "operationId": "create_comment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommentsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Comments"
+                }
+              }
+            },
+            "description": "Created"
+          }
+        },
+        "summary": "Create comment",
+        "tags": [
+          "comments"
+        ]
+      }
+    },
+    "/svc/acme/blog-service/comments/:id": {
+      "delete": {
+        "operationId": "delete_comment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        },
+        "summary": "Delete comment",
+        "tags": [
+          "comments"
+        ]
+      },
+      "get": {
+        "operationId": "get_comment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Comments"
+                }
+              }
+            },
+            "description": "Found"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get comment by ID",
+        "tags": [
+          "comments"
+        ]
+      },
+      "put": {
+        "operationId": "update_comment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommentsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Comments"
+                }
+              }
+            },
+            "description": "Updated"
+          }
+        },
+        "summary": "Update comment",
+        "tags": [
+          "comments"
+        ]
+      }
+    },
+    "/svc/acme/blog-service/posts": {
+      "get": {
+        "operationId": "list_posts",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default: 50, max: 200)",
+            "in": "query",
+            "name": "per_page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort by column (prefix - for DESC)",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON filter array",
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by id",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by title",
+            "in": "query",
+            "name": "title",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by slug",
+            "in": "query",
+            "name": "slug",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by body",
+            "in": "query",
+            "name": "body",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by author_id",
+            "in": "query",
+            "name": "author_id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by published",
+            "in": "query",
+            "name": "published",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter by created_at",
+            "in": "query",
+            "name": "created_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by updated_at",
+            "in": "query",
+            "name": "updated_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    },
+                    "results": {
+                      "items": {
+                        "$ref": "#/components/schemas/Posts"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Paginated list"
+          }
+        },
+        "summary": "List posts",
+        "tags": [
+          "posts"
+        ]
+      },
+      "post": {
+        "operationId": "create_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Posts"
+                }
+              }
+            },
+            "description": "Created"
+          }
+        },
+        "summary": "Create post",
+        "tags": [
+          "posts"
+        ]
+      }
+    },
+    "/svc/acme/blog-service/posts/:id": {
+      "delete": {
+        "operationId": "delete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        },
+        "summary": "Delete post",
+        "tags": [
+          "posts"
+        ]
+      },
+      "get": {
+        "operationId": "get_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Posts"
+                }
+              }
+            },
+            "description": "Found"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get post by ID",
+        "tags": [
+          "posts"
+        ]
+      },
+      "put": {
+        "operationId": "update_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Posts"
+                }
+              }
+            },
+            "description": "Updated"
+          }
+        },
+        "summary": "Update post",
+        "tags": [
+          "posts"
+        ]
+      }
+    },
+    "/svc/acme/blog-service/tags": {
+      "get": {
+        "operationId": "list_tags",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default: 50, max: 200)",
+            "in": "query",
+            "name": "per_page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort by column (prefix - for DESC)",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON filter array",
+            "in": "query",
+            "name": "filter",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by id",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by name",
+            "in": "query",
+            "name": "name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by post_id",
+            "in": "query",
+            "name": "post_id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by created_at",
+            "in": "query",
+            "name": "created_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by updated_at",
+            "in": "query",
+            "name": "updated_at",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    },
+                    "results": {
+                      "items": {
+                        "$ref": "#/components/schemas/Tags"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Paginated list"
+          }
+        },
+        "summary": "List tags",
+        "tags": [
+          "tags"
+        ]
+      },
+      "post": {
+        "operationId": "create_tag",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tags"
+                }
+              }
+            },
+            "description": "Created"
+          }
+        },
+        "summary": "Create tag",
+        "tags": [
+          "tags"
+        ]
+      }
+    },
+    "/svc/acme/blog-service/tags/:id": {
+      "delete": {
+        "operationId": "delete_tag",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        },
+        "summary": "Delete tag",
+        "tags": [
+          "tags"
+        ]
+      },
+      "get": {
+        "operationId": "get_tag",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tags"
+                }
+              }
+            },
+            "description": "Found"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get tag by ID",
+        "tags": [
+          "tags"
+        ]
+      },
+      "put": {
+        "operationId": "update_tag",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagsCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tags"
+                }
+              }
+            },
+            "description": "Updated"
+          }
+        },
+        "summary": "Update tag",
+        "tags": [
+          "tags"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+error: duplicate extensions keyword
+ --> tests/ui/fail/extensions_declared_twice.rs:5:5
+  |
+5 |     extensions: ["pdf.render"],
+  |     ^^^^^^^^^^

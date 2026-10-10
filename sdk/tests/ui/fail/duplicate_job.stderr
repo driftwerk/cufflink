@@ -1,0 +1,5 @@
+error: duplicate `job(...)` modifier on route
+ --> tests/ui/fail/duplicate_job.rs:4:56
+  |
+4 |     custom_routes: [("POST", "/run", "run", auth, job, job(timeout = 5))],
+  |                                                        ^^^

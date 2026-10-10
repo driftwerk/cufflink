@@ -1,0 +1,5 @@
+error: duplicate ack keyword
+ --> tests/ui/fail/subscription_duplicate_keyword.rs:4:70
+  |
+4 |     subscriptions: [("dw.{tenant}.a.b", "h", wasm, ack = on_success, ack = always)],
+  |                                                                      ^^^

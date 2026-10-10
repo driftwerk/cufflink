@@ -1,0 +1,94 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommitTypeAll(chore)",
+    ":dependencyDashboard",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Europe/London",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "prConcurrentLimit": 5,
+  "labels": [
+    "dependencies"
+  ],
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on the first day of the month"
+    ],
+    "automerge": true
+  },
+  "packageRules": [
+    {
+      "description": "Majors and toolchain bumps are never automerged; everything else waits for CI then merges itself",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Group all non-major Cargo updates into one weekly PR",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "cargo non-major",
+      "automerge": true
+    },
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "github-actions",
+      "automerge": true
+    },
+    {
+      "description": "Group Docker base image updates across the Dockerfiles and compose file, pinned to digests",
+      "matchManagers": [
+        "dockerfile",
+        "docker-compose"
+      ],
+      "groupName": "docker images",
+      "pinDigests": true,
+      "automerge": true
+    },
+    {
+      "description": "Pin the workflows' service container images to digests",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "pinDigests": true
+    },
+    {
+      "description": "Rust toolchain bumps change what CI compiles with; keep them separate and visible",
+      "matchManagers": [
+        "rust-toolchain"
+      ],
+      "groupName": "rust toolchain",
+      "commitMessageTopic": "Rust toolchain"
+    },
+    {
+      "description": "Do not propose updates to cufflink's own published crates",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "/^cufflink/"
+      ],
+      "enabled": false
+    }
+  ],
+  "automergeType": "pr",
+  "platformAutomerge": true
+}
