@@ -1,8 +1,10 @@
 mod layer;
 mod logs;
+mod spans;
 
 pub use layer::ScopeLayer;
 pub use logs::ScopeLogProcessor;
+pub use spans::ScopeSpanProcessor;
 
 use opentelemetry::StringValue;
 use std::sync::Arc;
@@ -210,19 +212,6 @@ impl Fields {
         }))
     }
 
-    fn except(&self, declared: &Self) -> Self {
-        Self(std::array::from_fn(|at| {
-            self.0[at].clone().filter(|_| declared.0[at].is_none())
-        }))
-    }
-
-    fn has(&self, name: &str) -> bool {
-        NAMES
-            .iter()
-            .zip(&self.0)
-            .any(|(field, value)| *field == name && value.is_some())
-    }
-
     fn set(&mut self, name: &str, value: &str) {
         if let Some(at) = NAMES.iter().position(|field| *field == name) {
             self.0[at] = Some(value.into());
@@ -370,10 +359,6 @@ mod tests {
                 (HANDLER, "on_book".to_owned()),
                 (KIND, "hook".to_owned()),
             ]
-        );
-        assert_eq!(
-            exported(&inherited.except(&declared)),
-            [(TENANT, "acme".to_owned()), (SERVICE, "notes".to_owned())]
         );
     }
 

@@ -118,7 +118,7 @@ pub fn request_span(
         let remote = parent.span().span_context().clone();
         if remote.is_valid() && remote.is_sampled() {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
-            span.set_parent(parent);
+            let _ = span.set_parent(parent);
         }
     }
     span

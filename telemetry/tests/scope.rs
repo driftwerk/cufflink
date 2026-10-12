@@ -325,7 +325,7 @@ fn a_log_under_a_propagated_parent_carries_the_parents_trace() {
     let (trace, parent) = propagated();
     let exported = exported_by(|| {
         let request = info_span!("request");
-        request.set_parent(parent);
+        request.set_parent(parent).expect("set parent");
         let _request = request.entered();
         info!("in the request");
         info_span!("db.query").in_scope(|| info!("in the query"));
@@ -357,7 +357,7 @@ fn a_log_under_a_task_span_carries_its_message_spans_trace() {
         });
 
         let published = info_span!(parent: None, "published");
-        published.set_parent(parent);
+        published.set_parent(parent).expect("set parent");
         published.in_scope(|| info!("in the published message"));
     });
 

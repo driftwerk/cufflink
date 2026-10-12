@@ -331,7 +331,7 @@ impl LongJobs {
                 );
                 let span = jobs::span("long", None);
                 if let Some(enqueued_under) = enqueued_under(&claim.job) {
-                    span.set_parent(enqueued_under);
+                    let _ = span.set_parent(enqueued_under);
                 }
                 async {
                     let attempt = self.execute(&claim, claimed_at).await;

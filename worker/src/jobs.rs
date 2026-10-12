@@ -14,7 +14,7 @@ pub fn span(kind: &'static str, headers: Option<&async_nats::HeaderMap>) -> trac
     );
     if let Some(parent) = headers.and_then(cufflink_platform::telemetry::context_from_nats_headers)
     {
-        span.set_parent(parent);
+        let _ = span.set_parent(parent);
     }
     span
 }
