@@ -147,6 +147,17 @@ declares.
 `cufflink services list --features` prints what each deployed service
 requires.
 
+## Changes in v0.32.0
+
+No new module-declared feature. Platform behaviour:
+
+- `GET /api/tenants/{tenant}/users/{user}/permissions` answers only the user
+  themself, a caller with deploy authority, or a service account; any other
+  tenant-realm token is refused.
+- `RATE_LIMIT_EXEMPT_IPS` lists addresses or CIDR ranges the per-IP rate
+  limiter never counts, and `RATE_LIMIT_EXEMPT_PRIVATE_PEERS=false` stops
+  exempting private-address callers ([rate limiting](guides.md#rate-limiting)).
+
 ## CLI, SDK and platform together
 
 | CLI | Platform | Guest uses a module-declared feature | Outcome |

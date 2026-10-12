@@ -1,6 +1,6 @@
 [package]
 name = "cufflink"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "Define CRUD microservices in Rust — deploy with a single command"
 license = "MIT OR Apache-2.0"

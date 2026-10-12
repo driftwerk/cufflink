@@ -1,6 +1,6 @@
 [package]
 name = "cufflink-migrate"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "SQL migration planning for Cufflink services: checksums, history and locks compatible with refinery"
 license = "MIT OR Apache-2.0"

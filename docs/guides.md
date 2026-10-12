@@ -3030,9 +3030,11 @@ The platform includes a per-client-IP rate limiter for the public API. It is **o
 RATE_LIMIT_ENABLED=true     # default: false
 RATE_LIMIT_PER_SECOND=20    # sustained requests per second per client IP (default: 20)
 RATE_LIMIT_BURST=60         # burst allowance per client IP (default: 60)
+RATE_LIMIT_EXEMPT_PRIVATE_PEERS=true   # skip callers on private addresses (default: true)
+RATE_LIMIT_EXEMPT_IPS=203.0.113.7,198.51.100.0/24   # addresses or CIDR ranges never limited (default: none)
 ```
 
-Health, readiness and metrics probes, and in-cluster callers on private addresses, are exempt. With `REDIS_URL` set the counters are shared across replicas; without it (or while Redis is unavailable) each instance limits with its own in-memory buckets.
+Health, readiness and metrics probes, in-cluster callers on private addresses (unless `RATE_LIMIT_EXEMPT_PRIVATE_PEERS=false`), and the addresses listed in `RATE_LIMIT_EXEMPT_IPS` are exempt. With `REDIS_URL` set the counters are shared across replicas; without it (or while Redis is unavailable) each instance limits with its own in-memory buckets.
 
 ### Observability
 

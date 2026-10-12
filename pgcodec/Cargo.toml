@@ -1,6 +1,6 @@
 [package]
 name = "cufflink-pgcodec"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "How Cufflink renders Postgres rows as JSON and binds JSON parameters to Postgres types"
 license = "MIT OR Apache-2.0"
