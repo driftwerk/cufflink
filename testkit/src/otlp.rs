@@ -236,6 +236,7 @@ mod tests {
             value: Some(AnyValue {
                 value: Some(any_value::Value::StringValue(value.into())),
             }),
+            ..Default::default()
         }
     }
 

@@ -11,9 +11,9 @@ use opentelemetry::KeyValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::{BatchLogProcessor, LogExporter, SdkLoggerProvider};
-use opentelemetry_sdk::trace::{SdkTracerProvider, SpanExporter};
+use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider, SpanExporter};
 use opentelemetry_sdk::Resource;
-use scope::{ScopeLayer, ScopeLogProcessor};
+use scope::{ScopeLayer, ScopeLogProcessor, ScopeSpanProcessor};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{info, warn, Subscriber};
@@ -158,7 +158,9 @@ where
 {
     let tracer = exporters.spans.map(|exporter| {
         SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
+            .with_span_processor(ScopeSpanProcessor::new(
+                BatchSpanProcessor::builder(exporter).build(),
+            ))
             .with_resource(resource.clone())
             .build()
     });
@@ -177,12 +179,14 @@ where
                 .json()
                 .with_writer(exporters.stdout),
         )
-        .with(tracer.as_ref().map(|provider| {
-            tracing_opentelemetry::layer().with_tracer(provider.tracer(component.service_name()))
-        }))
         .with(ScopeLayer::new(
             logger.as_ref().map(OpenTelemetryTracingBridge::new),
-        ));
+        ))
+        .with(tracer.as_ref().map(|provider| {
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer(component.service_name()))
+                .with_context_activation(false)
+        }));
     (subscriber, Providers { tracer, logger })
 }
 

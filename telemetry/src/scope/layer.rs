@@ -1,24 +1,36 @@
 use super::Fields;
 use opentelemetry::logs::{AnyValue, LogRecord};
-use opentelemetry::trace::{SpanBuilder, SpanId, TraceContextExt, TraceId};
+use opentelemetry::trace::{SpanId, TraceContextExt, TraceId};
 use opentelemetry::{KeyValue, StringValue};
 use opentelemetry_sdk::logs::SdkLogRecord;
 use std::cell::RefCell;
+use std::sync::OnceLock;
+use tracing::dispatcher::WeakDispatch;
+use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
-use tracing::{Event, Subscriber};
+use tracing::{Dispatch, Event, Subscriber};
 use tracing_log::NormalizeEvent;
-use tracing_opentelemetry::OtelData;
+use tracing_opentelemetry::get_otel_context;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::registry::{LookupSpan, SpanRef};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 pub struct ScopeLayer<B> {
     bridge: Option<B>,
+    dispatch: OnceLock<WeakDispatch>,
 }
 
 impl<B> ScopeLayer<B> {
     pub fn new(bridge: Option<B>) -> Self {
-        Self { bridge }
+        Self {
+            bridge,
+            dispatch: OnceLock::new(),
+        }
+    }
+
+    fn otel_context(&self, id: &Id) -> Option<opentelemetry::Context> {
+        let dispatch = self.dispatch.get()?.upgrade()?;
+        get_otel_context(id, &dispatch)
     }
 }
 
@@ -27,6 +39,10 @@ where
     S: Subscriber + for<'span> LookupSpan<'span>,
     B: Layer<S>,
 {
+    fn on_register_dispatch(&self, subscriber: &Dispatch) {
+        let _ = self.dispatch.set(subscriber.downgrade());
+    }
+
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else {
             return;
@@ -39,35 +55,26 @@ where
         if inherited.is_empty() && declared.is_empty() {
             return;
         }
-        let (added, effective) = match declared.is_empty() {
-            true => (None, inherited),
-            false => (Some(inherited.except(&declared)), declared.or(&inherited)),
-        };
-        export(&span, |builder| {
-            builder.attributes.get_or_insert_default().extend(
-                added
-                    .as_ref()
-                    .unwrap_or(&effective)
-                    .attributes()
-                    .map(key_value),
-            )
-        });
-        span.extensions_mut().insert(effective);
+        span.extensions_mut().insert(declared.or(&inherited));
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         let declared = Fields::declared(|visitor| values.record(visitor));
-        let Some(span) = ctx.span(id).filter(|_| !declared.is_empty()) else {
+        let mut renamed = Renamed(None);
+        values.record(&mut renamed);
+        let Some(span) = ctx.span(id) else {
             return;
         };
-        export(&span, |builder| {
-            let attributes = builder.attributes.get_or_insert_default();
-            attributes.retain(|attribute| !declared.has(attribute.key.as_str()));
-            attributes.extend(declared.attributes().map(key_value));
-        });
-        let mut extensions = span.extensions_mut();
-        let effective = declared.or(&extensions.remove::<Fields>().unwrap_or_default());
-        extensions.insert(effective);
+        if !declared.is_empty() {
+            let mut extensions = span.extensions_mut();
+            let effective = declared.or(&extensions.remove::<Fields>().unwrap_or_default());
+            extensions.insert(effective);
+        }
+        if let Some(name) = renamed.0 {
+            if let Some(cx) = self.otel_context(id) {
+                cx.span().update_name(name);
+            }
+        }
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -75,13 +82,27 @@ where
             return;
         };
         let _restore = EventScope::enter(ctx.event_span(event).map(|span| {
-            let extensions = span.extensions();
+            let fields = span
+                .extensions()
+                .get::<Fields>()
+                .cloned()
+                .unwrap_or_default();
             EventScope {
-                fields: extensions.get::<Fields>().cloned().unwrap_or_default(),
-                trace: extensions.get::<OtelData>().and_then(trace_context),
+                fields,
+                trace: self.otel_context(&span.id()).and_then(trace_context),
             }
         }));
         bridge.on_event(event, ctx);
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        let fields = ctx
+            .span(&id)
+            .and_then(|span| span.extensions().get::<Fields>().cloned())
+            .filter(|fields| !fields.is_empty());
+        if let Some((fields, cx)) = fields.zip(self.otel_context(&id)) {
+            cx.span().set_attributes(fields.attributes().map(key_value));
+        }
     }
 }
 
@@ -108,26 +129,28 @@ fn key_value((name, value): (&'static str, StringValue)) -> KeyValue {
     KeyValue::new(name, value)
 }
 
-fn export<'a, S>(span: &SpanRef<'a, S>, write: impl FnOnce(&mut SpanBuilder))
-where
-    S: LookupSpan<'a>,
-{
-    if let Some(OtelData {
-        builder,
-        parent_cx: _,
-    }) = span.extensions_mut().get_mut::<OtelData>()
-    {
-        write(builder);
-    }
+fn trace_context(cx: opentelemetry::Context) -> Option<(TraceId, SpanId)> {
+    let span = cx.span();
+    let context = span.span_context();
+    context
+        .is_valid()
+        .then(|| (context.trace_id(), context.span_id()))
 }
 
-fn trace_context(data: &OtelData) -> Option<(TraceId, SpanId)> {
-    let OtelData { builder, parent_cx } = data;
-    match parent_cx.has_active_span() {
-        true => Some(parent_cx.span().span_context().trace_id()),
-        false => builder.trace_id,
+struct Renamed(Option<String>);
+
+impl Visit for Renamed {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "otel.name" {
+            self.0 = Some(value.to_owned());
+        }
     }
-    .zip(builder.span_id)
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "otel.name" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
 }
 
 struct EventScope {

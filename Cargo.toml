@@ -108,13 +108,13 @@ cufflink-testkit = { path = "testkit" }
 cufflink-nats = { version = "0.4.0", path = "nats" }
 cufflink-native = { version = "0.4.0", path = "native" }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
-opentelemetry = "0.28"
+opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
-opentelemetry-otlp = { version = "0.28", features = ["logs", "trace", "http-proto"] }
-opentelemetry-appender-tracing = "0.28"
-tracing-opentelemetry = "0.29"
-opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
-prost = "0.13"
+opentelemetry-otlp = { version = "0.32", features = ["logs", "trace", "http-proto"] }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
+prost = "0.14"
 regex = "1"
 tempfile = "3"
 

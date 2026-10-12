@@ -374,7 +374,7 @@ fn subscription_span(
     );
     if let Some(parent) = headers.and_then(crate::telemetry::context_from_nats_headers) {
         use tracing_opentelemetry::OpenTelemetrySpanExt;
-        span.set_parent(parent);
+        let _ = span.set_parent(parent);
     }
     span
 }

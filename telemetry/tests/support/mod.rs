@@ -8,7 +8,6 @@ use opentelemetry_sdk::logs::{LogBatch, LogExporter, SdkLogRecord};
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use serde_json::Value;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tracing::Subscriber;
 use tracing_subscriber::fmt::MakeWriter;
@@ -38,12 +37,9 @@ impl<T: Clone> Kept<T> {
 }
 
 impl SpanExporter for Kept<SpanData> {
-    fn export(
-        &mut self,
-        batch: Vec<SpanData>,
-    ) -> Pin<Box<dyn Future<Output = OTelSdkResult> + Send + 'static>> {
+    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
         self.keep(batch);
-        Box::pin(std::future::ready(Ok(())))
+        std::future::ready(Ok(()))
     }
 }
 
