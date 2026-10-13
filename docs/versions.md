@@ -1086,3 +1086,13 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.33.1
+
+No new module-declared feature.
+
+- A caller holding `roles:manage` may read another user's roles and
+  permissions (`GET /api/tenants/{t}/users/{u}/permissions`), as it may
+  already assign and unassign them. v0.32 had limited the read to the user,
+  deploy authority and service accounts.
+- The web runner image runs apps on Node 22.
