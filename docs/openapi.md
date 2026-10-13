@@ -98,3 +98,9 @@ cufflink generate-client --local --generator openapi-generator \
 - A path parameter named `data` or `query` is the `dataParam` or
   `queryParam` argument of a built-in client method, which keeps `data` and
   `query` for the body and query object.
+- Both built-in clients take `ClientOptions` after the base URL: `fetch`,
+  the function that performs the requests (one that adds credentials or
+  retries, say), and `headers`, a record or a function called per request.
+  A plain headers record is still accepted. A non-2xx response throws a
+  `CufflinkError` with `status` and the parsed `body`; its message is the
+  body's `error` or `error_message` when there is one.
