@@ -26,8 +26,8 @@ fn identity() -> ServiceIdentity {
         tenant_id: Uuid::nil(),
         tenant_slug: "default".into(),
         service_id: Uuid::nil(),
-        service_name: "orders-service".into(),
-        schema: "orders_service".into(),
+        service_name: "catalog-service".into(),
+        schema: "catalog_service".into(),
     }
 }
 
@@ -83,13 +83,13 @@ fn durables_keep_the_names_and_the_configuration_they_had() {
         [
             (
                 "DW_DEFAULT",
-                "orders_service_on_payment",
-                as_v0_27_0("orders_service_on_payment", "dw.default.payments.succeeded")
+                "catalog_service_on_fine_paid",
+                as_v0_27_0("catalog_service_on_fine_paid", "dw.default.fines.paid")
             ),
             (
                 "CUFFLINK_TICKS",
-                "orders_service_sweep_stale",
-                as_v0_27_0("orders_service_sweep_stale", "cufflink.tick.hourly")
+                "catalog_service_sweep_stale",
+                as_v0_27_0("catalog_service_sweep_stale", "cufflink.tick.hourly")
             ),
         ],
         "what the server made of the defaults v0.27.0 created them with"

@@ -464,8 +464,8 @@ mod tests {
         for (json, deploy, schema) in [
             (
                 SAMPLE,
-                "32b79ba0e4b4697a505007ae19a1ab55a1f4fbefb26fe8fcd86a53847eccba28",
-                "422f205e16c949bd532f63707b78d8f6ccc4c9ba4eda0b2bd275c479a8d998f2",
+                "eee68954141745273b4157ffa4da676f33db4a908f63949bc9a4d7a2a437a17e",
+                "c1bfff7742704c2d5c1849a6eb964cece595080d25bcddf9e899dbd137ce5978",
             ),
             (
                 TODO,

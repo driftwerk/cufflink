@@ -1,60 +1,60 @@
 {
-  "name": "orders-service",
+  "name": "catalog-service",
   "version": "0.4.2",
   "tables": [
     {
-      "name": "orders",
+      "name": "loans",
       "columns": [
         {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false, "auto_generate": true, "default_value": null, "unique": false},
-        {"name": "customer_id", "column_type": "uuid", "primary_key": false, "nullable": false, "auto_generate": false, "default_value": null, "unique": false},
-        {"name": "status", "column_type": "text", "primary_key": false, "nullable": false, "auto_generate": false, "default_value": "'pending'", "unique": false, "validations": [{"rule": "one_of", "values": ["pending", "paid", "shipped"]}]},
-        {"name": "total", "column_type": "double", "primary_key": false, "nullable": false, "auto_generate": false, "default_value": "0", "unique": false, "validations": [{"rule": "min", "value": 0.0}]},
-        {"name": "shipment_id", "column_type": "uuid", "primary_key": false, "nullable": true, "auto_generate": false, "default_value": null, "references": "shipments.id", "on_delete": "set_null", "unique": false},
+        {"name": "borrower_id", "column_type": "uuid", "primary_key": false, "nullable": false, "auto_generate": false, "default_value": null, "unique": false},
+        {"name": "status", "column_type": "text", "primary_key": false, "nullable": false, "auto_generate": false, "default_value": "'pending'", "unique": false, "validations": [{"rule": "one_of", "values": ["pending", "active", "returned"]}]},
+        {"name": "fee", "column_type": "double", "primary_key": false, "nullable": false, "auto_generate": false, "default_value": "0", "unique": false, "validations": [{"rule": "min", "value": 0.0}]},
+        {"name": "volume_id", "column_type": "uuid", "primary_key": false, "nullable": true, "auto_generate": false, "default_value": null, "references": "volumes.id", "on_delete": "set_null", "unique": false},
         {"name": "created_at", "column_type": "timestamp", "primary_key": false, "nullable": false, "auto_generate": true, "default_value": null, "unique": false},
         {"name": "updated_at", "column_type": "timestamp", "primary_key": false, "nullable": false, "auto_generate": true, "default_value": null, "unique": false}
       ],
-      "indexes": [{"name": "orders_customer_idx", "columns": ["customer_id"], "unique": false}],
+      "indexes": [{"name": "loans_borrower_idx", "columns": ["borrower_id"], "unique": false}],
       "soft_delete": false,
-      "owner_field": "customer_id",
+      "owner_field": "borrower_id",
       "auth_required": true,
-      "permission_area": "orders",
+      "permission_area": "loans",
       "owner_self_service": true,
-      "hooks": {"before_create": "validate_order", "after_update": "notify_order"}
+      "hooks": {"before_create": "validate_loan", "after_update": "notify_loan"}
     },
     {
-      "name": "shipments",
+      "name": "volumes",
       "columns": [
         {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false, "auto_generate": true, "default_value": null, "unique": false},
-        {"name": "tracking", "column_type": "text", "primary_key": false, "nullable": true, "auto_generate": false, "default_value": null, "unique": true},
+        {"name": "barcode", "column_type": "text", "primary_key": false, "nullable": true, "auto_generate": false, "default_value": null, "unique": true},
         {"name": "created_at", "column_type": "timestamp", "primary_key": false, "nullable": false, "auto_generate": true, "default_value": null, "unique": false}
       ],
       "soft_delete": false,
       "auth_required": true,
-      "permission_area": "shipments",
+      "permission_area": "volumes",
       "owner_self_service": false
     }
   ],
   "cells": [],
   "events": [],
   "subscriptions": [
-    {"subject": "dw.{tenant}.payments.succeeded", "handler": "on_payment", "handler_type": "wasm", "config": {}},
+    {"subject": "dw.{tenant}.fines.paid", "handler": "on_fine_paid", "handler_type": "wasm", "config": {}},
     {"subject": "cufflink.tick.hourly", "handler": "sweep_stale", "handler_type": "wasm", "config": {}, "stream": "CUFFLINK_TICKS"}
   ],
   "custom_routes": [
     {"method": "POST", "path": "/stripe/webhook", "handler": "stripe_webhook", "posture": {"kind": "public", "reason": "Stripe-signed webhook"}},
-    {"method": "GET", "path": "/me/orders", "handler": "my_orders", "posture": {"kind": "owner", "field": "customer_id"}},
-    {"method": "GET", "path": "/orders/summary", "handler": "orders_summary", "posture": {"kind": "authenticated"}},
-    {"method": "POST", "path": "/orders/export", "handler": "export_orders", "job": {"timeout_secs": 900, "max_attempts": 1}, "posture": {"kind": "permission", "area": "orders", "operation": "view"}},
-    {"method": "POST", "path": "/orders/proxy", "handler": "proxy_orders", "posture": {"kind": "permission", "area": "orders", "operation": "edit"}, "forward_auth": true}
+    {"method": "GET", "path": "/me/loans", "handler": "my_loans", "posture": {"kind": "owner", "field": "borrower_id"}},
+    {"method": "GET", "path": "/loans/summary", "handler": "loans_summary", "posture": {"kind": "authenticated"}},
+    {"method": "POST", "path": "/loans/export", "handler": "export_loans", "job": {"timeout_secs": 900, "max_attempts": 1}, "posture": {"kind": "permission", "area": "loans", "operation": "view"}},
+    {"method": "POST", "path": "/loans/proxy", "handler": "proxy_loans", "posture": {"kind": "permission", "area": "loans", "operation": "edit"}, "forward_auth": true}
   ],
   "mode": "wasm",
   "authorization": {
     "areas": [
-      {"name": "orders", "operations": ["view", "create", "edit", "delete"]},
-      {"name": "shipments", "operations": ["view", "edit"]}
+      {"name": "loans", "operations": ["view", "create", "edit", "delete"]},
+      {"name": "volumes", "operations": ["view", "edit"]}
     ],
     "default_roles": [
-      {"name": "staff", "description": "Back office", "permissions": ["orders:*", "shipments:view"]},
+      {"name": "librarian", "description": "Front desk", "permissions": ["loans:*", "volumes:view"]},
       {"name": "admin", "description": "Everything", "permissions": ["*"]}
     ]
   },

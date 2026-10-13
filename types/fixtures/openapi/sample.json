@@ -1,87 +1,87 @@
 {
   "components": {
     "schemas": {
-      "Orders": {
+      "Loans": {
         "properties": {
+          "borrower_id": {
+            "format": "uuid",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
           },
-          "customer_id": {
-            "format": "uuid",
-            "type": "string"
+          "fee": {
+            "format": "double",
+            "type": "number"
           },
           "id": {
             "format": "uuid",
             "type": "string"
           },
-          "shipment_id": {
-            "format": "uuid",
-            "nullable": true,
-            "type": "string"
-          },
           "status": {
             "type": "string"
           },
-          "total": {
-            "format": "double",
-            "type": "number"
-          },
           "updated_at": {
             "format": "date-time",
+            "type": "string"
+          },
+          "volume_id": {
+            "format": "uuid",
+            "nullable": true,
             "type": "string"
           }
         },
         "required": [
           "id",
-          "customer_id",
+          "borrower_id",
           "status",
-          "total",
-          "shipment_id",
+          "fee",
+          "volume_id",
           "created_at",
           "updated_at"
         ],
         "type": "object"
       },
-      "OrdersCreate": {
+      "LoansCreate": {
         "properties": {
-          "customer_id": {
+          "borrower_id": {
             "format": "uuid",
             "type": "string"
           },
-          "shipment_id": {
-            "format": "uuid",
-            "nullable": true,
-            "type": "string"
+          "fee": {
+            "format": "double",
+            "type": "number"
           },
           "status": {
             "type": "string"
           },
-          "total": {
-            "format": "double",
-            "type": "number"
+          "volume_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
           }
         },
         "required": [],
         "type": "object"
       },
-      "OrdersUpdate": {
+      "LoansUpdate": {
         "properties": {
-          "customer_id": {
+          "borrower_id": {
             "format": "uuid",
             "type": "string"
           },
-          "shipment_id": {
-            "format": "uuid",
-            "nullable": true,
-            "type": "string"
+          "fee": {
+            "format": "double",
+            "type": "number"
           },
           "status": {
             "type": "string"
           },
-          "total": {
-            "format": "double",
-            "type": "number"
+          "volume_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
           }
         },
         "required": [],
@@ -104,8 +104,12 @@
         },
         "type": "object"
       },
-      "Shipments": {
+      "Volumes": {
         "properties": {
+          "barcode": {
+            "nullable": true,
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -113,22 +117,18 @@
           "id": {
             "format": "uuid",
             "type": "string"
-          },
-          "tracking": {
-            "nullable": true,
-            "type": "string"
           }
         },
         "required": [
           "id",
-          "tracking",
+          "barcode",
           "created_at"
         ],
         "type": "object"
       },
-      "ShipmentsCreate": {
+      "VolumesCreate": {
         "properties": {
-          "tracking": {
+          "barcode": {
             "nullable": true,
             "type": "string"
           }
@@ -136,9 +136,9 @@
         "required": [],
         "type": "object"
       },
-      "ShipmentsUpdate": {
+      "VolumesUpdate": {
         "properties": {
-          "tracking": {
+          "barcode": {
             "nullable": true,
             "type": "string"
           }
@@ -149,14 +149,14 @@
     }
   },
   "info": {
-    "title": "orders-service",
+    "title": "catalog-service",
     "version": "0.4.2"
   },
   "openapi": "3.1.0",
   "paths": {
-    "/svc/acme/orders-service/_fn/export_orders": {
+    "/svc/acme/catalog-service/_fn/export_loans": {
       "post": {
-        "operationId": "export_orders",
+        "operationId": "export_loans",
         "parameters": [],
         "requestBody": {
           "content": {
@@ -180,15 +180,15 @@
             "description": "Success"
           }
         },
-        "summary": "Custom: export_orders",
+        "summary": "Custom: export_loans",
         "tags": [
           "custom"
         ]
       }
     },
-    "/svc/acme/orders-service/_fn/my_orders": {
+    "/svc/acme/catalog-service/_fn/loans_summary": {
       "get": {
-        "operationId": "my_orders",
+        "operationId": "loans_summary",
         "parameters": [],
         "responses": {
           "200": {
@@ -202,15 +202,15 @@
             "description": "Success"
           }
         },
-        "summary": "Custom: my_orders",
+        "summary": "Custom: loans_summary",
         "tags": [
           "custom"
         ]
       }
     },
-    "/svc/acme/orders-service/_fn/orders_summary": {
+    "/svc/acme/catalog-service/_fn/my_loans": {
       "get": {
-        "operationId": "orders_summary",
+        "operationId": "my_loans",
         "parameters": [],
         "responses": {
           "200": {
@@ -224,15 +224,15 @@
             "description": "Success"
           }
         },
-        "summary": "Custom: orders_summary",
+        "summary": "Custom: my_loans",
         "tags": [
           "custom"
         ]
       }
     },
-    "/svc/acme/orders-service/_fn/proxy_orders": {
+    "/svc/acme/catalog-service/_fn/proxy_loans": {
       "post": {
-        "operationId": "proxy_orders",
+        "operationId": "proxy_loans",
         "parameters": [],
         "requestBody": {
           "content": {
@@ -256,13 +256,13 @@
             "description": "Success"
           }
         },
-        "summary": "Custom: proxy_orders",
+        "summary": "Custom: proxy_loans",
         "tags": [
           "custom"
         ]
       }
     },
-    "/svc/acme/orders-service/_fn/stripe_webhook": {
+    "/svc/acme/catalog-service/_fn/stripe_webhook": {
       "post": {
         "operationId": "stripe_webhook",
         "parameters": [],
@@ -294,9 +294,9 @@
         ]
       }
     },
-    "/svc/acme/orders-service/orders": {
+    "/svc/acme/catalog-service/loans": {
       "get": {
-        "operationId": "list_orders",
+        "operationId": "list_loans",
         "parameters": [
           {
             "description": "Page number (default: 1)",
@@ -340,9 +340,9 @@
             }
           },
           {
-            "description": "Filter by customer_id",
+            "description": "Filter by borrower_id",
             "in": "query",
-            "name": "customer_id",
+            "name": "borrower_id",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -357,18 +357,18 @@
             }
           },
           {
-            "description": "Filter by total",
+            "description": "Filter by fee",
             "in": "query",
-            "name": "total",
+            "name": "fee",
             "schema": {
               "format": "double",
               "type": "number"
             }
           },
           {
-            "description": "Filter by shipment_id",
+            "description": "Filter by volume_id",
             "in": "query",
-            "name": "shipment_id",
+            "name": "volume_id",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -404,7 +404,7 @@
                     },
                     "results": {
                       "items": {
-                        "$ref": "#/components/schemas/Orders"
+                        "$ref": "#/components/schemas/Loans"
                       },
                       "type": "array"
                     }
@@ -416,18 +416,18 @@
             "description": "Paginated list"
           }
         },
-        "summary": "List orders",
+        "summary": "List loans",
         "tags": [
-          "orders"
+          "loans"
         ]
       },
       "post": {
-        "operationId": "create_order",
+        "operationId": "create_loan",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/OrdersCreate"
+                "$ref": "#/components/schemas/LoansCreate"
               }
             }
           },
@@ -438,22 +438,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Orders"
+                  "$ref": "#/components/schemas/Loans"
                 }
               }
             },
             "description": "Created"
           }
         },
-        "summary": "Create order",
+        "summary": "Create loan",
         "tags": [
-          "orders"
+          "loans"
         ]
       }
     },
-    "/svc/acme/orders-service/orders/:id": {
+    "/svc/acme/catalog-service/loans/:id": {
       "delete": {
-        "operationId": "delete_order",
+        "operationId": "delete_loan",
         "parameters": [
           {
             "in": "path",
@@ -470,13 +470,13 @@
             "description": "Deleted"
           }
         },
-        "summary": "Delete order",
+        "summary": "Delete loan",
         "tags": [
-          "orders"
+          "loans"
         ]
       },
       "get": {
-        "operationId": "get_order",
+        "operationId": "get_loan",
         "parameters": [
           {
             "in": "path",
@@ -493,7 +493,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Orders"
+                  "$ref": "#/components/schemas/Loans"
                 }
               }
             },
@@ -503,13 +503,13 @@
             "description": "Not found"
           }
         },
-        "summary": "Get order by ID",
+        "summary": "Get loan by ID",
         "tags": [
-          "orders"
+          "loans"
         ]
       },
       "put": {
-        "operationId": "update_order",
+        "operationId": "update_loan",
         "parameters": [
           {
             "in": "path",
@@ -525,7 +525,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/OrdersUpdate"
+                "$ref": "#/components/schemas/LoansUpdate"
               }
             }
           },
@@ -536,22 +536,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Orders"
+                  "$ref": "#/components/schemas/Loans"
                 }
               }
             },
             "description": "Updated"
           }
         },
-        "summary": "Update order",
+        "summary": "Update loan",
         "tags": [
-          "orders"
+          "loans"
         ]
       }
     },
-    "/svc/acme/orders-service/shipments": {
+    "/svc/acme/catalog-service/volumes": {
       "get": {
-        "operationId": "list_shipments",
+        "operationId": "list_volumes",
         "parameters": [
           {
             "description": "Page number (default: 1)",
@@ -595,9 +595,9 @@
             }
           },
           {
-            "description": "Filter by tracking",
+            "description": "Filter by barcode",
             "in": "query",
-            "name": "tracking",
+            "name": "barcode",
             "schema": {
               "type": "string"
             }
@@ -623,7 +623,7 @@
                     },
                     "results": {
                       "items": {
-                        "$ref": "#/components/schemas/Shipments"
+                        "$ref": "#/components/schemas/Volumes"
                       },
                       "type": "array"
                     }
@@ -635,18 +635,18 @@
             "description": "Paginated list"
           }
         },
-        "summary": "List shipments",
+        "summary": "List volumes",
         "tags": [
-          "shipments"
+          "volumes"
         ]
       },
       "post": {
-        "operationId": "create_shipment",
+        "operationId": "create_volume",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ShipmentsCreate"
+                "$ref": "#/components/schemas/VolumesCreate"
               }
             }
           },
@@ -657,22 +657,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Shipments"
+                  "$ref": "#/components/schemas/Volumes"
                 }
               }
             },
             "description": "Created"
           }
         },
-        "summary": "Create shipment",
+        "summary": "Create volume",
         "tags": [
-          "shipments"
+          "volumes"
         ]
       }
     },
-    "/svc/acme/orders-service/shipments/:id": {
+    "/svc/acme/catalog-service/volumes/:id": {
       "delete": {
-        "operationId": "delete_shipment",
+        "operationId": "delete_volume",
         "parameters": [
           {
             "in": "path",
@@ -689,13 +689,13 @@
             "description": "Deleted"
           }
         },
-        "summary": "Delete shipment",
+        "summary": "Delete volume",
         "tags": [
-          "shipments"
+          "volumes"
         ]
       },
       "get": {
-        "operationId": "get_shipment",
+        "operationId": "get_volume",
         "parameters": [
           {
             "in": "path",
@@ -712,7 +712,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Shipments"
+                  "$ref": "#/components/schemas/Volumes"
                 }
               }
             },
@@ -722,13 +722,13 @@
             "description": "Not found"
           }
         },
-        "summary": "Get shipment by ID",
+        "summary": "Get volume by ID",
         "tags": [
-          "shipments"
+          "volumes"
         ]
       },
       "put": {
-        "operationId": "update_shipment",
+        "operationId": "update_volume",
         "parameters": [
           {
             "in": "path",
@@ -744,7 +744,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ShipmentsUpdate"
+                "$ref": "#/components/schemas/VolumesUpdate"
               }
             }
           },
@@ -755,16 +755,16 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Shipments"
+                  "$ref": "#/components/schemas/Volumes"
                 }
               }
             },
             "description": "Updated"
           }
         },
-        "summary": "Update shipment",
+        "summary": "Update volume",
         "tags": [
-          "shipments"
+          "volumes"
         ]
       }
     }

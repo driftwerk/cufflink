@@ -23,11 +23,11 @@ fn a_manifest_without_the_key_hashes_as_v0_29_2_did() {
             .expect("fixture");
     assert_eq!(
         sample.deploy_hash().expect("deploy hash"),
-        "32b79ba0e4b4697a505007ae19a1ab55a1f4fbefb26fe8fcd86a53847eccba28"
+        "eee68954141745273b4157ffa4da676f33db4a908f63949bc9a4d7a2a437a17e"
     );
     assert_eq!(
         sample.schema_hash().expect("schema hash"),
-        "422f205e16c949bd532f63707b78d8f6ccc4c9ba4eda0b2bd275c479a8d998f2"
+        "c1bfff7742704c2d5c1849a6eb964cece595080d25bcddf9e899dbd137ce5978"
     );
     for manifest in manifests() {
         let wire = serde_json::to_value(&manifest).expect("wire");

@@ -1656,13 +1656,13 @@ A service can react to NATS messages with a WASM handler. Declare subscriptions 
 
 ```rust
 cufflink::service! {
-    name: "fulfilment",
+    name: "circulation",
     mode: wasm,
-    tables: [Shipment],
+    tables: [Hold],
     subscriptions: [
         // `{tenant}` is replaced with the deploying tenant's slug.
-        ("dw.{tenant}.shop.orders.created", "on_order_created", wasm),
-        ("dw.{tenant}.shop.orders.*",       "on_any_order_event", wasm),
+        ("dw.{tenant}.catalog.loans.created", "on_loan_created", wasm),
+        ("dw.{tenant}.catalog.loans.*",       "on_any_loan_event", wasm),
     ],
 }
 ```
@@ -1683,29 +1683,29 @@ The payload is a JSON object carrying `action`, `table` and `data` (the row as w
 
 ### Subject matching
 
-Subjects are `.`-separated tokens. In a subscription pattern `*` matches exactly one token and a trailing `>` matches the rest of the subject (one or more tokens), so `dw.acme.shop.orders.*` matches `...orders.created` but not `...orders.created.v2`, and `dw.acme.shop.>` matches everything under `shop`.
+Subjects are `.`-separated tokens. In a subscription pattern `*` matches exactly one token and a trailing `>` matches the rest of the subject (one or more tokens), so `dw.acme.catalog.loans.*` matches `...loans.created` but not `...loans.created.v2`, and `dw.acme.catalog.>` matches everything under `catalog`.
 
 ### What the handler receives
 
 ```json
 {
   "method": "SUBSCRIPTION",
-  "handler": "on_order_created",
+  "handler": "on_loan_created",
   "headers": {},
   "body": { ...the published message, parsed as JSON... },
   "tenant": "acme",
-  "service": "fulfilment",
+  "service": "circulation",
   "auth": null
 }
 ```
 
 ```rust
-handler!(on_order_created, |req: Request| {
+handler!(on_loan_created, |req: Request| {
     let event = req.body();
-    let order_id = event["order_id"].as_str().unwrap_or("");
+    let loan_id = event["loan_id"].as_str().unwrap_or("");
     db::execute(&format!(
-        "INSERT INTO shipments (id, order_id, status) VALUES ('{}', '{}', 'pending')",
-        util::generate_uuid(), db::sql_escape(order_id)
+        "INSERT INTO holds (id, loan_id, status) VALUES ('{}', '{}', 'pending')",
+        util::generate_uuid(), db::sql_escape(loan_id)
     ));
     Response::empty()
 });

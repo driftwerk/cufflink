@@ -1,9 +1,9 @@
 {
-  "name": "orders-service",
+  "name": "catalog-service",
   "version": "0.0.0",
   "tables": [
     {
-      "name": "orders",
+      "name": "loans",
       "columns": [
         {
           "name": "id",
@@ -15,7 +15,7 @@
           "unique": false
         },
         {
-          "name": "customer_id",
+          "name": "borrower_id",
           "column_type": "uuid",
           "primary_key": false,
           "nullable": false,
@@ -43,13 +43,13 @@
         }
       ],
       "soft_delete": false,
-      "owner_field": "customer_id",
+      "owner_field": "borrower_id",
       "auth_required": true,
-      "permission_area": "orders",
+      "permission_area": "loans",
       "owner_self_service": false
     },
     {
-      "name": "shipments",
+      "name": "volumes",
       "columns": [
         {
           "name": "id",
@@ -61,7 +61,7 @@
           "unique": false
         },
         {
-          "name": "order_id",
+          "name": "book_id",
           "column_type": "uuid",
           "primary_key": false,
           "nullable": false,
@@ -72,7 +72,7 @@
       ],
       "soft_delete": false,
       "auth_required": false,
-      "permission_area": "shipments",
+      "permission_area": "volumes",
       "owner_self_service": false
     }
   ],
@@ -80,8 +80,8 @@
   "events": [],
   "subscriptions": [
     {
-      "subject": "dw.{tenant}.payments.succeeded",
-      "handler": "on_payment",
+      "subject": "dw.{tenant}.fines.paid",
+      "handler": "on_fine_paid",
       "handler_type": "wasm",
       "config": {}
     },
@@ -93,7 +93,7 @@
       "stream": "CUFFLINK_TICKS"
     },
     {
-      "subject": "dw.{tenant}.orders.deleted",
+      "subject": "dw.{tenant}.loans.deleted",
       "handler": "cascade",
       "handler_type": "delete_cascade",
       "config": {}
@@ -111,38 +111,38 @@
     },
     {
       "method": "GET",
-      "path": "/me/orders",
-      "handler": "my_orders",
+      "path": "/me/loans",
+      "handler": "my_loans",
       "posture": {
         "kind": "owner",
-        "field": "customer_id"
+        "field": "borrower_id"
       }
     },
     {
       "method": "GET",
-      "path": "/orders/summary",
-      "handler": "orders_summary",
+      "path": "/loans/summary",
+      "handler": "loans_summary",
       "posture": {
         "kind": "authenticated"
       }
     },
     {
       "method": "POST",
-      "path": "/orders/export",
-      "handler": "export_orders",
+      "path": "/loans/export",
+      "handler": "export_loans",
       "job": {
         "timeout_secs": 900,
         "max_attempts": 1
       },
       "posture": {
         "kind": "permission",
-        "area": "orders",
+        "area": "loans",
         "operation": "view"
       }
     },
     {
       "method": "POST",
-      "path": "/orders/rebuild",
+      "path": "/loans/rebuild",
       "handler": "rebuild",
       "job": {
         "timeout_secs": 600,
@@ -150,17 +150,17 @@
       },
       "posture": {
         "kind": "permission",
-        "area": "orders",
+        "area": "loans",
         "operation": "edit"
       }
     },
     {
       "method": "POST",
-      "path": "/orders/proxy",
-      "handler": "proxy_orders",
+      "path": "/loans/proxy",
+      "handler": "proxy_loans",
       "posture": {
         "kind": "permission",
-        "area": "orders",
+        "area": "loans",
         "operation": "edit"
       },
       "forward_auth": true
@@ -175,7 +175,7 @@
   "authorization": {
     "areas": [
       {
-        "name": "orders",
+        "name": "loans",
         "operations": [
           "view",
           "create",
@@ -184,7 +184,7 @@
         ]
       },
       {
-        "name": "shipments",
+        "name": "volumes",
         "operations": [
           "view"
         ]
@@ -192,11 +192,11 @@
     ],
     "default_roles": [
       {
-        "name": "staff",
-        "description": "Back office",
+        "name": "librarian",
+        "description": "Front desk",
         "permissions": [
-          "orders:*",
-          "shipments:view"
+          "loans:*",
+          "volumes:view"
         ]
       },
       {
@@ -210,7 +210,7 @@
   },
   "on_migrate": "handle_on_migrate",
   "publishes": [
-    "dw.shared.orders.>"
+    "dw.shared.loans.>"
   ],
   "required_platform_features": [
     "route_posture"

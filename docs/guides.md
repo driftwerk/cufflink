@@ -2388,11 +2388,11 @@ If service A in tenant "acme" needs to notify service B in tenant "globex", use 
 {
   "subscriptions": [
     {
-      "subject": "dw.acme.order-service.orders.created",
-      "handler": "forward_to_fulfillment",
+      "subject": "dw.acme.catalog-service.loans.created",
+      "handler": "forward_to_circulation",
       "handler_type": "webhook",
       "config": {
-        "url": "http://localhost:8080/svc/globex/fulfillment-service/_fn/new_order",
+        "url": "http://localhost:8080/svc/globex/circulation-service/_fn/new_loan",
         "method": "POST"
       }
     }
