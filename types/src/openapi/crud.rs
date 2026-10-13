@@ -142,7 +142,17 @@ fn list_parameters(table: &TableDefinition) -> Vec<Value> {
         json!({"name": "filter", "in": "query", "schema": {"type": "string"}, "description": "JSON filter array"}),
     ];
 
-    for col in &table.columns {
+    // A column named like a pagination or sort parameter cannot be filtered
+    // by its plain name, so it is not offered as a parameter.
+    let reserved: Vec<String> = params
+        .iter()
+        .filter_map(|param| param["name"].as_str().map(str::to_string))
+        .collect();
+    for col in table
+        .columns
+        .iter()
+        .filter(|col| !reserved.contains(&col.name))
+    {
         params.push(json!({
             "name": col.name,
             "in": "query",
@@ -159,5 +169,36 @@ fn singular(s: &str) -> String {
         s[..s.len() - 1].to_string()
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod reserved_parameter_tests {
+    use super::*;
+    use crate::{ColumnDefinition, ColumnType};
+
+    #[test]
+    fn a_column_named_like_a_pagination_parameter_is_not_offered_twice() {
+        let table = TableDefinition {
+            name: "backfill_runs".into(),
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".into(),
+                    column_type: ColumnType::Uuid,
+                    ..Default::default()
+                },
+                ColumnDefinition {
+                    name: "page".into(),
+                    column_type: ColumnType::Integer,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let names: Vec<String> = list_parameters(&table)
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["page", "per_page", "sort", "filter", "id"]);
     }
 }
