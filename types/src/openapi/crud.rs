@@ -83,7 +83,7 @@ pub(super) fn table_paths(
                     "summary": format!("Get {} by ID", singular(&table.name)),
                     "operationId": get_id,
                     "tags": [table.name],
-                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+                    "parameters": get_parameters(table),
                     "responses": {
                         "200": {
                             "description": "Found",
@@ -134,6 +134,21 @@ pub(super) fn table_paths(
     ]
 }
 
+/// `scope=own|all` on a table scoped by grants: which of its rows a caller
+/// with both reaches.
+fn scope_parameter(table: &TableDefinition) -> Option<Value> {
+    table.scoped_by.as_ref().map(|_| {
+        json!({"name": "scope", "in": "query", "schema": {"type": "string", "enum": ["own", "all"]},
+               "description": "Rows of the caller's own scope, or all the caller's grants reach"})
+    })
+}
+
+fn get_parameters(table: &TableDefinition) -> Vec<Value> {
+    std::iter::once(json!({"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}))
+        .chain(scope_parameter(table))
+        .collect()
+}
+
 fn list_parameters(table: &TableDefinition) -> Vec<Value> {
     let mut params = vec![
         json!({"name": "page", "in": "query", "schema": {"type": "integer"}, "description": "Page number (default: 1)"}),
@@ -141,6 +156,7 @@ fn list_parameters(table: &TableDefinition) -> Vec<Value> {
         json!({"name": "sort", "in": "query", "schema": {"type": "string"}, "description": "Sort by column (prefix - for DESC)"}),
         json!({"name": "filter", "in": "query", "schema": {"type": "string"}, "description": "JSON filter array"}),
     ];
+    params.extend(scope_parameter(table));
 
     // A column named like a pagination or sort parameter cannot be filtered
     // by its plain name, so it is not offered as a parameter.
@@ -200,5 +216,29 @@ mod reserved_parameter_tests {
             .map(|p| p["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["page", "per_page", "sort", "filter", "id"]);
+    }
+
+    #[test]
+    fn a_scoped_table_offers_the_scope_parameter_on_list_and_get() {
+        let mut table = TableDefinition {
+            name: "items".into(),
+            columns: vec![ColumnDefinition {
+                name: "id".into(),
+                column_type: ColumnType::Uuid,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let names = |params: Vec<Value>| -> Vec<String> {
+            params
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(!names(list_parameters(&table)).contains(&"scope".to_string()));
+        assert_eq!(names(get_parameters(&table)), ["id"]);
+        table.scoped_by = Some("items".into());
+        assert!(names(list_parameters(&table)).contains(&"scope".to_string()));
+        assert_eq!(names(get_parameters(&table)), ["id", "scope"]);
     }
 }
