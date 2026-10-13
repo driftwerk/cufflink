@@ -2,7 +2,7 @@
 name = "cufflink-ext-runner"
 version = "0.1.0"
 edition = "2021"
-license = "FSL-1.1-ALv2"
+license = "Elastic-2.0"
 repository = "https://github.com/driftwerk/cufflink"
 description = "Cufflink extension runner — supervises native services and relays their calls"
 publish = false

@@ -87,7 +87,7 @@ pushes Docker images.
 ## License
 
 A contribution is licensed under the license of the part of the repository it
-changes: FSL-1.1-ALv2 for the platform and server components, MIT OR
+changes: the Elastic License 2.0 for the platform and server components, MIT OR
 Apache-2.0 for the published crates and `examples/` (see the
 [README](README.md#license)). By submitting a contribution you also grant the
 licensor a perpetual, worldwide, royalty-free, irrevocable license to use,

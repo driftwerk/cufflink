@@ -448,10 +448,9 @@ Security issues should be reported privately per [SECURITY.md](SECURITY.md).
 ## License
 
 The platform and its server components are licensed under the
-[Functional Source License, Version 1.1, ALv2 Future License](LICENSE-FSL.md)
-(FSL-1.1-ALv2). You may use, modify and self-host them for any purpose other
-than offering a competing product or service. Each version becomes available
-under the Apache License, Version 2.0 two years after its release.
+[Elastic License 2.0](LICENSE-ELASTIC.md) (ELv2). You may use, modify and
+self-host them, but you may not provide them to others as a hosted or managed
+service.
 
 The crates you build services with — `cufflink`, `cufflink-fn`,
 `cufflink-types`, `cufflink-sdk-macros`, `cufflink-migrate`,
