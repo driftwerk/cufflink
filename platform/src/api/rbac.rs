@@ -333,13 +333,28 @@ fn may_read_permissions_of(caller: &AuthUser, user_id: &str) -> bool {
     caller.subject == user_id || caller.has_deploy_authority || caller.is_service_account
 }
 
+fn may_manage_roles(permissions: &[String]) -> bool {
+    grants::has_permission(permissions, "roles", "manage")
+}
+
 pub async fn get_user_permissions(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path((tenant_id, user_id)): Path<(Uuid, String)>,
 ) -> PlatformResult<Json<Value>> {
-    if tenant_id != user.tenant_id || !may_read_permissions_of(&user, &user_id) {
+    if tenant_id != user.tenant_id {
         return Err(PlatformError::Forbidden("Access denied".into()));
+    }
+    if !may_read_permissions_of(&user, &user_id) {
+        let caller = crate::auth::permissions::resolve_permissions(
+            &state.platform_db,
+            user.tenant_id,
+            &user.subject,
+        )
+        .await?;
+        if !may_manage_roles(&caller.permissions) {
+            return Err(PlatformError::Forbidden("Access denied".into()));
+        }
     }
 
     let client = state.platform_db.get().await?;
@@ -424,6 +439,13 @@ mod tests {
         assert!(!may_read_permissions_of(&caller("u1", false, false), "u2"));
         assert!(may_read_permissions_of(&caller("ops", true, false), "u2"));
         assert!(may_read_permissions_of(&caller("svc", false, true), "u2"));
+    }
+
+    #[test]
+    fn roles_manage_holders_may_read_others_permissions() {
+        assert!(may_manage_roles(&["roles:manage".to_string()]));
+        assert!(!may_manage_roles(&["items:read".to_string()]));
+        assert!(!may_manage_roles(&[]));
     }
 
     #[test]
