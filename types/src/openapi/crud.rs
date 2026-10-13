@@ -134,8 +134,7 @@ pub(super) fn table_paths(
     ]
 }
 
-/// `scope=own|all` on a table scoped by grants: which of its rows a caller
-/// with both reaches.
+/// The `scope=own|all` parameter of a table scoped by grants.
 fn scope_parameter(table: &TableDefinition) -> Option<Value> {
     table.scoped_by.as_ref().map(|_| {
         json!({"name": "scope", "in": "query", "schema": {"type": "string", "enum": ["own", "all"]},
@@ -158,8 +157,6 @@ fn list_parameters(table: &TableDefinition) -> Vec<Value> {
     ];
     params.extend(scope_parameter(table));
 
-    // A column named like a pagination or sort parameter cannot be filtered
-    // by its plain name, so it is not offered as a parameter.
     let reserved: Vec<String> = params
         .iter()
         .filter_map(|param| param["name"].as_str().map(str::to_string))
@@ -196,7 +193,7 @@ mod reserved_parameter_tests {
     #[test]
     fn a_column_named_like_a_pagination_parameter_is_not_offered_twice() {
         let table = TableDefinition {
-            name: "backfill_runs".into(),
+            name: "bookmarks".into(),
             columns: vec![
                 ColumnDefinition {
                     name: "id".into(),

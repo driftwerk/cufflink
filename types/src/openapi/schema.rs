@@ -70,7 +70,6 @@ pub(super) fn column_to_openapi_type(col_type: &ColumnType) -> Value {
         ColumnType::Boolean => json!({"type": "boolean"}),
         ColumnType::Timestamp => json!({"type": "string", "format": "date-time"}),
         ColumnType::Date => json!({"type": "string", "format": "date"}),
-        // Any JSON value: an array or a scalar is as valid as an object.
         ColumnType::Jsonb => json!({}),
         ColumnType::Numeric { .. } => json!({"type": "string", "format": "decimal"}),
         ColumnType::Varchar { length } => json!({"type": "string", "maxLength": length}),
@@ -107,9 +106,7 @@ fn column_schema(table: &TableDefinition, col: &ColumnDefinition, nullable: Null
     prop
 }
 
-/// A row as the data routes answer it: every column is present, a nullable
-/// one as `null`, so each is required of a response except a column some
-/// callers are not answered.
+/// A row as the data routes answer it.
 fn table_to_schema(table: &TableDefinition, nullable: Nullable) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
@@ -137,7 +134,6 @@ fn table_to_create_schema(table: &TableDefinition, nullable: Nullable) -> Value 
             continue;
         }
         properties.insert(col.name.clone(), column_schema(table, col, nullable));
-        // The platform fills the owner column from the caller's scope.
         let owner = table.owner_field.as_deref() == Some(col.name.as_str());
         if !col.nullable && col.default_value.is_none() && !owner {
             required.push(json!(col.name));
@@ -151,8 +147,7 @@ fn table_to_create_schema(table: &TableDefinition, nullable: Nullable) -> Value 
     })
 }
 
-/// An update body: the platform sets only the columns it is sent, so none
-/// is required.
+/// An update body, in which no column is required.
 fn table_to_update_schema(table: &TableDefinition, nullable: Nullable) -> Value {
     let properties: Map<String, Value> = table
         .columns

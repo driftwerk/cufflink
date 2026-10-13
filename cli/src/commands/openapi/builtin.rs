@@ -336,8 +336,7 @@ fn typed_client(spec: &Value, service_name: &str, class_name: &str) -> String {
     )
 }
 
-/// The options every generated client takes besides its base URL, and the
-/// error it throws for a non-2xx response.
+/// The `ClientOptions` and `CufflinkError` every generated client shares.
 const CLIENT_PREAMBLE: &str = r#"export interface ClientOptions {
   /** Sent with every request; a function is called per request, so a rotated token is used at once. */
   headers?: Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>);
@@ -380,8 +379,7 @@ export class CufflinkError extends Error {
 
 "#;
 
-/// The fields and constructor of both clients: a plain headers record (every
-/// value a string) is still accepted where `ClientOptions` is.
+/// The fields and constructor of both clients.
 const CLASS_HEAD: &str = r#"  private baseUrl: string;
   private headers: ClientOptions['headers'];
   private fetchImpl: NonNullable<ClientOptions['fetch']>;
@@ -735,8 +733,6 @@ mod tests {
         );
     }
 
-    /// Both emitters take the caller's fetch and per-request headers, and
-    /// throw a `CufflinkError` carrying the status and body.
     #[test]
     fn both_clients_take_options_and_throw_structured_errors() {
         let legacy = generate_typescript_client(&sample_spec(), "test-service", DEFAULT_CLASS_NAME);
