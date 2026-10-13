@@ -1,6 +1,6 @@
 [package]
 name = "cufflink-cli"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 description = "CLI for the Cufflink CRUD microservice platform — deploy, init, and manage services"
 license = "MIT OR Apache-2.0"

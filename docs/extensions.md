@@ -217,7 +217,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cufflink-native = "0.4"
+cufflink-native = "0.5"
 ```
 
 ```rust

@@ -74,8 +74,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-cufflink = { version = "0.16" }
-cufflink-fn = { version = "0.32" }
+cufflink = { version = "0.17" }
+cufflink-fn = { version = "0.33" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `v4` is intentionally omitted: the platform auto-generates row IDs, and
@@ -2289,7 +2289,7 @@ Messages appear in the platform (or worker) logs prefixed with `[wasm]`.
 
 ### stripe feature
 
-`cufflink-fn = { version = "0.32", features = ["stripe"] }` adds a `stripe` module (webhook signature verification over `req.raw_body()`, form encoding and a small REST client); it is opt-in so the crypto dependencies stay out of services that don't need it.
+`cufflink-fn = { version = "0.33", features = ["stripe"] }` adds a `stripe` module (webhook signature verification over `req.raw_body()`, form encoding and a small REST client); it is opt-in so the crypto dependencies stay out of services that don't need it.
 
 ### Compatibility
 

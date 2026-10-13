@@ -147,6 +147,25 @@ declares.
 `cufflink services list --features` prints what each deployed service
 requires.
 
+## Changes in v0.33.0
+
+No new module-declared feature. Spec and client changes:
+
+- Generated clients take `ClientOptions` (`fetch`, `headers`) after the base
+  URL and throw `CufflinkError` with the status and parsed body for a non-2xx
+  response; a plain headers record is still accepted. A typed client answers
+  `undefined` for an empty JSON body ([generating a client](openapi.md#generating-a-client)).
+- A table's row schema requires every column it is answered, a nullable one
+  as `null`; the create body no longer requires the owner column; a PUT body
+  has its own `…Update` schema with nothing required; a JSONB column is any
+  JSON value rather than an object. Regenerated clients change type shape
+  accordingly.
+- A table scoped by grants documents `scope=own|all` on its list and get
+  routes, and a column named like a list parameter is no longer offered as a
+  filter twice.
+- The telemetry crate is on the opentelemetry 0.32 family and token signing
+  uses jsonwebtoken 10 on the aws-lc-rs backend.
+
 ## Changes in v0.32.0
 
 No new module-declared feature. Platform behaviour:
