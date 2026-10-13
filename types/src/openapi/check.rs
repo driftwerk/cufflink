@@ -59,10 +59,7 @@ pub fn validate(manifest: &ServiceManifest) -> Result<(), OpenApiError> {
     manifest
         .tables
         .iter()
-        .flat_map(|table| {
-            let (row, create) = schema_names(table);
-            [row, create]
-        })
+        .flat_map(schema_names)
         .chain(
             (!manifest.tables.is_empty())
                 .then(|| "Pagination".to_string()),

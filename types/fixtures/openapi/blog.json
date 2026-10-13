@@ -56,6 +56,22 @@
         ],
         "type": "object"
       },
+      "CommentsUpdate": {
+        "properties": {
+          "author_name": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "post_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
       "Pagination": {
         "properties": {
           "current_page": {
@@ -108,6 +124,7 @@
         "required": [
           "id",
           "title",
+          "slug",
           "body",
           "author_id",
           "published",
@@ -142,6 +159,29 @@
           "author_id",
           "published"
         ],
+        "type": "object"
+      },
+      "PostsUpdate": {
+        "properties": {
+          "author_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "published": {
+            "type": "boolean"
+          },
+          "slug": {
+            "nullable": true,
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [],
         "type": "object"
       },
       "Tags": {
@@ -189,6 +229,19 @@
           "name",
           "post_id"
         ],
+        "type": "object"
+      },
+      "TagsUpdate": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "post_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [],
         "type": "object"
       }
     }
@@ -420,7 +473,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/CommentsCreate"
+                "$ref": "#/components/schemas/CommentsUpdate"
               }
             }
           },
@@ -681,7 +734,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PostsCreate"
+                "$ref": "#/components/schemas/PostsUpdate"
               }
             }
           },
@@ -918,7 +971,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TagsCreate"
+                "$ref": "#/components/schemas/TagsUpdate"
               }
             }
           },

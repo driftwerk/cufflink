@@ -37,6 +37,7 @@
           "customer_id",
           "status",
           "total",
+          "shipment_id",
           "created_at",
           "updated_at"
         ],
@@ -61,9 +62,29 @@
             "type": "number"
           }
         },
-        "required": [
-          "customer_id"
-        ],
+        "required": [],
+        "type": "object"
+      },
+      "OrdersUpdate": {
+        "properties": {
+          "customer_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "shipment_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [],
         "type": "object"
       },
       "Pagination": {
@@ -100,11 +121,22 @@
         },
         "required": [
           "id",
+          "tracking",
           "created_at"
         ],
         "type": "object"
       },
       "ShipmentsCreate": {
+        "properties": {
+          "tracking": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ShipmentsUpdate": {
         "properties": {
           "tracking": {
             "nullable": true,
@@ -493,7 +525,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/OrdersCreate"
+                "$ref": "#/components/schemas/OrdersUpdate"
               }
             }
           },
@@ -712,7 +744,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ShipmentsCreate"
+                "$ref": "#/components/schemas/ShipmentsUpdate"
               }
             }
           },

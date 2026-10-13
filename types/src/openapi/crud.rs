@@ -21,7 +21,7 @@ pub(super) fn table_paths(
     table: &TableDefinition,
 ) -> [(String, Value); 2] {
     let [list_id, create_id, get_id, update_id, delete_id] = operation_ids(table);
-    let (schema_name, create_schema_name) = schema_names(table);
+    let [schema_name, create_schema_name, update_schema_name] = schema_names(table);
     [
         (
             base_path,
@@ -105,7 +105,7 @@ pub(super) fn table_paths(
                         "required": true,
                         "content": {
                             "application/json": {
-                                "schema": { "$ref": format!("#/components/schemas/{}", create_schema_name) }
+                                "schema": { "$ref": format!("#/components/schemas/{}", update_schema_name) }
                             }
                         }
                     },

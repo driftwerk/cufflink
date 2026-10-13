@@ -65,10 +65,24 @@
           }
         },
         "required": [
-          "user_id",
           "title",
           "completed"
         ],
+        "type": "object"
+      },
+      "TodosUpdate": {
+        "properties": {
+          "completed": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [],
         "type": "object"
       }
     }
@@ -299,7 +313,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TodosCreate"
+                "$ref": "#/components/schemas/TodosUpdate"
               }
             }
           },

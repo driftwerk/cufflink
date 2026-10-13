@@ -428,6 +428,50 @@ mod tests {
     }
 
     #[test]
+    fn rows_require_every_column_and_bodies_follow_the_platform() {
+        let mut manifest = test_manifest();
+        let table = &mut manifest.tables[0];
+        table.owner_field = Some("owner_id".into());
+        table.columns.push(ColumnDefinition {
+            name: "owner_id".into(),
+            column_type: ColumnType::Uuid,
+            ..Default::default()
+        });
+        table.columns.push(ColumnDefinition {
+            name: "notes".into(),
+            column_type: ColumnType::Jsonb,
+            nullable: true,
+            ..Default::default()
+        });
+        let spec = generate_openapi(&manifest, PathStyle::ServerRelative { tenant: "acme" })
+            .expect("spec");
+        let schemas = &spec["components"]["schemas"];
+        assert_eq!(
+            schemas["Todos"]["required"],
+            serde_json::json!(["id", "title", "done", "owner_id", "notes"])
+        );
+        assert_eq!(
+            schemas["Todos"]["properties"]["notes"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            schemas["TodosCreate"]["required"],
+            serde_json::json!(["title"])
+        );
+        assert_eq!(schemas["TodosUpdate"]["required"], serde_json::json!([]));
+        assert!(schemas["TodosUpdate"]["properties"].get("id").is_none());
+        let put = spec["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find_map(|(_, item)| item.get("put"));
+        assert_eq!(
+            put.expect("put")["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TodosUpdate"
+        );
+    }
+
+    #[test]
     fn test_create_schema_excludes_auto_generated() {
         let manifest = test_manifest();
         let spec =

@@ -20,6 +20,13 @@ Both documents describe the tables of `tables` alone. A
 and no operation id, so a documented type may have the name its row schema
 would have had (`Note` beside a private `notes`).
 
+Each table has three schemas: the row (`Notes`), which requires every
+column a caller is answered, nullable ones as `null`; the create body
+(`NotesCreate`), which requires the non-null columns without a default,
+except the owner column the platform fills; and the update body
+(`NotesUpdate`), which requires nothing, since `PUT` sets only the columns
+it is sent. A `JSONB` column is any JSON value.
+
 ## Documenting routes
 
 ```toml

@@ -1,11 +1,12 @@
 use crate::{ColumnDefinition, ColumnType, TableDefinition};
 use serde_json::{json, Map, Value};
 
-/// The component names of `table`'s row schema and its create-body schema.
-pub(super) fn schema_names(table: &TableDefinition) -> (String, String) {
+/// The component names of `table`'s row, create-body and update-body schemas.
+pub(super) fn schema_names(table: &TableDefinition) -> [String; 3] {
     let schema_name = to_pascal_case(&table.name);
     let create_schema_name = format!("{}Create", schema_name);
-    (schema_name, create_schema_name)
+    let update_schema_name = format!("{}Update", schema_name);
+    [schema_name, create_schema_name, update_schema_name]
 }
 
 /// How a nullable column's schema says so.
@@ -35,12 +36,13 @@ impl Nullable {
     }
 }
 
-/// `table`'s row and create-body component schemas.
-pub(super) fn table_schemas(table: &TableDefinition, nullable: Nullable) -> [(String, Value); 2] {
-    let (schema_name, create_schema_name) = schema_names(table);
+/// `table`'s row, create-body and update-body component schemas.
+pub(super) fn table_schemas(table: &TableDefinition, nullable: Nullable) -> [(String, Value); 3] {
+    let [schema_name, create_schema_name, update_schema_name] = schema_names(table);
     [
         (schema_name, table_to_schema(table, nullable)),
         (create_schema_name, table_to_create_schema(table, nullable)),
+        (update_schema_name, table_to_update_schema(table, nullable)),
     ]
 }
 
@@ -68,7 +70,8 @@ pub(super) fn column_to_openapi_type(col_type: &ColumnType) -> Value {
         ColumnType::Boolean => json!({"type": "boolean"}),
         ColumnType::Timestamp => json!({"type": "string", "format": "date-time"}),
         ColumnType::Date => json!({"type": "string", "format": "date"}),
-        ColumnType::Jsonb => json!({"type": "object"}),
+        // Any JSON value: an array or a scalar is as valid as an object.
+        ColumnType::Jsonb => json!({}),
         ColumnType::Numeric { .. } => json!({"type": "string", "format": "decimal"}),
         ColumnType::Varchar { length } => json!({"type": "string", "maxLength": length}),
         ColumnType::TimestampNaive => json!({"type": "string", "format": "date-time"}),
@@ -104,15 +107,16 @@ fn column_schema(table: &TableDefinition, col: &ColumnDefinition, nullable: Null
     prop
 }
 
-/// A row as the data routes answer it. A column some callers are not
-/// answered is not required of a response.
+/// A row as the data routes answer it: every column is present, a nullable
+/// one as `null`, so each is required of a response except a column some
+/// callers are not answered.
 fn table_to_schema(table: &TableDefinition, nullable: Nullable) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
 
     for col in &table.columns {
         properties.insert(col.name.clone(), column_schema(table, col, nullable));
-        if !col.nullable && !table.withholds(col) {
+        if !table.withholds(col) {
             required.push(json!(col.name));
         }
     }
@@ -133,7 +137,9 @@ fn table_to_create_schema(table: &TableDefinition, nullable: Nullable) -> Value 
             continue;
         }
         properties.insert(col.name.clone(), column_schema(table, col, nullable));
-        if !col.nullable && col.default_value.is_none() {
+        // The platform fills the owner column from the caller's scope.
+        let owner = table.owner_field.as_deref() == Some(col.name.as_str());
+        if !col.nullable && col.default_value.is_none() && !owner {
             required.push(json!(col.name));
         }
     }
@@ -142,6 +148,22 @@ fn table_to_create_schema(table: &TableDefinition, nullable: Nullable) -> Value 
         "type": "object",
         "properties": Value::Object(properties),
         "required": required
+    })
+}
+
+/// An update body: the platform sets only the columns it is sent, so none
+/// is required.
+fn table_to_update_schema(table: &TableDefinition, nullable: Nullable) -> Value {
+    let properties: Map<String, Value> = table
+        .columns
+        .iter()
+        .filter(|col| !col.auto_generate)
+        .map(|col| (col.name.clone(), column_schema(table, col, nullable)))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": []
     })
 }
 
