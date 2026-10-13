@@ -10,15 +10,26 @@ env:
   CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
 jobs:
-  test:
-    name: Verify
-    uses: ./.github/workflows/ci.yml
-    secrets: inherit
+  verify:
+    name: CI passed on this commit
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find the passing CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/ci-passed.sh "$GITHUB_SHA"
 
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: test
+    needs: verify
     env:
       CRATES: cufflink-types cufflink-migrate cufflink-pgcodec cufflink-fn cufflink-sdk-macros cufflink cufflink-cli cufflink-nats cufflink-native
     steps:
@@ -54,7 +65,7 @@ jobs:
   release:
     name: Build CLI & Create Release
     runs-on: ubuntu-latest
-    needs: [test, publish]
+    needs: [verify, publish]
     permissions:
       contents: write
     steps:
