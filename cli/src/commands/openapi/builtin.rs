@@ -424,7 +424,9 @@ const TYPED_REQUEST: &str = r#"  private async request<T>(method: string, path: 
     if (!resp.ok) throw await CufflinkError.from(resp);
     if (resp.status === 204) return undefined as T;
     const type = resp.headers.get('content-type') ?? '';
-    return (type.includes('json') ? resp.json() : resp.blob()) as Promise<T>;
+    if (!type.includes('json')) return (await resp.blob()) as T;
+    const text = await resp.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 
 "#;
