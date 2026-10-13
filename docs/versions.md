@@ -1087,6 +1087,14 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.34.0
+
+No new module-declared feature and no change in behaviour. The platform and
+server components (`platform`, `worker`, `web-runner`, `ext-runner` and the
+crates they are built from) are licensed under FSL-1.1-ALv2; the published
+crates and `examples/` are MIT OR Apache-2.0
+([license](../README.md#license)).
+
 ## Changes in v0.33.1
 
 No new module-declared feature.

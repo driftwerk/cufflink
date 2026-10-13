@@ -86,10 +86,13 @@ pushes Docker images.
 
 ## License
 
-Cufflink is dual-licensed under MIT and Apache-2.0. Unless you explicitly state
-otherwise, any contribution you intentionally submit for inclusion is licensed
-the same way, as defined in the Apache-2.0 license, without any additional
-terms or conditions.
+A contribution is licensed under the license of the part of the repository it
+changes: FSL-1.1-ALv2 for the platform and server components, MIT OR
+Apache-2.0 for the published crates and `examples/` (see the
+[README](README.md#license)). By submitting a contribution you also grant the
+licensor a perpetual, worldwide, royalty-free, irrevocable license to use,
+modify, sublicense and distribute it under any terms, including in commercial
+products and services.
 
 ## Code of conduct
 

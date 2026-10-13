@@ -447,13 +447,20 @@ Security issues should be reported privately per [SECURITY.md](SECURITY.md).
 
 ## License
 
-Licensed under either of
+The platform and its server components are licensed under the
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE-FSL.md)
+(FSL-1.1-ALv2). You may use, modify and self-host them for any purpose other
+than offering a competing product or service. Each version becomes available
+under the Apache License, Version 2.0 two years after its release.
+
+The crates you build services with — `cufflink`, `cufflink-fn`,
+`cufflink-types`, `cufflink-sdk-macros`, `cufflink-migrate`,
+`cufflink-pgcodec`, `cufflink-cli`, `cufflink-nats` and `cufflink-native` —
+and the code under `examples/` are licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
 
-at your option.
+at your option. Each crate's `Cargo.toml` states its license.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+Contributions are accepted on the terms in [CONTRIBUTING.md](CONTRIBUTING.md#license).
