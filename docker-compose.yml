@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     environment:
       POSTGRES_USER: cufflink
       POSTGRES_PASSWORD: cufflink
@@ -31,7 +31,7 @@ services:
       retries: 5
 
   keycloak-db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     environment:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: keycloak
@@ -65,7 +65,7 @@ services:
         condition: service_healthy
 
   redis:
-    image: redis:6.2-alpine
+    image: redis:8.10-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
     ports:
       - "6379:6379"
     healthcheck:
@@ -221,7 +221,7 @@ services:
     command: ["-config.file=/etc/loki/local-config.yaml"]
 
   prometheus:
-    image: prom/prometheus:v2.48.0
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     volumes:
       - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheusdata:/prometheus
@@ -234,7 +234,7 @@ services:
       - "9090:9090"
 
   grafana:
-    image: grafana/grafana:12.1.0
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
     volumes:
       - ./infra/monitoring/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
       - ./infra/monitoring/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
