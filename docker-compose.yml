@@ -16,7 +16,7 @@ services:
       retries: 5
 
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.15-alpine@sha256:2ae57dfba3063d5e25fecb75256118c0882a1a2d2cf7d0fba17a7c701df956f6
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     ports:
       - "4222:4222"
@@ -45,7 +45,7 @@ services:
       retries: 5
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.0
+    image: quay.io/keycloak/keycloak:26.8@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
     command: start-dev --import-realm
     environment:
       KC_DB: postgres
@@ -75,7 +75,7 @@ services:
       retries: 5
 
   rustfs:
-    image: rustfs/rustfs:latest
+    image: rustfs/rustfs:latest@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
     environment:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
@@ -86,7 +86,7 @@ services:
       - rustfsdata:/data
 
   bucket-init:
-    image: amazon/aws-cli:latest
+    image: amazon/aws-cli:latest@sha256:ed3233c28ad56d6a66e9e7623a495ab2d7eb08d425f8eea0fdbdfacb12de2ba8
     environment:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
@@ -106,7 +106,7 @@ services:
     restart: "no"
 
   platform:
-    image: kingsleyh/cufflink-platform:latest
+    image: kingsleyh/cufflink-platform:latest@sha256:955bfd288d1f2b3ab4be38c79e234ae3f059c0d5c1314d5550b5b3e611e5e03a
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -145,7 +145,7 @@ services:
         condition: service_started
 
   wasm-worker:
-    image: kingsleyh/cufflink-worker:latest
+    image: kingsleyh/cufflink-worker:latest@sha256:3e7096c66650ab42362706cdc9b305f94cbe91edc27da6888a75bb185c383f7b
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -172,7 +172,7 @@ services:
         condition: service_started
 
   tenant-init:
-    image: curlimages/curl:8.10.1
+    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
     entrypoint: ["/bin/sh", "/bootstrap-tenant.sh"]
     volumes:
       - ./infra/compose/bootstrap-tenant.sh:/bootstrap-tenant.sh:ro
@@ -184,7 +184,7 @@ services:
     restart: "no"
 
   otel-collector:
-    image: &collector otel/opentelemetry-collector-contrib:0.128.0
+    image: &collector otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
     volumes:
       - ./infra/monitoring/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
@@ -251,7 +251,7 @@ services:
       - loki
 
   web-runner:
-    image: kingsleyh/cufflink-web-runner:latest
+    image: kingsleyh/cufflink-web-runner:latest@sha256:c4e4205341063257a35dc5eb61fc6149ec6fb03c2617ad81b39f085e18ac319b
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -288,7 +288,7 @@ services:
         condition: service_started
 
   ext-runner:
-    image: kingsleyh/cufflink-ext-runner:latest
+    image: kingsleyh/cufflink-ext-runner:latest@sha256:2a5ae5eb66afbc41e8c7e596d0df07fec0f54be757f8345e770c36608e3b5e14
     profiles: ["ext-runner"]
     stop_grace_period: 50s
     platform: linux/amd64
