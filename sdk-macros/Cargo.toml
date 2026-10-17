@@ -13,11 +13,11 @@ readme = "../README.md"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
-quote = "1"
-proc-macro2 = "1"
+syn = { version = "2.0.119", features = ["full"] }
+quote = "1.0.47"
+proc-macro2 = "1.0.107"
 cufflink-types = { workspace = true, features = ["schedule-eval"] }
 cufflink-migrate = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
