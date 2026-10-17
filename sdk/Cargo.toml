@@ -10,13 +10,13 @@ categories = ["web-programming", "database"]
 readme = "../README.md"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", default-features = false, features = ["serde", "std"] }
-chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.28.0", default-features = false, features = ["serde", "std"] }
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "std"] }
 cufflink-types = { workspace = true }
 cufflink-sdk-macros = { workspace = true }
-schemars = { version = "1", default-features = false, features = ["derive", "std", "uuid1", "chrono04"], optional = true }
+schemars = { version = "1.2.3", default-features = false, features = ["derive", "std", "uuid1", "chrono04"], optional = true }
 
 [features]
 typed-routes = ["dep:schemars"]

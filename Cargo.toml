@@ -29,57 +29,57 @@ members = [
 ]
 
 [workspace.dependencies]
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
-axum = { version = "0.8.8", features = ["macros", "multipart"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
+axum = { version = "0.8.9", features = ["macros", "multipart"] }
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5.3"
-tower-http = { version = "0.6.11", features = ["cors", "trace", "request-id"] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace", "request-id"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 
 tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
-deadpool-postgres = "0.14.1"
-postgres-protocol = "0.6"
-refinery = { version = "0.8", features = ["tokio-postgres"] }
-postgres-native-tls = "0.5"
-native-tls = "0.2"
+deadpool-postgres = "0.14.2"
+postgres-protocol = "0.6.12"
+refinery = { version = "0.10.0", features = ["tokio-postgres"] }
+postgres-native-tls = "0.5.3"
+native-tls = "0.2.18"
 cufflink-db = { path = "db" }
 
 async-nats = "0.50"
 
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-argon2 = "0.5.3"
+jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
+argon2 = "0.6.0"
 
-uuid = { version = "1.21", features = ["v4", "serde"] }
-chrono = { version = "0.4.43", features = ["serde"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 
-eyre = "0.6.12"
-thiserror = "2.0.18"
+eyre = "0.6.14"
+thiserror = "2.0.21"
 
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing-log = "0.2"
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rustls = { version = "0.23", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23.46", default-features = false }
 
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 
-ring = "0.17"
-zeroize = "1"
+ring = "0.17.14"
+zeroize = "1.9.1"
 
-syn = { version = "2.0", features = ["full"] }
-quote = "1.0"
-proc-macro2 = "1.0"
+syn = { version = "2.0.119", features = ["full"] }
+quote = "1.0.47"
+proc-macro2 = "1.0.107"
 
-wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation", "wat"] }
+wasmtime = { version = "36.0.18", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation", "wat"] }
 
-config = "0.15"
+config = "0.15.27"
 
 cufflink-types = { version = "0.18.0", path = "types" }
 cufflink-sdk-macros = { version = "0.18.0", path = "sdk-macros" }
@@ -87,17 +87,17 @@ cufflink-migrate = { version = "0.18.0", path = "migrate" }
 cufflink-pgcodec = { version = "0.18.0", path = "pgcodec" }
 cufflink-secrets = { path = "secrets" }
 hex = "0.4.3"
-base64 = "0.22.1"
-percent-encoding = "2.3"
-futures-util = "0.3.32"
-tokio-stream = "0.1.18"
-metrics = "0.24.3"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
-governor = "0.8"
-ipnet = "2.11"
-object_store = { version = "0.14", features = ["aws", "gcp"] }
-async-trait = "0.1"
-bytes = "1"
+base64 = "0.23.1"
+percent-encoding = "2.3.2"
+futures-util = "0.3.34"
+tokio-stream = "0.1.19"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+governor = "0.10.4"
+ipnet = "2.12.2"
+object_store = { version = "0.14.2", features = ["aws", "gcp"] }
+async-trait = "0.1.92"
+bytes = "1.12.1"
 cufflink-storage = { path = "storage" }
 cufflink-telemetry = { path = "telemetry" }
 cufflink-settings = { path = "settings" }
@@ -107,18 +107,18 @@ cufflink-test-guests = { path = "test-guests" }
 cufflink-testkit = { path = "testkit" }
 cufflink-nats = { version = "0.6.0", path = "nats" }
 cufflink-native = { version = "0.6.0", path = "native" }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
-opentelemetry-otlp = { version = "0.32", features = ["logs", "trace", "http-proto"] }
-opentelemetry-appender-tracing = "0.32"
-tracing-opentelemetry = "0.33"
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
-prost = "0.14"
-regex = "1"
-tempfile = "3"
+redis = { version = "0.32.7", features = ["tokio-comp", "connection-manager"] }
+opentelemetry = "0.33.1"
+opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.33.1", features = ["logs", "trace", "http-proto"] }
+opentelemetry-appender-tracing = "0.33.1"
+tracing-opentelemetry = "0.34.0"
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
+prost = "0.14.4"
+regex = "1.13.1"
+tempfile = "3.27.0"
 
-postgresql_embedded = { version = "0.20.2", default-features = false, features = ["theseus", "tokio", "rustls"] }
-wat = "1"
-libc = "0.2"
-trybuild = "1"
+postgresql_embedded = { version = "0.21.0", default-features = false, features = ["theseus", "tokio", "rustls"] }
+wat = "1.262.0"
+libc = "0.2.191"
+trybuild = "1.0.122"
