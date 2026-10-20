@@ -73,7 +73,7 @@ sha2 = "0.10.9"
 ring = "0.17"
 zeroize = "1"
 
-syn = { version = "2.0", features = ["full"] }
+syn = { version = "3.0.9", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 
