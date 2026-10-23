@@ -59,7 +59,8 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # The embedded Postgres binaries link libxml2.so.2, which ubuntu-26.04 runners no longer ship.
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
