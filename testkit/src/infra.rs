@@ -205,6 +205,10 @@ type Started = Arc<OnceCell<Result<String, String>>>;
 static PINNED: LazyLock<Mutex<HashMap<&'static str, Started>>> = LazyLock::new(Mutex::default);
 
 pub async fn postgres_at(version: &'static str) -> Option<String> {
+    let major = version.split('.').next().unwrap_or(version);
+    if let Ok(url) = std::env::var(format!("CUFFLINK_TEST_POSTGRES_{major}_URL")) {
+        return Some(url);
+    }
     let cell = PINNED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
