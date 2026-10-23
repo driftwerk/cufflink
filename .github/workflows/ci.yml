@@ -468,6 +468,22 @@ jobs:
             type=sha,format=long,prefix=sha-
             type=raw,value=latest
 
+      - name: Build for the security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.platform.ci
+          load: true
+          tags: cufflink-scan:local
+
+      - name: Security scan
+        run: |
+          status=0
+          python3 .github/scripts/security_scan.py --title "Image scan: Dockerfile.platform.ci" \
+            --image cufflink-scan:local --report /tmp/security-report.md || status=$?
+          cat /tmp/security-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
         with:
@@ -510,6 +526,22 @@ jobs:
           tags: |
             type=sha,format=long,prefix=sha-
             type=raw,value=latest
+
+      - name: Build for the security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.web-runner.ci
+          load: true
+          tags: cufflink-scan:local
+
+      - name: Security scan
+        run: |
+          status=0
+          python3 .github/scripts/security_scan.py --title "Image scan: Dockerfile.web-runner.ci" \
+            --image cufflink-scan:local --report /tmp/security-report.md || status=$?
+          cat /tmp/security-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
 
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
@@ -554,6 +586,22 @@ jobs:
             type=sha,format=long,prefix=sha-
             type=raw,value=latest
 
+      - name: Build for the security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.worker.ci
+          load: true
+          tags: cufflink-scan:local
+
+      - name: Security scan
+        run: |
+          status=0
+          python3 .github/scripts/security_scan.py --title "Image scan: Dockerfile.worker.ci" \
+            --image cufflink-scan:local --report /tmp/security-report.md || status=$?
+          cat /tmp/security-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
         with:
@@ -596,6 +644,22 @@ jobs:
           tags: |
             type=sha,format=long,prefix=sha-
             type=raw,value=latest
+
+      - name: Build for the security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.ext-runner.ci
+          load: true
+          tags: cufflink-scan:local
+
+      - name: Security scan
+        run: |
+          status=0
+          python3 .github/scripts/security_scan.py --title "Image scan: Dockerfile.ext-runner.ci" \
+            --image cufflink-scan:local --report /tmp/security-report.md || status=$?
+          cat /tmp/security-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
 
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v6
