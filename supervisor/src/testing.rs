@@ -12,6 +12,38 @@ use tokio::sync::mpsc;
 #[path = "../../telemetry/tests/support/mod.rs"]
 pub(crate) mod support;
 
+// A callsite first hit on another test's thread while this test's dispatcher registers can cache
+// Interest::never and lose its events here; a global default that is always undecided rules that out.
+pub(crate) fn subscriber() -> (
+    impl tracing::Subscriber + Send + Sync + 'static,
+    support::Sinks,
+) {
+    static UNDECIDED: std::sync::Once = std::sync::Once::new();
+    UNDECIDED.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Undecided);
+    });
+    support::subscriber()
+}
+
+struct Undecided;
+
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 pub(crate) struct Probe {
     exits: mpsc::UnboundedSender<Exit<Probe>>,
     pub(crate) lines: AtomicU64,

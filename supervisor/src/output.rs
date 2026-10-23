@@ -238,7 +238,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn each_window_of_output_is_a_span_of_its_own_exported_when_the_window_ends() {
-        let (subscriber, sinks) = support::subscriber();
+        let (subscriber, sinks) = crate::testing::subscriber();
         let _subscribed = tracing::subscriber::set_default(subscriber);
         let (mut child, output) = tokio::io::duplex(64 * 1024);
         let (probe, _exits) = Probe::new();
