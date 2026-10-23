@@ -10,7 +10,7 @@
   "schedule": [
     "before 6am on monday"
   ],
-  "prConcurrentLimit": 5,
+  "prConcurrentLimit": 20,
   "labels": [
     "dependencies"
   ],
@@ -90,5 +90,12 @@
     }
   ],
   "automergeType": "pr",
-  "platformAutomerge": true
+  "platformAutomerge": true,
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": [
+      "dependencies",
+      "security"
+    ]
+  }
 }
