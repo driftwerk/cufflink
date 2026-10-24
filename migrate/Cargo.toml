@@ -11,10 +11,10 @@ readme = "../README.md"
 
 [dependencies]
 cufflink-types = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-siphasher = "1"
-thiserror = "2"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+siphasher = "1.0.4"
+thiserror = "2.0.21"
 
 [dev-dependencies]
-refinery-core = "0.8"
-tempfile = "3"
+refinery-core = "0.10.0"
+tempfile = "3.27.0"
