@@ -19,7 +19,7 @@ uuid = { version = "1", default-features = false, features = ["serde", "std"], o
 wasmparser = { version = "0.236", default-features = false, features = ["std"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"], optional = true }
-croner = { version = "2.2", optional = true }
+croner = { version = "4.0.2", optional = true }
 
 [features]
 wasm-inspect = ["dep:wasmparser"]
