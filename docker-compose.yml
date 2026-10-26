@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     environment:
       POSTGRES_USER: cufflink
       POSTGRES_PASSWORD: cufflink
@@ -16,7 +16,7 @@ services:
       retries: 5
 
   nats:
-    image: nats:2.15-alpine@sha256:2ae57dfba3063d5e25fecb75256118c0882a1a2d2cf7d0fba17a7c701df956f6
+    image: nats:2.15-alpine@sha256:7ae34c25dfd6fe2e01c6483eabef20d796690fdcac6c4d94ca780a6cf9877fde
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     ports:
       - "4222:4222"
@@ -31,7 +31,7 @@ services:
       retries: 5
 
   keycloak-db:
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     environment:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: keycloak
@@ -45,7 +45,7 @@ services:
       retries: 5
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
+    image: quay.io/keycloak/keycloak:26.8@sha256:a78d6b79572168cb25886b80a8b5b8d4ed4390743e3eecb810538683e209dd6b
     command: start-dev --import-realm
     environment:
       KC_DB: postgres
@@ -65,7 +65,7 @@ services:
         condition: service_healthy
 
   redis:
-    image: redis:8.10-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    image: redis:8.10-alpine@sha256:0bf6577d7774e592b29d093e3ac9390eb91e13d72c21e506afce736de5e0eeb0
     ports:
       - "6379:6379"
     healthcheck:
@@ -75,7 +75,7 @@ services:
       retries: 5
 
   rustfs:
-    image: rustfs/rustfs:latest@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+    image: rustfs/rustfs:latest@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
     environment:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
@@ -86,7 +86,7 @@ services:
       - rustfsdata:/data
 
   bucket-init:
-    image: amazon/aws-cli:latest@sha256:ed3233c28ad56d6a66e9e7623a495ab2d7eb08d425f8eea0fdbdfacb12de2ba8
+    image: amazon/aws-cli:latest@sha256:c8156a0e74e13929a42d7e60f0d4e14e7d28d980cd21822505d4bff80e5460c1
     environment:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
@@ -106,7 +106,7 @@ services:
     restart: "no"
 
   platform:
-    image: kingsleyh/cufflink-platform:latest@sha256:955bfd288d1f2b3ab4be38c79e234ae3f059c0d5c1314d5550b5b3e611e5e03a
+    image: kingsleyh/cufflink-platform:latest@sha256:69fd77b39c5caca215c2d875bd9b5b60bd7a433363893409da0785ddc10622b5
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -145,7 +145,7 @@ services:
         condition: service_started
 
   wasm-worker:
-    image: kingsleyh/cufflink-worker:latest@sha256:3e7096c66650ab42362706cdc9b305f94cbe91edc27da6888a75bb185c383f7b
+    image: kingsleyh/cufflink-worker:latest@sha256:ef3a629980f174388e76aff27e2264c7a7525b26b2988be205f0337590a90b87
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -172,7 +172,7 @@ services:
         condition: service_started
 
   tenant-init:
-    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+    image: curlimages/curl:8.23.0@sha256:11e64e28c5f58c8d93ee95fcf22ac055f48b0bc440e0ce7d8013bbb5ad6aa8ac
     entrypoint: ["/bin/sh", "/bootstrap-tenant.sh"]
     volumes:
       - ./infra/compose/bootstrap-tenant.sh:/bootstrap-tenant.sh:ro
@@ -184,7 +184,7 @@ services:
     restart: "no"
 
   otel-collector:
-    image: &collector otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
+    image: &collector otel/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
     volumes:
       - ./infra/monitoring/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
@@ -221,7 +221,7 @@ services:
     command: ["-config.file=/etc/loki/local-config.yaml"]
 
   prometheus:
-    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
     volumes:
       - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheusdata:/prometheus
@@ -251,7 +251,7 @@ services:
       - loki
 
   web-runner:
-    image: kingsleyh/cufflink-web-runner:latest@sha256:c4e4205341063257a35dc5eb61fc6149ec6fb03c2617ad81b39f085e18ac319b
+    image: kingsleyh/cufflink-web-runner:latest@sha256:a3165454730f4ff3eeb09f8ccfc33ae8b4e370bbe592fcf8bbc847c938e5b13e
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -288,7 +288,7 @@ services:
         condition: service_started
 
   ext-runner:
-    image: kingsleyh/cufflink-ext-runner:latest@sha256:2a5ae5eb66afbc41e8c7e596d0df07fec0f54be757f8345e770c36608e3b5e14
+    image: kingsleyh/cufflink-ext-runner:latest@sha256:563ca576daa8e534d7a4e29e1651ceefe067a8fcbdee6248bceea953aecbcba2
     profiles: ["ext-runner"]
     stop_grace_period: 50s
     platform: linux/amd64
