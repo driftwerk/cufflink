@@ -33,7 +33,7 @@ securestore = "0.100"
 tempfile = "3"
 cufflink-types = { workspace = true, features = ["wasm-inspect"] }
 cufflink-migrate = { workspace = true }
-comfy-table = "7"
+comfy-table = "8.0.1"
 shellexpand = "3.1.2"
 chrono.workspace = true
 serde_yaml = "0.9"
