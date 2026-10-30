@@ -20,7 +20,7 @@ metrics-exporter-prometheus = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-subtle = "2"
+subtle = "2.6.1"
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
