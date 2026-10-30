@@ -10,9 +10,11 @@ Design only. Nothing here is implemented yet.
 
 ## Outcome
 
-Guest execution cannot push a platform or worker process past its
-container's memory limit. That holds for any single request, any burst of
-requests and any slow dependency. Precisely:
+Under `WASM_MEMORY_BUDGET_MODE=enforce`, guest execution cannot push a
+platform or worker process past its container's memory limit. That holds
+for any single request, any burst of requests and any slow dependency.
+(`warn`, the first release's default, only measures what `enforce` would
+do; section 5.1.) Precisely:
 
 - Every byte a guest holds is charged to a process-wide **guest memory
   budget** before it exists. That covers its linear memory, its tables and
@@ -287,10 +289,22 @@ capped and reserved at a declared multiple of its size.
   allocation with a counting global allocator, and fails when the measure
   exceeds the constant (section 8).
 
-Every cap below is enforced whatever `WASM_MEMORY_BUDGET_MODE` is: a cap
-is a size limit, not the budget. A cap or a refused reservation answers
-the guest with the call's existing failure, and no import gains an error
-kind an older SDK cannot read:
+**The mode governs every cap**, as it governs the budget (section 5.1):
+
+- `enforce` refuses past a cap;
+- `warn` counts and logs what it would refuse, and lets the call proceed
+  as today;
+- `off` evaluates nothing.
+
+So the test that pins a host response copied "however large" holds under
+`off` and `warn`. The rewrites that change only how a result is built (the
+streaming render, the request and response changes below) apply in every
+mode. They must therefore produce byte-identical output: golden tests in
+section 8 compare old and new.
+
+Under `enforce`, a cap or a refused reservation answers the guest with the
+call's existing failure, and no import gains an error kind an older SDK
+cannot read:
 
 - `-1` for the legacy imports;
 - `TooLarge` in the v2 envelopes of `http`, `storage`, `ext` and `nats`;
@@ -518,8 +532,13 @@ reservation held across it would keep an idle durable's
     silently abandoned by the server.
   - Without `max_deliver`, the JetStream default, deferrals are unbounded,
     and so is the delay between them.
-  - Re-running a handler that has partly run is the same contract as any
-    redelivery.
+  - Re-running a handler that has partly run is the redelivery contract of
+    `on_success`. **Under `ack: always` it is new.** Today such a
+    subscription runs a message at most once, since every outcome is acked.
+    With this change, a message denied for capacity mid-run may run again,
+    so a capacity denial turns at-most-once into possibly-twice for that
+    message. The alternative, acking it and losing it, is what this change
+    exists to avoid. Section 7 and the release notes state it.
 - **Jobs.** A capacity denial is the new `Attempt::Deferred(retry_after)`,
   not `Interrupted`.
   - The job is released with `attempts` unchanged and
@@ -628,15 +647,15 @@ uses its own cgroup.
   Nothing waits. The per-guest cap is not clamped.
 - **`enforce`.** As this note describes.
 
-These are not governed by the mode, because they are limits rather than
-the budget, so they apply under `off` too:
+The mode governs everything new here, the host caps of section 2.4 and
+`WASM_MAX_CONCURRENT_PER_SERVICE` included: under `warn` they are counted
+and logged, and enforced only under `enforce`. There are two exceptions:
 
-- the host-side caps of section 2.4;
-- a route's declared `max_concurrent`;
-- `WASM_MAX_CONCURRENT_PER_SERVICE`.
-
-They are the part of this change that can alter what a guest observes
-before `enforce`. They are named in the release notes.
+- **A route's declared `max_concurrent`** is enforced in every mode. The
+  service's author opted into it, no existing manifest has the key, and it
+  is not a soak target.
+- **The byte-identical rewrites** of section 2.4 apply in every mode,
+  because they change no output.
 
 The mode is process-wide rather than a tenant policy (question 2). One
 tenant left in `warn` could otherwise still grow the shared process into
@@ -773,11 +792,17 @@ describing each rule:
 ## 7. Compatibility
 
 - **Below the budget, nothing changes in what a guest observes.**
-  - `off` is exactly today, and `warn` changes metrics and logs only.
-  - The exceptions are the host-side caps, a route's `max_concurrent` and
-    the per-service slot limit, which apply in every mode (section 5.1).
-    Of those, the response cap and the fan-out item cap can refuse a call
-    that succeeds today, and the release notes say so.
+  - `off` is exactly today, and `warn` changes metrics and logs only. The
+    host caps and the per-service slot limit follow the mode.
+  - A route's declared `max_concurrent` is enforced in every mode, but only
+    a manifest that adds the key has one.
+  - The streaming render and the request and response rewrites run in
+    every mode, pinned byte-identical by golden tests.
+  - Under `enforce`, the host caps can refuse a call that succeeds today,
+    and the release notes say which.
+  - **`ack: always` subscriptions.** Under `enforce`, a message denied for
+    capacity mid-run is re-run or deferred rather than acked. It may
+    therefore run twice where today it runs at most once (section 3.5).
 - **Error kinds.** No new error kind reaches an SDK that cannot read it.
   The legacy imports keep `-1`, the v2 envelopes reuse `TooLarge`, and
   `db_v2`'s new `TooLarge` reads as `Other` in older SDKs.
@@ -866,6 +891,14 @@ describing each rule:
   - an image transform;
   - a 64 MiB response.
 - **`threads` stays off.** A module with a shared memory fails to compile.
+- **Byte-identical rewrites (golden tests).** The streaming `db_query`
+  render is compared byte for byte with
+  `serde_json::to_string(&legacy_rows(&rows))` over a table of every column
+  type the codec renders: integers, floats, NUMERIC, text, booleans,
+  UUIDs, dates, timestamps with and without zone, JSON and JSONB, arrays
+  and NULLs. Key order and number and time text must match. The same holds
+  for the `db_v2` result envelope, for the request a custom route hands its
+  guest (old and new `request_str`), and for `guest_response::decode`.
 
 **Engine** (multi-thread tokio tests with WAT guests, like the existing
 `wasm_runtime` tests):
@@ -934,11 +967,16 @@ tenants `acme` and `globex` and services `catalog-service` and
 **Under a real limit: a required CI job.**
 
 - `.github/workflows/ci.yml` gains a `memory-limit` job, required like
-  `test`. It runs
+  `test`.
+- **It builds outside the limit.** rustc and the linker need more than the
+  scope allows, so the job first builds with no limit:
+  `cargo build -p cufflink-platform --bins` and
+  `cargo test -p cufflink-platform --test wasm_budget_cgroup --no-run`. It
+  reads the test binary's path from `--message-format=json`.
+- **It runs inside the limit.** Then it runs only that binary in the scope:
   `sudo systemd-run --scope -p MemoryMax=768M --uid=$(id -u) --gid=$(id -g)
-  -E … cargo test -p cufflink-platform --test wasm_budget_cgroup -- --ignored`.
-  The tests run in a scope with a real limit, and the platform child
-  inherits it.
+  -E … -- <test binary> --ignored`. The platform child it starts inherits
+  the limit.
 - The tests are `#[ignore = "needs a memory-limited cgroup; run by the
   memory-limit CI job"]`. The `test` job therefore never runs them, and
   never reaches `testkit::skip`, which panics under `CUFFLINK_CI`.
@@ -980,11 +1018,14 @@ tenants `acme` and `globex` and services `catalog-service` and
   > `WASM_MEMORY_BUDGET_MODE` is `warn` by default: nothing waits or is
   > refused for the budget yet, and `cufflink_wasm_admission_refused_total{mode="warn"}`
   > shows what would have been. A later release makes `enforce` the default.
-  > In every mode, a host response is capped at 64 MiB
+  > Under `enforce`, a host response is capped at 64 MiB
   > (`WASM_MAX_HOST_RESPONSE_MB`), a fan-out call at 128 items, and an image
   > transform at 32 MiB and 40 megapixels; a call past a cap fails as the
   > call fails today (`-1`, or `TooLarge`). A service is limited to 32
   > invocations in flight per replica (`WASM_MAX_CONCURRENT_PER_SERVICE`).
+  > Under `warn` each of these is counted and logged instead. A message of
+  > an `ack: always` subscription denied for capacity mid-run is run again
+  > rather than acked.
 
   The rollback table gains a row: services that declare `max_concurrent`
   run without the limit on an older platform and cannot be deployed there.
@@ -1047,14 +1088,14 @@ day (see its entry).
     under the same mode, in this change or the next? It changes what a guest
     that reads more than 64 MiB observes. *Proposed: the next change, with
     the streaming render.*
-    **Changed by the owner on 2026-10-30: in this change.** Reason: the
-    outcome this note promises cannot hold while one host call can allocate without
-    bound before the ledger sees it. A budget that guards linear memory
-    while `db_query`, downloads and fan-outs build unbounded buffers in the
-    host leaves the process exposed to the very failure it exists to
-    prevent. The caps and the streaming render are therefore section 2.4.
-    The cap applies in every mode (section 5.1), as a limit rather than
-    part of the budget.
+    **Changed by the owner on 2026-10-30: in this change.** The review
+    found that the outcome cannot hold while one host call can allocate
+    without bound before the ledger sees it. `db_query`, downloads,
+    fan-outs and image transforms build unbounded buffers in the host, so a
+    budget guarding linear memory alone leaves the process exposed to the
+    failure it exists to prevent. The caps and the streaming render are
+    therefore section 2.4. As the question proposed, the caps follow the
+    same mode as the budget (section 5.1).
 11. **Pressure gate.** Include the cgroup v2 `anon` gate (section 3.4)
     now? *Proposed: yes, on by default where cgroup v2 is mounted.*
     (The revision moves the gate to section 3.8 and has it read the
@@ -1068,12 +1109,10 @@ day (see its entry).
 
 None is answered yet. Each states the proposed default.
 
-13. **Caps outside the mode.** The host caps of section 2.4, a route's
-    `max_concurrent` and `WASM_MAX_CONCURRENT_PER_SERVICE` apply under `off`
-    and `warn` too. Or should the response and fan-out caps also soak in
-    `warn` first, counted but not enforced? *Proposed: always enforced; they
-    are size limits like `WASM_MAX_RESPONSE_MB`, and the release notes name
-    them.*
+13. **A declared `max_concurrent` outside the mode.** Enforce a route's
+    `max_concurrent` in every mode, since its author opted in, while
+    everything else follows `WASM_MEMORY_BUDGET_MODE`? Or have it follow the
+    mode too? *Proposed: every mode.*
 14. **Fan-out item cap.** `HOST_FANOUT_MAX_ITEMS` 128 for
     `s3_download_many` and `http_fetch_many`? *Proposed: 128.*
 15. **Image limits.** `IMAGE_MAX_INPUT_MB` 32, `IMAGE_MAX_PIXELS` 40 megapixels,
