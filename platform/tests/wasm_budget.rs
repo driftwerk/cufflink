@@ -200,3 +200,106 @@ async fn under_warn_the_same_burst_runs_and_counts_what_would_have_waited() {
         .unwrap_or_default();
     assert!(counted >= 1.0, "would-be refusals are counted: {counted}");
 }
+
+#[tokio::test]
+async fn a_db_query_past_the_response_cap_fails_the_call_and_the_guest_answers() {
+    let Some((platform, mut db)) = budgeted("enforce").await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let manifest = common::wasm_manifest("catalog-service", &[("big_query", "/big_query")]);
+    let (status, body) = platform.deploy(&catalog, &manifest).await;
+    assert_eq!(status, 200, "deploy failed: {body}");
+    let url = platform.fn_url(&catalog, "catalog-service", "big_query");
+    let answer = call(&platform, &url, Duration::ZERO).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.body, json!({"rc": -1}));
+    assert_eq!(platform.status("/health").await, Some(200));
+    assert_eq!(
+        platform
+            .metric(
+                "cufflink_wasm_memory_in_use_bytes",
+                &[("class", "interactive")]
+            )
+            .await,
+        Some(0.0),
+        "the rows' charge went back"
+    );
+}
+
+#[tokio::test]
+async fn a_light_service_keeps_answering_while_another_saturates_its_share() {
+    let Some((platform, mut db)) = budgeted("enforce").await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let loans = db.mint_tenant().await;
+    let heavy = common::wasm_manifest("catalog-service", &[("hold_48", "/hold_48")]);
+    let light = common::wasm_manifest("loan-service", &[("echo", "/echo")]);
+    for (tenant, manifest) in [(&catalog, &heavy), (&loans, &light)] {
+        let (status, body) = platform.deploy(tenant, manifest).await;
+        assert_eq!(status, 200, "deploy failed: {body}");
+    }
+    let hold = platform.fn_url(&catalog, "catalog-service", "hold_48");
+    let echo = platform.fn_url(&loans, "loan-service", "echo");
+    let light_calls = async {
+        let mut answers = Vec::new();
+        for _ in 0..6 {
+            answers.push(call(&platform, &echo, Duration::from_millis(100)).await);
+        }
+        answers
+    };
+    let (heavy_answers, light_answers) = tokio::join!(
+        futures_util::future::join_all((0..12).map(|_| call(&platform, &hold, Duration::ZERO))),
+        light_calls,
+    );
+    assert!(
+        heavy_answers.iter().any(|answer| answer.status == 503),
+        "the heavy service passes its share"
+    );
+    for answer in &light_answers {
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(answer.took < Duration::from_secs(1), "{:?}", answer.took);
+    }
+}
+
+#[tokio::test]
+async fn a_handler_calling_itself_with_its_slots_full_is_answered_503_and_never_hangs() {
+    let wasm = match cufflink_test_guests::UNAVAILABLE {
+        Some(reason) => {
+            common::skip(reason);
+            return;
+        }
+        None => cufflink_test_guests::wasm("service-call", cufflink_test_guests::Profile::Debug)
+            .expect("built guest"),
+    };
+    let Some((platform, mut db)) = budgeted("enforce").await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[("relay", "/relay")]);
+    manifest["custom_routes"][0]["max_concurrent"] = json!(1);
+    let (status, body) = platform.deploy_module(&catalog, &manifest, &wasm).await;
+    assert_eq!(status, 200, "deploy failed: {body}");
+    let started = Instant::now();
+    let response = platform
+        .http
+        .post(platform.fn_url(&catalog, "catalog-service", "relay"))
+        .json(&json!({
+            "service": "catalog-service",
+            "method": "POST",
+            "path": "/_fn/relay",
+            "body": {},
+        }))
+        .send()
+        .await
+        .expect("relay request");
+    assert_eq!(response.status().as_u16(), 200);
+    let answer: Value = response.json().await.expect("json body");
+    assert_eq!(answer["status"], json!(503), "{answer}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the nested call did not wait on its caller's slot: {:?}",
+        started.elapsed()
+    );
+}

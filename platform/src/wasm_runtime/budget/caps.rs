@@ -5,8 +5,7 @@ use eyre::Result;
 use std::sync::LazyLock;
 
 const MIB: usize = 1024 * 1024;
-pub(crate) const S3_HOST_MULTIPLE: (usize, usize) = (7, 3);
-pub(crate) const IMAGE_BYTES_PER_PIXEL: u64 = 20;
+pub const IMAGE_BYTES_PER_PIXEL: u64 = 20;
 pub(crate) const IMAGE_MAX_SIDE: u32 = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,12 +126,9 @@ impl HostCaps {
     }
 }
 
-pub(crate) fn s3_host_bytes(size: u64) -> usize {
-    let (num, den) = S3_HOST_MULTIPLE;
-    usize::try_from(size)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(num)
-        .div_ceil(den)
+pub fn s3_host_bytes(size: u64) -> usize {
+    let size = usize::try_from(size).unwrap_or(usize::MAX);
+    size.saturating_add(base64_len(size))
 }
 
 pub(crate) fn base64_len(len: usize) -> usize {
@@ -186,6 +182,7 @@ mod tests {
     #[test]
     fn the_declared_multiples() {
         assert_eq!(s3_host_bytes(3), 7);
+        assert_eq!(s3_host_bytes(4), 12, "the bytes and their padded base64");
         assert_eq!(s3_host_bytes(48 * MIB as u64), 112 * MIB);
         assert_eq!(base64_len(0), 0);
         assert_eq!(base64_len(1), 4);

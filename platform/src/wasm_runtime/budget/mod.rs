@@ -9,7 +9,9 @@ mod pressure;
 mod slots;
 mod stack;
 
-pub(crate) use caps::{base64_len, s3_host_bytes, IMAGE_BYTES_PER_PIXEL, IMAGE_MAX_SIDE};
+pub(crate) use caps::{base64_len, IMAGE_MAX_SIDE};
+#[doc(hidden)]
+pub use caps::{s3_host_bytes, IMAGE_BYTES_PER_PIXEL};
 pub use caps::{CapExceeded, HostCaps};
 pub use cgroup::{detect as detect_cgroup, CgroupLimit, LimitSource};
 pub use config::{thread_stack_bytes, BudgetConfig};
@@ -692,7 +694,7 @@ pub fn runtime() -> eyre::Result<tokio::runtime::Runtime> {
 
 #[cfg(test)]
 mod tests {
-    use super::sets_mmap_threshold;
+    use super::{sets_mmap_threshold, Class};
 
     #[test]
     fn the_mmap_threshold_is_set_only_under_a_budget_and_never_over_the_operators() {
@@ -708,6 +710,14 @@ mod tests {
             "glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=4194304"
         )]));
         assert!(with(&[("GLIBC_TUNABLES", "glibc.malloc.arena_max=2")]));
+    }
+
+    #[test]
+    fn a_call_with_a_caller_is_nested_and_any_other_is_interactive() {
+        assert_eq!(Class::of_call(None), Class::Interactive);
+        assert_eq!(Class::of_call(Some(0)), Class::Interactive);
+        assert_eq!(Class::of_call(Some(1)), Class::Nested);
+        assert_eq!(Class::of_call(Some(u8::MAX)), Class::Nested);
     }
 }
 

@@ -6,6 +6,10 @@ const STRINGS: &[(&str, &str)] = &[
     ("SLEEP_2", "SELECT pg_sleep(2)"),
     ("OK", r#"{\"ok\":true}"#),
     ("SELECT_ONE", "SELECT 1"),
+    (
+        "BIG_QUERY",
+        "SELECT repeat('x',1000) FROM generate_series(1,200000)",
+    ),
     ("SAID", SAID),
     (
         "INSERT_SLOW",
@@ -107,6 +111,10 @@ $DATA
     (if (result i32) (i32.eq (call $db_execute (i32.const $SLEEP_600_OFF) (i32.const $SLEEP_600_LEN)) (i32.const -1))
       (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
       (else (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))))
+  (func (export "big_query") (param i32 i32) (result i32)
+    (if (result i32) (i32.eq (call $db_query (i32.const $BIG_QUERY_OFF) (i32.const $BIG_QUERY_LEN)) (i32.const -1))
+      (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
+      (else (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))))
   (func (export "sleep2") (param i32 i32) (result i32)
     (drop (call $db_execute (i32.const $SLEEP_2_OFF) (i32.const $SLEEP_2_LEN)))
     (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))

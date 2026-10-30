@@ -272,7 +272,8 @@ pub(crate) fn stepped(bytes: usize) -> usize {
 pub struct ChargedJson;
 
 impl ChargedJson {
-    pub(crate) fn parse<M: Meter + ?Sized>(
+    #[doc(hidden)]
+    pub fn parse<M: Meter + ?Sized>(
         input: &[u8],
         meter: &mut M,
     ) -> Result<Parsed, ChargedJsonError> {
@@ -312,7 +313,8 @@ impl ChargedJson {
         }
     }
 
-    pub(crate) fn write<T: Serialize + ?Sized, M: Meter + ?Sized>(
+    #[doc(hidden)]
+    pub fn write<T: Serialize + ?Sized, M: Meter + ?Sized>(
         value: &T,
         meter: &mut M,
     ) -> Result<String, ChargedJsonError> {
@@ -342,7 +344,8 @@ impl ChargedJson {
         }
     }
 
-    pub(crate) fn to_value<T: Serialize + ?Sized, M: Meter + ?Sized>(
+    #[doc(hidden)]
+    pub fn to_value<T: Serialize + ?Sized, M: Meter + ?Sized>(
         value: &T,
         meter: &mut M,
     ) -> Result<Parsed, ChargedJsonError> {

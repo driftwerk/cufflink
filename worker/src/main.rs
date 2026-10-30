@@ -467,6 +467,13 @@ async fn resolve_job(
     }
 }
 
+fn class_of(class: Class, nested: bool) -> Class {
+    match (class, nested) {
+        (Class::Interactive, true) => Class::Nested,
+        (class, _) => class,
+    }
+}
+
 async fn process_job(
     app_state: &Arc<AppState>,
     wasm_engine: &WasmEngine,
@@ -511,10 +518,7 @@ async fn process_job(
             version: job.version,
         })?;
 
-    let class = match (class, job.nested) {
-        (Class::Interactive, true) => Class::Nested,
-        (class, _) => class,
-    };
+    let class = class_of(class, job.nested);
     let identity = context.identity();
     let invocation = |request_json| Invocation {
         compiled: Arc::clone(&compiled),
@@ -734,6 +738,14 @@ impl Work for AfterHookWork {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_routed_call_with_a_caller_is_nested_and_a_hook_stays_background() {
+        assert_eq!(class_of(Class::Interactive, false), Class::Interactive);
+        assert_eq!(class_of(Class::Interactive, true), Class::Nested);
+        assert_eq!(class_of(Class::Background, true), Class::Background);
+        assert_eq!(class_of(Class::Background, false), Class::Background);
+    }
 
     #[test]
     fn an_after_hook_is_retried_only_when_a_retry_can_help() {

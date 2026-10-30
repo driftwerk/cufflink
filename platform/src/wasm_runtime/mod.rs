@@ -2332,6 +2332,164 @@ pub(crate) mod tests {
         );
     }
 
+    fn charged_classes(ledger: &budget::Ledger) -> usize {
+        Class::ALL
+            .iter()
+            .map(|class| ledger.in_use_by(*class))
+            .sum()
+    }
+
+    async fn settled(ledger: &budget::Ledger) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while charged_classes(ledger) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        charged_classes(ledger)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_that_traps_or_overruns_its_deadline_leaves_nothing_charged() {
+        let engine = budgeted("enforce", "64");
+        let ending = format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "trap") (param i32 i32) (result i32)
+                (drop (memory.grow (i32.const {PAGES_24_MIB})))
+                (unreachable))
+              (func (export "spin") (param i32 i32) (result i32)
+                (drop (memory.grow (i32.const {PAGES_24_MIB})))
+                {SPIN}))"#
+        );
+        let (_, compiled) = install(&engine, &ending);
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        for (handler, budget) in [
+            ("trap", Duration::from_secs(5)),
+            ("spin", Duration::from_millis(300)),
+        ] {
+            let err = engine
+                .run_text(
+                    Arc::clone(&state),
+                    invocation(
+                        Arc::clone(&compiled),
+                        handler,
+                        InvocationKind::Route,
+                        budget,
+                    ),
+                )
+                .await
+                .expect_err(handler);
+            assert!(
+                matches!(
+                    (handler, &err),
+                    ("trap", ExecutionError::Trap(_))
+                        | ("spin", ExecutionError::DeadlineExceeded { .. })
+                ),
+                "{handler}: {err:?}"
+            );
+            assert_eq!(settled(&ledger).await, 0, "{handler}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_its_caller_stopped_waiting_for_stays_charged_until_it_ends() {
+        let engine = budgeted("enforce", "64");
+        let (_, compiled) = install(&engine, &holding_guest(PAGES_24_MIB, 800));
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let caller = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "hold",
+                            InvocationKind::Route,
+                            Duration::from_secs(5),
+                        ),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        caller.abort();
+        assert!(caller.await.is_err_and(|e| e.is_cancelled()));
+        assert!(
+            ledger.in_use_by(Class::Interactive) >= 24 * MIB,
+            "the guest still holds its memory"
+        );
+        assert_eq!(settled(&ledger).await, 0, "credited once the guest ended");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nested_call_is_refused_at_once_rather_than_waiting() {
+        let engine = budgeted("enforce", "64");
+        let (_, compiled) = install(&engine, &holding_guest(1, 0));
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let full = ledger
+            .try_reserve(
+                Class::Interactive,
+                &budget::ServiceKey {
+                    tenant: "globex".into(),
+                    service: "loan-service".into(),
+                },
+                60 * MIB,
+            )
+            .expect("fills the budget");
+        let started = Instant::now();
+        let answered = engine
+            .run_text(
+                state,
+                Invocation {
+                    class: Class::Nested,
+                    ..invocation(
+                        compiled,
+                        "hold",
+                        InvocationKind::Route,
+                        Duration::from_secs(30),
+                    )
+                },
+            )
+            .await;
+        assert!(
+            matches!(answered, Err(ExecutionError::Overloaded { ran: false, .. })),
+            "{answered:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a nested call never waits: its caller holds memory it would wait on"
+        );
+        drop(full);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn after_a_burst_only_the_live_threads_stacks_stay_claimed() {
+        let engine = budgeted("enforce", "64");
+        let (results, _) = burst(&engine).await;
+        assert!(results.iter().any(Result::is_ok), "{results:?}");
+        let ledger = engine.budget.ledger().expect("a ledger");
+        assert_eq!(settled(ledger).await, 0, "no guest holds anything");
+        let residue = ledger.residue();
+        assert_eq!(residue % MIB, 0, "whole 1 MiB stacks: {residue}");
+        assert!(
+            residue <= results.len() * MIB,
+            "at most one stack per thread that ran a guest: {residue}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_memory_does_not_compile() {
+        let engine = engine();
+        assert!(
+            Module::new(&engine.engine, "(module (memory 1 2 shared))").is_err(),
+            "threads are off, so no guest memory escapes the ledger by being shared"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_cap_is_enforced_or_warned_by_mode() {
         let hog = guest(

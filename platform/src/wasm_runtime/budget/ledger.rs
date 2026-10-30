@@ -1214,4 +1214,55 @@ mod tests {
         assert_eq!(ledger.in_use(), 0);
         assert_eq!(ledger.residue(), 0);
     }
+
+    #[test]
+    fn a_scrape_publishes_each_service_and_zeroes_one_that_let_go() {
+        let recorder = cufflink_telemetry::metrics_builder()
+            .expect("metrics builder")
+            .build_recorder();
+        let handle = recorder.handle();
+        let ledger = ledger(true);
+        let (catalog, loans) = (service("catalog-service"), service("loan-service"));
+        let line = |rendered: &str, name: &str| {
+            rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with("cufflink_wasm_memory_service_bytes")
+                        && line.contains(&format!("service=\"{name}\""))
+                })
+                .map(str::to_owned)
+        };
+        metrics::with_local_recorder(&recorder, || {
+            ledger.force(Class::Interactive, &catalog, 3 * MIB);
+            ledger.force(Class::Background, &loans, MIB);
+            ledger.publish();
+            let rendered = handle.render();
+            assert!(line(&rendered, "catalog-service").is_some_and(|l| l.ends_with(" 3145728")));
+            assert!(line(&rendered, "loan-service").is_some_and(|l| l.ends_with(" 1048576")));
+
+            ledger.release(Class::Background, &loans, MIB);
+            ledger.publish();
+            let rendered = handle.render();
+            assert!(
+                line(&rendered, "loan-service").is_some_and(|l| l.ends_with(" 0")),
+                "{rendered}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_charge_held_by_a_thread_that_panics_is_credited_as_it_unwinds() {
+        let ledger = ledger(true);
+        let holder = std::thread::spawn({
+            let ledger = Arc::clone(&ledger);
+            move || {
+                let _charge = ledger
+                    .try_reserve(Class::Interactive, &service("catalog-service"), 8 * MIB)
+                    .expect("fits");
+                panic!("a host call panicked");
+            }
+        });
+        assert!(holder.join().is_err());
+        assert_eq!(ledger.in_use_by(Class::Interactive), 0);
+    }
 }

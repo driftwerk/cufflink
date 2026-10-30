@@ -9,8 +9,9 @@ use image::{
 use std::io::Cursor;
 use std::sync::Arc;
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Format {
+pub enum Format {
     Jpeg,
     Webp,
     Avif,
@@ -34,7 +35,7 @@ impl Format {
         }
     }
 
-    fn encode(self, img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    pub fn encode(self, img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
         match self {
             Format::Jpeg => encode_jpeg(img, quality),
             Format::Webp => encode_webp(img, quality),
@@ -201,7 +202,8 @@ pub(crate) async fn transform_multi(
     Ok(sizes)
 }
 
-fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<RgbImage> {
+#[doc(hidden)]
+pub fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<RgbImage> {
     let mut decoder = ImageReader::new(Cursor::new(input))
         .with_guessed_format()
         .wrap_err("failed to guess image format")?
@@ -219,7 +221,8 @@ fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<RgbImage> {
     Ok(decoded.to_rgb8())
 }
 
-fn resize_to(img: &RgbImage, max_dim: u32) -> RgbImage {
+#[doc(hidden)]
+pub fn resize_to(img: &RgbImage, max_dim: u32) -> RgbImage {
     let (w, h) = img.dimensions();
     if max_dim > 0 && w.max(h) > max_dim {
         let (new_w, new_h) = scaled_dims(w, h, max_dim);
