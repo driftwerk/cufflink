@@ -1,7 +1,7 @@
 # Guest memory budget and admission control
 
-Design only. Nothing here is implemented yet; section 11 lists the
-decisions the maintainer still has to make.
+Design only. Nothing here is implemented yet. The maintainer answered
+section 11's questions on 2026-10-30, accepting every proposed default.
 
 ## Outcome
 
@@ -631,7 +631,7 @@ fixtures `acme` and `globex`, services `catalog-service` and
 
 ## 11. Owner questions
 
-None is answered yet. Each states the proposed default.
+Answered by the owner on 2026-10-30: every proposed default below is accepted as stated.
 
 1. **Default mode in the first release.** `warn`, as every behaviour change
    here has shipped, with `enforce` the default one release later?
