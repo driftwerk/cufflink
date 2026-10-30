@@ -387,6 +387,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_wasm_handler_duration_seconds` | histogram | `kind`, `result` (`ok`, `error`, `timeout`, `trap`, `memory_limit`, `shutdown`, `cancelled`) | Guest execution time and outcome |
 | `cufflink_wasm_inflight` | gauge | `kind` | Guests executing |
 | `cufflink_wasm_queue_wait_seconds` | histogram | `kind` | Wait for an execution slot (`WASM_MAX_CONCURRENT`) |
+| `cufflink_wasm_admission_refused_total` | counter | `tenant`, `service`, `class` (`interactive`), `reason` (`route_concurrency`), `mode` (`enforce`) | Invocations answered `503` without running, because their route's `max_concurrent` stayed full for `WASM_ADMISSION_WAIT_MS`; logged at most once a minute per tenant, service and reason under target `cufflink::wasm::budget` |
 | `cufflink_wasm_memory_peak_bytes` | histogram | `kind` | Peak linear memory per execution |
 | `cufflink_wasm_response_bytes` | histogram | `kind` | Response size per execution |
 | `cufflink_wasm_limit_events_total` | counter | `limit` (`memory`, `length`, `response`, `table`), `mode` (`warn`, `enforce`) | Guest limits hit |

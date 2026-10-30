@@ -399,7 +399,7 @@ mod tests {
             name: "svc",
             tables: [],
             custom_routes: [
-                ("POST", "/import", "import", perm("t", "edit"), multipart, body_limit = 10_485_760, timeout = 60),
+                ("POST", "/import", "import", perm("t", "edit"), multipart, body_limit = 10_485_760, timeout = 60, max_concurrent = 4),
                 ("GET", "/plain", "plain", auth),
             ],
         })
@@ -412,8 +412,34 @@ mod tests {
             out.contains("timeout_secs : :: std :: option :: Option :: Some (60u32)"),
             "{out}"
         );
+        assert!(
+            out.contains("max_concurrent : :: std :: option :: Option :: Some (4u32)"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("max_concurrent : :: std :: option :: Option :: None")
+                .count(),
+            1,
+            "{out}"
+        );
         assert_eq!(out.matches("multipart : true").count(), 1, "{out}");
         for (routes, message) in [
+            (
+                quote! { ("POST", "/c", "c", auth, max_concurrent = 0) },
+                "max_concurrent must be between 1 and 1024",
+            ),
+            (
+                quote! { ("POST", "/c", "c", auth, max_concurrent = 1025) },
+                "max_concurrent must be between 1 and 1024",
+            ),
+            (
+                quote! { ("POST", "/c", "c", auth, max_concurrent = 1, max_concurrent = 2) },
+                "duplicate max_concurrent modifier",
+            ),
+            (
+                quote! { ("POST", "/c", "c", auth, job, max_concurrent = 2) },
+                "max_concurrent cannot be combined with job(...) or sse(...)",
+            ),
             (
                 quote! { ("POST", "/j", "j", auth, job, timeout = 5) },
                 "timeout cannot be combined with job(...); set the job's own timeout",

@@ -101,6 +101,12 @@ pub enum ExecutionError {
     Trap(String),
     #[error("WASM runtime error: {0}")]
     Runtime(String),
+    #[error("WASM guest capacity exhausted ({reason})")]
+    Overloaded {
+        reason: super::budget::Reason,
+        retry_after: Duration,
+        ran: bool,
+    },
 }
 
 impl ExecutionError {
@@ -119,6 +125,7 @@ impl ExecutionError {
             ExecutionError::Cancelled => "cancelled",
             ExecutionError::MemoryLimit { .. } => "memory_limit",
             ExecutionError::Trap(_) => "trap",
+            ExecutionError::Overloaded { .. } => "overloaded",
             ExecutionError::Response(_)
             | ExecutionError::HandlerNotFound(_)
             | ExecutionError::Runtime(_) => "error",

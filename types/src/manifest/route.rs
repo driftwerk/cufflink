@@ -34,6 +34,10 @@ pub struct CustomRouteDefinition {
     /// Parse a `multipart/form-data` body into parts for the guest.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multipart: bool,
+    /// Invocations of the route in flight at once on one replica; more wait
+    /// briefly, then are answered 503 with `Retry-After`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
     /// Serve the route as a server-sent event stream fed by a NATS subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse: Option<SseRouteDef>,
@@ -329,12 +333,19 @@ impl CustomRouteDefinition {
     pub const TIMEOUT_SECS: std::ops::RangeInclusive<u32> = 1..=120;
     /// The methods a multipart route may use.
     pub const MULTIPART_METHODS: [&'static str; 3] = ["POST", "PUT", "PATCH"];
+    /// The range `max_concurrent` must fall in.
+    pub const MAX_CONCURRENT: std::ops::RangeInclusive<u32> = 1..=1024;
 
     /// Platform features this route's declaration requires.
     pub fn derived_features(&self) -> impl Iterator<Item = &'static str> {
         let jobs_v2 = self.job.as_ref().is_some_and(JobConfig::uses_v2);
         self.request_features()
             .chain(jobs_v2.then_some(features::JOBS_V2))
+            .chain(
+                self.max_concurrent
+                    .is_some()
+                    .then_some(features::ROUTE_CONCURRENCY),
+            )
     }
 
     /// The features that shape how the route is reached and what its guest

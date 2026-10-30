@@ -57,7 +57,7 @@ service, `/svc/{tenant}/{service}/books/7/due-date`:
 
 ```rust
 ("POST", "/templates/import", "import_templates", perm("templates", "edit"),
-    multipart, body_limit = 10_485_760, timeout = 60),
+    multipart, body_limit = 10_485_760, timeout = 60, max_concurrent = 4),
 ```
 
 - The body of every custom route is read only **after** the caller is
@@ -65,6 +65,14 @@ service, `/svc/{tenant}/{service}/books/7/due-date`:
   4 MiB by default). A larger body answers `413`.
 - `timeout` (1 to 120 seconds; 30 by default) is the route's execution
   budget, on a worker too. A `job(...)` route keeps its own timeout.
+- `max_concurrent` (1 to 1024) is how many invocations of the route may be
+  in flight at once on one replica. A call beyond it waits up to
+  `WASM_ADMISSION_WAIT_MS` (1 s) for a slot, then answers `503` with
+  `Retry-After` (`WASM_ADMISSION_RETRY_AFTER_SECS`, 2) and
+  `{"error": "guest capacity exhausted; the request was not run"}`; the
+  handler did not run. The limit holds on every replica separately, also
+  when the route is worker-routed, and cannot be combined with `job(...)`
+  or `sse(...)`. Needs a platform advertising `route_concurrency`.
 - `multipart` (POST, PUT, PATCH) parses a `multipart/form-data` body into
   `req.multipart()` parts (name, filename, content type, bytes; at most 100
   parts, each within the limit). A malformed form answers `400`.

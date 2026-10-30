@@ -457,6 +457,8 @@ Every guest execution runs under one deadline: the caller's timeout, the epoch i
 | `WASM_MAX_RESPONSE_MB` | `64` | Largest handler response; beyond it the call fails with a 500 rather than allocating |
 | `WASM_MAX_CONCURRENT` | `256` | Guest executions in flight at once; queueing for a slot counts against the handler's budget |
 | `WASM_MAX_OPEN_TX` | `2` | Interactive `db_v2` transactions one invocation may hold open ([db-v2](db-v2.md)) |
+| `WASM_ADMISSION_WAIT_MS` | `1000` | Longest a route waits for a slot of its `max_concurrent` before it is answered `503` ([route limits](routing.md#route-limits)) |
+| `WASM_ADMISSION_RETRY_AFTER_SECS` | `2` | `Retry-After` of a `503` answered for capacity |
 | `WASM_EPOCH_TICK_MS` | `100` | How often the deadline is checked while a guest runs; a runaway guest survives its deadline by at most one tick |
 | `WASM_MODULE_CACHE_MAX` | `128` | Compiled modules kept in memory (least recently used evicted) |
 

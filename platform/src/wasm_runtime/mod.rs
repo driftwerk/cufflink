@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod host;
 pub mod image;
 mod invocation;
@@ -17,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::info;
 use uuid::Uuid;
 use wasmtime::*;
@@ -48,6 +49,8 @@ pub struct WasmLimits {
     pub max_concurrent: usize,
     pub epoch_tick: Duration,
     pub module_cache_max: usize,
+    pub admission_wait: Duration,
+    pub retry_after: Duration,
 }
 
 impl Default for WasmLimits {
@@ -62,6 +65,8 @@ impl Default for WasmLimits {
             max_concurrent: 256,
             epoch_tick: Duration::from_millis(100),
             module_cache_max: 128,
+            admission_wait: Duration::from_millis(1000),
+            retry_after: Duration::from_secs(2),
         }
     }
 }
@@ -101,6 +106,14 @@ impl WasmLimits {
                 defaults.epoch_tick.as_millis() as u64,
             )?),
             module_cache_max: env_var("WASM_MODULE_CACHE_MAX", defaults.module_cache_max)?,
+            admission_wait: Duration::from_millis(env_var(
+                "WASM_ADMISSION_WAIT_MS",
+                defaults.admission_wait.as_millis() as u64,
+            )?),
+            retry_after: Duration::from_secs(env_var(
+                "WASM_ADMISSION_RETRY_AFTER_SECS",
+                defaults.retry_after.as_secs(),
+            )?),
         };
         limits.validate()?;
         Ok(limits)
@@ -117,6 +130,14 @@ impl WasmLimits {
             ("WASM_MAX_CONCURRENT", self.max_concurrent as u64),
             ("WASM_MODULE_CACHE_MAX", self.module_cache_max as u64),
             ("WASM_EPOCH_TICK_MS", self.epoch_tick.as_millis() as u64),
+            (
+                "WASM_ADMISSION_WAIT_MS",
+                self.admission_wait.as_millis() as u64,
+            ),
+            (
+                "WASM_ADMISSION_RETRY_AFTER_SECS",
+                self.retry_after.as_secs(),
+            ),
         ]
         .iter()
         .find(|(_, value)| *value == 0)
@@ -273,6 +294,7 @@ pub struct WasmEngine {
     host_fn_names: Arc<HashSet<&'static str>>,
     limits: Arc<WasmLimits>,
     permits: Arc<Semaphore>,
+    route_slots: Arc<budget::RouteSlots>,
     modules: Arc<ModuleCache>,
     storage: Arc<RwLock<Option<S3Storage>>>,
     artifact_index: Arc<std::sync::OnceLock<deadpool_postgres::Pool>>,
@@ -296,6 +318,7 @@ impl WasmEngine {
             linker: Arc::new(linker),
             host_fn_names: Arc::new(host_fn_names),
             permits: Arc::new(Semaphore::new(limits.max_concurrent)),
+            route_slots: Arc::default(),
             modules: Arc::new(ModuleCache::new(limits.module_cache_max)),
             limits: Arc::new(limits),
             storage: Arc::new(RwLock::new(None)),
@@ -672,6 +695,35 @@ impl WasmEngine {
         self.modules.len()
     }
 
+    pub(crate) async fn route_slot(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        handler: &str,
+        max_concurrent: u32,
+    ) -> Result<OwnedSemaphorePermit, ExecutionError> {
+        let semaphore = self
+            .route_slots
+            .semaphore(identity.service_id, handler, max_concurrent);
+        match tokio::time::timeout(self.limits.admission_wait, semaphore.acquire_owned()).await {
+            Ok(Ok(slot)) => Ok(slot),
+            Ok(Err(e)) => Err(ExecutionError::Runtime(format!("route slots closed: {e}"))),
+            Err(_) => {
+                let reason = budget::Reason::RouteConcurrency;
+                budget::refused(
+                    &identity.tenant_slug,
+                    &identity.service_name,
+                    handler,
+                    reason,
+                );
+                Err(ExecutionError::Overloaded {
+                    reason,
+                    retry_after: self.limits.retry_after,
+                    ran: false,
+                })
+            }
+        }
+    }
+
     pub async fn run(
         &self,
         state: Arc<AppState>,
@@ -1026,6 +1078,14 @@ pub(crate) mod tests {
         };
         let err = zero.validate().unwrap_err().to_string();
         assert!(err.contains("WASM_MAX_CONCURRENT"), "{err}");
+        assert_eq!(defaults.admission_wait, Duration::from_millis(1000));
+        assert_eq!(defaults.retry_after, Duration::from_secs(2));
+        let no_wait = WasmLimits {
+            admission_wait: Duration::ZERO,
+            ..WasmLimits::default()
+        };
+        let err = no_wait.validate().unwrap_err().to_string();
+        assert!(err.contains("WASM_ADMISSION_WAIT_MS"), "{err}");
     }
 
     #[test]
@@ -1563,6 +1623,65 @@ pub(crate) mod tests {
         drop(held);
         let response = engine.run(state, queued(None)).await.expect("response");
         assert!(!response.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_route_at_its_limit_waits_for_a_slot_then_is_refused_unrun() {
+        let handle = global_metrics();
+        let engine = engine_with(WasmLimits {
+            admission_wait: Duration::from_millis(150),
+            ..WasmLimits::default()
+        });
+        let identity = crate::registry::ServiceIdentity {
+            tenant_id: Uuid::new_v4(),
+            tenant_slug: "globex".to_string(),
+            service_id: Uuid::new_v4(),
+            schema: "loan_service".to_string(),
+            service_name: "loan-service".to_string(),
+        };
+        let refusals = || {
+            counter(
+                &handle.render(),
+                "cufflink_wasm_admission_refused_total",
+                &["tenant=\"globex\"", "reason=\"route_concurrency\""],
+            )
+        };
+        let before = refusals();
+        let slot = || engine.route_slot(&identity, "export", 2);
+        let first = slot().await.expect("first slot");
+        let _second = slot().await.expect("second slot");
+
+        let started = Instant::now();
+        let err = slot().await.expect_err("a third waits, then is refused");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            matches!(
+                err,
+                ExecutionError::Overloaded {
+                    reason: budget::Reason::RouteConcurrency,
+                    retry_after,
+                    ran: false,
+                } if retry_after == Duration::from_secs(2)
+            ),
+            "{err}"
+        );
+        assert_eq!(err.label(), "overloaded");
+        assert_eq!(refusals(), before + 1.0);
+        assert!(
+            engine.route_slot(&identity, "import", 2).await.is_ok(),
+            "another route of the service has its own slots"
+        );
+
+        let waiting = tokio::spawn({
+            let (engine, identity) = (engine.clone(), identity.clone());
+            async move { engine.route_slot(&identity, "export", 2).await.map(drop) }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(first);
+        waiting
+            .await
+            .expect("join")
+            .expect("a waiter takes the slot freed within the wait");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

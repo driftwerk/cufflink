@@ -141,6 +141,7 @@ mod tests {
             INACTIVE_DEPLOY,
             CONFIG_APPLY,
             COLUMN_PERMISSIONS,
+            ROUTE_CONCURRENCY,
         ] {
             assert!(supports.contains(&finished), "{finished}");
         }

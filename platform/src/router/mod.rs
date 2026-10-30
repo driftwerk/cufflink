@@ -50,6 +50,16 @@ pub(crate) fn map_execution_error(subject: &str, err: ExecutionError) -> Platfor
         ExecutionError::ShuttingDown => PlatformError::Internal(format!(
             "{subject} execution aborted: platform is shutting down"
         )),
+        ExecutionError::Overloaded {
+            retry_after, ran, ..
+        } => PlatformError::RetryLater {
+            message: match ran {
+                false => "guest capacity exhausted; the request was not run",
+                true => "guest capacity exhausted while the request ran; it may have been partly applied",
+            }
+            .to_string(),
+            after: retry_after,
+        },
         other => PlatformError::Internal(format!("{subject} execution error: {other}")),
     }
 }
@@ -92,6 +102,61 @@ mod tests {
         assert_eq!(
             map_execution_error("WASM", ExecutionError::Cancelled).to_string(),
             "Internal error: WASM execution error: WASM execution cancelled"
+        );
+    }
+
+    #[test]
+    fn capacity_is_a_retryable_503_that_says_whether_the_handler_ran() {
+        use axum::response::IntoResponse;
+        let answer = |ran| {
+            map_execution_error(
+                "WASM",
+                ExecutionError::Overloaded {
+                    reason: crate::wasm_runtime::budget::Reason::RouteConcurrency,
+                    retry_after: Duration::from_secs(2),
+                    ran,
+                },
+            )
+            .into_response()
+        };
+        for (ran, message) in [
+            (false, "guest capacity exhausted; the request was not run"),
+            (
+                true,
+                "guest capacity exhausted while the request ran; it may have been partly applied",
+            ),
+        ] {
+            let response = answer(ran);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .map(|v| v.as_bytes()),
+                Some(&b"2"[..])
+            );
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::errors::PlatformErrorBody>()
+                    .map(|body| body.message.as_str()),
+                Some(message)
+            );
+        }
+        assert_eq!(
+            map_execution_error(
+                "WASM",
+                ExecutionError::MemoryLimit {
+                    requested: 2,
+                    limit: 1
+                }
+            )
+            .into_response()
+            .status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

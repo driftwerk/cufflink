@@ -193,6 +193,15 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         .wasm_engine
         .as_ref()
         .ok_or_else(|| PlatformError::Internal("WASM runtime not available".into()))?;
+    let _route_slot = match route.max_concurrent {
+        Some(max) => Some(
+            wasm_engine
+                .route_slot(&service.identity(), &route.handler, max)
+                .await
+                .map_err(|e| map_execution_error("WASM", e))?,
+        ),
+        None => None,
+    };
     let compiled = module(wasm_engine, &service).await?;
 
     let body_value = parse_body(&body);

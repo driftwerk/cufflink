@@ -144,6 +144,12 @@ declares.
 |---------|-------------|----------|
 | `column_permissions` | any column declares `#[restricted(...)]` | columns read and written through the data routes only with a grant ([column permissions](column-permissions.md)) |
 
+## Features added in v0.35.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `route_concurrency` | any route sets `max_concurrent` | invocations of a route in flight at once, per replica ([route limits](routing.md#route-limits)) |
+
 `cufflink services list --features` prints what each deployed service
 requires.
 
@@ -245,6 +251,12 @@ Rolling a platform back from v0.31.0 to v0.30:
 |--------------------|----------------------------------|
 | Services that declare column permissions (`cufflink services list --features` names them, as `column_permissions`) | **Roll each back first, to a version without them.** The v0.30 platform drops the key it does not know and serves the service without it: every restricted column is answered to, and written by, every caller that reaches the row. Such a service cannot be deployed there (422, naming the feature) |
 | The database | Nothing: v0.31.0 has no migration |
+
+Rolling a platform back from v0.35.0 to an earlier release:
+
+| What v0.35.0 added | Before rolling the platform back |
+|--------------------|----------------------------------|
+| Services that declare `max_concurrent` on a route (`cufflink services list --features` names them, as `route_concurrency`) | Nothing must be done first. The older platform drops the key it does not know and runs the route without its limit. Such a service cannot be deployed there (422, naming the feature) |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
