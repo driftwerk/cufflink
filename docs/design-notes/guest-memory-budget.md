@@ -6,7 +6,10 @@ Design only. Nothing here is implemented yet.
   every proposed default. On the same day the maintainer re-decided
   question 10, bringing the host-side caps into this change.
 - The note was then revised after an independent review. Section 12
-  lists the questions the revision raised.
+  lists the questions that revision raised. The owner answered them on
+  2026-10-30, all as proposed, and accepted the change `ack: always`
+  subscriptions see for capacity denials (section 3.5).
+- A second review followed. Section 13 lists the questions it raised.
 
 ## Outcome
 
@@ -16,13 +19,19 @@ for any single request, any burst of requests and any slow dependency.
 (`warn`, the first release's default, only measures what `enforce` would
 do; section 5.1.) Precisely:
 
-- Every byte a guest holds is charged to a process-wide **guest memory
-  budget** before it exists. That covers its linear memory, its tables and
-  the host buffers made on its behalf: requests, host-call inputs and
-  results, and responses.
-- What is not charged byte for byte is bounded by caps and declared
-  multiples (section 2.4). That bound is what the host reserve (section 5)
-  is sized from.
+- Every byte held for a guest is charged to a process-wide **guest memory
+  budget**. That covers its linear memory, its tables, its stack, and the
+  host memory made on its behalf: the request, host-call inputs and
+  results, work handed to other tasks, and the response.
+- Each byte is charged before it is allocated, or as it is built in
+  steps of at most 1 MiB, and stays charged until it is freed.
+  - That includes work that outlives the invocation: a detached decode, or
+    a response body a slow client is still reading.
+  - Where a library allocates for us, the charge is a declared multiple,
+    and a test pins that it is not exceeded (section 2.4).
+- What stays outside the ledger is the process's own baseline, idle thread
+  stacks and allocator fragmentation. The host reserve is sized for these
+  (section 5.2), and the pressure gate (section 3.8) watches them.
 - Guests that run within their memory today run as before.
 
 When guests in flight together reach the budget:
@@ -186,12 +195,39 @@ during a large request is several times the body's size.
     `to_rgb8`), resize, and hold every encoded output.
   - All of this runs on a further `spawn_blocking` thread.
 
+- **`redis_get` and `redis_mget`** read whole values, which Redis
+  allows up to 512 MB, with no cap (`host/redis.rs`). `cache::mget` is
+  capped (`CACHE_MGET_MAX_BYTES`).
+- **`service_call`** collects the callee's response up to
+  `HOST_HTTP_MAX_RESPONSE_BYTES` (`to_bytes`), copies it (`to_vec`), and
+  sets an envelope carrying it again in base64.
+- **Detached host work.** `image::transform_multi` decodes on its own
+  `spawn_blocking` task. `block_on_within` (`host/mod.rs`) drops only the
+  future on a deadline or cancellation. The decode therefore keeps running,
+  and keeps its memory, after the host call, and even the store, has
+  ended.
+- **The JSON trees** the host builds have a size that depends on the
+  shape, not just the length.
+  - An array starts empty and grows to a capacity of 4 (4 × 32 bytes), on
+    top of the 32 bytes of each element. So `[[0],[0],…]` costs 40 to 50
+    host bytes per input byte.
+  - A small object costs a whole B-tree node.
+  - This affects `parse_body` on every custom route (public ones
+    included), `guest_json`'s `to_value`, `guest_response::decode` (whose
+    shape the guest controls), and host inputs parsed into a `Value`, such
+    as `image_transform_multi`'s targets.
+
 **The response:**
 
 - `read_response` copies it out of the guest (`to_vec`, at most
   `WASM_MAX_RESPONSE_MB`, 64).
 - The `String` outlives the store.
 - `guest_response::decode` parses it into a `Value` and clones `__body`.
+
+**Thread stacks.** wasm runs on the blocking thread's own stack:
+wasmtime's default `max_wasm_stack` is 512 KiB, which `Config` does not
+change. Pages a thread has touched stay resident while the thread lives,
+which tokio keeps for 10 s after its last task.
 
 **The allocator.** The binaries use glibc's allocator (Debian base image,
 no global allocator). Its dynamic mmap threshold rises to 32 MiB once a
@@ -243,7 +279,9 @@ A `Charge` sits in `GuestLimits`, inside `HostState`, and records:
 | **Linear growth** | `memory_growing(current, desired)`: `desired - current`, first from the reservation, then from the ledger's free bytes. The pending amount is remembered | `memory_grow_failed` credits the pending amount. The rest is credited at drop |
 | **Tables** | `table_growing`: `(desired - current) × 8` bytes, the same way | as above, with `table_grow_failed` |
 | **Host buffers** | through `HostState::set_host_response`, which debits the new length and credits the replaced one in one ledger operation. Every other host allocation is reserved before it is made (section 2.4) | on replacement, or when the `Charge` drops; never on read |
-| **Host-call input** | `read_guest_bytes`: the copied length times the call's declared parse multiple, before copying | when the host call returns |
+| **Host-call input** | `read_guest_bytes`: the copied length, before copying. A parse of it is charged as it builds (section 2.4) | when the host call returns |
+| **Stack** | at admission, `WASM_STACK_CHARGE` (1 MiB): the 512 KiB wasm stack and the host frames under it | when the `Charge` drops |
+| **Sub-charges** | work a host call hands to another task (section 2.4: the image decode, a fan-out item) takes an owned sub-charge of what it will allocate, moved into that task | when **that task** ends, not when the host call, the store or the `Charge` does |
 
 **`host_response` becomes private.** Every site goes through
 `set_host_response`. `get_host_response` copies from the buffer in place,
@@ -257,11 +295,27 @@ unwinding through `spawn_blocking`.
 
 - The store drops when the blocking task ends, not when `run`'s timeout
   returns. So the ledger stays charged until the memory is actually freed.
-- The guest's response is the exception. `call_handler` moves the
-  `Charge`'s response part into a `ResponseCharge` of
-  `len × RESPONSE_HOST_MULTIPLE`, returned beside the response `String`.
-  The router drops it once the HTTP response is rendered, or the
-  subscription or job has settled.
+- **Sub-charges outlive the store when the work does.** A sub-charge is
+  owned by the closure or future it was moved into. When a deadline makes
+  `block_on_within` drop the waiting future, a detached `spawn_blocking`
+  decode keeps running with its sub-charge, and credits it only when it
+  returns.
+  - Repeated timeouts therefore cannot stack uncharged decodes: each one
+    stays on the ledger until it actually ends.
+  - The rule holds for every `spawn_blocking` and every spawned task a host
+    call starts on a guest's behalf.
+- **The guest's response is the other exception.** `call_handler` moves
+  the response part of the `Charge` into a `ResponseCharge`, returned
+  beside the response `String`. It covers the `String` and what the router
+  builds from it, both charged as they are built (section 2.4).
+  - On a route the router wraps the HTTP response body in a `ChargedBody`
+    that owns the `ResponseCharge`. The charge is dropped when the body has
+    yielded its last frame or is itself dropped (the client went away), not
+    when the response is handed to hyper. A slow client therefore stays on
+    the ledger for as long as its body is held.
+  - A subscription or job drops it once settled.
+  - A worker-routed route's reply is charged on the platform as it arrives,
+    by its payload length, into the same kind of `ResponseCharge`.
 
 Growth is an upper bound on resident linear memory: pages grown but never
 touched are not resident, so the ledger over-counts slightly, in the safe
@@ -280,14 +334,54 @@ direction.
 
 ### 2.4 Host allocations: caps, and reserving before allocating
 
-Each path of section 1.4 either reserves exactly before allocating, or is
-capped and reserved at a declared multiple of its size.
+Each path of section 1.4 is charged in one of three ways.
 
-- A multiple is a named constant per path, such as
-  `REQUEST_HOST_MULTIPLE`.
-- Each multiple is pinned by a test that measures the path's peak host
-  allocation with a counting global allocator, and fails when the measure
-  exceeds the constant (section 8).
+**Exactly, before allocating.** When the size is known in advance:
+
+- a body's length;
+- base64 at 4/3;
+- an object's `head` size;
+- a buffer grown in 1 MiB steps, charged by its capacity rather than its
+  length. Growth uses `reserve_exact`, so capacity stays within 1 MiB of
+  the length. With the mmap threshold at 1 MiB (section 5.2), glibc's
+  `realloc` of such a block is an `mremap`, with no second copy.
+
+**As built, through a charged builder.** For a JSON tree, whose cost
+depends on its shape:
+
+- **`ChargedJson::parse`** deserialises into a `Value` through a visitor
+  that charges each node as it allocates it: a `Vec`'s capacity × 32, a
+  map node, a `String`'s capacity. It charges in 1 MiB steps.
+- **`ChargedJson::write`** serialises into a buffer grown as above.
+- When a step cannot be charged, the parse or write stops. Under
+  `enforce` the call fails with `Overloaded`, or with `TooLarge` when the
+  structure alone exceeds the service share. Under `warn` the step is
+  counted and allowed.
+- No fixed multiple is reserved for JSON, so an adversarial shape is
+  charged what it costs rather than refused for its length.
+- Every `Value` the host builds for a guest goes through these:
+  - `parse_body`;
+  - `guest_json`;
+  - `guest_response::decode`;
+  - host inputs such as `image_transform_multi`'s targets, and the
+    `s3_download_many` and `http_fetch_many` item lists.
+
+**At a declared multiple.** Where a library allocates for us:
+
+- `S3_HOST_MULTIPLE` = 7/3 (the bytes and their base64);
+- `IMAGE_BYTES_PER_PIXEL` = 20 (a 16-bit RGBA decode at 8, the RGB copy at
+  3, each resize at most 3, the encoder's buffers);
+- `WASM_STACK_CHARGE` = 1 MiB.
+
+**Tests.** A counting `#[global_allocator]` test measures each path's
+peak host allocation, with ordinary and worst-case shapes, and fails when:
+
+- a charged builder's charge is more than 10 % below what was really
+  allocated; or
+- a multiple is below what was really allocated.
+
+The worst-case shapes include `[[0],[0],…]`, `[{},{},…]`, deep nesting,
+many one-key objects, and strings of escapes (section 8).
 
 **The mode governs every cap**, as it governs the budget (section 5.1):
 
@@ -314,23 +408,63 @@ cannot read:
 | Path | Change |
 |------|--------|
 | Every host response | `WASM_MAX_HOST_RESPONSE_MB` (64; question 10), enforced inside each path as the buffer grows, not after it is built |
-| `db_query`, `db_v2` results | Rows are streamed (`query_raw`) and rendered straight to text, row by row, with no `Value` tree. A running byte count is reserved in steps of 1 MiB. At the cap, or when a step cannot be reserved, the statement is cancelled and the call fails. `DB_READ_ONLY_MAX_ROWS` still applies to read-only queries |
-| `s3_download` | `head` first. An object whose base64 would pass the response cap (above 48 MiB) is refused before downloading. Otherwise its size × `S3_HOST_MULTIPLE` is reserved, and the body is read into one buffer and encoded with no `to_vec` copy |
-| `s3_download_many`, `http_fetch_many` | At most `HOST_FANOUT_MAX_ITEMS` (128) items. Each item reserves its size (`head`, or `HOST_HTTP_MAX_RESPONSE_BYTES` for HTTP) before it starts. Results are appended to the response text as they finish, not held until `join_all`. The total stays under the response cap |
-| `image_transform`, `_multi` | Source objects of at most `IMAGE_MAX_INPUT_MB` (32). `image::Limits` with `max_image_width` and `max_image_height` (16 384) and `max_alloc` from the reservation. The header's dimensions are read before decoding. Then `width × height × IMAGE_HOST_MULTIPLE` is reserved (decoded, RGB and resized copies), and each output as it is encoded. Images over `IMAGE_MAX_PIXELS` (40 megapixels) are refused |
-| Host-call inputs | Reserved at copy time (section 2.2). The parse multiple is 1 for byte payloads and `JSON_PARSE_MULTIPLE` for parsed JSON |
-| The custom-route request | `execute` no longer re-parses the request: the caller passes `auth` and `caller.depth` in the `Invocation`. The audit record keeps the raw body, not a cloned tree, and parses it when the record is written, after the guest has run. The request `Value` is dropped as soon as `request_str` is built. `body_raw_b64` stays, because guests read it. What remains is reserved before the body is read, at `body length × REQUEST_HOST_MULTIPLE` (section 3.7) |
-| The guest's response | `guest_response::decode` takes `__body` out of the parsed map instead of cloning it. The `ResponseCharge` (section 2.2) covers the `String` and the parsed tree until the response is rendered |
+| `db_query`, `db_v2` results | Detailed below the table |
+| `s3_download` | `head` first. An object whose base64 would pass the response cap (above 48 MiB) is refused before downloading. Otherwise `size × S3_HOST_MULTIPLE` is reserved. The object is read through `open_read`'s stream (`ObjectReader`), never `get_bytes`' unbounded `bytes()`. The read stops at `head`'s size plus one byte, so an object replaced between `head` and `get` can never be read past what was charged; a longer one fails the call. It is encoded with no `to_vec` copy |
+| `s3_download_many`, `http_fetch_many` | At most `HOST_FANOUT_MAX_ITEMS` (128) items. Each item takes a sub-charge of its size (`head`, or `HOST_HTTP_MAX_RESPONSE_BYTES` for HTTP) before it starts. **Results stay in input order**, since guests index them by position. Item *i* is written to the response text once items 0 to *i − 1* are written; a result that finishes early waits under its own sub-charge. The total stays under the response cap. Golden tests compare both envelopes byte for byte with today's |
+| `image_transform`, `_multi` | Source objects of at most `IMAGE_MAX_INPUT_MB` (32), read as `s3_download` reads. The header's dimensions are read before decoding, and `width × height × IMAGE_BYTES_PER_PIXEL` is taken as a sub-charge moved into the `spawn_blocking` decode (section 2.2). `image::Limits` caps each side at 16 384 pixels and sets `max_alloc` to the sub-charge. Images over the pixel cap are refused. The cap is the smaller of `IMAGE_MAX_PIXELS` (40 megapixels) and the service share ÷ 20 bytes: 40 MP is about 800 MB at 20 bytes a pixel, more than a 2 GiB container's service share, so there the share decides (about 37 MP) |
+| `redis_get`, `redis_mget` | `GETRANGE key 0 <cap>` in place of `GET` (pipelined per key for `mget`): one byte past the cap fails the call, and nothing longer is ever read. For values within the cap the answer is the same. A type error is the same error `GET` returns |
+| `service_call` | The callee's body is reserved at `HOST_HTTP_MAX_RESPONSE_BYTES` before it is collected, then shrunk to its length. It is encoded into the envelope without the `to_vec` copy. The envelope is charged through `set_host_response` |
+| Host-call inputs | The copy is charged before copying (section 2.2); a parse of it through `ChargedJson` |
+| The custom-route request | Detailed below the table |
+| The guest's response | `guest_response::decode` parses through `ChargedJson`, into the `ResponseCharge`, and takes `__body` out of the parsed map instead of cloning it. The rendered body is written through `ChargedJson::write`. The charge lives until the body is sent or dropped (section 2.2) |
+
+**`db_query` and `db_v2` results.** Rows are read through `bind` and
+`query_portal` with a row limit per fetch (1000), inside the per-call
+transaction the call already runs in (`run_transactional`). They are
+rendered straight to text, row by row, with no `Value` tree, into a buffer
+grown and charged as above.
+
+- **Byte-identical to today.** `legacy_rows` collects each row into a
+  `serde_json::Map`, a `BTreeMap` because `preserve_order` is off: keys
+  come out sorted, and of two columns with the same name the last wins.
+  The streamed render computes that order once per statement, as a
+  permutation of the columns with each duplicate name resolved to its last
+  index, and writes each row in that order through the same
+  `column_to_json` encoding. `NaN` and `±Infinity` render as they do today.
+- **Stopping.** At the cap, or when a step cannot be charged, the portal
+  is not fetched again and the call fails. Its transaction ends as a
+  failed call's does, which closes the portal, so the server stops
+  producing rows. Dropping a `query_raw` stream would not stop it.
+- `DB_READ_ONLY_MAX_ROWS` still applies to read-only queries.
+
+**The custom-route request.**
+
+- `execute` no longer re-parses the request: the caller passes `auth` and
+  `caller.depth` in the `Invocation`.
+- The audit record keeps the raw body, not a cloned tree, and parses it
+  through `ChargedJson` when the record is written.
+- The request's reservation is held until `record()` has built and handed
+  off its payloads (`outbox/emit.rs`).
+- The body is parsed through `ChargedJson`. The request `Value` is dropped
+  as soon as `request_str` is written through `ChargedJson::write`.
+- `body_raw_b64` stays, because guests read it, and is reserved at 4/3.
+- The raw body is reserved before it is read (section 3.7).
 
 ### 2.5 The estimate
 
 The reservation at admission is the handler's estimate.
 
 - **Samples.** One per finished invocation of a `(service_id, handler)`:
-  the `Charge`'s peak. A denied invocation's sample is the size it asked
-  for: the `desired` of its denied grow, or the length of its refused
-  host allocation, plus what it held. Exits, denials, traps and deadlines
-  all count.
+  its peak **actual use**, meaning linear growth plus tables plus host
+  buffers and sub-charges at the same instant.
+  - A sample never includes unused reservation, so it can fall below
+    the last estimate, or the cold seed.
+  - It never includes the request's host cost or the stack, which are
+    charged separately at every admission, so they are not counted twice.
+  - A denied invocation's sample is its actual use plus what it asked for:
+    the `desired − current` of its denied grow, or the size of its refused
+    host allocation.
+  - Exits, denials, traps and deadlines all count.
 - **Estimate.** The largest sample of the last 16 that is younger than
   `WASM_ESTIMATE_MAX_AGE_SECS` (600). Older samples decay away, so a
   handler that has stopped being heavy stops being treated as heavy.
@@ -442,6 +576,19 @@ are released if the deadline passes:
   (section 3.5). Background work may also hold at most half of a
   service's slots and 75 % of the global slots, so a backlog never fills
   the slots that routes need.
+  - With the default 32 service slots, this caps a subscription's
+    effective concurrency at 16 per process under `enforce`, whatever its
+    `consumer.concurrency`.
+  - A worker-only process can raise `WASM_MAX_CONCURRENT_PER_SERVICE` for
+    itself; the release notes say so.
+- Committed work (in-process after-hooks) is capped the same way: at most
+  half of a service's slots. A bulk write's after-hooks therefore cannot
+  hold every slot of their service.
+  - Under `enforce` they wait for a slot outside their handler budget,
+    for up to `WASM_COMMITTED_WAIT_SECS` (300).
+  - Past that they are dropped and logged, as a failed after-hook is today.
+  - The slow path for bulk after-hooks remains worker routing, which is
+    durable.
 
 The result is an `Admission`: the slots plus the `Charge`. It moves into
 the blocking task and drops with the store.
@@ -538,19 +685,44 @@ reservation held across it would keep an idle durable's
     With this change, a message denied for capacity mid-run may run again,
     so a capacity denial turns at-most-once into possibly-twice for that
     message. The alternative, acking it and losing it, is what this change
-    exists to avoid. Section 7 and the release notes state it.
+    exists to avoid. The owner accepted this on 2026-10-30. Section 7 and
+    the release notes state it.
 - **Jobs.** A capacity denial is the new `Attempt::Deferred(retry_after)`,
   not `Interrupted`.
-  - The job is released with `attempts` unchanged and
-    `next_attempt_at = now() + retry_after`. The worker naks with the same
-    delay, so it neither spends an attempt nor loops hot.
-  - After `WASM_CAPACITY_RETRIES_JOB` (10) consecutive deferrals the next
-    one counts as a failed attempt of class `Capacity`, retried under the
-    job's own policy. A job that can never fit is thereby bounded by its
-    attempts.
+  - **Persistence.** A claim increments `attempts`. A deferral writes:
+
+    ```sql
+    status = 'pending',
+    attempts = attempts - 1,
+    capacity_deferrals = capacity_deferrals + 1,
+    next_attempt_at = now() + retry_after
+    ```
+
+    Undoing the claim's increment leaves `attempts` as it was before the
+    claim, as `release` does today. Unlike `release`, the next attempt is
+    not now. The worker naks with the same delay, so a deferral neither
+    spends an attempt nor loops hot.
+  - **The counter.** `capacity_deferrals` is a new column (migration
+    `V7__capacity_deferrals.sql`: `ADD COLUMN IF NOT EXISTS
+    capacity_deferrals INTEGER NOT NULL DEFAULT 0`). It survives
+    redelivery and replicas, and any conclusion other than a deferral
+    resets it to 0.
+  - **The bound.** When a deferral would make it exceed
+    `WASM_CAPACITY_RETRIES_JOB` (10), the attempt concludes instead as
+    `Failed { class: Capacity }`: the attempt counts and the counter
+    resets.
+  - **Retry.** `JobErrorClass::Capacity` is always retried, as `Crash` is
+    (`is_retried`), so it is bounded by the job's `max_attempts` and then
+    fails as any exhausted job does.
   - `cufflink_wasm_job_deferrals_total` counts every deferral.
-- **Worker after-hooks** are deferred like subscriptions on the worker's
-  ledger.
+- **Worker after-hooks** are re-run in place and deferred like
+  subscriptions, on the worker's ledger.
+  - Their consumer's `AFTER_HOOK_MAX_DELIVER` is 3. A capacity deferral's
+    nak spends one of those deliveries; JetStream cannot nak without
+    counting.
+  - The bound is therefore 3 deliveries, each with up to
+    `WASM_CAPACITY_RETRIES` in-place re-runs. After that, the hook is
+    dead-lettered with reason `capacity`, from where it can be replayed.
 
 ### 3.6 Granting
 
@@ -574,13 +746,15 @@ together.
 A custom route's body is host memory. The order in
 `router/custom/dispatch.rs`, after authorization:
 
-1. **Reserve the request's host cost** before reading the body:
-   `body length × REQUEST_HOST_MULTIPLE`, where the length is
-   `Content-Length`, or the route's `body_limit` for a chunked body.
+1. **Reserve the raw body** before reading it: its `Content-Length`, or
+   the route's `body_limit` for a chunked body.
    - Once the body has been read, the reservation shrinks to the actual
      length.
    - A slow upload therefore holds only the memory its body needs, and no
      slot.
+   - What is built from the body afterwards is charged as it is built
+     (section 2.4): the base64 at 4/3, then the parsed tree and
+     `request_str` through `ChargedJson`.
 2. **Read the body.**
 3. **Take** the route, service and global slots and the handler's
    estimate (section 3.2), within what is left of the one admission
@@ -594,12 +768,20 @@ body, and admits the guest on the worker, where it runs.
 
 ### 3.8 The pressure gate
 
-Host memory the ledger cannot see stays: tokio, connection pools,
-compiled modules, CRUD lists, and the transient work section 2.4 bounds
-by multiples. It is covered by the host reserve (section 5) and by a gate.
+Some host memory stays outside the ledger:
 
-- Where cgroup v2 is mounted, a task reads the process cgroup's
-  `memory.stat` every 250 ms.
+- tokio, connection pools, compiled modules and CRUD lists;
+- the stacks of idle blocking threads, which keep the pages they touched
+  for tokio's 10 s keep-alive. The pool may hold up to
+  `max_blocking_threads` (section 3.3) threads, each with up to the 512 KiB
+  of wasm stack it last touched.
+  - The running invocations' stacks are charged (`WASM_STACK_CHARGE`).
+  - Idle ones count against the reserve.
+
+This is covered by the host reserve (section 5.2) and by a gate.
+
+- Where the process's cgroup is a v2 cgroup with the memory controller
+  (section 5.2), a task reads its `memory.stat` every 250 ms.
 - It takes the non-reclaimable part: `anon + shmem + kernel` where
   `kernel` is reported, else `memory.current − active_file −
   inactive_file`.
@@ -669,6 +851,10 @@ the kernel's limit.
 When unset, the budget is `limit − reserve`:
 
 - **The limit.**
+  - **v2 or v1.** v2 is chosen only when the unified hierarchy's
+    `cgroup.controllers` (at the mount root, and in the process's cgroup)
+    lists `memory`. On a hybrid host the memory controller is on v1, so v1
+    is used.
   - **cgroup v2.** Resolve the process's cgroup from `/proc/self/cgroup`
     (the `0::<path>` line), and take the smallest `memory.max` and
     `memory.high` that is not `max` over that cgroup and each ancestor up
@@ -680,7 +866,16 @@ When unset, the budget is `limit − reserve`:
   - **No limit** (no cgroup, `max` all the way up, macOS). The budget is
     off whatever the mode, logged once.
 - **The reserve.** `WASM_MEMORY_HOST_RESERVE_MB`, default
-  `max(256, 30 % of limit)` (question 3).
+  `max(256, 30 % of limit)` (question 3). It must hold:
+  - the process's baseline;
+  - the compiled modules;
+  - idle threads' stacks (section 3.8);
+  - fragmentation below the mmap threshold.
+
+  The startup log prints the worst case of the idle stacks,
+  `max_blocking_threads × 512 KiB`, beside the reserve. It warns when that
+  is above half the reserve: lower `WASM_MAX_CONCURRENT` or raise the
+  reserve.
 - **A derived budget that is zero or negative** (a very small limit, a
   large reserve) turns the budget off with a warning. Only an explicit
   `WASM_MEMORY_BUDGET_MB=0` refuses startup.
@@ -711,6 +906,8 @@ environment still overrides it.
 | `WASM_MEMORY_JOB_FLOOR_MB` | `32` | Section 3.5 |
 | `WASM_BACKGROUND_AGING_SECS` | `30` | Section 3.5 |
 | `WASM_CAPACITY_RETRIES` / `WASM_CAPACITY_RETRIES_JOB` | `3` / `10` | Section 3.5 |
+| `WASM_COMMITTED_WAIT_SECS` | `300` | Section 3.2 |
+| `WASM_STACK_CHARGE_KB` | `1024` | Section 2.2 |
 | `WASM_MEMORY_PRESSURE_GATE` | `true` | Section 3.8; ignored without cgroup v2 |
 | `WASM_MAX_CONCURRENT_PER_SERVICE` | `32` | At most `WASM_MAX_CONCURRENT` (question 7) |
 | `WASM_ADMISSION_WAIT_MS` | `1000` | Section 3.2 (question 6) |
@@ -816,12 +1013,19 @@ describing each rule:
     runs today's single semaphore, and lifts the host caps.
   - It drops `max_concurrent` from a service already deployed with it: the
     service runs without the limit there and cannot be deployed there.
-  - No database migration and no tenant policy row is involved.
+  - **One additive migration**, `V7__capacity_deferrals.sql`. An older
+    platform or worker ignores the column. Like every additive migration
+    before it, it makes an older binary log the "missing migration" line
+    at start, which is expected and harmless ("Rolling a platform back").
+    A job deferred when the rollback happens keeps its delayed
+    `next_attempt_at`, and the older binary runs it then.
+  - No tenant policy row is involved.
 - **wasmtime.** The design depends only on `ResourceLimiter`'s
   `memory_growing`, `memory_grow_failed`, `table_growing` and
   `table_grow_failed`, as wasmtime 36 defines them, and on
-  `Memory::data_and_store_mut`. The open update to wasmtime 50 does not
-  build yet. Whichever lands first, check these against wasmtime 50.
+  `Memory::data_and_store_mut`. If the update to wasmtime 50 lands
+  before this change, these four methods and that accessor are checked
+  against wasmtime 50, and the design is adjusted where they differ.
   `threads` stays off: a test asserts that a module with a shared memory is
   refused (section 8).
 
@@ -881,9 +1085,10 @@ describing each rule:
 - **Errors.** Admission refusal and mid-run denial give their two 503
   messages, both with `Retry-After`. `MemoryLimit` gives the same 500 as
   today.
-- **Host multiples.** A test binary with a counting `#[global_allocator]`
-  measures the peak host allocation of each path in section 2.4 and fails
-  when it exceeds its declared multiple:
+- **Host charges.** A test binary with a counting `#[global_allocator]`
+  measures the peak host allocation of each path in section 2.4. It fails
+  when the path's charge falls more than 10 % below that measure, or below
+  its declared multiple. The paths:
   - a 16 MiB request through a custom route;
   - `db_query` over a large result;
   - `s3_download` and `_many`;
@@ -891,14 +1096,37 @@ describing each rule:
   - an image transform;
   - a 64 MiB response.
 - **`threads` stays off.** A module with a shared memory fails to compile.
+- **Sub-charges.** An image decode, its host call timed out, stays charged
+  until the decode returns. Ten repeated timeouts never hold more than ten
+  decodes' sub-charges, and the ledger returns to zero.
+- **`ChargedBody`.** A response read slowly by a client stays charged until
+  the last frame. A client that disconnects mid-body releases the charge.
+- **Estimates.** A handler that peaks at 2 MiB, after its cold seed, is
+  estimated at 2 MiB: no ratchet to the seed, and no request cost counted.
+- **Jobs.** A deferral leaves `attempts` unchanged and `next_attempt_at`
+  in the future. The eleventh consecutive deferral is a counted `Capacity`
+  failure, and the counter resets. `Capacity` is retried up to
+  `max_attempts`.
 - **Byte-identical rewrites (golden tests).** The streaming `db_query`
   render is compared byte for byte with
   `serde_json::to_string(&legacy_rows(&rows))` over a table of every column
-  type the codec renders: integers, floats, NUMERIC, text, booleans,
-  UUIDs, dates, timestamps with and without zone, JSON and JSONB, arrays
-  and NULLs. Key order and number and time text must match. The same holds
-  for the `db_v2` result envelope, for the request a custom route hands its
-  guest (old and new `request_str`), and for `guest_response::decode`.
+  type the codec renders: integers, floats including `NaN` and `±Infinity`,
+  NUMERIC, text, booleans, UUIDs, dates, timestamps with and without zone,
+  JSON and JSONB, arrays and NULLs. Two columns share a name, so the last
+  must win. Key order, and the text of numbers and times, must match.
+
+  The same holds for:
+  - the `db_v2` result envelope;
+  - the request a custom route hands its guest (old and new
+    `request_str`);
+  - `guest_response::decode`;
+  - the `s3_download_many` and `http_fetch_many` envelopes, with results
+    finishing out of order;
+  - `GETRANGE` against `GET` for values within the cap.
+- **Worst-case shapes.** The counting-allocator tests of section 2.4 run
+  `ChargedJson` over ordinary JSON and over `[[0],[0],…]`, `[{},{},…]`,
+  64-deep nesting, a million one-key objects and strings of `\u` escapes,
+  as request bodies, guest responses and host inputs.
 
 **Engine** (multi-thread tokio tests with WAT guests, like the existing
 `wasm_runtime` tests):
@@ -928,8 +1156,8 @@ tenants `acme` and `globex` and services `catalog-service` and
   - Some succeed. Every other call is a 503 with `Retry-After: 2` and the
     not-run message, and none is a 500.
   - `/health` answers 200 throughout, from the same pid.
-  - On Linux, `VmHWM` stays below the baseline plus 128 MiB plus the
-    declared slack.
+  - On Linux, `VmHWM` stays below the baseline, plus 128 MiB, plus the
+    idle-stack worst case of section 3.8.
 - **Host-heavy burst.** The same with guests that:
   - run an unbounded `db_query` over a large table;
   - download a 40 MiB object;
@@ -960,34 +1188,61 @@ tenants `acme` and `globex` and services `catalog-service` and
 - **Committed and worker work.**
   - An after-hook and an `on_migrate` started with the budget full run
     once room frees.
-  - A worker after-hook under load is deferred, not dead-lettered.
+  - A worker after-hook under load is re-run in place and deferred. It
+    reaches the dead-letter subject, with reason `capacity`, only after its
+    three deliveries.
+  - A bulk write's after-hooks hold at most half of their service's
+    slots.
   - A worker-routed route refused on the worker answers 503 with
     `Retry-After` through the platform.
 
 **Under a real limit: a required CI job.**
 
-- `.github/workflows/ci.yml` gains a `memory-limit` job, required like
-  `test`.
-- **It builds outside the limit.** rustc and the linker need more than the
-  scope allows, so the job first builds with no limit:
-  `cargo build -p cufflink-platform --bins` and
-  `cargo test -p cufflink-platform --test wasm_budget_cgroup --no-run`. It
-  reads the test binary's path from `--message-format=json`.
-- **It runs inside the limit.** Then it runs only that binary in the scope:
-  `sudo systemd-run --scope -p MemoryMax=768M --uid=$(id -u) --gid=$(id -g)
-  -E … -- <test binary> --ignored`. The platform child it starts inherits
-  the limit.
-- The tests are `#[ignore = "needs a memory-limited cgroup; run by the
-  memory-limit CI job"]`. The `test` job therefore never runs them, and
-  never reaches `testkit::skip`, which panics under `CUFFLINK_CI`.
-- Run with `--ignored`, they **fail** unless `/proc/self/cgroup` resolves to
-  a `memory.max` of at most 1 GiB, so the job cannot pass vacuously.
-- They start the platform with the derived budget under `enforce`, then
-  send twenty concurrent 96 MiB guests and the host-heavy guests above.
-- They assert that the platform pid survives and that the scope's
-  `memory.events` reports `oom_kill 0`.
-- Outside CI they run the same way under a local `systemd-run --user
-  --scope`, or are ignored.
+- **The job.** `.github/workflows/ci.yml` gains a `memory-limit` job,
+  required like `test`.
+  - It uses the `test` job's service containers for Postgres and Redis, and
+    its NATS step, and sets the same `CUFFLINK_TEST_*` variables.
+  - So no embedded Postgres, NATS or Redis shares the limit.
+- **Only the platform is limited.** The build, the test process and its
+  client run outside any scope, so rustc and the test's own buffers never
+  count.
+  - `testkit` gains `CUFFLINK_TEST_PLATFORM_LAUNCHER`, a command prefix
+    that `PlatformProcess` puts before the platform binary.
+  - The job sets it to `sudo -E systemd-run --scope --quiet
+    --unit=cufflink-budget-<n> -p MemoryMax=768M -p MemorySwapMax=0
+    --uid=<runner uid> --gid=<runner gid> --`. `-E` keeps the variables
+    `testkit` sets after it clears the environment.
+- **Running the tests.** The job runs `cargo test -p cufflink-platform
+  --test wasm_budget_cgroup -- --ignored`.
+  - The tests are `#[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a
+    memory limit; run by the memory-limit CI job"]`. The `test` job never
+    runs them, and never reaches `testkit::skip`, which panics under
+    `CUFFLINK_CI`.
+  - Run with `--ignored`, they **fail** unless the platform child's cgroup
+    has a `memory.max` of at most 1 GiB and a `memory.swap.max` of 0, so
+    the job cannot pass vacuously.
+  - The tests find the child's pid in the scope's `cgroup.procs` (`sudo` is
+    its parent), and read the scope's memory files from there.
+- **The numbers.** 768 MiB, with the derived reserve `max(256, 230)` =
+  256 MiB, gives a 512 MiB budget and a 256 MiB service share. Every
+  expectation fits inside that share:
+  - twenty concurrent 96 MiB guests: at most two of one service at once;
+  - 16 MiB request bodies: raw 16, base64 21.3, a string-valued `Value`
+    16, `request_str` 37.3, the guest's copy 37.3, about 128 MiB at the
+    peak;
+  - a 24 MiB object: about 88 MiB with the guest's copy;
+  - a `db_query` stopped at the 64 MiB response cap: about 140 MiB with the
+    guest's copy;
+  - 128 HTTP items of 1 MiB, which are refused at the response cap.
+- **Assertions.**
+  - The platform pid survives.
+  - The scope's `memory.events` reports `oom_kill 0`.
+  - `memory.swap.peak` (or `memory.swap.current` on kernels without it)
+    stays 0.
+  - The count of `max` events stays under a bound recorded by the test.
+- **Outside CI** the same tests run with a local launcher, `systemd-run
+  --user --scope -p MemoryMax=768M -p MemorySwapMax=0 --`, or stay
+  ignored.
 
 ## 9. Documentation, when implemented
 
@@ -1025,7 +1280,12 @@ tenants `acme` and `globex` and services `catalog-service` and
   > invocations in flight per replica (`WASM_MAX_CONCURRENT_PER_SERVICE`).
   > Under `warn` each of these is counted and logged instead. A message of
   > an `ack: always` subscription denied for capacity mid-run is run again
-  > rather than acked.
+  > rather than acked, so it may run twice. Under `enforce`, background work
+  > may hold half of a service's slots, so with the default of 32 a
+  > subscription runs at most 16 messages at once per process, whatever its
+  > `consumer.concurrency`. Raise `WASM_MAX_CONCURRENT_PER_SERVICE` on a
+  > worker-only process to suit it. Migration `V7__capacity_deferrals.sql`
+  > adds a column to `wasm_jobs`.
 
   The rollback table gains a row: services that declare `max_concurrent`
   run without the limit on an older platform and cannot be deployed there.
@@ -1107,7 +1367,10 @@ day (see its entry).
 
 ## 12. Questions raised by the revision
 
-None is answered yet. Each states the proposed default.
+Answered by the owner on 2026-10-30: every proposed default below is
+accepted as stated. On the same day the owner also accepted that an
+`ack: always` subscription's message denied for capacity mid-run may run
+twice (section 3.5), in place of being acked and lost.
 
 13. **A declared `max_concurrent` outside the mode.** Enforce a route's
     `max_concurrent` in every mode, since its author opted in, while
@@ -1129,3 +1392,18 @@ None is answered yet. Each states the proposed default.
     with the `VmHWM` data of the real-limit job.*
 19. **Required CI job.** Make `memory-limit` (sudo `systemd-run` with a
     768 MiB scope) a required check? *Proposed: yes.*
+
+## 13. Questions raised by the second review
+
+None is answered yet. Each states the proposed default.
+
+20. **Committed waits.** Under `enforce`, in-process after-hooks are capped
+    at half of their service's slots. They wait for one outside their
+    budget, for up to `WASM_COMMITTED_WAIT_SECS` (300), and are dropped and
+    logged past it. *Proposed: as stated.*
+21. **The job migration.** Add `wasm_jobs.capacity_deferrals`
+    (`V7__capacity_deferrals.sql`) so the bound on consecutive deferrals
+    survives redelivery? *Proposed: yes.*
+22. **The image pixel cap.** Take the smaller of `IMAGE_MAX_PIXELS`
+    (40 megapixels) and the service share ÷ 20 bytes, so the cap shrinks on
+    small containers (about 37 MP in a 2 GiB container)? *Proposed: yes.*
