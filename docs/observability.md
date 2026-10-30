@@ -433,7 +433,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_db_v2_call_duration_seconds` | histogram | `op` | Guest `db-v2` call time |
 | `cufflink_db_tx_open` | gauge | — | Guest interactive transactions open |
 | `cufflink_db_tx_duration_seconds` | histogram | `outcome` (`commit`, `rollback`, `abandoned`) | Guest transaction lifetime |
-| `cufflink_db_tx_abandoned_total` | counter | `reason` (`trap`, `deadline`, `shutdown`, `leaked`) | Transactions the guest left open, rolled back by the platform |
+| `cufflink_db_tx_abandoned_total` | counter | `reason` (`trap`, `deadline`, `shutdown`, `leaked`, `unread`) | Transactions the guest left open, rolled back by the platform; `unread` is one whose result passed the host response cap or the budget mid-stream |
 | `cufflink_cache_calls_total` | counter | `op` (`get`, `mget`, `set`, `set_nx`, `del`, `incr`, `expire`, or `invalid` for a call that is not one), `result` (`ok` or `unavailable`, `timeout`, `invalid_key`, `invalid_ttl`, `too_large`, `protocol`) | Guest namespaced-cache calls |
 | `cufflink_cache_call_duration_seconds` | histogram | `op` (as above) | Guest cache call time |
 | `cufflink_service_calls_total` | counter | `caller`, `target` (`-` before the target is known), `result` (`ok`, `http_4xx`, `http_5xx`, `timeout`, `depth`, `unknown_service`, `transport`, `denied`) | Guest service calls |

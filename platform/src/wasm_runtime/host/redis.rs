@@ -1,6 +1,6 @@
 use super::{block_on, read_guest_string, wrap, HostState};
 use crate::policy::{self, PolicyKey, Violation};
-use crate::wasm_runtime::redis_scope;
+use crate::wasm_runtime::redis_scope::{self, Reading};
 use std::collections::HashSet;
 use wasmtime::{Caller, Linker};
 
@@ -25,7 +25,11 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            match block_on(redis_scope::get(&app_state.redis, &plan)) {
+            match block_on(redis_scope::get(
+                &app_state.redis,
+                &plan,
+                Reading::of(caller.data().caps()),
+            )) {
                 Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
                     caller.data_mut().respond_with("redis_get", read.value)
@@ -122,7 +126,11 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            match block_on(redis_scope::get(&app_state.redis, &plan)) {
+            match block_on(redis_scope::get(
+                &app_state.redis,
+                &plan,
+                Reading::of(caller.data().caps()),
+            )) {
                 Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
                     let found = read.value.is_some();
@@ -182,12 +190,16 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            let result = block_on(redis_scope::mget(&app_state.redis, &plans))
-                .map_err(eyre::Report::from)
-                .and_then(|read| {
-                    caller.data().record_redis_fallback(read.from_fallback);
-                    serde_json::to_string(&read.value).map_err(Into::into)
-                });
+            let result = block_on(redis_scope::mget(
+                &app_state.redis,
+                &plans,
+                Reading::of(caller.data().caps()),
+            ))
+            .map_err(eyre::Report::from)
+            .and_then(|read| {
+                caller.data().record_redis_fallback(read.from_fallback);
+                serde_json::to_string(&read.value).map_err(Into::into)
+            });
             match result {
                 Ok(json) => caller.data_mut().respond("redis_mget", json),
                 Err(e) => {

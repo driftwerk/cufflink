@@ -5,6 +5,7 @@ use crate::egress::{EgressError, EgressGuard, EgressTarget, OutboundRequest};
 use crate::policy::{Denied, PolicyKey};
 use crate::router::HOP_BY_HOP_HEADERS;
 use crate::telemetry::{record_response, request_span, resolving};
+use crate::wasm_runtime::budget::Refused;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
@@ -12,7 +13,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -386,7 +387,7 @@ async fn send_local(
     Ok(CallResponse {
         status,
         headers,
-        body: body.to_vec(),
+        body: body.into(),
     })
 }
 
@@ -541,18 +542,50 @@ async fn runs_in_tenant(
     }
 }
 
-fn envelope(outcome: &Result<CallResponse, CallFailure>) -> Value {
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Envelope<'a> {
+    Answered {
+        body_b64: Base64<'a>,
+        headers: &'a BTreeMap<String, String>,
+        ok: bool,
+        status: u16,
+    },
+    Failed {
+        error: FailureBody,
+        ok: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct FailureBody {
+    kind: &'static str,
+    message: String,
+}
+
+struct Base64<'a>(&'a [u8]);
+
+impl serde::Serialize for Base64<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&base64::display::Base64Display::new(self.0, &STANDARD))
+    }
+}
+
+fn envelope(outcome: &Result<CallResponse, CallFailure>) -> Envelope<'_> {
     match outcome {
-        Ok(response) => json!({
-            "ok": true,
-            "status": response.status,
-            "headers": response.headers,
-            "body_b64": STANDARD.encode(&response.body),
-        }),
-        Err(failure) => json!({
-            "ok": false,
-            "error": { "kind": failure.kind(), "message": failure.message() },
-        }),
+        Ok(response) => Envelope::Answered {
+            body_b64: Base64(&response.body),
+            headers: &response.headers,
+            ok: true,
+            status: response.status,
+        },
+        Err(failure) => Envelope::Failed {
+            error: FailureBody {
+                kind: failure.kind(),
+                message: failure.message(),
+            },
+            ok: false,
+        },
     }
 }
 
@@ -576,6 +609,11 @@ pub(super) fn register(
         |mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
             let bytes = host_try!(read_guest_bytes(&mut caller, "service_call", ptr, len));
             let started = Instant::now();
+            let mut body = caller.data().hold();
+            let reserved = caller.data().app_state.egress.effective_max_bytes(None);
+            if let Err(capacity) = body.grow(usize::try_from(reserved).unwrap_or(usize::MAX)) {
+                return caller.data_mut().refused(Refused::Budget(capacity));
+            }
             let state = caller.data();
             let resolved = OnceCell::new();
             let outcome = match serde_json::from_slice::<CallRequest>(&bytes) {
@@ -611,6 +649,11 @@ pub(super) fn register(
             .increment(1);
             metrics::histogram!("cufflink_service_call_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
+            body.shrink_to(
+                outcome
+                    .as_ref()
+                    .map_or(0, |response| response.body.capacity()),
+            );
             caller
                 .data_mut()
                 .respond_json("service_call", &envelope(&outcome))
@@ -621,6 +664,7 @@ pub(super) fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1010,13 +1054,23 @@ mod tests {
             headers: BTreeMap::from([("x-a".to_string(), "1".to_string())]),
             body: b"hi".to_vec(),
         });
+        let before =
+            json!({"ok": true, "status": 201, "headers": {"x-a": "1"}, "body_b64": "aGk="});
         assert_eq!(
-            envelope(&ok),
-            json!({"ok": true, "status": 201, "headers": {"x-a": "1"}, "body_b64": "aGk="})
+            serde_json::to_string(&envelope(&ok)).expect("envelope"),
+            serde_json::to_string(&before).expect("before"),
+            "byte for byte as the Value it replaced"
         );
         assert_eq!(result_label(&ok), "ok");
         let failed = Err(CallFailure::DepthExceeded);
-        assert_eq!(envelope(&failed)["error"]["kind"], "depth_exceeded");
+        let before = json!({
+            "ok": false,
+            "error": { "kind": "depth_exceeded", "message": CallFailure::DepthExceeded.message() },
+        });
+        assert_eq!(
+            serde_json::to_string(&envelope(&failed)).expect("envelope"),
+            serde_json::to_string(&before).expect("before")
+        );
         assert_eq!(result_label(&failed), "depth");
         for (status, label) in [(404, "http_4xx"), (503, "http_5xx")] {
             assert_eq!(

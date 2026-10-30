@@ -940,4 +940,19 @@ mod bounded_tests {
             Err(ChargedJsonError::Capacity(_))
         ));
     }
+
+    #[test]
+    fn response_text_is_held_to_a_cap_smaller_than_its_charge_step() {
+        let caps = HostCaps {
+            response: 64 * 1024,
+            ..enforced()
+        };
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        let mut text = ResponseText::new(&mut hold, &caps, "s3_download_many");
+        text.push(&"x".repeat(64 * 1024)).expect("at the cap");
+        assert!(matches!(text.push("x"), Err(Refused::Cap(_))));
+        drop(text);
+        assert_eq!(hold.bytes(), 64 * 1024);
+        assert_eq!(ledger.in_use(), 64 * 1024);
+    }
 }

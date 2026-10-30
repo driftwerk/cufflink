@@ -50,6 +50,7 @@ mod limits;
 mod log;
 mod nats;
 mod redis;
+mod rows;
 mod service_call;
 mod storage;
 mod util;
@@ -64,6 +65,7 @@ pub(crate) use limits::{BudgetDenial, GuestLimits, LimitContext};
 pub use nats::NatsPublishPolicy;
 #[cfg(test)]
 pub(crate) use redis::RESERVED_REDIS_KEY;
+pub use rows::{RowText, Stopped};
 pub(crate) use service_call::caller_depth;
 pub use service_call::LocalDispatch;
 pub use storage::{max_upload_bytes_from_env, DEFAULT_MAX_UPLOAD_BYTES};
@@ -557,6 +559,7 @@ impl BatchResult {
 
 pub(crate) struct ResponseText<'a> {
     text: String,
+    cap: usize,
     meter: Capped<'a, Hold>,
 }
 
@@ -564,6 +567,7 @@ impl<'a> ResponseText<'a> {
     pub(crate) fn new(hold: &'a mut Hold, caps: &'a HostCaps, path: &'static str) -> Self {
         Self {
             text: String::new(),
+            cap: caps.response,
             meter: Capped::new(hold, caps, path),
         }
     }
@@ -571,12 +575,17 @@ impl<'a> ResponseText<'a> {
     pub(crate) fn push(&mut self, part: &str) -> Result<(), Refused> {
         let needed = self.text.len().saturating_add(part.len());
         if needed > self.text.capacity() {
-            let grown = stepped(needed);
+            let grown = stepped(needed).min(self.cap.max(needed));
             self.meter.charge(grown - self.text.capacity())?;
             self.text.reserve_exact(grown - self.text.len());
         }
         self.text.push_str(part);
         Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.meter.credit(self.text.capacity());
+        self.text = String::new();
     }
 
     pub(crate) fn into_text(self) -> String {

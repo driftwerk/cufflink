@@ -12,6 +12,7 @@ pub enum AbandonReason {
     Deadline,
     Shutdown,
     Leaked,
+    Unread,
 }
 
 impl AbandonReason {
@@ -21,6 +22,7 @@ impl AbandonReason {
             AbandonReason::Deadline => "deadline",
             AbandonReason::Shutdown => "shutdown",
             AbandonReason::Leaked => "leaked",
+            AbandonReason::Unread => "unread",
         }
     }
 

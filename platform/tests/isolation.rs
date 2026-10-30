@@ -5,7 +5,7 @@ use cufflink_platform::policy::PolicyMode;
 use cufflink_platform::redis_conn::RedisHandle;
 use cufflink_platform::repo::deployments::{self, ActivateVersion};
 use cufflink_platform::repo::tenants::NewTenant;
-use cufflink_platform::wasm_runtime::redis_scope::{self, KeyPlan};
+use cufflink_platform::wasm_runtime::redis_scope::{self, KeyPlan, Reading};
 use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
@@ -130,6 +130,13 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         return;
     };
     let redis = RedisHandle::connect_in_background(url).expect("redis url");
+    for reading in [Reading::Plain, Reading::Whole, Reading::Upto(1024)] {
+        dual_read(&redis, reading).await;
+    }
+}
+
+async fn dual_read(redis: &RedisHandle, reading: Reading) {
+    let redis = redis.clone();
     let tenant = Uuid::new_v4();
     let legacy_key = format!("feature_flags:{tenant}:checkout");
     let plan = |mode| redis_scope::plan(mode, tenant, &legacy_key).expect("plan");
@@ -143,7 +150,7 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
     redis_scope::set(&redis, &plan(PolicyMode::Off), "legacy", None)
         .await
         .expect("pre-migration write");
-    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn))
+    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
         .await
         .expect("read");
     assert_eq!(read.value.as_deref(), Some("legacy"));
@@ -154,24 +161,26 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         .iter()
         .map(|key| redis_scope::plan(PolicyMode::Warn, tenant, key).expect("plan"))
         .collect();
-    let many = redis_scope::mget(&redis, &plans).await.expect("mget");
+    let many = redis_scope::mget(&redis, &plans, reading)
+        .await
+        .expect("mget");
     assert_eq!(many.value, vec![Some("legacy".to_string()), None]);
     assert!(many.from_fallback);
 
     redis_scope::set(&redis, &plan(PolicyMode::Warn), "rewritten", Some(60))
         .await
         .expect("write");
-    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn))
+    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
         .await
         .expect("read");
     assert_eq!(read.value.as_deref(), Some("rewritten"));
     assert!(!read.from_fallback, "the tenant key wins once written");
-    let enforced = redis_scope::get(&redis, &plan(PolicyMode::Enforce))
+    let enforced = redis_scope::get(&redis, &plan(PolicyMode::Enforce), reading)
         .await
         .expect("read");
     assert_eq!(enforced.value.as_deref(), Some("rewritten"));
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Off))
+        redis_scope::get(&redis, &plan(PolicyMode::Off), reading)
             .await
             .expect("read")
             .value
@@ -184,7 +193,7 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         .await
         .expect("delete");
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Enforce))
+        redis_scope::get(&redis, &plan(PolicyMode::Enforce), reading)
             .await
             .expect("read")
             .value,
@@ -192,7 +201,7 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         "a warn-mode delete removes the tenant's key"
     );
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Off))
+        redis_scope::get(&redis, &plan(PolicyMode::Off), reading)
             .await
             .expect("read")
             .value
@@ -200,7 +209,7 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         Some("legacy"),
         "and never the unprefixed key, which may be another tenant's"
     );
-    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn))
+    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
         .await
         .expect("read");
     assert_eq!(
@@ -211,7 +220,9 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         },
         "a deleted key does not come back from the unprefixed one"
     );
-    let many = redis_scope::mget(&redis, &plans).await.expect("mget");
+    let many = redis_scope::mget(&redis, &plans, reading)
+        .await
+        .expect("mget");
     assert_eq!(many.value, vec![None, None]);
     assert!(!many.from_fallback);
     let primary = plan(PolicyMode::Warn).primary().to_string();
@@ -235,7 +246,7 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         .await
         .expect("write");
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Warn))
+        redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
             .await
             .expect("read")
             .value
@@ -472,4 +483,78 @@ async fn backup_restores_only_read_backups_the_caller_controls() {
         )
         .await;
     assert_eq!(status, 422);
+}
+
+#[tokio::test]
+async fn bounded_redis_reads_answer_as_get_and_mget_do() {
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let Some(url) = infra.require_redis() else {
+        return;
+    };
+    let redis = RedisHandle::connect_in_background(url).expect("redis url");
+    for _ in 0..50 {
+        if redis.is_connected() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let tenant = Uuid::new_v4();
+    let key = |name: &str| format!("bounded:{tenant}:{name}");
+    let plan = |name: &str| redis_scope::plan(PolicyMode::Off, tenant, &key(name)).expect("plan");
+    redis
+        .call(|mut conn| {
+            let (empty, list, at_cap, past_cap) =
+                (key("empty"), key("list"), key("at_cap"), key("past_cap"));
+            async move {
+                use redis::AsyncCommands;
+                conn.set::<_, _, ()>(empty, "").await?;
+                conn.rpush::<_, _, ()>(list, "x").await?;
+                conn.set::<_, _, ()>(at_cap, "a".repeat(16)).await?;
+                conn.set::<_, _, ()>(past_cap, "b".repeat(17)).await
+            }
+        })
+        .await
+        .expect("fixtures");
+
+    let names = ["missing", "empty", "list", "at_cap", "past_cap"];
+    let plans: Vec<KeyPlan> = names.iter().map(|name| plan(name)).collect();
+    let plain = redis_scope::mget(&redis, &plans, Reading::Plain)
+        .await
+        .expect("mget");
+    for reading in [Reading::Whole, Reading::Upto(16)] {
+        let bounded = redis_scope::mget(&redis, &plans, reading)
+            .await
+            .expect("bounded mget");
+        for (i, name) in names.iter().enumerate() {
+            let expected = match (reading, *name) {
+                (Reading::Upto(_), "past_cap") => Some("b".repeat(17)),
+                _ => plain.value[i].clone(),
+            };
+            assert_eq!(bounded.value[i], expected, "{reading:?} mget {name}");
+        }
+        for name in names {
+            let single = plan(name);
+            let get = |reading| redis_scope::get(&redis, &single, reading);
+            match (get(Reading::Plain).await, get(reading).await) {
+                (Ok(plain), Ok(bounded)) if name == "past_cap" => {
+                    assert_eq!(plain.value.as_deref().map(str::len), Some(17));
+                    assert_eq!(
+                        bounded.value.as_deref().map(str::len),
+                        Some(17),
+                        "{reading:?}"
+                    );
+                }
+                (Ok(plain), Ok(bounded)) => assert_eq!(plain, bounded, "{reading:?} get {name}"),
+                (Err(plain), Err(bounded)) => {
+                    assert_eq!(plain.to_string(), bounded.to_string(), "{reading:?} {name}")
+                }
+                other => panic!("{reading:?} get {name}: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(plain.value[0], None);
+    assert_eq!(plain.value[1].as_deref(), Some(""));
+    assert_eq!(plain.value[2], None, "MGET answers nil for a wrong type");
 }

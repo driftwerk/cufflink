@@ -2,8 +2,12 @@ use cufflink_testkit as common;
 
 use cufflink_db::{PoolSettings, Recycling};
 use cufflink_platform::tenant_sessions::STATEMENT_STOP_EVERY;
-use cufflink_platform::wasm_runtime::host::{run_db_batch, run_guest_statement, GuestStatement};
+use cufflink_platform::wasm_runtime::budget::{Hold, HostCaps};
+use cufflink_platform::wasm_runtime::host::{
+    run_db_batch, run_guest_statement, GuestStatement, RowText,
+};
 use deadpool_postgres::Pool;
+use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -11,6 +15,21 @@ const BUDGET: Duration = Duration::from_secs(30);
 
 async fn guest(pool: &Pool, schema: &str) -> cufflink_platform::tenant_sessions::Session {
     cufflink_platform::tenant_sessions::Session::over(pool.get().await.expect("checkout"), schema)
+}
+
+async fn query(
+    session: &mut cufflink_platform::tenant_sessions::Session,
+    budget: Duration,
+    sql: &str,
+) -> Result<Vec<Value>, String> {
+    let mut hold = Hold::none();
+    let caps = HostCaps::default();
+    let rows = RowText::legacy(&mut hold, &caps, "db_query");
+    run_guest_statement(session, budget, GuestStatement::Query(sql, &rows))
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = rows.finish().map_err(|stopped| format!("{stopped:?}"))?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
 struct Session {
@@ -223,7 +242,7 @@ async fn guest_statements_run_under_the_schema_and_budget_and_leave_nothing_behi
     let db = infra.create_database().await;
     let session = Session::open(&db, "guest_stmt").await;
     let fixture = &session;
-    let run = |budget: Duration, stmt: GuestStatement<'static>| async move {
+    let run = |budget: Duration, stmt: GuestStatement<'static, 'static>| async move {
         run_guest_statement(
             &mut guest(&fixture.pool, fixture.schema).await,
             budget,
@@ -240,35 +259,32 @@ async fn guest_statements_run_under_the_schema_and_budget_and_leave_nothing_behi
     .expect("insert")
     .affected();
     assert_eq!(affected, 1);
-    let rows = run(
+    let select = |budget: Duration, sql: &'static str| async move {
+        query(&mut guest(&fixture.pool, fixture.schema).await, budget, sql).await
+    };
+    let rows = select(
         Duration::from_secs(10),
-        GuestStatement::Query("SELECT current_setting('statement_timeout') AS t, id FROM widgets"),
+        "SELECT current_setting('statement_timeout') AS t, id FROM widgets",
     )
     .await
-    .expect("select")
-    .rows();
+    .expect("select");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, String>("t"), "9500ms");
+    assert_eq!(rows[0]["t"], "9500ms");
     session.assert_clean().await;
 
-    let returned = run(
+    let returned = select(
         Duration::from_secs(10),
-        GuestStatement::Query("INSERT INTO widgets (id, ord) VALUES (2, 2) RETURNING id, ord"),
+        "INSERT INTO widgets (id, ord) VALUES (2, 2) RETURNING id, ord",
     )
     .await
-    .expect("insert returning")
-    .rows();
+    .expect("insert returning");
     assert_eq!(returned.len(), 1);
-    assert_eq!(returned[0].get::<_, i32>("id"), 2);
+    assert_eq!(returned[0]["id"], 2);
     assert_eq!(session.ids().await, vec![1, 2]);
 
-    let err = run(
-        Duration::from_secs(10),
-        GuestStatement::Query("SELECT * FROM no_such_table"),
-    )
-    .await
-    .err()
-    .expect("missing table errors");
+    let err = select(Duration::from_secs(10), "SELECT * FROM no_such_table")
+        .await
+        .expect_err("missing table errors");
     assert!(err.to_string().contains("no_such_table"), "{err}");
     session.assert_clean().await;
     let err = run(
@@ -347,14 +363,14 @@ async fn a_cancelled_executions_statement_is_stopped_by_the_server() {
             started.elapsed()
         );
         assert_eq!(sleeping(&pool).await, 0, "nothing runs on at the server");
-        run_guest_statement(&mut session, BUDGET, GuestStatement::Query("SELECT 1"))
+        query(&mut session, BUDGET, "SELECT 1")
             .await
             .expect("the session is as the statement's end left it");
         session.release(&cancelled);
     }
 
     let mut session = guest(&pool, "public").await;
-    run_guest_statement(&mut session, BUDGET, GuestStatement::Query("SELECT 1"))
+    query(&mut session, BUDGET, "SELECT 1")
         .await
         .expect("a session after those that were closed");
     let unhurried = session
@@ -401,4 +417,106 @@ async fn guest_transaction_control_cannot_leak_a_transaction() {
         1
     );
     assert_eq!(session.ids().await, vec![9]);
+}
+
+const EVERY_TYPE: &str = "SELECT g AS id, g::int2 AS small, (g::int8 * 1000003) AS big,
+       CASE g % 4 WHEN 0 THEN 'NaN'::float8 WHEN 1 THEN 'Infinity'::float8
+                  WHEN 2 THEN '-Infinity'::float8 ELSE g / 3.0 END AS f8,
+       (g / 7.0)::float4 AS f4, (g / 3.0)::numeric(20, 6) AS num,
+       'row \"' || g || E'\"\\n\\u00e9' AS label, g % 2 = 0 AS even,
+       md5(g::text)::uuid AS uid, DATE '2024-01-01' + g AS day,
+       TIMESTAMP '2024-01-01 00:00:00.25' + g * INTERVAL '1 minute' AS at,
+       TIMESTAMPTZ '2024-01-01 00:00:00+00' + g * INTERVAL '1 second' AS at_tz,
+       json_build_object('g', g, 'b', 'x') AS j,
+       jsonb_build_object('z', g, 'a', ARRAY[g, g + 1]) AS jb,
+       ARRAY[g, NULL, g + 1] AS ints, ARRAY['a', g::text] AS texts,
+       NULLIF(g % 3, 0) AS maybe, g AS dup, 'last' AS dup
+  FROM generate_series(1, 2500) AS g ORDER BY g";
+
+fn shaped<'a>(legacy: bool, hold: &'a mut Hold, caps: &'a HostCaps) -> RowText<'a> {
+    match legacy {
+        true => RowText::legacy(hold, caps, "db_query"),
+        false => RowText::v2(hold, caps, "db_call"),
+    }
+}
+
+#[tokio::test]
+async fn the_streamed_render_is_byte_identical_to_the_collected_one() {
+    use cufflink_pgcodec::render::{legacy_rows, rows_v2};
+    use cufflink_platform::tenant_sessions::Statements;
+
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let db = infra.create_database().await;
+    let fixture = Session::open(&db, "golden").await;
+    let mut session = guest(&fixture.pool, "golden").await;
+    let statement = session.prepare(EVERY_TYPE).await.expect("prepare");
+    let collected = session.query(&statement, &[]).await.expect("rows");
+    let legacy = serde_json::to_string(&legacy_rows(&collected)).expect("legacy");
+    let v2 = serde_json::to_string(&rows_v2(statement.columns(), &collected).expect("v2"))
+        .expect("v2 envelope");
+    drop(collected);
+
+    let caps = HostCaps::default();
+    for shape in [true, false] {
+        let expected = if shape { &legacy } else { &v2 };
+        let mut hold = Hold::none();
+        let rows = shaped(shape, &mut hold, &caps);
+        session
+            .query_rows(&statement, &[], &rows)
+            .await
+            .expect("streamed outside a transaction");
+        assert_eq!(&rows.finish().expect("rendered"), expected, "query_raw");
+
+        let mut hold = Hold::none();
+        let rows = shaped(shape, &mut hold, &caps);
+        let tx = session.transaction().await.expect("begin");
+        tx.query_rows(&statement, &[], &rows)
+            .await
+            .expect("streamed through a portal");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(&rows.finish().expect("rendered"), expected, "portal");
+    }
+    assert_eq!(
+        query(&mut session, BUDGET, EVERY_TYPE)
+            .await
+            .expect("db_query")
+            .len(),
+        2500
+    );
+}
+
+#[tokio::test]
+async fn a_result_past_the_response_cap_stops_the_statement_and_returns_its_session() {
+    use cufflink_platform::policy::PolicyMode;
+
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let db = infra.create_database().await;
+    let fixture = Session::open(&db, "capped").await;
+    let caps = HostCaps {
+        mode: PolicyMode::Enforce,
+        response: 64 * 1024,
+        ..HostCaps::default()
+    };
+    let sql = "SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 10000000) AS g";
+    let mut hold = Hold::none();
+    let rows = RowText::legacy(&mut hold, &caps, "db_query");
+    let started = Instant::now();
+    let mut session = guest(&fixture.pool, "capped").await;
+    let failed = run_guest_statement(&mut session, BUDGET, GuestStatement::Query(sql, &rows))
+        .await
+        .err()
+        .expect("past the cap");
+    assert!(failed.to_string().contains("response cap"), "{failed}");
+    assert!(rows.refused().is_some());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the portal stopped: {:?}",
+        started.elapsed()
+    );
+    session.release(&CancellationToken::new());
+    fixture.assert_clean().await;
 }

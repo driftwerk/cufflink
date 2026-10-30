@@ -4,15 +4,15 @@ use super::db::{
     controls_transaction, pooler_refusal, requires_autocommit, run_wrapped, statement_timeout_for,
     GuestWork, WrapperError,
 };
-use super::{block_on, read_guest_bytes, wrap, HostState};
+use super::{block_on, read_guest_bytes, wrap, HostState, RowText, Stopped};
 use crate::db_error::{from_pg, from_pool, pool_timeout};
 use crate::registry::ServiceIdentity;
 use crate::row_json::check_columns_v2;
 use crate::tenant_sessions::{
     AcquireError, Purpose, Scope, Session, StatementStop, Statements, TenantSessions,
 };
+use crate::wasm_runtime::budget::{Hold, HostCaps};
 use cufflink_pgcodec::bind;
-use cufflink_pgcodec::render::rows_v2;
 use cufflink_pgcodec::tx::{
     admit, in_failed_transaction, invalid_savepoint, isolation_sql, next,
     parameters_outside_transaction, rolled_back_by_commit, savepoint_sql, savepoints_after,
@@ -23,6 +23,7 @@ use cufflink_types::db::{DbError, DbErrorKind, DbRequest, DbResponse, Isolation,
 use session::TxEnd;
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::Statement;
@@ -44,30 +45,50 @@ pub(super) fn register(
         "db_call",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
             let bytes = host_try!(read_guest_bytes(&mut caller, "db_call", ptr, len));
-            let response = match serde_json::from_slice::<DbRequest>(&bytes) {
+            match serde_json::from_slice::<DbRequest>(&bytes) {
                 Ok(request) => handle(caller.data_mut(), request),
                 Err(e) => {
                     record("invalid", Instant::now(), Some(DbErrorKind::Protocol));
-                    DbResponse::Failed(DbError::new(
+                    let failed = DbResponse::Failed(DbError::new(
                         DbErrorKind::Protocol,
                         format!("malformed db_call request: {e}"),
-                    ))
+                    ));
+                    caller.data_mut().respond_json("db_call", &failed)
                 }
-            };
-            caller.data_mut().respond_json("db_call", &response)
+            }
         },
     )
 }
 
-fn handle(state: &mut HostState, request: DbRequest) -> DbResponse {
+fn handle(state: &mut HostState, request: DbRequest) -> i32 {
+    state.clear_host_response();
     let app_state = state.app_state.clone();
+    let limits = Arc::clone(&state.limits);
+    let mut hold = state.hold();
+    let rows = RowText::v2(&mut hold, &limits.budget.caps, "db_call");
     let target = DbTarget {
         sessions: &app_state.tenant_sessions,
         identity: &state.identity,
         deadline: state.deadline,
         cancel: &state.cancel,
     };
-    block_on(call(&mut state.db, &target, request))
+    let reply = block_on(call_into(&mut state.db, &target, request, &rows));
+    let finished = match reply {
+        Reply::Response(response) => Err(response),
+        Reply::Rendered => rows.finish().map_err(|stopped| {
+            if let Stopped::Refused(refused) = stopped {
+                state.guest_limits.host_refused(refused);
+            }
+            DbResponse::Failed(stopped.error())
+        }),
+    };
+    match finished {
+        Ok(text) => {
+            state.set_charged_response(text, hold);
+            0
+        }
+        Err(response) => state.respond_json("db_call", &response),
+    }
 }
 
 #[doc(hidden)]
@@ -108,15 +129,42 @@ impl DbTarget<'_> {
     }
 }
 
+pub(crate) enum Reply {
+    Response(DbResponse),
+    Rendered,
+}
+
 #[doc(hidden)]
 pub async fn call(
     session: &mut DbSession,
     target: &DbTarget<'_>,
     request: DbRequest,
+    caps: &HostCaps,
 ) -> DbResponse {
+    let mut hold = Hold::none();
+    let rows = RowText::v2(&mut hold, caps, "db_call");
+    match call_into(session, target, request, &rows).await {
+        Reply::Response(response) => response,
+        Reply::Rendered => rows
+            .finish()
+            .map_err(|stopped| stopped.error())
+            .and_then(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|e| DbError::new(DbErrorKind::Protocol, e.to_string()))
+            })
+            .unwrap_or_else(DbResponse::Failed),
+    }
+}
+
+async fn call_into(
+    session: &mut DbSession,
+    target: &DbTarget<'_>,
+    request: DbRequest,
+    rows: &RowText<'_>,
+) -> Reply {
     let op = request.op();
     let started = Instant::now();
-    let result = dispatch(session, target, request)
+    let result = dispatch(session, target, request, rows)
         .instrument(tracing::info_span!(
             "db",
             otel.name = %format!("db.v2.{op}"),
@@ -124,7 +172,7 @@ pub async fn call(
         ))
         .await;
     record(op, started, result.as_ref().err().map(|e| e.kind));
-    result.unwrap_or_else(DbResponse::Failed)
+    result.unwrap_or_else(|error| Reply::Response(DbResponse::Failed(error)))
 }
 
 fn record(op: &'static str, started: Instant, failure: Option<DbErrorKind>) {
@@ -138,13 +186,16 @@ async fn dispatch(
     session: &mut DbSession,
     target: &DbTarget<'_>,
     request: DbRequest,
-) -> Result<DbResponse, DbError> {
-    match request {
+    rows: &RowText<'_>,
+) -> Result<Reply, DbError> {
+    let response = match request {
         DbRequest::Query { sql, params, tx } => {
-            statement(session, target, tx, Kind::Query, &sql, &params).await
+            let bound = Bound::new(Kind::Query, &sql, &params, rows);
+            return statement(session, target, tx, bound).await;
         }
         DbRequest::Execute { sql, params, tx } => {
-            statement(session, target, tx, Kind::Execute, &sql, &params).await
+            let bound = Bound::new(Kind::Execute, &sql, &params, rows);
+            return statement(session, target, tx, bound).await;
         }
         DbRequest::Begin {
             isolation,
@@ -163,7 +214,8 @@ async fn dispatch(
         DbRequest::RollbackTo { tx, name } => {
             savepoint(session, target, tx, SavepointOp::RollbackTo, &name).await
         }
-    }
+    };
+    response.map(Reply::Response)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,52 +259,70 @@ impl From<WrapperError> for StatementFailure {
     }
 }
 
-struct BoundStatement<'a> {
+struct Bound<'a, 'h> {
     kind: Kind,
     sql: &'a str,
     params: &'a [Param],
+    rows: &'a RowText<'h>,
 }
 
-impl GuestWork for BoundStatement<'_> {
-    type Output = DbResponse;
+impl<'a, 'h> Bound<'a, 'h> {
+    fn new(kind: Kind, sql: &'a str, params: &'a [Param], rows: &'a RowText<'h>) -> Self {
+        Self {
+            kind,
+            sql,
+            params,
+            rows,
+        }
+    }
+}
+
+impl GuestWork for Bound<'_, '_> {
+    type Output = Reply;
     type Error = StatementFailure;
 
     fn sql(&self) -> &str {
         self.sql
     }
 
-    async fn run<C: Statements>(&self, client: &C) -> Result<DbResponse, StatementFailure> {
+    fn unread(&self) -> bool {
+        self.rows.refused().is_some()
+    }
+
+    async fn run<C: Statements>(&self, client: &C) -> Result<Reply, StatementFailure> {
         let statement = client
             .prepare(self.sql)
             .await
             .map_err(StatementFailure::server)?;
-        run_prepared(client, &statement, self.kind, self.params).await
+        run_prepared(client, &statement, self).await
     }
 }
 
 async fn run_prepared<C: Statements>(
     client: &C,
     statement: &Statement,
-    kind: Kind,
-    params: &[Param],
-) -> Result<DbResponse, StatementFailure> {
-    if kind == Kind::Query {
+    bound: &Bound<'_, '_>,
+) -> Result<Reply, StatementFailure> {
+    if bound.kind == Kind::Query {
         check_columns_v2(statement.columns()).map_err(StatementFailure::refused)?;
     }
-    let bound = bind(statement.params(), params).map_err(StatementFailure::refused)?;
-    let args: Vec<&(dyn ToSql + Sync)> = bound.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
-    match kind {
+    let params = bind(statement.params(), bound.params).map_err(StatementFailure::refused)?;
+    let args: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
+    match bound.kind {
         Kind::Query => {
-            let rows = client
-                .query(statement, &args)
+            client
+                .query_rows(statement, &args, bound.rows)
                 .await
                 .map_err(StatementFailure::server)?;
-            rows_v2(statement.columns(), &rows).map_err(StatementFailure::refused)
+            match bound.rows.stop() {
+                Some(stopped) => Err(StatementFailure::refused(stopped.error())),
+                None => Ok(Reply::Rendered),
+            }
         }
         Kind::Execute => client
             .execute(statement, &args)
             .await
-            .map(DbResponse::Affected)
+            .map(|affected| Reply::Response(DbResponse::Affected(affected)))
             .map_err(StatementFailure::server),
     }
 }
@@ -270,38 +340,33 @@ async fn statement(
     session: &mut DbSession,
     target: &DbTarget<'_>,
     tx: Option<u32>,
-    kind: Kind,
-    sql: &str,
-    params: &[Param],
-) -> Result<DbResponse, DbError> {
-    refused(target, sql)?;
+    bound: Bound<'_, '_>,
+) -> Result<Reply, DbError> {
+    refused(target, bound.sql)?;
     match tx {
-        None => autocommit(target, kind, sql, params).await,
-        Some(tx) => in_transaction(session, target, tx, kind, sql, params).await,
+        None => autocommit(target, &bound).await,
+        Some(tx) => in_transaction(session, target, tx, &bound).await,
     }
 }
 
-async fn autocommit(
-    target: &DbTarget<'_>,
-    kind: Kind,
-    sql: &str,
-    params: &[Param],
-) -> Result<DbResponse, DbError> {
-    if requires_autocommit(sql) && !params.is_empty() {
+async fn autocommit(target: &DbTarget<'_>, bound: &Bound<'_, '_>) -> Result<Reply, DbError> {
+    if requires_autocommit(bound.sql) && !bound.params.is_empty() {
         return Err(parameters_outside_transaction());
     }
     let remaining = remaining(target.deadline);
     let mut session = target.session().await?;
-    let work = BoundStatement { kind, sql, params };
     let outcome = target
         .run(
             session.stop(),
-            run_wrapped(&mut session, statement_timeout_for(remaining), &work),
+            run_wrapped(&mut session, statement_timeout_for(remaining), bound),
         )
         .await;
     match outcome {
         Ok(result) => {
-            session.release(target.cancel);
+            match bound.unread() {
+                true => session.discard(),
+                false => session.release(target.cancel),
+            }
             result.map_err(|failure| failure.error)
         }
         Err(elapsed) => {
@@ -315,10 +380,8 @@ async fn in_transaction(
     session: &mut DbSession,
     target: &DbTarget<'_>,
     tx: u32,
-    kind: Kind,
-    sql: &str,
-    params: &[Param],
-) -> Result<DbResponse, DbError> {
+    bound: &Bound<'_, '_>,
+) -> Result<Reply, DbError> {
     let slot = session.slot(tx)?;
     admit(slot.phase, SlotOp::Statement).map_err(in_failed_transaction)?;
     let timeout_ms = statement_timeout_for(remaining(target.deadline))
@@ -330,13 +393,17 @@ async fn in_transaction(
             let timeout_arg: [&(dyn ToSql + Sync); 1] = [&timeout_ms];
             let (_, statement) = tokio::try_join!(
                 client.execute(&slot.set_timeout, &timeout_arg),
-                client.prepare(sql),
+                client.prepare(bound.sql),
             )
             .map_err(StatementFailure::server)?;
-            run_prepared(client, &statement, kind, params).await
+            run_prepared(client, &statement, bound).await
         })
         .await;
     match outcome {
+        Ok(result) if bound.unread() => {
+            session.remove(tx)?.abandon(AbandonReason::Unread);
+            result.map_err(|failure| failure.error)
+        }
         Ok(result) => {
             let outcome = result
                 .as_ref()

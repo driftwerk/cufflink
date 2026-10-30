@@ -1,14 +1,15 @@
-use super::{block_on, duration_from_env, read_guest_string, wrap, HostState};
+use super::{block_on, duration_from_env, read_guest_string, wrap, HostState, RowText, Stopped};
 use crate::tenant_sessions::{Purpose, Scope, Session, Statements};
+use crate::wasm_runtime::budget::Refused;
 use cufflink_pgcodec::error::server_message as pg_error_string;
 pub(crate) use cufflink_pgcodec::pooler::pooler_refusal;
-use cufflink_pgcodec::render::legacy_rows;
 use cufflink_pgcodec::session as pg_session;
 use cufflink_pgcodec::statement::rows_as_json;
 pub(crate) use cufflink_pgcodec::statement::{controls_transaction, requires_autocommit};
 use serde_json::json;
 use std::collections::HashSet;
 use std::ops::AsyncFnOnce;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::{Caller, Linker};
 
@@ -26,21 +27,35 @@ pub(super) fn register(
                 return -1;
             }
             let _span = db_span("query", &sql);
+            caller.data_mut().clear_host_response();
+            let limits = Arc::clone(&caller.data().limits);
+            let mut hold = caller.data().hold();
+            let rows = RowText::legacy(&mut hold, &limits.budget.caps, "db_query");
 
-            let result = block_on(on_guest_session(
+            let result = block_on(on_guest_session_until(
                 caller.data(),
+                || rows.refused().is_some(),
                 async |session: &mut Session, remaining| {
-                    let rows = run_guest_statement(session, remaining, GuestStatement::Query(&sql))
-                        .await?
-                        .rows();
-                    serde_json::to_string(&legacy_rows(&rows))
-                        .map_err(|e| DbCallError(e.to_string()))
+                    run_guest_statement(session, remaining, GuestStatement::Query(&sql, &rows))
+                        .await
                 },
             ));
+            let rendered = match (result, rows.refused()) {
+                (_, Some(refused)) => Err(Rendered::Refused(refused)),
+                (Err(e), None) => Err(Rendered::Failed(e.to_string())),
+                (Ok(_), None) => rows.finish().map_err(|stopped| match stopped {
+                    Stopped::Refused(refused) => Rendered::Refused(refused),
+                    Stopped::Decode(e) => Rendered::Failed(e.message.clone()),
+                }),
+            };
 
-            match result {
-                Ok(json_str) => caller.data_mut().respond("db_query", json_str),
-                Err(e) => {
+            match rendered {
+                Ok(text) => {
+                    caller.data_mut().set_charged_response(text, hold);
+                    0
+                }
+                Err(Rendered::Refused(refused)) => caller.data_mut().refused(refused),
+                Err(Rendered::Failed(e)) => {
                     tracing::error!("[wasm] db_query error: {}", e);
                     -1
                 }
@@ -194,8 +209,21 @@ pub(super) fn register(
     Ok(())
 }
 
+enum Rendered {
+    Refused(Refused),
+    Failed(String),
+}
+
 async fn on_guest_session<T, E: From<DbCallError>>(
     state: &HostState,
+    work: impl AsyncFnOnce(&mut Session, Duration) -> Result<T, E>,
+) -> Result<T, E> {
+    on_guest_session_until(state, || false, work).await
+}
+
+async fn on_guest_session_until<T, E: From<DbCallError>>(
+    state: &HostState,
+    unread: impl FnOnce() -> bool,
     work: impl AsyncFnOnce(&mut Session, Duration) -> Result<T, E>,
 ) -> Result<T, E> {
     let mut session = state
@@ -208,7 +236,10 @@ async fn on_guest_session<T, E: From<DbCallError>>(
         .stop()
         .stopping(&state.cancel, work(&mut session, state.remaining_budget()))
         .await;
-    session.release(&state.cancel);
+    match unread() {
+        true => session.discard(),
+        false => session.release(&state.cancel),
+    }
     ended
 }
 
@@ -310,15 +341,15 @@ fn record_guest_statement(op: &'static str, started: Instant) {
 }
 
 #[doc(hidden)]
-pub enum GuestStatement<'a> {
-    Query(&'a str),
+pub enum GuestStatement<'a, 'h> {
+    Query(&'a str, &'a RowText<'h>),
     Execute(&'a str),
 }
 
-impl GuestStatement<'_> {
+impl GuestStatement<'_, '_> {
     fn op(&self) -> &'static str {
         match self {
-            Self::Query(_) => "query",
+            Self::Query(..) => "query",
             Self::Execute(_) => "execute",
         }
     }
@@ -326,21 +357,14 @@ impl GuestStatement<'_> {
 
 #[doc(hidden)]
 pub enum GuestDbOutcome {
-    Rows(Vec<tokio_postgres::Row>),
+    Rendered,
     Affected(u64),
 }
 
 impl GuestDbOutcome {
-    pub fn rows(self) -> Vec<tokio_postgres::Row> {
-        match self {
-            Self::Rows(rows) => rows,
-            Self::Affected(_) => Vec::new(),
-        }
-    }
-
     pub fn affected(self) -> u64 {
         match self {
-            Self::Rows(rows) => rows.len() as u64,
+            Self::Rendered => 0,
             Self::Affected(n) => n,
         }
     }
@@ -404,22 +428,37 @@ pub(crate) trait GuestWork {
 
     fn sql(&self) -> &str;
 
+    fn unread(&self) -> bool {
+        false
+    }
+
     async fn run<C: Statements>(&self, client: &C) -> Result<Self::Output, Self::Error>;
 }
 
-impl GuestWork for GuestStatement<'_> {
+impl GuestWork for GuestStatement<'_, '_> {
     type Output = GuestDbOutcome;
     type Error = DbCallError;
 
     fn sql(&self) -> &str {
         match self {
-            Self::Query(sql) | Self::Execute(sql) => sql,
+            Self::Query(sql, _) | Self::Execute(sql) => sql,
         }
+    }
+
+    fn unread(&self) -> bool {
+        matches!(self, Self::Query(_, rows) if rows.refused().is_some())
     }
 
     async fn run<C: Statements>(&self, client: &C) -> Result<GuestDbOutcome, DbCallError> {
         match self {
-            GuestStatement::Query(sql) => Ok(GuestDbOutcome::Rows(client.query(*sql, &[]).await?)),
+            GuestStatement::Query(sql, rows) => {
+                let statement = client.prepare(sql).await?;
+                client.query_rows(&statement, &[], *rows).await?;
+                match rows.refused() {
+                    Some(refused) => Err(DbCallError(refused.to_string())),
+                    None => Ok(GuestDbOutcome::Rendered),
+                }
+            }
             GuestStatement::Execute(sql) => {
                 Ok(GuestDbOutcome::Affected(client.execute(*sql, &[]).await?))
             }
@@ -431,7 +470,7 @@ impl GuestWork for GuestStatement<'_> {
 pub async fn run_guest_statement(
     session: &mut Session,
     remaining: Duration,
-    stmt: GuestStatement<'_>,
+    stmt: GuestStatement<'_, '_>,
 ) -> Result<GuestDbOutcome, DbCallError> {
     let started = Instant::now();
     let outcome = run_wrapped(session, statement_timeout_for(remaining), &stmt).await;
@@ -492,6 +531,9 @@ async fn run_autocommit<W: GuestWork>(
         .await
         .map_err(WrapperError::at(WrapperStep::Setup))?;
     let result = work.run(session).await;
+    if work.unread() {
+        return result;
+    }
     if let Err(e) = session.batch_execute(session.reset()).await {
         tracing::warn!(error = %pg_error_string(&e), "RESET after an autocommit guest statement failed");
     }
