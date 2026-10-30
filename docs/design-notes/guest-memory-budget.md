@@ -11,9 +11,10 @@ Design only. Nothing here is implemented yet.
   subscriptions see for capacity denials (section 3.5).
 - A second review followed. Section 13 lists the questions it raised,
   which the owner answered on 2026-10-30, all as proposed.
-- A third and a fourth review followed. Their findings are folded in;
-  neither raised a new question. The owner accepted the fourth review's
-  audit cost (section 2.4).
+- A third, a fourth and a fifth review followed. Their findings are folded
+  in, and none raised a new question. The owner accepted the fourth
+  review's audit cost (section 2.4). The fifth review found the design
+  sound to implement.
 
 ## Outcome
 
@@ -330,6 +331,23 @@ unwinding through `spawn_blocking`.
     such as an image decode.
   - A thread therefore only ever comes into being with a stack charge
     already on the ledger, and threads never over-commit it.
+  - **Admission claims idle residues.** Without this, a burst would leave
+    up to its peak's worth of residues behind. For up to the 2 s
+    keep-alive, new admissions would debit fresh stack charges beside
+    them, and the ledger would dip below what it could admit.
+    - So the ledger counts the residues in the `stack_residue` bucket.
+      While one is idle, an admission takes it over, moving that stack
+      charge to the new invocation, instead of debiting a new one.
+    - tokio hands the task to an idle thread when it has one, so the claim
+      and the thread usually match.
+    - When they do not match, the task starts on a new thread while the
+      claimed residue's thread is busy with non-guest work. The new
+      thread's start then debits one more stack charge unconditionally,
+      since the invocation is already admitted.
+    - That over-commit is at most one stack per blocking thread doing
+      non-guest work at that instant, which the reserve already holds
+      (section 3.8). The residue's own thread re-enters the bucket when
+      its non-guest work ends.
   - **Why not the alternatives.** Lowering `max_wasm_stack` would make
     deeply recursive guests trap where they run today. Deriving
     `WASM_MAX_CONCURRENT` from the reserve would cut concurrency for light
@@ -548,6 +566,16 @@ EXEC
 For `mget`, the two commands are repeated per key inside one `MULTI`,
 pipelined as an atomic block.
 
+- **Sending and decoding.** The locked redis-rs, 0.27.6, has no
+  `ignore_errors` on a pipeline, and its typed `query_async` may collapse a
+  per-command error inside `EXEC` into an error for the whole call.
+  - So the block is sent as plain commands through
+    `ConnectionLike::req_packed_commands`, and the `EXEC` reply is kept as
+    its raw `Vec<Value>`.
+  - Each element is decoded on its own. A `Value::ServerError` is the
+    `WRONGTYPE` of that key's `GETRANGE`.
+  - If a later redis-rs adds an `ignore_errors` that keeps the elements,
+    it may replace this. The golden tests below decide either way.
 - **Missing key.** `EXISTS` 0 answers nil, as `GET` and `MGET` do.
 - **Present key.** `GETRANGE`'s answer is the value. An empty string is
   `""`. A tombstone is an ordinary string that `Stored` decodes as today.
@@ -566,6 +594,12 @@ pipelined as an atomic block.
 - It has no script cache to lose: a Lua script would need `NOSCRIPT`
   handling after every Redis restart.
 - It reproduces `GET` and `MGET` in every case listed above.
+- **Expiry.** It needs Redis 7 or later, which freezes time for the
+  whole of an `EXEC`. A key expiring between `EXISTS` and `GETRANGE` then
+  cannot answer `""` where `GET` would answer nil.
+  - Startup reads `INFO server`. On an older Redis it logs a warning, and
+    that edge case is accepted there: a key expiring in that instant
+    answers `""` instead of nil.
 - In a cluster its `mget` block has the same single-slot requirement
   `MGET` has today.
 
@@ -581,7 +615,9 @@ fall-back.
   - missing keys;
   - the fallback path;
   - a tombstone;
-  - wrong types in both calls;
+  - wrong types in both calls, including an `mget` that mixes a
+    wrong-type key with good ones: nil for the bad key, the values for the
+    rest;
   - empty strings;
   - values at the cap, at `cap + 1`, and replaced between two calls.
 
@@ -601,6 +637,27 @@ fall-back.
     what the tree costs. That measured charge is kept as a reservation
     when the tree is dropped, held until `record()` returns, and the
     re-parse draws from it.
+  - **The payloads.** `record()` serialises two payload strings,
+    `legacy_payload().to_string()` and `durable_payload().to_string()`
+    (`outbox/emit.rs`). Together they are two to three times the body's
+    text, and numbers can grow when they are written again.
+    - They must not be refusable either. So when `parse_body` succeeds, the
+      tree is also serialised into a **counting sink**, which allocates
+      nothing, to measure the body's text exactly as the payloads will
+      write it.
+    - Twice that length, plus a fixed allowance of 64 KiB per payload for
+      the envelope's other fields, is added to the same reservation.
+    - `record()` writes each payload through `ChargedJson::write`, drawing
+      from it.
+    - Redaction (`audit_redact`) only shortens the body. If an envelope
+      exceeds its allowance, the excess, bounded by the envelope's small
+      fields, is debited unconditionally rather than refused.
+    - Under a non-enforced `outbox`, `spawn_publish` hands a payload to a
+      detached task, which keeps it after `record()` returns and the
+      reservation is released. That copy is bounded in size by the NATS
+      server's `max_payload`, since a larger publish fails at once, and in
+      time by `publish_bounded`'s timeout. It is one of the things the
+      reserve holds (section 3.8).
   - **It always fits.** `ChargedJson` is deterministic for the same input,
     so the re-parse needs exactly what the first parse did, and `Capacity`
     cannot occur on this path.
@@ -939,6 +996,13 @@ Some host memory stays outside the ledger:
 - the stacks of the runtime's core worker threads, a fixed handful.
   Blocking threads' stacks after guest work, idle ones included, are
   charged (section 2.2);
+- CRUD request bodies. axum parses them into a `Value`, up to
+  `HTTP_DATA_BODY_LIMIT_BYTES`, before any hook is admitted. With the
+  hardened HTTP profile's lower limit these are small, and they are bounded
+  by `HTTP_MAX_CONCURRENT_REQUESTS` when it is set;
+- the audit payload a detached `spawn_publish` still holds after `record()`
+  returns, bounded by NATS's `max_payload` and the publish timeout
+  (section 2.4);
 - blocking threads started only for non-guest work, which carry no stack
   charge: hyper's DNS lookups (`spawn_blocking`) and module compilation;
 - behind PgBouncer, a statement stopped at the cap may run on in the
@@ -1320,9 +1384,17 @@ describing each rule:
 - **NOSCRIPT is moot.** The Redis reads use no scripts. A test flushes
   the script cache (`SCRIPT FLUSH`) between two reads, and restarts
   Redis between two others, and both still answer.
-- **Audit.** For an authenticated request whose body parse charged *N*
-  bytes, *N* stay reserved until `record()` returns, and the re-parse
-  draws from them without a new ledger debit.
+- **Audit.**
+  - For an authenticated request whose body parse charged *N* bytes, *N*
+    stay reserved until `record()` returns, and the re-parse draws from
+    them without a new ledger debit.
+  - The two payloads are written within the reservation measured by the
+    counting sink, for bodies whose numbers grow when written again
+    (`1e2`, `1.0`).
+  - With the ledger full, `record()` still writes both payloads.
+- **Stack claims.** After a burst, admissions take over idle residues
+  rather than debiting new stack charges, so the ledger does not dip
+  during the keep-alive.
 - **Images.** 17 targets are refused. Outputs are uploaded one at a time,
   each charged as it is encoded.
 - **Worst-case shapes.** The counting-allocator tests of section 2.4 run
@@ -1467,11 +1539,19 @@ tenants `acme` and `globex` and services `catalog-service` and
     container, the 512 MiB budget is used up by the stacks of 256
     invocations, light ones included.
   - **Tuning for many light concurrent guests.** Either raise the
-    container's memory, or lower the blocking threads' stack with
-    `WASM_THREAD_STACK_KB`. That sets both the runtime's `thread_stack_size`
-    and the charge, and must still exceed wasmtime's 512 KiB
-    `max_wasm_stack` plus host frames; startup refuses anything below
-    1 MiB. Or lower `WASM_MAX_CONCURRENT`.
+    container's memory, or lower the threads' stack with
+    `WASM_THREAD_STACK_KB`, or lower `WASM_MAX_CONCURRENT`.
+    - `WASM_THREAD_STACK_KB` sets tokio's `thread_stack_size`, and so the
+      charge. That applies to **every** runtime thread: tokio's core worker
+      threads as well as the blocking ones.
+    - Startup refuses less than 1 MiB. A blocking thread holds wasmtime's
+      512 KiB `max_wasm_stack` with the host's deepest call paths beneath
+      it: a host function's serde, tokio-postgres and TLS frames, which run
+      on the same stack.
+    - The core workers run the router, axum's body parsing and serde over
+      request data. Running out of stack there aborts the whole process
+      rather than trapping one guest, so the floor errs well above the
+      512 KiB.
   - **What the reserve still holds:** the baseline, compiled modules,
     core and non-guest blocking threads' stacks, and fragmentation.
 - `docs/routing.md`, "Route limits": `max_concurrent`.
