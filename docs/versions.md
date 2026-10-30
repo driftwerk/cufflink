@@ -149,9 +149,11 @@ declares.
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
 | `route_concurrency` | any route sets `max_concurrent` | invocations of a route in flight at once, per replica ([route limits](routing.md#route-limits)) |
+| `guest_memory_budget` | never demanded | a process-wide budget for guest memory and the host memory made for guests, with admission that waits or answers 503 and `Retry-After` rather than exceeding it ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)) |
 
 This release adds the guest memory budget: a process-wide ledger of the
-linear memory, tables and thread stacks of the guests in flight, with
+linear memory, tables and thread stacks of the guests in flight, and of the
+memory the host makes for them, with
 admission that waits, or answers `503` and `Retry-After`, rather than
 exceed it ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)).
 `WASM_MEMORY_BUDGET_MODE` is `warn` by default: nothing waits or is refused
@@ -169,10 +171,35 @@ been. A later release makes `enforce` the default. Under `enforce`:
 - a route denied memory mid-run is answered `503`, saying the request may
   have been partly applied.
 
-Memory the host allocates for guests (host-call results, request and
-response bodies) is not yet in the ledger, so `guest_memory_budget` is not
-advertised by this release. Migration `V7__capacity_deferrals.sql` adds a
-column to `wasm_jobs`.
+Memory the host makes for guests is charged before it is made: request
+and response bodies, and the results of host calls (database rows,
+objects, HTTP responses, Redis values, images). Under `enforce`, each
+host-call result is capped at `WASM_MAX_HOST_RESPONSE_MB` (64); under
+`warn`, a result past it is counted in `cufflink_wasm_host_cap_total` and
+answered as before. Under `enforce`:
+
+- a `db_query` result past the cap fails the call with `-1`, and a
+  `db_v2` call answers the new `DbErrorKind::TooLarge` (`too_large`). The
+  statement is stopped, and a transaction it ran in is rolled back
+  (`cufflink_db_tx_abandoned_total{reason="unread"}`);
+- a Redis value is read only up to the cap.
+
+In every mode, `image_transform_multi` encodes and uploads its targets one
+at a time, so a failure part way leaves the earlier targets uploaded.
+
+These process changes apply in every mode, `off` included:
+
+- the runtime's idle blocking threads exit after 2 s, and at most
+  `WASM_MAX_CONCURRENT × 5 + 64` exist at once;
+- on glibc, allocations of 1 MiB or more are returned to the kernel when
+  freed (`mallopt(M_MMAP_THRESHOLD)`), unless the mode is `off` or
+  `MALLOC_MMAP_THRESHOLD_` or `GLIBC_TUNABLES` sets it;
+- a malformed budget variable (any of those
+  [setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs) lists
+  for the budget, `WASM_THREAD_STACK_KB` included) stops the process at
+  startup rather than falling back to a default.
+
+Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 
 `cufflink services list --features` prints what each deployed service
 requires.

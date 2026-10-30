@@ -29,10 +29,11 @@ platform or worker past its container's limit.
   memory, lower `WASM_THREAD_STACK_KB` (at least 1024; it sets every runtime
   thread's stack), or lower `WASM_MAX_CONCURRENT`.
 - **What the reserve holds:** the process's baseline, compiled modules, the
-  core threads' stacks, fragmentation, and for now the host buffers of
-  host calls, requests and responses. On glibc startup sets
-  `M_MMAP_THRESHOLD` to 1 MiB, so freed buffers of a mebibyte or more go
-  back to the kernel; `MALLOC_MMAP_THRESHOLD_` still overrides it.
+  core threads' stacks and fragmentation. The host buffers of host calls,
+  requests and responses are charged to the budget. On glibc startup sets
+  `M_MMAP_THRESHOLD` to 1 MiB unless the mode is `off`, so freed buffers of
+  a mebibyte or more go back to the kernel; `MALLOC_MMAP_THRESHOLD_` or
+  `GLIBC_TUNABLES` still overrides it.
 - **Soak** in `warn`, the default, and read
   `cufflink_wasm_admission_refused_total{mode="warn"}` and
   `cufflink_wasm_memory_denied_total{mode="warn"}` before setting `enforce`.

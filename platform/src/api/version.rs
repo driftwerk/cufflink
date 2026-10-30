@@ -142,6 +142,7 @@ mod tests {
             CONFIG_APPLY,
             COLUMN_PERMISSIONS,
             ROUTE_CONCURRENCY,
+            GUEST_MEMORY_BUDGET,
         ] {
             assert!(supports.contains(&finished), "{finished}");
         }

@@ -50,6 +50,7 @@ pub const PRIVATE_TABLES: &str = "private_tables";
 pub const INACTIVE_DEPLOY: &str = "inactive_deploy";
 pub const CONFIG_APPLY: &str = "config_apply";
 pub const COLUMN_PERMISSIONS: &str = "column_permissions";
+pub const GUEST_MEMORY_BUDGET: &str = "guest_memory_budget";
 
 impl ServiceManifest {
     /// Features this manifest's declared shape requires, sorted and

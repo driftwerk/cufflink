@@ -27,7 +27,10 @@ pub(crate) use budget::RouteKey;
 pub use budget::{Admission, Class};
 pub use invocation::{ExecutionError, Invocation, InvocationKind};
 
-pub(crate) const FEATURES: &[&str] = &["precompiled_modules"];
+pub(crate) const FEATURES: &[&str] = &[
+    "precompiled_modules",
+    cufflink_types::features::GUEST_MEMORY_BUDGET,
+];
 
 pub(super) fn wt(err: wasmtime::Error) -> eyre::Report {
     eyre::eyre!("{}", err)

@@ -928,7 +928,9 @@ reservation held across it would keep an idle durable's
     `V7__capacity_deferrals.sql`: `ADD COLUMN IF NOT EXISTS
     capacity_deferrals INTEGER NOT NULL DEFAULT 0`). It survives
     redelivery and replicas, and any conclusion other than a deferral
-    resets it to 0.
+    resets it to 0. A release (an interrupted claim put back) resets it
+    too: a deferral bound counts consecutive deferrals, and a release is not
+    one.
   - **The bound.** When a deferral would make it exceed
     `WASM_CAPACITY_RETRIES_JOB` (10), the attempt concludes instead as
     `Failed { class: Capacity }`: the attempt counts and the counter
@@ -1712,3 +1714,82 @@ accepted as stated.
 22. **The image pixel cap.** Take the smaller of `IMAGE_MAX_PIXELS`
     (40 megapixels) and the service share ÷ 20 bytes, so the cap shrinks on
     small containers (about 37 MP in a 2 GiB container)? *Proposed: yes.*
+
+## 14. Where the implementation differs
+
+Recorded as the change was built, each with its reason.
+
+**Admission and the ledger.**
+
+- **Stack charges.** A stack charge moves to the thread's residue when the
+  guest starts on the thread rather than when it ends, so the running
+  guest's stack counts toward no service share. A thread's residue is
+  credited by a thread-local destructor rather than `on_thread_stop`, and a
+  test ends a real thread to show it.
+- **Pre-fetch check.** The worker's after-hook consumer checks
+  `WASM_MEMORY_JOB_FLOOR_MB` before it fetches, as the long-jobs consumer
+  does, because its one durable carries every handler.
+- **SSE reducers** wait the interactive 1 s bound.
+- **The pressure gate** is cgroup v2 only. Under v1 the budget is still
+  derived, but nothing is gated.
+- **The global pool.** A full global pool under `enforce` is refused with
+  reason `service_concurrency`, since section 6 has no reason for it. Its
+  logs name the pool.
+- **An RPC message deferred for capacity** gets no reply. It is naked with
+  its delay, and the redelivery answers, as an interrupted `on_success`
+  message does today. A requester whose timeout is shorter than the delay
+  sees a timeout.
+- **`warn` counts.** Under `warn` a denial is counted where `enforce` would
+  have refused. A host buffer forced past the budget raises the ledger, so
+  later checks in the same window see it, and the count is an upper bound
+  on what `enforce` would have refused.
+
+**Requests and responses.**
+
+- **The request's `auth` and `caller.depth`** are read from the request
+  text by a partial deserialisation, which skips every other field without
+  building it, rather than carried by the `Invocation`.
+- **Multipart parts.** `multer` copies the body into one buffer and the
+  parts are slices of it, so the copy is charged once, at the body's
+  length, before parsing.
+- **A worker's reply** is charged at twice its payload while it is decoded
+  (the payload and the response it carries), then shrunk to the response.
+- **A hook's answer** is charged until the hook returns. A before-hook's
+  returned body, used by the write that follows, is not charged after that.
+
+**Host calls.**
+
+- **Fan-out and image-target inputs.** The item lists of
+  `s3_download_many` and `http_fetch_many`, and `image_transform_multi`'s
+  targets, are charged at their input length before parsing into small
+  typed lists (at most 128 items), rather than parsed through `ChargedJson`
+  into a `Value` first.
+- **A fetched item's charge.** `http_fetch_many` reserves
+  `HOST_HTTP_MAX_RESPONSE_BYTES` per item. When the fetch returns, the
+  charge is set to the result's measured size.
+- **An object read** reads exactly `head`'s size. An object that grew
+  between `head` and the read fails the call without reading the extra
+  byte first. The charge is the bytes plus their padded base64, which the
+  counting-allocator test measures exactly.
+- **Image outputs** are covered by the 20 bytes a pixel the decode is
+  charged, which counts the encoder's buffers. Targets are encoded and
+  uploaded one at a time, so a failure part way leaves the earlier targets
+  uploaded.
+- **`db_query` inside a guest-owned transaction.** That transaction is a
+  `BEGIN` the guest sent on its session, so no portal can be bound in it.
+  Its statements stream with `query_raw` instead. A result stopped at the
+  cap leaves rows unread, so the transaction is abandoned (reason
+  `unread`) and the guest's later calls on it answer `TransactionNotFound`.
+- **A role fallback.** When the statement is wrapped in a `SAVEPOINT` or
+  its own `BEGIN`, ending it after a stop may wait for the server, bounded
+  by `statement_timeout`. Memory stays bounded.
+- **An autocommit statement stopped at the cap** discards its session,
+  even on the portal path, rather than closing the portal and reusing it.
+- **A `db_v2` decode error** keeps reading rows to the end, as the
+  collected render did, so the error and the statement's end are the same
+  as before. Only a refusal stops early.
+- **`redis_mget`** reads each key up to the response cap. The total is
+  checked once, at the response.
+- **`service_call`** reserves the callee's whole response limit before the
+  call and shrinks the charge to the body it got, since the body is read by
+  the HTTP client in one piece.

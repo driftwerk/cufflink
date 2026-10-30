@@ -432,6 +432,10 @@ from the platform and the worker.
 ### `image` — image transforms
 `image::transform_jpeg`, `image::transform_webp`, `image::transform_avif`, and
 `image::transform_multi` (decode once, encode several outputs). Run on the host, not in WASM.
+Under the memory budget's `enforce` mode, the source is at most `IMAGE_MAX_INPUT_MB` (32) and
+`IMAGE_MAX_PIXELS` (40 megapixels, less on a small container), and `transform_multi` takes at
+most 16 targets. `transform_multi` encodes and uploads its targets one at a time, so when one
+fails the targets before it are already uploaded.
 
 ### `config` — service config & secrets
 `config::get(key)` reads values set via `cufflink config set KEY VALUE [--secret]`.
