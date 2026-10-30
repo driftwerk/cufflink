@@ -9,7 +9,10 @@ Design only. Nothing here is implemented yet.
   lists the questions that revision raised. The owner answered them on
   2026-10-30, all as proposed, and accepted the change `ack: always`
   subscriptions see for capacity denials (section 3.5).
-- A second review followed. Section 13 lists the questions it raised.
+- A second review followed. Section 13 lists the questions it raised,
+  which the owner answered on 2026-10-30, all as proposed.
+- A third review followed. Its findings are folded in; it raised no new
+  question.
 
 ## Outcome
 
@@ -29,8 +32,9 @@ do; section 5.1.) Precisely:
     a response body a slow client is still reading.
   - Where a library allocates for us, the charge is a declared multiple,
     and a test pins that it is not exceeded (section 2.4).
-- What stays outside the ledger is the process's own baseline, idle thread
-  stacks and allocator fragmentation. The host reserve is sized for these
+- What stays outside the ledger is the process's own baseline and
+  allocator fragmentation. Thread stacks are charged, idle ones included
+  (section 2.2). The host reserve is sized for these
   (section 5.2), and the pressure gate (section 3.8) watches them.
 - Guests that run within their memory today run as before.
 
@@ -52,8 +56,10 @@ the whole budget or every execution slot.
 
 Read from `platform/src`, `worker/src`, `storage/src` and `testkit/src` on
 `main`. Since v0.33.1, `main` has changed only crate versions, the licence
-and dependency patches, wasmtime among them (36.0.16 to 36.0.19). v0.34.0
-changes nothing described here.
+and dependency patches, wasmtime's patch releases among them. v0.34.0
+changes nothing described here. wasmtime is on its 36 series. Patch
+releases do not change the APIs this note relies on; section 7 says what
+to re-check on a major update.
 
 ### 1.1 Engine, stores and limits
 
@@ -280,7 +286,7 @@ A `Charge` sits in `GuestLimits`, inside `HostState`, and records:
 | **Tables** | `table_growing`: `(desired - current) × 8` bytes, the same way | as above, with `table_grow_failed` |
 | **Host buffers** | through `HostState::set_host_response`, which debits the new length and credits the replaced one in one ledger operation. Every other host allocation is reserved before it is made (section 2.4) | on replacement, or when the `Charge` drops; never on read |
 | **Host-call input** | `read_guest_bytes`: the copied length, before copying. A parse of it is charged as it builds (section 2.4) | when the host call returns |
-| **Stack** | at admission, `WASM_STACK_CHARGE` (1 MiB): the 512 KiB wasm stack and the host frames under it | when the `Charge` drops |
+| **Stack** | at admission, `WASM_STACK_CHARGE`: the blocking thread's whole stack, which the runtime sets explicitly (`thread_stack_size`, 2 MiB, tokio's default). Resident stack can never exceed the mapped size, so the charge is an upper bound with nothing to measure | not when the `Charge` drops: the charge moves to the thread (below) |
 | **Sub-charges** | work a host call hands to another task (section 2.4: the image decode, a fan-out item) takes an owned sub-charge of what it will allocate, moved into that task | when **that task** ends, not when the host call, the store or the `Charge` does |
 
 **`host_response` becomes private.** Every site goes through
@@ -295,6 +301,32 @@ unwinding through `spawn_blocking`.
 
 - The store drops when the blocking task ends, not when `run`'s timeout
   returns. So the ledger stays charged until the memory is actually freed.
+- **Stacks stay charged while their thread lives.** A thread keeps the
+  stack pages it touched until it exits, so crediting the stack when the
+  invocation ends would let idle threads hold memory the ledger has
+  released.
+  - When an invocation ends, its stack charge moves into a thread-local
+    *residue* on the blocking thread it ran on.
+  - The next invocation on that thread credits the residue as it starts,
+    since it brings its own stack charge. The net effect is one stack charge
+    per live thread.
+  - The runtime's `on_thread_stop` hook credits the residue when tokio
+    retires the thread.
+  - Both binaries build their runtime with `thread_keep_alive` of 2 s
+    instead of tokio's 10 s, so idle residues are returned quickly.
+  - Every `spawn_blocking` task started for a guest carries a stack
+    charge that moves to its thread's residue the same way. That covers an
+    admitted invocation, nested ones included, and a sub-charged host task
+    such as an image decode.
+  - A thread therefore only ever comes into being with a stack charge
+    already on the ledger, and threads never over-commit it.
+  - **Why not the alternatives.** Lowering `max_wasm_stack` would make
+    deeply recursive guests trap where they run today. Deriving
+    `WASM_MAX_CONCURRENT` from the reserve would cut concurrency for light
+    guests that need no memory. Charging the live threads keeps the
+    defaults sound with neither change: `max_blocking_threads` (section 3.3)
+    is only a ceiling, and the ledger, not the reserve, bounds what the
+    threads that exist actually hold.
 - **Sub-charges outlive the store when the work does.** A sub-charge is
   owned by the closure or future it was moved into. When a deadline makes
   `block_on_within` drop the waiting future, a detached `spawn_blocking`
@@ -352,16 +384,46 @@ depends on its shape:
 - **`ChargedJson::parse`** deserialises into a `Value` through a visitor
   that charges each node as it allocates it: a `Vec`'s capacity × 32, a
   map node, a `String`'s capacity. It charges in 1 MiB steps.
+  - **The scratch buffer.** serde_json uses a scratch buffer for strings
+    with escapes, which can grow to the input's length. `ChargedJson::parse`
+    charges the input's length for it before parsing, and credits it when
+    the parse returns.
 - **`ChargedJson::write`** serialises into a buffer grown as above.
-- When a step cannot be charged, the parse or write stops. Under
-  `enforce` the call fails with `Overloaded`, or with `TooLarge` when the
-  structure alone exceeds the service share. Under `warn` the step is
-  counted and allowed.
+- **`ChargedJson::to_value`** turns a `Serialize` struct into a `Value`.
+  It writes the struct through `ChargedJson::write`, then parses that text
+  through `ChargedJson::parse`.
+  - The result is the `Value` `serde_json::to_value` builds today: maps are
+    sorted either way.
+  - It replaces `GuestRequest::to_value`, whose `serde_json::to_value` deep
+    copies the body tree, `body_raw_b64` and any multipart fields outside
+    any charge. A golden test compares the two.
+- **Errors.** Every `ChargedJson` call returns
+  `ChargedJsonError::{Syntax, Capacity}`, so no caller can mistake one for
+  the other.
+  - A `Syntax` error keeps each caller's behaviour today. `parse_body`
+    falls back to `Value::String` of the lossy body, and
+    `guest_response::decode` to `Value::String` of the raw response.
+  - A `Capacity` error never takes a fall-back. Each caller handles it
+    explicitly, with a test per site:
+
+    | Caller | On `Capacity` |
+    |--------|---------------|
+    | `parse_body` | 503 `Overloaded`, not run |
+    | `guest_response::decode` | 503 `Overloaded`, ran |
+    | a CRUD hook request | the hook's `Overloaded`, so a before-hook's request is 503 |
+    | a host input | the call's failure (`-1` or `TooLarge`) |
+    | the audit record | a body of `{"unrecorded": "body exceeded the guest memory budget"}`, counted in `cufflink_wasm_audit_body_unrecorded_total`, because a record cannot be refused after the fact |
+
+  - Under `enforce` a structure that alone exceeds the service share is
+    `TooLarge` rather than `Overloaded`.
+  - Under `warn` a step that cannot be charged is counted and allowed, so
+    no `Capacity` error arises.
 - No fixed multiple is reserved for JSON, so an adversarial shape is
   charged what it costs rather than refused for its length.
 - Every `Value` the host builds for a guest goes through these:
   - `parse_body`;
-  - `guest_json`;
+  - `guest_json`, through `ChargedJson::to_value`, for custom routes and
+    for CRUD hook requests (`router/crud.rs`);
   - `guest_response::decode`;
   - host inputs such as `image_transform_multi`'s targets, and the
     `s3_download_many` and `http_fetch_many` item lists.
@@ -371,7 +433,8 @@ depends on its shape:
 - `S3_HOST_MULTIPLE` = 7/3 (the bytes and their base64);
 - `IMAGE_BYTES_PER_PIXEL` = 20 (a 16-bit RGBA decode at 8, the RGB copy at
   3, each resize at most 3, the encoder's buffers);
-- `WASM_STACK_CHARGE` = 1 MiB.
+- `WASM_STACK_CHARGE` = the blocking threads' `thread_stack_size`
+  (2 MiB). It is not a measured multiple: resident stack cannot exceed it.
 
 **Tests.** A counting `#[global_allocator]` test measures each path's
 peak host allocation, with ordinary and worst-case shapes, and fails when:
@@ -411,8 +474,10 @@ cannot read:
 | `db_query`, `db_v2` results | Detailed below the table |
 | `s3_download` | `head` first. An object whose base64 would pass the response cap (above 48 MiB) is refused before downloading. Otherwise `size × S3_HOST_MULTIPLE` is reserved. The object is read through `open_read`'s stream (`ObjectReader`), never `get_bytes`' unbounded `bytes()`. The read stops at `head`'s size plus one byte, so an object replaced between `head` and `get` can never be read past what was charged; a longer one fails the call. It is encoded with no `to_vec` copy |
 | `s3_download_many`, `http_fetch_many` | At most `HOST_FANOUT_MAX_ITEMS` (128) items. Each item takes a sub-charge of its size (`head`, or `HOST_HTTP_MAX_RESPONSE_BYTES` for HTTP) before it starts. **Results stay in input order**, since guests index them by position. Item *i* is written to the response text once items 0 to *i − 1* are written; a result that finishes early waits under its own sub-charge. The total stays under the response cap. Golden tests compare both envelopes byte for byte with today's |
-| `image_transform`, `_multi` | Source objects of at most `IMAGE_MAX_INPUT_MB` (32), read as `s3_download` reads. The header's dimensions are read before decoding, and `width × height × IMAGE_BYTES_PER_PIXEL` is taken as a sub-charge moved into the `spawn_blocking` decode (section 2.2). `image::Limits` caps each side at 16 384 pixels and sets `max_alloc` to the sub-charge. Images over the pixel cap are refused. The cap is the smaller of `IMAGE_MAX_PIXELS` (40 megapixels) and the service share ÷ 20 bytes: 40 MP is about 800 MB at 20 bytes a pixel, more than a 2 GiB container's service share, so there the share decides (about 37 MP) |
-| `redis_get`, `redis_mget` | `GETRANGE key 0 <cap>` in place of `GET` (pipelined per key for `mget`): one byte past the cap fails the call, and nothing longer is ever read. For values within the cap the answer is the same. A type error is the same error `GET` returns |
+| `image_transform`, `_multi` | Source objects of at most `IMAGE_MAX_INPUT_MB` (32), read as `s3_download` reads. The header's dimensions are read before decoding, and `width × height × IMAGE_BYTES_PER_PIXEL` is taken as a sub-charge moved into the `spawn_blocking` decode (section 2.2). `image::Limits` caps each side at 16 384 pixels and sets `max_alloc` to the sub-charge. Images over the pixel cap are refused. **`_multi` takes at most `IMAGE_MAX_TARGETS` (16) targets.** Today it encodes every output into a `Vec<Vec<u8>>`, each buffer pre-allocated at a quarter of the raw size, and holds them all until the uploads finish. Instead, each output is encoded under its own sub-charge, charged by its buffer's capacity, then uploaded and dropped before the next is encoded. The uploads happen in the same order and the answer (the sizes) is the same. The cap is the smaller of `IMAGE_MAX_PIXELS` (40 megapixels) and the service share ÷ 20 bytes: 40 MP is about 800 MB at 20 bytes a pixel, more than a 2 GiB container's service share, so there the share decides (about 37 MP) |
+| `redis_get`, `redis_mget` | Detailed below the table |
+| CRUD hooks | The hook request is built through `ChargedJson::to_value`. A detached in-process after-hook (`spawn_after_hook`) holds its request **text**, written and charged before it is spawned, not the row's `Value`. The charge is held while it waits for a slot (section 3.2) and until it runs |
+| Multipart bodies | `body::multipart` copies each field out of the body. Each copy is charged as it is read, against the route's reservation, and so is the `MultipartField` list `ChargedJson::to_value` builds from them |
 | `service_call` | The callee's body is reserved at `HOST_HTTP_MAX_RESPONSE_BYTES` before it is collected, then shrunk to its length. It is encoded into the envelope without the `to_vec` copy. The envelope is charged through `set_host_response` |
 | Host-call inputs | The copy is charged before copying (section 2.2); a parse of it through `ChargedJson` |
 | The custom-route request | Detailed below the table |
@@ -435,7 +500,54 @@ grown and charged as above.
   is not fetched again and the call fails. Its transaction ends as a
   failed call's does, which closes the portal, so the server stops
   producing rows. Dropping a `query_raw` stream would not stop it.
+- **Statements that need autocommit** (`requires_autocommit`) cannot run
+  in the transaction a portal needs.
+  - They run through `simple_query_raw`, whose rows also arrive as a
+    stream and are rendered the same way.
+  - At the cap, or when a step cannot be charged, the call fails and the
+    session's connection is **closed** rather than returned to the pool. A
+    closed connection ends the statement on the server, and a pooled one
+    would still be receiving rows.
+  - Such statements (`VACUUM`, `CREATE INDEX CONCURRENTLY`, …) rarely
+    return rows.
 - `DB_READ_ONLY_MAX_ROWS` still applies to read-only queries.
+
+**`redis_get` and `redis_mget`.** `GETRANGE` cannot stand in for `GET`:
+on a missing key it answers `""`, not nil. That would stop
+`redis_scope`'s fallback-key read from ever firing, and hand guests
+`Some("")` instead of `None`. Each key is read instead by a short Lua
+script (`EVALSHA`, loaded once), one per key, pipelined for `mget`, so
+keys in different cluster slots still work:
+
+```lua
+local t = redis.call('TYPE', KEYS[1]).ok
+if t == 'none' then return false end           -- nil, as GET answers
+if t ~= 'string' then
+  if ARGV[2] == 'mget' then return false end  -- MGET answers nil for a wrong type
+  return redis.error_reply('WRONGTYPE Operation against a key holding the wrong kind of value')
+end
+if tonumber(ARGV[1]) > 0 and redis.call('STRLEN', KEYS[1]) > tonumber(ARGV[1]) then
+  return redis.error_reply('CUFFLINK_TOO_LARGE')
+end
+return redis.call('GET', KEYS[1])
+```
+
+- It runs atomically, so the length checked is the length read.
+- Its answers are those of `GET` and `MGET` in every case: a missing key,
+  an empty string, a tombstone (an ordinary string that `Stored`
+  decodes), a wrong type, and a value at the cap. So `redis_scope::get`
+  and `mget`, with their fallback reads and tombstones, are unchanged.
+- **By mode.** `ARGV[1]` is the cap under `enforce` and 0 under `warn`,
+  which then counts from the value's length. Under `off`, `GET` and
+  `MGET` are used as today.
+- **Where scripts are refused.** A Redis whose ACLs refuse scripts is
+  detected at startup. Under `enforce` it falls back to `STRLEN` then
+  `GET` and logs that the check is not atomic. A value replaced between
+  the two can then exceed the cap by what it grew; the response cap still
+  refuses it once read.
+- **Golden tests** compare the scripted reads with `GET` and `MGET` for
+  missing keys, the fallback path, a tombstone, wrong types in both
+  calls, empty strings and a value at the cap.
 
 **The custom-route request.**
 
@@ -554,7 +666,9 @@ All waits are bounded by one **admission deadline** per invocation:
 - `interactive`: `WASM_ADMISSION_WAIT_MS` (1000), inside the invocation's
   budget;
 - `nested`: none, since a nested invocation never waits;
-- `committed`: its budget;
+- `committed`: none under `off` and `warn`. Under `enforce`, up to
+  `WASM_COMMITTED_WAIT_SECS` (300) for a slot, outside its budget
+  (section 3.2), after which it is dropped and logged;
 - `background`: section 3.5, outside the handler's budget.
 
 Steps are taken in order, each held while the next is awaited, and all
@@ -771,12 +885,8 @@ body, and admits the guest on the worker, where it runs.
 Some host memory stays outside the ledger:
 
 - tokio, connection pools, compiled modules and CRUD lists;
-- the stacks of idle blocking threads, which keep the pages they touched
-  for tokio's 10 s keep-alive. The pool may hold up to
-  `max_blocking_threads` (section 3.3) threads, each with up to the 512 KiB
-  of wasm stack it last touched.
-  - The running invocations' stacks are charged (`WASM_STACK_CHARGE`).
-  - Idle ones count against the reserve.
+- the stacks of the runtime's core worker threads, a fixed handful.
+  Blocking threads' stacks, idle ones included, are charged (section 2.2).
 
 This is covered by the host reserve (section 5.2) and by a gate.
 
@@ -801,7 +911,8 @@ labelled `overloaded`, and `ExecutionError::TooLarge`, labelled
 | Route, `_fn`, before-hook | `PlatformError::RetryLater`: 503, `Retry-After: WASM_ADMISSION_RETRY_AFTER_SECS` (2), `{"error": "guest capacity exhausted; the request was not run"}` | 503 with `Retry-After`, `{"error": "guest capacity exhausted while the request ran; it may have been partly applied"}` |
 | Service call (nested) | the callee's 503 reaches the caller's guest as the call's response | the same |
 | Worker request/reply | `WasmJobResult` gains `retry_after_ms: Option<u64>` and `ran: Option<bool>` (`serde(default)`, skipped when `None`). The platform answers as above when they are set. An older platform ignores them and answers 500; an older worker never sets them | the same |
-| After-hook in process, `on_migrate` | never refused at admission | logged like any hook failure; `on_migrate` fails the deploy as any error does |
+| After-hook in process | never refused at once. Under `enforce` it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today | logged like any hook failure |
+| `on_migrate` | never refused; it waits its budget, as today | fails the deploy as any error does |
 | SSE reducer | waits at most the reducer's budget, then the event is dropped and counted `reducer_error`, as any reducer failure is today | the same |
 | Subscription, job, worker after-hook | never refused (section 3.5) | section 3.5 |
 
@@ -851,17 +962,24 @@ the kernel's limit.
 When unset, the budget is `limit − reserve`:
 
 - **The limit.**
-  - **v2 or v1.** v2 is chosen only when the unified hierarchy's
-    `cgroup.controllers` (at the mount root, and in the process's cgroup)
-    lists `memory`. On a hybrid host the memory controller is on v1, so v1
-    is used.
+  - **Finding the hierarchies.** `/proc/self/mountinfo` names where each
+    is mounted:
+    - the `cgroup2` mount: `/sys/fs/cgroup` on a unified host,
+      `/sys/fs/cgroup/unified` on a hybrid one;
+    - the v1 mount whose super options include `memory`.
+  - **v2 or v1.** v2 is chosen only when the `cgroup2` mount's
+    `cgroup.controllers`, and the process's cgroup's own file, list
+    `memory`. On a hybrid host the memory controller is on v1, so v1 is
+    used.
   - **cgroup v2.** Resolve the process's cgroup from `/proc/self/cgroup`
     (the `0::<path>` line), and take the smallest `memory.max` and
     `memory.high` that is not `max` over that cgroup and each ancestor up
     to the mount root. `memory.high` counts because above it the kernel
     throttles and reclaims hard.
-  - **cgroup v1.** `hierarchical_memory_limit` from the memory
-    controller's `memory.stat`, which already folds in the ancestors. A
+  - **cgroup v1.** The process's memory cgroup is the
+    `/proc/self/cgroup` line whose controller list includes `memory`
+    (`N:memory:<path>`), under the v1 memory mount. Its `memory.stat` gives
+    `hierarchical_memory_limit`, which already folds in the ancestors. A
     value at or above `MemTotal` means unlimited.
   - **No limit** (no cgroup, `max` all the way up, macOS). The budget is
     off whatever the mode, logged once.
@@ -869,13 +987,11 @@ When unset, the budget is `limit − reserve`:
   `max(256, 30 % of limit)` (question 3). It must hold:
   - the process's baseline;
   - the compiled modules;
-  - idle threads' stacks (section 3.8);
+  - the core worker threads' stacks;
   - fragmentation below the mmap threshold.
 
-  The startup log prints the worst case of the idle stacks,
-  `max_blocking_threads × 512 KiB`, beside the reserve. It warns when that
-  is above half the reserve: lower `WASM_MAX_CONCURRENT` or raise the
-  reserve.
+  Blocking threads' stacks are charged to the ledger (section 2.2), so
+  the reserve does not have to hold them.
 - **A derived budget that is zero or negative** (a very small limit, a
   large reserve) turns the budget off with a warning. Only an explicit
   `WASM_MEMORY_BUDGET_MB=0` refuses startup.
@@ -907,7 +1023,8 @@ environment still overrides it.
 | `WASM_BACKGROUND_AGING_SECS` | `30` | Section 3.5 |
 | `WASM_CAPACITY_RETRIES` / `WASM_CAPACITY_RETRIES_JOB` | `3` / `10` | Section 3.5 |
 | `WASM_COMMITTED_WAIT_SECS` | `300` | Section 3.2 |
-| `WASM_STACK_CHARGE_KB` | `1024` | Section 2.2 |
+| `WASM_STACK_CHARGE_KB` | the runtime's `thread_stack_size` (2048) | Section 2.2; not set separately, so the charge always matches the stack |
+| `IMAGE_MAX_TARGETS` | `16` | Section 2.4 |
 | `WASM_MEMORY_PRESSURE_GATE` | `true` | Section 3.8; ignored without cgroup v2 |
 | `WASM_MAX_CONCURRENT_PER_SERVICE` | `32` | At most `WASM_MAX_CONCURRENT` (question 7) |
 | `WASM_ADMISSION_WAIT_MS` | `1000` | Section 3.2 (question 6) |
@@ -1122,7 +1239,17 @@ describing each rule:
   - `guest_response::decode`;
   - the `s3_download_many` and `http_fetch_many` envelopes, with results
     finishing out of order;
-  - `GETRANGE` against `GET` for values within the cap.
+  - the scripted Redis reads against `GET` and `MGET`, as listed in
+    section 2.4;
+  - `ChargedJson::to_value` against `serde_json::to_value` for the guest
+    request, multipart fields included.
+- **`Capacity` is never `Syntax`.** For each caller of section 2.4, a
+  capacity stop gives that caller's capacity answer, and never the
+  string fall-back.
+- **Stacks.** After a burst, the ledger keeps one stack charge per live
+  blocking thread, and returns to zero once tokio retires them.
+- **Images.** 17 targets are refused. Outputs are uploaded one at a time,
+  each charged as it is encoded.
 - **Worst-case shapes.** The counting-allocator tests of section 2.4 run
   `ChargedJson` over ordinary JSON and over `[[0],[0],…]`, `[{},{},…]`,
   64-deep nesting, a million one-key objects and strings of `\u` escapes,
@@ -1156,8 +1283,8 @@ tenants `acme` and `globex` and services `catalog-service` and
   - Some succeed. Every other call is a 503 with `Retry-After: 2` and the
     not-run message, and none is a 500.
   - `/health` answers 200 throughout, from the same pid.
-  - On Linux, `VmHWM` stays below the baseline, plus 128 MiB, plus the
-    idle-stack worst case of section 3.8.
+  - On Linux, `VmHWM` stays below the baseline plus the 128 MiB budget.
+    Stacks are inside the budget.
 - **Host-heavy burst.** The same with guests that:
   - run an unbounded `db_query` over a large table;
   - download a 40 MiB object;
@@ -1209,7 +1336,7 @@ tenants `acme` and `globex` and services `catalog-service` and
   - `testkit` gains `CUFFLINK_TEST_PLATFORM_LAUNCHER`, a command prefix
     that `PlatformProcess` puts before the platform binary.
   - The job sets it to `sudo -E systemd-run --scope --quiet
-    --unit=cufflink-budget-<n> -p MemoryMax=768M -p MemorySwapMax=0
+    --unit=cufflink-budget-<pid>-<counter> -p MemoryMax=768M -p MemorySwapMax=0
     --uid=<runner uid> --gid=<runner gid> --`. `-E` keeps the variables
     `testkit` sets after it clears the environment.
 - **Running the tests.** The job runs `cargo test -p cufflink-platform
@@ -1223,6 +1350,16 @@ tenants `acme` and `globex` and services `catalog-service` and
     the job cannot pass vacuously.
   - The tests find the child's pid in the scope's `cgroup.procs` (`sudo` is
     its parent), and read the scope's memory files from there.
+- **Teardown.** `ChildProcess::kill` sends `SIGKILL` to its direct child.
+  For a launched platform that child is `sudo`, which cannot forward
+  `SIGKILL`, so the platform would outlive the test.
+  - A launched child is stopped with `SIGTERM` first, which `sudo`
+    forwards, and waited for up to 5 s.
+  - Then, whatever happened, it runs `sudo systemctl stop <unit>`, which
+    ends every process in the scope.
+  - The unit name is unique per launch (`cufflink-budget-<pid>-<counter>`),
+    so concurrent tests never stop each other's scope.
+  - A test asserts that the scope is gone after teardown.
 - **The numbers.** 768 MiB, with the derived reserve `max(256, 230)` =
   256 MiB, gives a 512 MiB budget and a 256 MiB service share. Every
   expectation fits inside that share:
@@ -1395,7 +1532,8 @@ twice (section 3.5), in place of being acked and lost.
 
 ## 13. Questions raised by the second review
 
-None is answered yet. Each states the proposed default.
+Answered by the owner on 2026-10-30: every proposed default below is
+accepted as stated.
 
 20. **Committed waits.** Under `enforce`, in-process after-hooks are capped
     at half of their service's slots. They wait for one outside their
