@@ -12,8 +12,9 @@ flight together reach the process's **guest memory budget**:
 
 - a new HTTP invocation waits briefly and is then refused with
   `503 Service Unavailable` and `Retry-After`;
-- a consumer or job is not fetched until there is room, so no message
-  is lost and no delivery attempt is spent;
+- a consumer or job is not fetched while there is no room, and one
+  already fetched waits instead of being refused, so no message is lost
+  and no delivery attempt is spent;
 - a guest that tries to grow past the budget fails with its own error
   (503 for a route), not a kill of the process.
 
@@ -250,13 +251,19 @@ the store.
 | Class | Who | Waits for admission | When the wait ends without room |
 |-------|-----|---------------------|---------------------------------|
 | `interactive` | `Route`, CRUD before-hook, `WorkerRoute`, `SseReducer` | up to `WASM_ADMISSION_WAIT_MS` (1000), never past the budget | `Overloaded`: 503 with `Retry-After` |
-| `nested` | an invocation with `caller.depth > 0` | not at all: no route, service or global slot (its caller already holds one), memory only | `Overloaded` at once. The caller's service call receives a 503 it can handle |
+| `nested` | an invocation whose verified `ServiceCaller` has `depth > 0` | not at all: no route, service or global slot (its caller already holds one), memory only | `Overloaded` at once. The caller's service call receives a 503 it can handle |
 | `committed` | CRUD after-hook in process, `on_migrate` | up to its own budget, as today | a deadline, as today. Never refused for capacity: the write has committed and the deploy is running |
-| `background` | `Subscription`, `Job` | in the pump, before the fetch (section 3.3) | the message is not fetched |
+| `background` | `Subscription`, `Job` | a headroom check before the fetch, then a reservation that may wait without bound (section 3.3) | the message is not fetched, or waits in progress; never refused |
 
 A nested invocation does not queue for two reasons. Its caller holds
 memory and a blocking thread while it waits. And a per-service limit would
 otherwise deadlock a service that calls itself.
+
+The class is taken from the `ServiceCaller` that `postures::internal`
+builds from the verified service-identity header (`service_identity::verify`),
+never from the request body's `caller` field or anything else a client
+sends. A request without a verified identity is never `nested`, so no
+caller can claim nesting to skip the concurrency limits.
 
 ### 3.2 Shares (fairness)
 
@@ -291,21 +298,35 @@ Refusing a message after it is fetched loses or spends it:
 - `Interrupted` naks with no delay, a hot loop;
 - `Retry` spends a JetStream delivery and can dead-letter a valid message.
 
-So background admission happens before the fetch.
+So a fetched message is never refused for capacity: it waits. A pump does
+not reserve before it fetches either. The pump's fetch is a long poll that
+is outstanding almost all the time, so a reservation taken before it would
+hold an idle durable's `concurrency × estimate` of the budget away from
+routes for as long as the durable is idle.
 
-- **Subscriptions.** The pump already acquires a slot before each fetch.
-  With the budget on, it then waits for a reservation for its handler,
-  which the `SubscriptionSpec` names, so the estimate is known. The
-  reservation is handed to the invocation of the message fetched with it.
-  The fetch size becomes the smaller of today's `fetch_size` and the number
-  of reservations held, so a batch never holds messages the pump has no room
-  to run. The pump waits without bound but keeps watching `halted`, so it
-  stops for a stop or shutdown as today.
-- **Long jobs (worker).** One durable carries every job, so the handler is
-  unknown before the fetch. The consumer waits until the ledger's
-  background share has at least `WASM_MEMORY_JOB_FLOOR_MB` (32) free before
-  each fetch. It then admits the fetched job as `background`, keeping the
-  job leased while it waits.
+- **Before the fetch: a headroom check, not a reservation.** The pump
+  already acquires a slot before each fetch. With the budget on, it then
+  waits until the background share has room for at least one estimate of
+  its handler, which the `SubscriptionSpec` names. Nothing is reserved. It
+  sizes the fetch as the smaller of today's `fetch_size` and the number of
+  estimates that fit at that moment. A durable whose handler cannot fit
+  does not fetch, so its messages stay in the stream undelivered. The
+  pump waits without bound but keeps watching `halted`, so it stops for a
+  stop or shutdown as today.
+- **After the fetch: a reservation that may wait.** Each fetched message is
+  admitted as `background` before its invocation starts. If the room
+  checked before the fetch has been taken meanwhile, the message waits.
+  - The wait sits outside the handler's budget timeout, so waiting does
+    not eat into the handler's time.
+  - The pump's heartbeat (`AckProgress`) keeps the message in progress
+    while it waits.
+  - The message is delayed, never nak'd, so it spends no delivery and
+    cannot be dead-lettered by the wait.
+- **Long jobs (worker).** One durable carries every job, so the handler
+  is unknown before the fetch. The consumer checks for at least
+  `WASM_MEMORY_JOB_FLOOR_MB` (32) free in the background share before each
+  fetch. It then admits the fetched job as `background` with the job's
+  estimate, keeping the job leased while it waits.
 - **Mid-run denial.**
   - A job denied mid-run is classified `Interrupted`, not `HandlerError`,
     so it is re-run without counting a failed attempt.
@@ -437,7 +458,7 @@ execution"):
 | `cufflink_wasm_estimate_bytes` | histogram | `kind` | Reservations taken at admission |
 | `cufflink_process_memory_limit_bytes` | gauge | — | The cgroup limit read at startup |
 | `cufflink_process_memory_anon_bytes` | gauge | — | The cgroup's `anon`, as the pressure gate last read it |
-| `cufflink_pump_admission_wait_seconds` | histogram | `kind` | A pump's wait for a reservation before a fetch |
+| `cufflink_pump_admission_wait_seconds` | histogram | `kind` | A pump's wait for headroom before a fetch |
 
 Changes to existing metrics:
 
@@ -483,9 +504,9 @@ are.
     without its route limit and cannot be deployed there (422).
   - Neither the database nor any tenant policy row is touched, so nothing
     needs undoing.
-- **wasmtime.** The design uses `ResourceLimiter::memory_growing` and
-  `memory_grow_failed` only. Both have the same signatures in the
-  wasmtime major release the open upgrade proposes.
+- **wasmtime.** The design depends only on `ResourceLimiter::memory_growing`
+  and `memory_grow_failed`, as wasmtime 36 defines them. Check both against
+  any wasmtime upgrade that lands first; the open one does not build yet.
 
 ## 8. Tests
 
@@ -549,7 +570,11 @@ fixtures `acme` and `globex`, services `catalog-service` and
     48 MiB, with a budget that fits two.
   - Every message is handled once, with `num_delivered == 1`, and none is
     dead-lettered.
-  - The pump's admission wait is recorded.
+  - Messages a pump fetched while the budget was full wait in progress
+    and are run, with no nak. A durable whose estimate does not fit fetches
+    nothing until room frees.
+  - An idle durable holds nothing in the ledger.
+  - The pump's headroom wait is recorded.
 - **Committed work.** An after-hook and an `on_migrate` started while the
   budget is full both run once room frees.
 - **Worker.** A worker-routed route refused on the worker answers 503 with
@@ -634,8 +659,8 @@ None is answered yet. Each states the proposed default.
    part of the handler has run? Or 500, as for the per-guest cap, so that
    clients do not retry a partly applied request? *Proposed: 503.*
 9. **A subscription denied mid-run.** Nak after `Retry-After`, spending one
-   JetStream delivery as a timeout does today? *Proposed: yes; admission
-   before the fetch makes it rare.*
+   JetStream delivery as a timeout does today? *Proposed: yes; the headroom
+   check before the fetch makes it rare.*
 10. **Host response cap.** Add `WASM_MAX_HOST_RESPONSE_MB` (64, matching
     `WASM_MAX_GUEST_LEN_MB`) for `db_query` and the other host responses
     under the same mode, in this change or the next? It changes what a guest
