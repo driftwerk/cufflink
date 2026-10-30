@@ -6,9 +6,18 @@ const STRINGS: &[(&str, &str)] = &[
     ("SLEEP_2", "SELECT pg_sleep(2)"),
     ("OK", r#"{\"ok\":true}"#),
     ("SELECT_ONE", "SELECT 1"),
+    ("GATE", "SELECT pg_advisory_xact_lock(4242)"),
+    (
+        "INSERT_HOOKED",
+        "INSERT INTO items (title) VALUES ('hooked')",
+    ),
     (
         "BIG_QUERY",
         "SELECT repeat('x',1000) FROM generate_series(1,200000)",
+    ),
+    (
+        "PAST_A_MIB",
+        "SELECT repeat('x',1000) FROM generate_series(1,1100)",
     ),
     ("SAID", SAID),
     (
@@ -103,6 +112,30 @@ $DATA
     (i32.store8 (i32.const 50331648) (i32.const 1))
     (drop (call $sleep_ms (i32.const 500)))
     (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "hold_gated_56") (param i32 i32) (result i32)
+    (if (i32.eq (memory.grow (i32.const 896)) (i32.const -1)) (then (unreachable)))
+    (i32.store8 (i32.const 58720256) (i32.const 1))
+    (drop (call $db_execute (i32.const $GATE_OFF) (i32.const $GATE_LEN)))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "hold_gated_24") (param i32 i32) (result i32)
+    (if (i32.eq (memory.grow (i32.const 384)) (i32.const -1)) (then (unreachable)))
+    (i32.store8 (i32.const 25165824) (i32.const 1))
+    (drop (call $db_execute (i32.const $GATE_OFF) (i32.const $GATE_LEN)))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "grow_24") (param i32 i32) (result i32)
+    (if (i32.eq (memory.grow (i32.const 384)) (i32.const -1)) (then (unreachable)))
+    (i32.store8 (i32.const 25165824) (i32.const 1))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "gate") (param i32 i32) (result i32)
+    (drop (call $db_execute (i32.const $GATE_OFF) (i32.const $GATE_LEN)))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "gate_then_insert") (param i32 i32) (result i32)
+    (drop (call $db_execute (i32.const $GATE_OFF) (i32.const $GATE_LEN)))
+    (drop (call $db_execute (i32.const $INSERT_HOOKED_OFF) (i32.const $INSERT_HOOKED_LEN)))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "insert_hooked") (param i32 i32) (result i32)
+    (drop (call $db_execute (i32.const $INSERT_HOOKED_OFF) (i32.const $INSERT_HOOKED_LEN)))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
   (func (export "neg_len") (param i32 i32) (result i32)
     (if (result i32) (i32.eq (call $db_query (i32.const 0) (i32.const -1)) (i32.const -1))
       (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
@@ -113,6 +146,10 @@ $DATA
       (else (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))))
   (func (export "big_query") (param i32 i32) (result i32)
     (if (result i32) (i32.eq (call $db_query (i32.const $BIG_QUERY_OFF) (i32.const $BIG_QUERY_LEN)) (i32.const -1))
+      (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
+      (else (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))))
+  (func (export "query_past_a_mib") (param i32 i32) (result i32)
+    (if (result i32) (i32.eq (call $db_query (i32.const $PAST_A_MIB_OFF) (i32.const $PAST_A_MIB_LEN)) (i32.const -1))
       (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
       (else (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))))
   (func (export "sleep2") (param i32 i32) (result i32)

@@ -126,10 +126,13 @@ impl WasmLimits {
                 "WASM_ADMISSION_WAIT_MS",
                 defaults.admission_wait.as_millis() as u64,
             )?),
-            retry_after: Duration::from_secs(env_var(
-                "WASM_ADMISSION_RETRY_AFTER_SECS",
-                defaults.retry_after.as_secs(),
-            )?),
+            retry_after: match cufflink_settings::process_var("WASM_ADMISSION_RETRY_AFTER_MS") {
+                Some(_) => Duration::from_millis(env_var("WASM_ADMISSION_RETRY_AFTER_MS", 0)?),
+                None => Duration::from_secs(env_var(
+                    "WASM_ADMISSION_RETRY_AFTER_SECS",
+                    defaults.retry_after.as_secs(),
+                )?),
+            },
             budget,
         };
         limits.validate()?;
@@ -152,8 +155,8 @@ impl WasmLimits {
                 self.admission_wait.as_millis() as u64,
             ),
             (
-                "WASM_ADMISSION_RETRY_AFTER_SECS",
-                self.retry_after.as_secs(),
+                "WASM_ADMISSION_RETRY_AFTER_SECS (or _MS)",
+                self.retry_after.as_millis() as u64,
             ),
         ]
         .iter()
@@ -1367,6 +1370,12 @@ pub(crate) mod tests {
         };
         let err = no_wait.validate().unwrap_err().to_string();
         assert!(err.contains("WASM_ADMISSION_WAIT_MS"), "{err}");
+        let no_delay = WasmLimits {
+            retry_after: Duration::ZERO,
+            ..WasmLimits::default()
+        };
+        let err = no_delay.validate().unwrap_err().to_string();
+        assert!(err.contains("WASM_ADMISSION_RETRY_AFTER"), "{err}");
     }
 
     #[test]

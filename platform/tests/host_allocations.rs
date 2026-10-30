@@ -4,13 +4,11 @@ use cufflink_platform::wasm_runtime::budget::{
 use cufflink_platform::wasm_runtime::image::{decode_oriented, resize_to, Format};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 struct Counting;
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 const HARNESS_SLACK: usize = 4096;
 
@@ -80,22 +78,23 @@ impl Meter for Count {
 const MIB: usize = 1024 * 1024;
 
 fn shapes() -> Vec<(&'static str, String)> {
-    let n = 200_000;
-    let repeated = |item: &str| format!("[{}]", vec![item; n].join(","));
+    let repeated = |item: &str, n: usize| format!("[{}]", vec![item; n].join(","));
     vec![
-        ("ordinary", {
-            let row = r#"{"id":12345,"name":"catalog item","price":19.99,"tags":["a","b"],"active":true}"#;
-            repeated(row)
-        }),
-        ("nested arrays", repeated("[0]")),
-        ("empty objects", repeated("{}")),
-        ("one-key objects", repeated(r#"{"k":1}"#)),
-        ("escaped strings", repeated(r#""é\n\t\"\\""#)),
-        ("deep nesting", {
-            let depth = 120;
-            let inner = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-            repeated(&inner)
-        }),
+        (
+            "ordinary",
+            repeated(
+                r#"{"id":12345,"name":"catalog item","price":19.99,"tags":["a","b"],"active":true}"#,
+                200_000,
+            ),
+        ),
+        ("nested arrays", repeated("[0]", 200_000)),
+        ("empty objects", repeated("{}", 200_000)),
+        ("one-key objects", repeated(r#"{"k":1}"#, 1_000_000)),
+        ("escaped strings", repeated(r#""é\n\t\"\\""#, 200_000)),
+        (
+            "deep nesting",
+            repeated(&format!("{}{}", "[".repeat(120), "]".repeat(120)), 10_000),
+        ),
         ("one large string", format!("\"{}\"", "x".repeat(8 * MIB))),
     ]
 }
@@ -107,9 +106,16 @@ fn within_tenth(name: &str, path: &str, charged: usize, allocated: usize) {
     );
 }
 
+// The allocator counts every thread, so the paths are measured one after
+// another in one test: no other test, nor its result line, runs meanwhile.
 #[test]
+fn host_buffers_stay_within_what_they_charge() {
+    charged_json_is_charged_within_a_tenth_of_what_it_allocates();
+    an_object_read_stays_within_its_declared_multiple();
+    an_image_transform_stays_within_its_bytes_per_pixel();
+}
+
 fn charged_json_is_charged_within_a_tenth_of_what_it_allocates() {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (name, text) in shapes() {
         let mut meter = Count::default();
         let parsed = measure(|| ChargedJson::parse(text.as_bytes(), &mut meter).expect(name));
@@ -137,10 +143,8 @@ fn charged_json_is_charged_within_a_tenth_of_what_it_allocates() {
     }
 }
 
-#[test]
 fn an_object_read_stays_within_its_declared_multiple() {
     use base64::Engine;
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for size in [1, 3 * MIB, 24 * MIB + 7] {
         let read = measure(|| {
             let bytes = vec![7u8; size];
@@ -155,10 +159,8 @@ fn an_object_read_stays_within_its_declared_multiple() {
     }
 }
 
-#[test]
 fn an_image_transform_stays_within_its_bytes_per_pixel() {
     use image::{ImageBuffer, Rgb};
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (width, height) = (3000u32, 2000u32);
     let source: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
         Rgb([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8])

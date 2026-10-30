@@ -38,6 +38,46 @@ fn deliveries_of(req: &Request) -> i64 {
     .unwrap_or_default()
 }
 
+fn tries(req: &Request) -> usize {
+    let tried = format!("{}:try", req.handler());
+    let body = text(Some(&req.body().to_string()));
+    db::execute(&format!(
+        "INSERT INTO deliveries (handler, body) VALUES ({}, {body})",
+        text(Some(&tried))
+    ));
+    db::query_one(&format!(
+        "SELECT count(*) AS n FROM deliveries WHERE handler = {} AND body = {body}",
+        text(Some(&tried))
+    ))
+    .and_then(|row| row["n"].as_u64())
+    .and_then(|n| usize::try_from(n).ok())
+    .unwrap_or(1)
+}
+
+fn holding(req: &Request) -> Response {
+    let body = req.body();
+    let mib = match body["mib"].as_array() {
+        Some(by_try) => by_try
+            .get(tries(req).saturating_sub(1))
+            .or_else(|| by_try.last())
+            .and_then(Value::as_u64),
+        None => body["mib"].as_u64(),
+    };
+    let mib = mib.and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+    let held = vec![1u8; mib * 1024 * 1024];
+    if let Some(key) = body["gate"].as_i64() {
+        db::execute(&format!("SELECT pg_advisory_xact_lock({key})"));
+    }
+    record(req);
+    Response::json(&json!({ "held": held.len() }))
+}
+
+cufflink_fn::handler!(hold, |req: Request| { holding(&req) });
+
+cufflink_fn::handler!(hold_more, |req: Request| { holding(&req) });
+
+cufflink_fn::handler!(grow, |req: Request| { holding(&req) });
+
 cufflink_fn::handler!(succeed, |req: Request| {
     record(&req);
     Response::json(&json!({ "ok": true }))

@@ -785,11 +785,11 @@ impl Scope {
     }
 }
 
-fn launched(binary: &Path) -> (Command, Option<Scope>) {
+fn launched(binary: &Path, variables: &[(String, String)]) -> (Command, Option<Scope>) {
     let prefix = std::env::var(PLATFORM_LAUNCHER).unwrap_or_default();
     let mut words = prefix.split_whitespace();
     let Some(program) = words.next() else {
-        return (Command::new(binary), None);
+        return (direct(binary, variables), None);
     };
     let unit = format!(
         "cufflink-budget-{}-{}",
@@ -798,10 +798,40 @@ fn launched(binary: &Path) -> (Command, Option<Scope>) {
     );
     let mut command = Command::new(program);
     command
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
         .args(words.map(|word| word.replace("{unit}", &unit)))
+        .args(["env", "-i"])
+        .args(
+            variables
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        )
         .arg(binary);
     let user = prefix.split_whitespace().any(|word| word == "--user");
     (command, Some(Scope { unit, user }))
+}
+
+fn variables(env: &[(&str, &str)], port_var: &str, port: u16) -> Vec<(String, String)> {
+    let mut variables = BTreeMap::from([
+        (
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        ),
+        ("WASM_MEMORY_BUDGET_MODE".to_string(), "off".to_string()),
+    ]);
+    variables.extend(
+        env.iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    variables.insert(port_var.to_string(), port.to_string());
+    variables.into_iter().collect()
+}
+
+fn direct(binary: &Path, variables: &[(String, String)]) -> Command {
+    let mut command = Command::new(binary);
+    command.env_clear().envs(variables.iter().cloned());
+    command
 }
 
 pub struct ChildProcess {
@@ -867,16 +897,11 @@ impl ChildProcess {
         port_var: &str,
         env: &[(&str, &str)],
     ) -> Self {
+        let variables = variables(env, port_var, port);
         let (mut command, scope) = match launch {
-            Launch::Direct => (Command::new(binary), None),
-            Launch::Launcher => launched(binary),
+            Launch::Direct => (direct(binary, &variables), None),
+            Launch::Launcher => launched(binary, &variables),
         };
-        command
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("WASM_MEMORY_BUDGET_MODE", "off")
-            .envs(env.iter().copied())
-            .env(port_var, port.to_string());
         let output = std::env::var("CUFFLINK_TEST_LOG")
             .is_err()
             .then(|| NamedTempFile::new().expect("a file for the child's output"));

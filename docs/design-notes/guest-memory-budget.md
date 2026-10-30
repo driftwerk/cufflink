@@ -1484,10 +1484,10 @@ tenants `acme` and `globex` and services `catalog-service` and
   count.
   - `testkit` gains `CUFFLINK_TEST_PLATFORM_LAUNCHER`, a command prefix
     that `PlatformProcess` puts before the platform binary.
-  - The job sets it to `sudo -E systemd-run --scope --quiet
+  - The job sets it to `sudo systemd-run --scope --quiet
     --unit=cufflink-budget-<pid>-<counter> -p MemoryMax=768M -p MemorySwapMax=0
-    --uid=<runner uid> --gid=<runner gid> --`. `-E` keeps the variables
-    `testkit` sets after it clears the environment.
+    --uid=<runner uid> --gid=<runner gid> --`. `testkit` follows it with
+    `env -i` and the variables it sets, then the binary (section 14).
 - **Running the tests.** The job runs `cargo test -p cufflink-platform
   --test wasm_budget_cgroup -- --ignored`.
   - The tests are `#[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a
@@ -1793,3 +1793,28 @@ Recorded as the change was built, each with its reason.
 - **`service_call`** reserves the callee's whole response limit before the
   call and shrinks the charge to the body it got, since the body is read by
   the HTTP client in one piece.
+
+**Configuration and tests.**
+
+- **`WASM_ADMISSION_RETRY_AFTER_MS`** sets the capacity delay in
+  milliseconds and is used instead of `WASM_ADMISSION_RETRY_AFTER_SECS`
+  when set. A deferred message or job waits it before it is delivered
+  again, so tests can defer and redeliver within a fraction of a second. A
+  `Retry-After` header stays a whole number of seconds, at least 1.
+- **The launcher passes the platform's environment as arguments.** The
+  runner's `sudo` refuses `-E`, so `testkit` runs `<launcher> env -i
+  NAME=value… <platform binary>` and the job's prefix is `sudo systemd-run
+  … --`. The platform therefore sees exactly the variables `testkit` sets,
+  as it does when launched directly.
+- **The image codecs build optimised in the dev profile**
+  (`[profile.dev.package.*]` in the workspace manifest), and the resize goes
+  through `DynamicImage::resize_exact`, so its Lanczos code is built in the
+  `image` crate rather than the platform's. The counting-allocator test's
+  3000 × 2000 transforms take about 20 s instead of 110 s, with the same
+  peaks. What remains is the AV1 encoder code `ravif` inlines into the
+  platform crate, which builds at the platform's level.
+- **The counting-allocator paths run in one test.** The allocator counts
+  every thread, so no other test, nor its result line, may run while one
+  is measured.
+- **The `ChargedJson` shapes** are 200 000 items each, except a million
+  one-key objects and 10 000 arrays nested 120 deep.

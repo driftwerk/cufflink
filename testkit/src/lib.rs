@@ -1,5 +1,6 @@
 pub mod deployment;
 pub mod error;
+pub mod gate;
 pub mod guest;
 pub mod in_process;
 pub mod infra;
@@ -16,6 +17,7 @@ pub mod sdk;
 
 pub use deployment::Deployment;
 pub use error::{unless_absent, TestkitError};
+pub use gate::Gate;
 pub use in_process::{
     Answer, Client, Platform, PlatformOptions, TenantClient, TenantHandle, TenantOptions,
     TenantToken,

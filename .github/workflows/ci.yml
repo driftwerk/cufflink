@@ -211,9 +211,9 @@ jobs:
 
       - name: Run the budget under a 768 MiB limit
         run: |
-          CUFFLINK_TEST_PLATFORM_LAUNCHER="sudo -E systemd-run --scope --quiet --unit={unit} -p MemoryMax=768M -p MemorySwapMax=0 --uid=$(id -u) --gid=$(id -g) --"
+          CUFFLINK_TEST_PLATFORM_LAUNCHER="sudo systemd-run --scope --quiet --unit={unit} -p MemoryMax=768M -p MemorySwapMax=0 --uid=$(id -u) --gid=$(id -g) --"
           export CUFFLINK_TEST_PLATFORM_LAUNCHER
-          cargo test -p cufflink-platform --test wasm_budget_cgroup -- --ignored --test-threads=1
+          cargo test -p cufflink-platform --test wasm_budget_cgroup -- --ignored
 
   test-pgbouncer:
     name: Test (PgBouncer)

@@ -123,7 +123,7 @@ impl Source {
 }
 
 struct Decoded {
-    image: RgbImage,
+    image: DynamicImage,
     _hold: Hold,
 }
 
@@ -203,7 +203,7 @@ pub(crate) async fn transform_multi(
 }
 
 #[doc(hidden)]
-pub fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<RgbImage> {
+pub fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<DynamicImage> {
     let mut decoder = ImageReader::new(Cursor::new(input))
         .with_guessed_format()
         .wrap_err("failed to guess image format")?
@@ -218,17 +218,18 @@ pub fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<RgbImage> 
     let mut decoded =
         DynamicImage::from_decoder(decoder).wrap_err("failed to decode source image")?;
     decoded.apply_orientation(orientation);
-    Ok(decoded.to_rgb8())
+    Ok(DynamicImage::ImageRgb8(decoded.to_rgb8()))
 }
 
 #[doc(hidden)]
-pub fn resize_to(img: &RgbImage, max_dim: u32) -> RgbImage {
-    let (w, h) = img.dimensions();
+pub fn resize_to(img: &DynamicImage, max_dim: u32) -> RgbImage {
+    let (w, h) = (img.width(), img.height());
     if max_dim > 0 && w.max(h) > max_dim {
         let (new_w, new_h) = scaled_dims(w, h, max_dim);
-        image::imageops::resize(img, new_w, new_h, FilterType::Lanczos3)
+        img.resize_exact(new_w, new_h, FilterType::Lanczos3)
+            .into_rgb8()
     } else {
-        img.clone()
+        img.to_rgb8()
     }
 }
 

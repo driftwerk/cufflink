@@ -474,6 +474,7 @@ Every guest execution runs under one deadline: the caller's timeout, the epoch i
 | `WASM_THREAD_STACK_KB` | `2048` | Stack of every runtime thread (at least 1024). Each blocking thread that ran a guest is charged its stack until it retires, 2 s after its last task |
 | `WASM_ADMISSION_WAIT_MS` | `1000` | Longest a route, `_fn`, before-hook or worker request waits for a slot or memory before it is answered `503` ([route limits](routing.md#route-limits)) |
 | `WASM_ADMISSION_RETRY_AFTER_SECS` | `2` | `Retry-After` of a `503` answered for capacity |
+| `WASM_ADMISSION_RETRY_AFTER_MS` | unset | The same delay in milliseconds, used instead when set: the delay before a message or job deferred for capacity is delivered again. A `Retry-After` header is at least 1 s |
 | `WASM_EPOCH_TICK_MS` | `100` | How often the deadline is checked while a guest runs; a runaway guest survives its deadline by at most one tick |
 | `WASM_MODULE_CACHE_MAX` | `128` | Compiled modules kept in memory (least recently used evicted) |
 
