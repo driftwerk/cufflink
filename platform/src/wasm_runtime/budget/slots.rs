@@ -1,3 +1,4 @@
+use super::ServiceKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::Semaphore;
@@ -43,6 +44,52 @@ impl RouteSlots {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ServiceSlot {
+    pub all: Arc<Semaphore>,
+    pub committed: Arc<Semaphore>,
+    pub background: Arc<Semaphore>,
+    per_service: usize,
+}
+
+impl ServiceSlot {
+    fn idle(&self) -> bool {
+        self.all.available_permits() == self.per_service
+    }
+}
+
+pub(crate) struct ServiceSlots {
+    slots: Mutex<HashMap<ServiceKey, ServiceSlot>>,
+    per_service: usize,
+}
+
+impl ServiceSlots {
+    pub(crate) fn new(per_service: usize) -> Self {
+        Self {
+            slots: Mutex::default(),
+            per_service,
+        }
+    }
+
+    pub(crate) fn of(&self, service: &ServiceKey) -> ServiceSlot {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = slots.get(service) {
+            return slot.clone();
+        }
+        if slots.len() >= PRUNE_ABOVE {
+            slots.retain(|_, slot| !slot.idle());
+        }
+        let slot = ServiceSlot {
+            all: Arc::new(Semaphore::new(self.per_service)),
+            committed: Arc::new(Semaphore::new((self.per_service / 2).max(1))),
+            background: Arc::new(Semaphore::new((self.per_service / 2).max(1))),
+            per_service: self.per_service,
+        };
+        slots.insert(service.clone(), slot.clone());
+        slot
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +108,24 @@ mod tests {
         let redeployed = slots.semaphore(id, "export", 3);
         assert!(!Arc::ptr_eq(&first, &redeployed));
         assert_eq!(redeployed.available_permits(), 3);
+    }
+
+    #[test]
+    fn committed_and_background_work_hold_at_most_half_of_a_services_slots() {
+        let slots = ServiceSlots::new(32);
+        let key = ServiceKey {
+            tenant: "acme".into(),
+            service: "catalog-service".into(),
+        };
+        let slot = slots.of(&key);
+        assert_eq!(slot.all.available_permits(), 32);
+        assert_eq!(slot.committed.available_permits(), 16);
+        assert_eq!(slot.background.available_permits(), 16);
+        assert!(Arc::ptr_eq(&slot.all, &slots.of(&key).all));
+        assert_eq!(
+            ServiceSlots::new(1).of(&key).committed.available_permits(),
+            1
+        );
     }
 
     #[test]

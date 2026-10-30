@@ -82,9 +82,16 @@ async fn a_route_runs_max_concurrent_calls_at_once_and_refuses_the_rest_unrun() 
         json!({"error": "guest capacity exhausted; the request was not run"})
     );
     assert!(
-        third.took >= Duration::from_secs(1) && third.took < Duration::from_secs(2),
-        "the third call waits WASM_ADMISSION_WAIT_MS for a slot, not for the handlers: {:?}",
+        third.took >= Duration::from_secs(1),
+        "the third call waits WASM_ADMISSION_WAIT_MS for a slot: {:?}",
         third.took
+    );
+    assert!(
+        third.took + Duration::from_millis(400) < first.took.min(second.took),
+        "and is refused while the handlers holding the slots still run: {:?} {:?} {:?}",
+        third.took,
+        first.took,
+        second.took
     );
     assert_eq!(
         platform
@@ -102,4 +109,94 @@ async fn a_route_runs_max_concurrent_calls_at_once_and_refuses_the_rest_unrun() 
 
     let again = call(&platform, &limited, Duration::ZERO).await;
     assert_eq!(again.status, 200, "slots are freed: {}", again.body);
+}
+
+const MIB: u64 = 1024 * 1024;
+
+async fn budgeted(mode: &str) -> Option<(PlatformProcess, common::TestDb)> {
+    let infra = common::infra().await?;
+    let db = infra.create_database().await;
+    let platform = PlatformProcess::start(
+        &db.url,
+        infra.nats_url(),
+        &[
+            ("WASM_MEMORY_BUDGET_MODE", mode),
+            ("WASM_MEMORY_BUDGET_MB", "128"),
+        ],
+    )
+    .await;
+    platform.wait_ready().await;
+    Some((platform, db))
+}
+
+#[tokio::test]
+async fn a_burst_under_enforce_is_answered_503_with_retry_after_and_the_process_survives() {
+    let Some((platform, mut db)) = budgeted("enforce").await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let manifest = common::wasm_manifest("catalog-service", &[("hold_48", "/hold_48")]);
+    let (status, body) = platform.deploy(&catalog, &manifest).await;
+    assert_eq!(status, 200, "deploy failed: {body}");
+    let url = platform.fn_url(&catalog, "catalog-service", "hold_48");
+    let health = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        platform.status("/health").await
+    };
+    let (answers, healthy) = tokio::join!(
+        futures_util::future::join_all((0..12).map(|_| call(&platform, &url, Duration::ZERO))),
+        health,
+    );
+    assert_eq!(healthy, Some(200), "health answers during the burst");
+    let ok = answers.iter().filter(|a| a.status == 200).count();
+    assert!(ok >= 1, "some calls run");
+    for answer in answers.iter().filter(|a| a.status != 200) {
+        assert_eq!(answer.status, 503, "never a 500: {}", answer.body);
+        assert_eq!(answer.retry_after.as_deref(), Some("2"));
+        assert_eq!(
+            answer.body,
+            json!({"error": "guest capacity exhausted; the request was not run"})
+        );
+    }
+    assert!(
+        ok < 12,
+        "a 128 MiB budget cannot run twelve 48 MiB guests at once"
+    );
+    assert_eq!(
+        platform.status("/health").await,
+        Some(200),
+        "the process that took the burst still answers"
+    );
+    assert_eq!(
+        platform
+            .metric("cufflink_wasm_memory_budget_bytes", &[],)
+            .await,
+        Some((128 * MIB) as f64)
+    );
+}
+
+#[tokio::test]
+async fn under_warn_the_same_burst_runs_and_counts_what_would_have_waited() {
+    let Some((platform, mut db)) = budgeted("warn").await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let manifest = common::wasm_manifest("catalog-service", &[("hold_48", "/hold_48")]);
+    let (status, body) = platform.deploy(&catalog, &manifest).await;
+    assert_eq!(status, 200, "deploy failed: {body}");
+    let url = platform.fn_url(&catalog, "catalog-service", "hold_48");
+    let answers =
+        futures_util::future::join_all((0..6).map(|_| call(&platform, &url, Duration::ZERO))).await;
+    assert!(
+        answers.iter().all(|answer| answer.status == 200),
+        "warn refuses nothing"
+    );
+    let counted = platform
+        .metric(
+            "cufflink_wasm_admission_refused_total",
+            &[("mode", "warn"), ("tenant", catalog.slug.as_str())],
+        )
+        .await
+        .unwrap_or_default();
+    assert!(counted >= 1.0, "would-be refusals are counted: {counted}");
 }

@@ -455,9 +455,24 @@ Every guest execution runs under one deadline: the caller's timeout, the epoch i
 | `WASM_MAX_TABLES` / `WASM_MAX_TABLE_ELEMENTS` / `WASM_MAX_INSTANCES` | `8` / `1000000` / `1` | Table and instance caps; a Rust `cdylib` guest needs one table and instantiates nothing |
 | `WASM_MAX_GUEST_LEN_MB` | `64` | Largest pointer/length pair a guest may hand a host function; a negative or larger length returns `-1` and counts `limit="length"` |
 | `WASM_MAX_RESPONSE_MB` | `64` | Largest handler response; beyond it the call fails with a 500 rather than allocating |
-| `WASM_MAX_CONCURRENT` | `256` | Guest executions in flight at once; queueing for a slot counts against the handler's budget |
+| `WASM_MAX_CONCURRENT` | `256` | Guest executions in flight at once; queueing for a slot counts against the handler's budget. Background work may hold 75 % of them under `enforce`, and a service's own limit is `WASM_MAX_CONCURRENT_PER_SERVICE`. The blocking pool is sized `WASM_MAX_CONCURRENT × 5 + 64` threads, so a chain of service calls never waits for a thread its callers hold |
 | `WASM_MAX_OPEN_TX` | `2` | Interactive `db_v2` transactions one invocation may hold open ([db-v2](db-v2.md)) |
-| `WASM_ADMISSION_WAIT_MS` | `1000` | Longest a route waits for a slot of its `max_concurrent` before it is answered `503` ([route limits](routing.md#route-limits)) |
+| `WASM_MEMORY_BUDGET_MODE` | `warn` | The guest memory budget: `off` admits as before this release, `warn` measures the ledger, shares and per-service slots and counts and logs what `enforce` would refuse or deny without refusing anything, `enforce` makes routes and hooks wait briefly for room and answers `503` with `Retry-After` when there is none; a service call never waits, and is answered `503` at once. Process-wide, not a tenant policy |
+| `WASM_MEMORY_BUDGET_MB` | derived | The budget. When unset: the process's cgroup limit (the smallest `memory.max` or `memory.high` of its cgroup v2 and its ancestors, or cgroup v1's `hierarchical_memory_limit`) less the host reserve. With no limit (no cgroup, macOS) the budget is off, logged once. `0` refuses startup; a derived budget of nothing turns it off with a warning |
+| `WASM_MEMORY_HOST_RESERVE_MB` | `max(256, 30 % of the limit)` | What a derived budget leaves for the host: its baseline, compiled modules, the core threads' stacks and fragmentation |
+| `WASM_MEMORY_SERVICE_SHARE_PERCENT` | `50` | Most of the budget one tenant's service may hold, reservations and growth together. Under `enforce`, a `WASM_MAX_MEMORY_MB` above it is clamped to it at startup, with a warning |
+| `WASM_MEMORY_ADMIT_PERCENT` | `90` | New invocations are admitted only below this share of the budget; the rest is headroom for running ones and service calls |
+| `WASM_MEMORY_BACKGROUND_SHARE_PERCENT` | `75` | Most of the budget subscriptions and jobs may hold |
+| `WASM_MEMORY_COLD_ESTIMATE_MB` | `32` | What a handler with no measurement reserves at admission; a measured one reserves the largest of its last 16 peaks |
+| `WASM_ESTIMATE_MAX_AGE_SECS` / `WASM_ESTIMATE_MAP_MAX` | `600` / `4096` | Age past which a peak is forgotten, and handlers remembered |
+| `WASM_MAX_CONCURRENT_PER_SERVICE` | `32` | Invocations of one tenant's service in flight at once (at most `WASM_MAX_CONCURRENT`); an in-process after-hook may hold half of them. Enforced under `enforce`, counted under `warn` |
+| `WASM_MEMORY_JOB_FLOOR_MB` | `32` | Under `enforce`, room the background share must have before the long-jobs and after-hook consumers fetch, since one durable carries every handler |
+| `WASM_BACKGROUND_AGING_SECS` | `30` | A subscription or job waiting for memory longer than this is granted before routes, so a steady flow of small requests cannot starve it |
+| `WASM_CAPACITY_RETRIES` / `WASM_CAPACITY_RETRIES_JOB` | `3` / `10` | Under `enforce`, a subscription or worker after-hook denied memory mid-run is run again in place up to `WASM_CAPACITY_RETRIES` times, then naked with a delay; a job is put off with a delay, its attempts unchanged, up to `WASM_CAPACITY_RETRIES_JOB` times in a row, then counted as a `capacity` failure, retried as a crash is |
+| `WASM_MEMORY_PRESSURE_GATE` | `true` | Where the process's cgroup is v2, read its `memory.stat` every 250 ms; while what the kernel cannot reclaim is above the limit less half the reserve, new routes and background work wait as if the budget were full (`reason="pressure"`) |
+| `WASM_COMMITTED_WAIT_SECS` | `300` | Under `enforce`, longest an in-process after-hook waits for a slot or memory, outside its budget, before it is dropped and logged |
+| `WASM_THREAD_STACK_KB` | `2048` | Stack of every runtime thread (at least 1024). Each blocking thread that ran a guest is charged its stack until it retires, 2 s after its last task |
+| `WASM_ADMISSION_WAIT_MS` | `1000` | Longest a route, `_fn`, before-hook or worker request waits for a slot or memory before it is answered `503` ([route limits](routing.md#route-limits)) |
 | `WASM_ADMISSION_RETRY_AFTER_SECS` | `2` | `Retry-After` of a `503` answered for capacity |
 | `WASM_EPOCH_TICK_MS` | `100` | How often the deadline is checked while a guest runs; a runaway guest survives its deadline by at most one tick |
 | `WASM_MODULE_CACHE_MAX` | `128` | Compiled modules kept in memory (least recently used evicted) |

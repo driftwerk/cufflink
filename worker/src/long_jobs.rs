@@ -2,7 +2,7 @@ use crate::http::WorkerReadiness;
 use crate::jobs;
 use chrono::Utc;
 use cufflink_platform::errors::PlatformResult;
-use cufflink_platform::nats_manager::delivery::{decide, Decision, Outcome};
+use cufflink_platform::nats_manager::delivery::{decide, Decision, Outcome, CAPACITY_REASON};
 use cufflink_platform::nats_manager::dlq::DeadLetter;
 use cufflink_platform::nats_manager::events::LONG_JOBS_STREAM;
 use cufflink_platform::nats_manager::pump::{
@@ -16,7 +16,7 @@ use cufflink_platform::router::jobs::state::{
 use cufflink_platform::router::jobs::{
     count_transition, dead_letter, enqueued_under, fail_lost, JOB_RETENTION,
 };
-use cufflink_platform::wasm_runtime::{Invocation, InvocationKind, WasmEngine};
+use cufflink_platform::wasm_runtime::{Class, Invocation, InvocationKind, WasmEngine};
 use cufflink_platform::AppState;
 use cufflink_telemetry::Kind;
 use cufflink_types::backoff::Backoff;
@@ -198,6 +198,10 @@ impl Work for LongJobs {
             false,
             meta.stream_sequence,
         )
+    }
+
+    fn headroom(&self) -> BoxFuture<'_, usize> {
+        self.wasm_engine.headroom_for_any_handler().boxed()
     }
 
     fn dead_letter<'a>(
@@ -441,10 +445,17 @@ impl LongJobs {
                         u64::try_from(job.timeout_secs.max(1)).unwrap_or(1),
                     ),
                     cancel: Some(lost.clone()),
+                    class: Class::Background,
+                    admission: None,
                 },
             )
             .await;
-        classify(run, job, self.app_state.shutdown.hard_deadline_reached())
+        classify(
+            run,
+            job,
+            self.app_state.shutdown.hard_deadline_reached(),
+            self.wasm_engine.capacity_deferrals_allowed(),
+        )
     }
 
     async fn conclude(&self, claim: &Claim, attempt: Attempt) -> Outcome {
@@ -464,6 +475,17 @@ impl LongJobs {
                 wasm_jobs::release(self.pool(), fence)
                     .await
                     .map(|fenced| (Transition::Released, fenced, Outcome::Interrupted))
+            }
+            Attempt::Deferred(after) => {
+                wasm_jobs::defer(self.pool(), fence, *after)
+                    .await
+                    .map(|fenced| {
+                        (
+                            Transition::Deferred,
+                            fenced,
+                            retry_in(*after, CAPACITY_REASON),
+                        )
+                    })
             }
             Attempt::LeaseLost => Ok((Transition::Executed, Fenced::Lost, Outcome::Ok)),
         };
@@ -548,6 +570,7 @@ enum Transition {
     Retried { crashed: bool },
     Failed,
     Released,
+    Deferred,
     Executed,
 }
 
@@ -558,6 +581,7 @@ impl Transition {
             Transition::Retried { .. } => "retry",
             Transition::Failed => "fail",
             Transition::Released => "release",
+            Transition::Deferred => "defer",
             Transition::Executed => "execute",
         }
     }
@@ -569,6 +593,7 @@ impl Transition {
             Transition::Retried { crashed: false } => Some(("retry", "retry")),
             Transition::Failed => Some(("failed", "failed")),
             Transition::Released => Some(("released", "interrupted")),
+            Transition::Deferred => Some(("deferred", "deferred")),
             Transition::Executed => None,
         }
     }
@@ -708,6 +733,7 @@ mod tests {
             trace_context: None,
             dead_lettered_at: None,
             idempotency_key: None,
+            capacity_deferrals: 0,
             schedule_name: None,
         }
     }

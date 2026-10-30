@@ -3,7 +3,7 @@ use crate::nats_manager::subjects::{resolve_subject, subject_covers};
 use crate::registry::{RegisteredService, ServiceIdentity};
 use crate::router::custom::{execute, Execution};
 use crate::router::sse::SseSlot;
-use crate::wasm_runtime::{CompiledModule, InvocationKind};
+use crate::wasm_runtime::{Class, CompiledModule, InvocationKind};
 use crate::AppState;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -287,6 +287,8 @@ impl Reducer {
                 request: &request,
                 kind: InvocationKind::SseReducer,
                 budget: REDUCER_BUDGET,
+                class: Class::Interactive,
+                admission: None,
             },
         )
         .await

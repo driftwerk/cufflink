@@ -150,6 +150,30 @@ declares.
 |---------|-------------|----------|
 | `route_concurrency` | any route sets `max_concurrent` | invocations of a route in flight at once, per replica ([route limits](routing.md#route-limits)) |
 
+This release adds the guest memory budget: a process-wide ledger of the
+linear memory, tables and thread stacks of the guests in flight, with
+admission that waits, or answers `503` and `Retry-After`, rather than
+exceed it ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)).
+`WASM_MEMORY_BUDGET_MODE` is `warn` by default: nothing waits or is refused
+for the budget yet, and
+`cufflink_wasm_admission_refused_total{mode="warn"}` shows what would have
+been. A later release makes `enforce` the default. Under `enforce`:
+
+- a service is limited to 32 invocations in flight per replica
+  (`WASM_MAX_CONCURRENT_PER_SERVICE`). Background work may hold half of
+  them, so with the default a subscription runs at most 16 messages at once
+  per process, whatever its `consumer.concurrency`; raise the limit on a
+  worker-only process to suit it;
+- a message of an `ack: always` subscription denied memory mid-run is run
+  again rather than acked, so it may run twice;
+- a route denied memory mid-run is answered `503`, saying the request may
+  have been partly applied.
+
+Memory the host allocates for guests (host-call results, request and
+response bodies) is not yet in the ledger, so `guest_memory_budget` is not
+advertised by this release. Migration `V7__capacity_deferrals.sql` adds a
+column to `wasm_jobs`.
+
 `cufflink services list --features` prints what each deployed service
 requires.
 
@@ -257,6 +281,8 @@ Rolling a platform back from v0.35.0 to an earlier release:
 | What v0.35.0 added | Before rolling the platform back |
 |--------------------|----------------------------------|
 | Services that declare `max_concurrent` on a route (`cufflink services list --features` names them, as `route_concurrency`) | Nothing must be done first. The older platform drops the key it does not know and runs the route without its limit. Such a service cannot be deployed there (422, naming the feature) |
+| The guest memory budget | Nothing: the older platform ignores the `WASM_MEMORY_*` variables and admits as before |
+| The database | Nothing: `V7__capacity_deferrals` only adds a column the older binary ignores. A job put off for capacity keeps its later `next_attempt_at` and runs then |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
@@ -280,7 +306,8 @@ only the plaintext column, which `encrypted` storage empties
 Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
-`V5__extensions` and `V6__runner_keys` on v0.28.0): expected and harmless, as migrations are
+`V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
+v0.35.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist

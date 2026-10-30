@@ -16,6 +16,9 @@ pub enum Outcome {
         reason: String,
     },
     Interrupted,
+    Deferred {
+        after: Duration,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +42,14 @@ fn give_up(dead_letter: bool, reason: &str) -> Decision {
     }
 }
 
+pub const CAPACITY_REASON: &str = "capacity";
+const LONGEST_DEFERRAL: Duration = Duration::from_secs(60);
+
+fn deferral(after: Duration, delivered: u64) -> Duration {
+    let doublings = attempt(delivered).saturating_sub(1).min(16);
+    after.saturating_mul(1 << doublings).min(LONGEST_DEFERRAL)
+}
+
 fn attempt(delivered: u64) -> u32 {
     u32::try_from(delivered.max(1)).unwrap_or(u32::MAX)
 }
@@ -53,6 +64,10 @@ pub fn decide(
     seed: u64,
 ) -> Decision {
     match (ack, outcome) {
+        (_, Outcome::Deferred { .. }) if exhausted(delivered, max_deliver) => {
+            give_up(dead_letter, CAPACITY_REASON)
+        }
+        (_, Outcome::Deferred { after }) => Decision::Nak(deferral(*after, delivered)),
         (AckMode::Always, _) | (AckMode::OnSuccess, Outcome::Ok) => Decision::Ack,
         (AckMode::OnSuccess, Outcome::Interrupted) => Decision::Nak(Duration::ZERO),
         (AckMode::OnSuccess, Outcome::Invalid { reason } | Outcome::Terminal { reason }) => {
@@ -75,6 +90,7 @@ pub fn result_label(outcome: &Outcome, decision: &Decision) -> &'static str {
         (Decision::Ack, Outcome::Invalid { .. }) => "invalid",
         (Decision::Ack, _) => "error",
         (Decision::Nak(_), Outcome::Interrupted) => "nak",
+        (Decision::Nak(_), Outcome::Deferred { .. }) => "deferred",
         (Decision::Nak(_), _) => "retry",
         (Decision::DeadLetterThenTerm { .. }, _) => "dead_letter",
         (Decision::Term { .. }, _) => "terminal",
@@ -102,6 +118,50 @@ mod tests {
         Outcome::Invalid {
             reason: "payload is not JSON".into(),
         }
+    }
+
+    #[test]
+    fn a_capacity_deferral_is_a_delayed_nak_under_both_ack_modes_until_the_deliveries_run_out() {
+        let deferred = Outcome::Deferred {
+            after: Duration::from_secs(2),
+        };
+        for ack in [AckMode::Always, AckMode::OnSuccess] {
+            let decided = |delivered, max_deliver, dead_letter| {
+                decide(
+                    ack,
+                    &deferred,
+                    delivered,
+                    max_deliver,
+                    &fixed(),
+                    dead_letter,
+                    1,
+                )
+            };
+            assert_eq!(decided(1, -1, true), Decision::Nak(Duration::from_secs(2)));
+            assert_eq!(decided(3, -1, true), Decision::Nak(Duration::from_secs(8)));
+            assert_eq!(
+                decided(40, -1, true),
+                Decision::Nak(Duration::from_secs(60)),
+                "unbounded without max_deliver, the delay held at 60 s"
+            );
+            assert_eq!(decided(2, 3, true), Decision::Nak(Duration::from_secs(4)));
+            assert_eq!(
+                decided(3, 3, true),
+                Decision::DeadLetterThenTerm {
+                    reason: "capacity".into()
+                }
+            );
+            assert_eq!(
+                decided(3, 3, false),
+                Decision::Term {
+                    reason: "capacity".into()
+                }
+            );
+        }
+        assert_eq!(
+            result_label(&deferred, &Decision::Nak(Duration::from_secs(2))),
+            "deferred"
+        );
     }
 
     fn outcomes() -> [Outcome; 6] {

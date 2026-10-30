@@ -41,6 +41,19 @@ pub(crate) fn guest_text(request: &GuestRequest) -> PlatformResult<String> {
     guest_json(request).map(|request| request.to_string())
 }
 
+pub(crate) fn retry_later(after: std::time::Duration, ran: bool) -> PlatformError {
+    PlatformError::RetryLater {
+        message: match ran {
+            false => "guest capacity exhausted; the request was not run",
+            true => {
+                "guest capacity exhausted while the request ran; it may have been partly applied"
+            }
+        }
+        .to_string(),
+        after,
+    }
+}
+
 pub(crate) fn map_execution_error(subject: &str, err: ExecutionError) -> PlatformError {
     match err {
         ExecutionError::DeadlineExceeded { budget } => PlatformError::Internal(format!(
@@ -52,14 +65,7 @@ pub(crate) fn map_execution_error(subject: &str, err: ExecutionError) -> Platfor
         )),
         ExecutionError::Overloaded {
             retry_after, ran, ..
-        } => PlatformError::RetryLater {
-            message: match ran {
-                false => "guest capacity exhausted; the request was not run",
-                true => "guest capacity exhausted while the request ran; it may have been partly applied",
-            }
-            .to_string(),
-            after: retry_after,
-        },
+        } => retry_later(retry_after, ran),
         other => PlatformError::Internal(format!("{subject} execution error: {other}")),
     }
 }

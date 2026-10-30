@@ -384,13 +384,28 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `cufflink_wasm_handler_duration_seconds` | histogram | `kind`, `result` (`ok`, `error`, `timeout`, `trap`, `memory_limit`, `shutdown`, `cancelled`) | Guest execution time and outcome |
+| `cufflink_wasm_handler_duration_seconds` | histogram | `kind`, `result` (`ok`, `error`, `timeout`, `trap`, `memory_limit`, `shutdown`, `cancelled`, `overloaded`, `too_large`) | Guest execution time and outcome |
 | `cufflink_wasm_inflight` | gauge | `kind` | Guests executing |
 | `cufflink_wasm_queue_wait_seconds` | histogram | `kind` | Wait for an execution slot (`WASM_MAX_CONCURRENT`) |
-| `cufflink_wasm_admission_refused_total` | counter | `tenant`, `service`, `class` (`interactive`), `reason` (`route_concurrency`), `mode` (`enforce`) | Invocations answered `503` without running, because their route's `max_concurrent` stayed full for `WASM_ADMISSION_WAIT_MS`; logged at most once a minute per tenant, service and reason under target `cufflink::wasm::budget` |
+| `cufflink_wasm_admission_refused_total` | counter | `tenant`, `service`, `class` (`interactive`, `nested`, `committed`, `background`), `reason` (`memory`, `service_share`, `service_concurrency`, `route_concurrency`), `mode` (`warn`, `enforce`) | Invocations refused unrun for capacity, or under `warn` those that would have waited; logged at most once a minute per tenant, service and reason under target `cufflink::wasm::budget` |
+| `cufflink_wasm_admission_wait_seconds` | histogram | `class`, `result` (`admitted`, `refused`) | Arrival to admission; `cufflink_wasm_queue_wait_seconds` is kept one release as an alias |
+| `cufflink_wasm_admission_waiters` | gauge | `class` | Invocations waiting for memory |
+| `cufflink_wasm_memory_budget_bytes` | gauge | — | The guest memory budget in force (0 when off) |
+| `cufflink_wasm_memory_in_use_bytes` | gauge | `class`, and `stack_residue` | What the budget's ledger holds: reservations, linear memory, tables, and the stacks of blocking threads that ran a guest |
+| `cufflink_wasm_memory_service_bytes` | gauge | `tenant`, `service` | The same per service |
+| `cufflink_wasm_memory_denied_total` | counter | `tenant`, `service`, `kind`, `reason`, `what` (`grow`, `table`), `mode` | Growth past the budget or a service's share; denied under `enforce`, counted under `warn` |
+| `cufflink_wasm_estimate_bytes` | histogram | `kind` | Memory reserved at admission |
+| `cufflink_wasm_admission_oldest_wait_seconds` | gauge | `class` | Age of the oldest invocation waiting for memory; for `background`, starvation shows here |
+| `cufflink_wasm_capacity_retries_total` | counter | `kind` | Subscriptions and worker after-hooks run again in place after a mid-run capacity denial |
+| `cufflink_wasm_job_deferrals_total` | counter | `result` (`deferred`, `counted`) | Jobs put off for capacity, and those whose deferrals ran out and counted as a failed attempt |
+| `cufflink_pump_admission_wait_seconds` | histogram | `kind` | A consumer's wait for room in the budget before it fetches |
+| `cufflink_process_memory_limit_bytes` | gauge | `source` (`max`, `high`, `v1`) | The cgroup limit the budget was derived from |
+| `cufflink_process_memory_current_bytes` | gauge | — | cgroup v2 `memory.current`, as the pressure gate last read it |
+| `cufflink_process_memory_unreclaimable_bytes` | gauge | — | What the pressure gate reads: `anon + shmem + kernel`, or `memory.current` less the file cache |
+| `cufflink_process_memory_events_total` | counter | `event` (`high`, `max`, `oom`, `oom_kill`) | cgroup v2 `memory.events`, as last read |
 | `cufflink_wasm_memory_peak_bytes` | histogram | `kind` | Peak linear memory per execution |
 | `cufflink_wasm_response_bytes` | histogram | `kind` | Response size per execution |
-| `cufflink_wasm_limit_events_total` | counter | `limit` (`memory`, `length`, `response`, `table`), `mode` (`warn`, `enforce`) | Guest limits hit |
+| `cufflink_wasm_limit_events_total` | counter | `limit` (`memory`, `length`, `response`, `table`, `budget`), `mode` (`warn`, `enforce`) | Guest limits hit |
 | `cufflink_wasm_module_cache_entries` | gauge | — | Compiled modules cached (platform only; set at scrape) |
 | `cufflink_wasm_module_compile_seconds` | histogram | `source` (`deploy`, `s3`) | Module compilation time |
 | `cufflink_wasm_module_load_seconds` | histogram | `source` (`cwasm`, `compile`) | Time to load a module a replica had not cached: from its precompiled artefact, or compiled from the `.wasm` |

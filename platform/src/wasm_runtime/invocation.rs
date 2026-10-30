@@ -70,6 +70,8 @@ pub struct Invocation {
     pub scope_kind: Option<Kind>,
     pub budget: Duration,
     pub cancel: Option<CancellationToken>,
+    pub class: super::Class,
+    pub admission: Option<super::Admission>,
 }
 
 impl Invocation {
@@ -101,6 +103,11 @@ pub enum ExecutionError {
     Trap(String),
     #[error("WASM runtime error: {0}")]
     Runtime(String),
+    #[error(
+        "WASM guest needs more memory than its service may hold (requested {requested} bytes, \
+         service share {share} bytes)"
+    )]
+    TooLarge { requested: usize, share: usize },
     #[error("WASM guest capacity exhausted ({reason})")]
     Overloaded {
         reason: super::budget::Reason,
@@ -126,6 +133,7 @@ impl ExecutionError {
             ExecutionError::MemoryLimit { .. } => "memory_limit",
             ExecutionError::Trap(_) => "trap",
             ExecutionError::Overloaded { .. } => "overloaded",
+            ExecutionError::TooLarge { .. } => "too_large",
             ExecutionError::Response(_)
             | ExecutionError::HandlerNotFound(_)
             | ExecutionError::Runtime(_) => "error",

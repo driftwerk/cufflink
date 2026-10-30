@@ -12,7 +12,9 @@ use crate::router::sse::stream_principal;
 use crate::router::sse_bridge::{self, Reducer, ReducerContext};
 use crate::router::strict::split_svc_path;
 use crate::router::{jobs, map_execution_error};
-use crate::wasm_runtime::{CompiledModule, Invocation, InvocationKind, WasmEngine};
+use crate::wasm_runtime::{
+    Admission, Class, CompiledModule, Invocation, InvocationKind, RouteAdmission, WasmEngine,
+};
 use crate::AppState;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Uri};
@@ -24,6 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::info;
 
 const HANDLER_BUDGET: Duration = Duration::from_secs(30);
@@ -193,16 +196,35 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         .wasm_engine
         .as_ref()
         .ok_or_else(|| PlatformError::Internal("WASM runtime not available".into()))?;
-    let _route_slot = match route.max_concurrent {
-        Some(max) => Some(
+    let compiled = module(wasm_engine, &service).await?;
+    let class = Class::of_call(call.as_ref().map(|call| call.depth));
+    let identity = service.identity();
+    let handler_budget = ServiceCaller::bound(call.as_ref(), budget(route));
+    let route_admission = || RouteAdmission {
+        handler: &route.handler,
+        class,
+        max_concurrent: route.max_concurrent,
+        budget: handler_budget,
+    };
+    let here = route.job.is_none()
+        && wasm_engine.admits_before_running()
+        && !state.config.is_worker_routed(&service.name, &route.handler);
+    let admitted = match here {
+        true => Admitted::Here(
             wasm_engine
-                .route_slot(&service.identity(), &route.handler, max)
+                .admit_route(&compiled, &identity, route_admission())
                 .await
                 .map_err(|e| map_execution_error("WASM", e))?,
         ),
-        None => None,
+        false if route.job.is_some() => Admitted::Elsewhere(None),
+        false => Admitted::Elsewhere(
+            wasm_engine
+                .route_slot(&identity, route_admission())
+                .await
+                .map_err(|e| map_execution_error("WASM", e))?,
+        ),
     };
-    let compiled = module(wasm_engine, &service).await?;
+    let (_route_slot, admission) = admitted.into_parts();
 
     let body_value = parse_body(&body);
     let audit_body = if auth_user.is_some() {
@@ -289,7 +311,9 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
             compiled,
             request: &request_json,
             kind: InvocationKind::Route,
-            budget: ServiceCaller::bound(call.as_ref(), budget(route)),
+            budget: handler_budget,
+            class,
+            admission,
         },
     )
     .await?;
@@ -350,6 +374,20 @@ async fn module(
     }
 }
 
+enum Admitted {
+    Here(Admission),
+    Elsewhere(Option<OwnedSemaphorePermit>),
+}
+
+impl Admitted {
+    fn into_parts(self) -> (Option<OwnedSemaphorePermit>, Option<Admission>) {
+        match self {
+            Admitted::Here(admission) => (None, Some(admission)),
+            Admitted::Elsewhere(route_slot) => (route_slot, None),
+        }
+    }
+}
+
 pub(crate) struct Execution<'a> {
     pub service: &'a RegisteredService,
     pub handler: &'a str,
@@ -357,6 +395,8 @@ pub(crate) struct Execution<'a> {
     pub request: &'a Value,
     pub kind: InvocationKind,
     pub budget: Duration,
+    pub class: Class,
+    pub admission: Option<Admission>,
 }
 
 pub(crate) async fn execute(
@@ -370,6 +410,8 @@ pub(crate) async fn execute(
         request,
         kind,
         budget,
+        class,
+        admission,
     } = execution;
     let request_str = serde_json::to_string(request)
         .map_err(|e| PlatformError::Internal(format!("Failed to serialize request: {}", e)))?;
@@ -394,6 +436,8 @@ pub(crate) async fn execute(
                     scope_kind: None,
                     budget,
                     cancel: None,
+                    class,
+                    admission,
                 },
             )
             .await

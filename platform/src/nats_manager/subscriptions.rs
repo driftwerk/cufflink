@@ -15,7 +15,7 @@ use crate::router::guest_response::{self, GuestResponse};
 use crate::schedules::work::ScheduleWork;
 use crate::shutdown::DrainOutcome;
 use crate::tenant_sessions::{Purpose, Statements};
-use crate::wasm_runtime::{ExecutionError, Invocation, InvocationKind};
+use crate::wasm_runtime::{Class, ExecutionError, Invocation, InvocationKind};
 use crate::AppState;
 use async_nats::jetstream;
 use async_nats::HeaderMap;
@@ -454,6 +454,15 @@ impl Work for SubscriptionWork {
         )
     }
 
+    fn headroom(&self) -> BoxFuture<'_, usize> {
+        match (&self.ctx.handler_type, &self.ctx.state.wasm_engine) {
+            (HandlerType::Wasm, Some(engine)) => engine
+                .headroom(&self.ctx.identity, Some(&self.ctx.handler_name))
+                .boxed(),
+            _ => std::future::ready(usize::MAX).boxed(),
+        }
+    }
+
     fn dead_letter<'a>(
         &'a self,
         msg: &'a jetstream::Message,
@@ -478,12 +487,17 @@ impl Work for SubscriptionWork {
 pub(crate) enum HandlerFailure {
     Interrupted(eyre::Report),
     Failed(eyre::Report),
+    Deferred {
+        after: Duration,
+        reason: eyre::Report,
+    },
 }
 
 impl HandlerFailure {
     pub(crate) fn outcome(&self) -> Outcome {
         match self {
             HandlerFailure::Interrupted(_) => Outcome::Interrupted,
+            HandlerFailure::Deferred { after, .. } => Outcome::Deferred { after: *after },
             HandlerFailure::Failed(e) => Outcome::Retry {
                 after: None,
                 reason: e.to_string(),
@@ -512,7 +526,9 @@ impl HandlerOutcome {
         match self {
             HandlerOutcome::Rpc(Ok(_)) | HandlerOutcome::SideEffect(Ok(())) => None,
             HandlerOutcome::Rpc(Err(
-                HandlerFailure::Interrupted(e) | HandlerFailure::Failed(e),
+                HandlerFailure::Interrupted(e)
+                | HandlerFailure::Failed(e)
+                | HandlerFailure::Deferred { reason: e, .. },
             ))
             | HandlerOutcome::SideEffect(Err(e)) => Some(e.to_string()),
         }
@@ -630,6 +646,7 @@ async fn handle_message(
                 publish_reply(&ctx.state.nats, inbox, error_envelope(&e.to_string())).await;
             }
         }
+        (Some(_), HandlerOutcome::Rpc(Err(HandlerFailure::Deferred { .. }))) => {}
         (Some(_), HandlerOutcome::SideEffect(_)) => {
             warn!(
                 "Subscription {} received `{}` for non-RPC handler `{:?}`; ignoring",
@@ -771,25 +788,34 @@ pub(crate) async fn run_handler(
         "Executing WASM {} handler '{}'", what, handler_name
     );
 
+    let identity = service.identity();
     let response_str = wasm_engine
-        .run(
+        .run_retrying_capacity(
             state.clone(),
-            Invocation {
-                compiled,
+            InvocationKind::Subscription,
+            request_str,
+            |request_json| Invocation {
+                compiled: Arc::clone(&compiled),
                 handler: handler_name.to_string(),
-                request_json: request_str,
-                identity: service.identity(),
+                request_json,
+                identity: identity.clone(),
                 publishes: service.manifest.publishes.clone(),
                 extensions: service.manifest.extensions.clone(),
                 kind: InvocationKind::Subscription,
                 scope_kind: Some(run.kind),
                 budget: run.budget,
                 cancel: None,
+                class: Class::Background,
+                admission: None,
             },
         )
         .await
         .map_err(|e| {
             let interrupted = e.interrupted_by_shutdown(state.shutdown.hard_deadline_reached());
+            let deferred = match &e {
+                ExecutionError::Overloaded { retry_after, .. } => Some(*retry_after),
+                _ => None,
+            };
             let report = match e {
                 ExecutionError::DeadlineExceeded { budget } => eyre::eyre!(
                     "WASM {} handler timed out after {}s",
@@ -798,10 +824,13 @@ pub(crate) async fn run_handler(
                 ),
                 other => eyre::eyre!("WASM execution error: {}", other),
             };
-            if interrupted {
-                HandlerFailure::Interrupted(report)
-            } else {
-                HandlerFailure::Failed(report)
+            match (deferred, interrupted) {
+                (Some(after), _) => HandlerFailure::Deferred {
+                    after,
+                    reason: report,
+                },
+                (None, true) => HandlerFailure::Interrupted(report),
+                (None, false) => HandlerFailure::Failed(report),
             }
         })?;
 

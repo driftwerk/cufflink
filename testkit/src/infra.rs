@@ -761,6 +761,7 @@ impl ChildProcess {
         command
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("WASM_MEMORY_BUDGET_MODE", "off")
             .envs(env.iter().copied())
             .env(port_var, port.to_string());
         let output = std::env::var("CUFFLINK_TEST_LOG")

@@ -52,14 +52,43 @@ pub struct WasmJobResult {
     pub ok: bool,
     pub response: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran: Option<bool>,
 }
 
 impl WasmJobResult {
+    pub fn answered(response: String) -> Self {
+        Self {
+            ok: true,
+            response: Some(response),
+            error: None,
+            retry_after_ms: None,
+            ran: None,
+        }
+    }
+
     pub fn failed(error: impl Into<String>) -> Self {
         Self {
             ok: false,
             response: None,
             error: Some(error.into()),
+            retry_after_ms: None,
+            ran: None,
+        }
+    }
+
+    pub fn of_error(error: &crate::wasm_runtime::ExecutionError, message: String) -> Self {
+        match error {
+            crate::wasm_runtime::ExecutionError::Overloaded {
+                retry_after, ran, ..
+            } => Self {
+                retry_after_ms: Some(u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX)),
+                ran: Some(*ran),
+                ..Self::failed(message)
+            },
+            _ => Self::failed(message),
         }
     }
 }
@@ -111,6 +140,11 @@ pub async fn execute_on_worker(
         result
             .response
             .ok_or_else(|| PlatformError::Internal("Worker returned ok but no response".into()))
+    } else if let Some(retry_after_ms) = result.retry_after_ms {
+        Err(crate::router::retry_later(
+            Duration::from_millis(retry_after_ms),
+            result.ran.unwrap_or(true),
+        ))
     } else {
         let error_msg = result
             .error

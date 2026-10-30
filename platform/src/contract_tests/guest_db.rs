@@ -83,6 +83,8 @@ async fn legacy_failure_codes_hold_next_to_db_call() {
                 scope_kind: None,
                 budget: Duration::from_secs(15),
                 cancel: None,
+                class: crate::wasm_runtime::Class::Background,
+                admission: None,
             },
         )
         .await

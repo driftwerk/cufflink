@@ -1327,6 +1327,7 @@ dependencies = [
  "image",
  "ipnet",
  "jsonwebtoken",
+ "libc",
  "matchit",
  "metrics",
  "metrics-exporter-prometheus",

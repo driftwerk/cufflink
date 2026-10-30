@@ -23,7 +23,7 @@ use crate::schema_manager::adopt::{AdoptedColumn, AdoptedSchema};
 use crate::schema_manager::introspect::TypeKind;
 use crate::tenant_catalog::TenantEntry;
 use crate::tenant_sessions::{Purpose, ServiceSessions, Statements};
-use crate::wasm_runtime::{Invocation, InvocationKind};
+use crate::wasm_runtime::{Class, Invocation, InvocationKind};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, RawQuery, State},
@@ -51,6 +51,7 @@ pub(crate) async fn execute_hook(
 ) -> PlatformResult<Value> {
     execute_hook_as(
         InvocationKind::Hook,
+        Class::of_call(call.map(|call| call.depth)),
         state,
         service,
         hook_name,
@@ -61,8 +62,10 @@ pub(crate) async fn execute_hook(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_hook_as(
     kind: InvocationKind,
+    class: Class,
     state: &Arc<AppState>,
     service: &RegisteredService,
     hook_name: &str,
@@ -126,6 +129,8 @@ pub(crate) async fn execute_hook_as(
                     scope_kind: None,
                     budget,
                     cancel: None,
+                    class,
+                    admission: None,
                 },
             )
             .await
@@ -246,7 +251,18 @@ async fn execute_after_hook(
         {
             tracing::warn!("Failed to publish async after-hook '{}': {}", hook_name, e);
         }
-    } else if let Err(e) = execute_hook(state, service, hook_name, body, auth_json, call).await {
+    } else if let Err(e) = execute_hook_as(
+        InvocationKind::Hook,
+        Class::Committed,
+        state,
+        service,
+        hook_name,
+        body,
+        auth_json,
+        call,
+    )
+    .await
+    {
         tracing::warn!("after hook '{}' error: {}", hook_name, e);
     }
 }
