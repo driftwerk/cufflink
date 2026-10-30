@@ -6,14 +6,16 @@ use crate::errors::{PlatformError, PlatformResult};
 use crate::outbox::emit::Sink;
 use crate::registry::RegisteredService;
 use crate::router::authz::guest_auth_json;
-use crate::router::guest_response::decode;
+use crate::router::guest_response::{decode, DecodeError};
 use crate::router::postures::{authorize_route, Authorized, NamedPrincipal, ServiceCaller, Target};
 use crate::router::sse::stream_principal;
 use crate::router::sse_bridge::{self, Reducer, ReducerContext};
 use crate::router::strict::split_svc_path;
 use crate::router::{jobs, map_execution_error};
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Drawing, Hold, Refused};
 use crate::wasm_runtime::{
-    Admission, Class, CompiledModule, Invocation, InvocationKind, RouteAdmission, WasmEngine,
+    Admission, Class, CompiledModule, GuestOutput, Invocation, InvocationKind, RouteAdmission,
+    WasmEngine,
 };
 use crate::AppState;
 use axum::body::Body;
@@ -156,10 +158,11 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         body,
         peer,
     } = call;
+    let route_index = route;
     let route = service
         .manifest
         .custom_routes
-        .get(route)
+        .get(route_index)
         .ok_or_else(|| PlatformError::NotFound("Not found".into()))?;
     let tenant = state
         .tenants
@@ -182,26 +185,45 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
     let (auth_user, principal) = principal.into_parts();
     let actor = actor(call.as_ref(), &auth_user, principal.as_ref());
 
+    let wasm_engine = state
+        .wasm_engine
+        .as_ref()
+        .ok_or_else(|| PlatformError::Internal("WASM runtime not available".into()))?;
+    let class = Class::of_call(call.as_ref().map(|call| call.depth));
+    let identity = service.identity();
+    let refused = |refused, ran| map_execution_error("WASM", wasm_engine.refusal(refused, ran));
+    let charged = |error| match error {
+        ChargedJsonError::Capacity(refused_by) => refused(refused_by, false),
+        ChargedJsonError::Syntax(e) => PlatformError::Internal(format!("guest request: {e}")),
+    };
+
     let limit = body_limit(route);
-    let body = body::read(body, usize::try_from(limit).unwrap_or(usize::MAX))
-        .await
-        .map_err(Refusal::Body)?;
+    let limit_bytes = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut raw = wasm_engine.hold(&identity, class, &route.handler, InvocationKind::Route);
+    raw.grow(declared_length(&headers).map_or(limit_bytes, |length| length.min(limit_bytes)))
+        .map_err(|capacity| refused(Refused::Budget(capacity), false))?;
+    let body = body::read(body, limit_bytes).await.map_err(Refusal::Body)?;
+    raw.shrink_to(body.len());
+    let mut parts_held = raw.sibling();
     let parts = if route.multipart {
+        parts_held
+            .grow(body.len())
+            .map_err(|capacity| refused(Refused::Budget(capacity), false))?;
         Some(body::multipart(&headers, body.clone(), limit).await?)
     } else {
         None
     };
 
-    let wasm_engine = state
-        .wasm_engine
-        .as_ref()
-        .ok_or_else(|| PlatformError::Internal("WASM runtime not available".into()))?;
     let compiled = module(wasm_engine, &service).await?;
-    let class = Class::of_call(call.as_ref().map(|call| call.depth));
-    let identity = service.identity();
     let handler_budget = ServiceCaller::bound(call.as_ref(), budget(route));
+    let route_key = crate::wasm_runtime::RouteKey {
+        service_id: service.service_id,
+        version: service.version,
+        index: route_index,
+    };
     let route_admission = || RouteAdmission {
         handler: &route.handler,
+        route: route_key,
         class,
         max_concurrent: route.max_concurrent,
         budget: handler_budget,
@@ -226,11 +248,17 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
     };
     let (_route_slot, admission) = admitted.into_parts();
 
-    let body_value = parse_body(&body);
-    let audit_body = if auth_user.is_some() {
-        body_value.clone()
-    } else {
-        json!({ "redacted": "unauthenticated request body not recorded" })
+    let mut tree = raw.sibling();
+    let body_value = parse_body(&body, &mut tree)
+        .map_err(|refused_by| refused(refused_by, false))?
+        .value;
+    let audit = match auth_user.is_some() {
+        true => {
+            tree.grow(audit_reserve(&body_value))
+                .map_err(|capacity| refused(Refused::Budget(capacity), false))?;
+            Some(tree)
+        }
+        false => None,
     };
 
     let client_ip = crate::middleware::rate_limit::client_ip(
@@ -239,7 +267,7 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         state.config.client_ip_source,
     );
 
-    let request_json = RouteRequest {
+    let (request_json, value_held) = RouteRequest {
         method: guest_method(&method, strict.is_some()),
         handler: &route.handler,
         headers: guest_headers(&tenant, &service.name, route, &headers),
@@ -261,7 +289,10 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
             },
         ),
     }
-    .into_json()?;
+    .into_json(&raw)
+    .map_err(charged)?;
+    drop(parts);
+    drop(parts_held);
 
     if let Some(cfg) = &route.job {
         let auth_snapshot = auth_user.as_ref().map(|u| jobs::AuthSnapshot {
@@ -298,18 +329,23 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         None => None,
     };
 
+    let mut text_held = raw.sibling();
+    let request_text = ChargedJson::write(&request_json, &mut text_held).map_err(charged)?;
+    drop(request_json);
+    drop(value_held);
+
     info!(
         tenant = %service.tenant_slug,
         service = %service.name,
         "Executing WASM handler '{}'", route.handler
     );
-    let raw = execute(
+    let output = execute(
         state,
         Execution {
             service: &service,
             handler: &route.handler,
             compiled,
-            request: &request_json,
+            request: request_text,
             kind: InvocationKind::Route,
             budget: handler_budget,
             class,
@@ -317,26 +353,62 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         },
     )
     .await?;
-    Sink::of(state, &tenant, &service).record(
-        &audit_record(
+    drop(text_held);
+    let recorded = |data| {
+        audit_record(
             &service,
             &route.handler,
             &auth_user,
             actor,
             crate::middleware::request_id::request_id(&headers),
-            audit_body,
+            data,
         )
-        .redact(&route.audit_redact),
-    );
-    let response =
-        decode(raw).map_err(|e| PlatformError::Internal(format!("WASM execution error: {e}")))?;
+        .redact(&route.audit_redact)
+    };
+    let sink = Sink::of(state, &tenant, &service);
+    match audit {
+        Some(mut reservation) => {
+            let left = reservation.bytes();
+            let mut drawing = Drawing::from(&mut reservation, left);
+            let data = parse_body(&body, &mut drawing)
+                .or_else(|_| parse_body(&body, &mut Hold::none()))
+                .map_or(Value::Null, |parsed| parsed.value);
+            sink.record_drawing(&recorded(data), &mut drawing);
+        }
+        None => sink.record(&recorded(
+            json!({ "redacted": "unauthenticated request body not recorded" }),
+        )),
+    }
+    drop(raw);
+    let (response, hold) = decode(output).map_err(|e| match e {
+        DecodeError::Refused(refused_by) => refused(refused_by, true),
+        DecodeError::Invalid(e) => PlatformError::Internal(format!("WASM execution error: {e}")),
+    })?;
     let mut bodies = GuestBodies {
         state,
         service: &service,
         tenant: &tenant,
         sse,
     };
-    Ok(response.render(&service.name, &mut bodies).await)
+    response
+        .render(&service.name, &mut bodies, hold)
+        .await
+        .map_err(|refused_by| Refusal::from(refused(refused_by, true)))
+}
+
+const AUDIT_ENVELOPE: usize = 64 * 1024;
+
+fn audit_reserve(body: &Value) -> usize {
+    ChargedJson::measure(body)
+        .saturating_mul(2)
+        .saturating_add(2 * AUDIT_ENVELOPE)
+}
+
+fn declared_length(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 async fn module(
@@ -392,7 +464,7 @@ pub(crate) struct Execution<'a> {
     pub service: &'a RegisteredService,
     pub handler: &'a str,
     pub compiled: Arc<CompiledModule>,
-    pub request: &'a Value,
+    pub request: String,
     pub kind: InvocationKind,
     pub budget: Duration,
     pub class: Class,
@@ -402,7 +474,7 @@ pub(crate) struct Execution<'a> {
 pub(crate) async fn execute(
     state: &Arc<AppState>,
     execution: Execution<'_>,
-) -> PlatformResult<String> {
+) -> PlatformResult<GuestOutput> {
     let Execution {
         service,
         handler,
@@ -413,22 +485,31 @@ pub(crate) async fn execute(
         class,
         admission,
     } = execution;
-    let request_str = serde_json::to_string(request)
-        .map_err(|e| PlatformError::Internal(format!("Failed to serialize request: {}", e)))?;
+    let wasm_engine = state
+        .wasm_engine
+        .as_ref()
+        .ok_or_else(|| PlatformError::Internal("WASM runtime not available".into()))?;
     if state.config.is_worker_routed(&service.name, handler) {
-        let job = crate::worker_dispatch::WasmJob::of(service, handler, request_str);
-        crate::worker_dispatch::execute_on_worker(&state.nats, &service.name, job, budget).await
+        let job = crate::worker_dispatch::WasmJob::of(service, handler, request)
+            .nested(class == Class::Nested);
+        let reply = wasm_engine.hold(&service.identity(), class, handler, kind);
+        crate::worker_dispatch::execute_on_worker(
+            &state.nats,
+            &service.name,
+            job,
+            budget,
+            reply,
+            Some(wasm_engine),
+        )
+        .await
     } else {
-        state
-            .wasm_engine
-            .as_ref()
-            .ok_or_else(|| PlatformError::Internal("WASM runtime not available".into()))?
+        wasm_engine
             .run(
                 state.clone(),
                 Invocation {
                     compiled,
                     handler: handler.to_string(),
-                    request_json: request_str,
+                    request_json: request,
                     identity: service.identity(),
                     publishes: service.manifest.publishes.clone(),
                     extensions: service.manifest.extensions.clone(),

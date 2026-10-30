@@ -17,6 +17,7 @@ pub(crate) mod sse_bridge;
 pub(crate) mod strict;
 
 use crate::errors::{PlatformError, PlatformResult};
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold};
 use crate::wasm_runtime::ExecutionError;
 use cufflink_types::host::request::GuestRequest;
 use serde_json::Value;
@@ -38,7 +39,30 @@ pub(crate) fn guest_json(request: &GuestRequest) -> PlatformResult<Value> {
 }
 
 pub(crate) fn guest_text(request: &GuestRequest) -> PlatformResult<String> {
-    guest_json(request).map(|request| request.to_string())
+    charged_guest_text(request, &mut Hold::none())
+        .map_err(|e| PlatformError::Internal(format!("guest request: {e}")))
+}
+
+pub(crate) fn charged_guest_text(
+    request: &GuestRequest,
+    hold: &mut Hold,
+) -> Result<String, ChargedJsonError> {
+    let mut tree = hold.sibling();
+    let parsed = ChargedJson::to_value(request, &mut tree)?;
+    ChargedJson::write(&parsed.value, hold)
+}
+
+pub(crate) fn request_refused(
+    state: &crate::AppState,
+    subject: &str,
+    error: ChargedJsonError,
+) -> PlatformError {
+    match (error, state.wasm_engine.as_ref()) {
+        (ChargedJsonError::Capacity(refused), Some(engine)) => {
+            map_execution_error(subject, engine.refusal(refused, false))
+        }
+        (error, _) => PlatformError::Internal(format!("guest request: {error}")),
+    }
 }
 
 pub(crate) fn retry_later(after: std::time::Duration, ran: bool) -> PlatformError {
@@ -185,5 +209,32 @@ mod tests {
             guest_json(&request).expect("value").to_string(),
             guest_text(&request).expect("text")
         );
+    }
+
+    #[test]
+    fn a_charged_request_text_keeps_only_the_text_charged() {
+        use crate::wasm_runtime::budget::testing::{self, MIB};
+        let request = GuestRequest {
+            method: "POST".into(),
+            handler: "h".into(),
+            body: serde_json::json!({"rows": vec![[0]; 200_000]}),
+            body_raw_b64: Some("QUJD".repeat(MIB)),
+            ..GuestRequest::default()
+        };
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        let text = charged_guest_text(&request, &mut hold).expect("fits");
+        assert_eq!(
+            text,
+            serde_json::to_value(&request).expect("value").to_string()
+        );
+        assert_eq!(hold.bytes(), ledger.in_use());
+        assert!(hold.bytes() >= text.len() && hold.bytes() < text.len() + 2 * MIB);
+
+        let (ledger, mut hold) = testing::hold(4 * MIB);
+        assert!(matches!(
+            charged_guest_text(&request, &mut hold),
+            Err(ChargedJsonError::Capacity(_))
+        ));
+        assert_eq!(ledger.in_use(), 0);
     }
 }

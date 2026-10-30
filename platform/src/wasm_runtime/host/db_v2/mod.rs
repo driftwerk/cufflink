@@ -54,16 +54,7 @@ pub(super) fn register(
                     ))
                 }
             };
-            match serde_json::to_string(&response) {
-                Ok(json) => {
-                    caller.data_mut().host_response = Some(json);
-                    0
-                }
-                Err(e) => {
-                    tracing::error!("[wasm] db_call: encode failed: {e}");
-                    -1
-                }
-            }
+            caller.data_mut().respond_json("db_call", &response)
         },
     )
 }

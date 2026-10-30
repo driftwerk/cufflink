@@ -21,8 +21,9 @@ use cufflink_platform::repo::deployments::{execution_context, ExecutionContext};
 use cufflink_platform::shutdown::{self, Shutdown, DEPENDENCY_FLUSH_CAP};
 use cufflink_platform::storage::S3Storage;
 use cufflink_platform::tenant_db::TenantPoolManager;
+use cufflink_platform::wasm_runtime::budget::Hold;
 use cufflink_platform::wasm_runtime::{
-    Class, ExecutionError, Invocation, InvocationKind, WasmEngine,
+    Class, ExecutionError, GuestOutput, Invocation, InvocationKind, WasmEngine,
 };
 use cufflink_platform::worker_dispatch::{requested_budget, WasmJob, WasmJobResult};
 use cufflink_platform::{AppState, Assembly};
@@ -384,21 +385,17 @@ async fn reply_to_sync_job(
     .await;
     jobs::record("sync", if outcome.is_ok() { "ok" } else { "error" });
 
-    let result = match outcome {
-        Ok(response) => WasmJobResult::answered(response),
-        Err(e) => match &e {
-            JobError::Execution(error) => WasmJobResult::of_error(error, e.to_string()),
-            _ => WasmJobResult::failed(e.to_string()),
-        },
+    let (result, mut hold) = match outcome {
+        Ok(response) => (WasmJobResult::answered(response.text), response.hold),
+        Err(e) => (
+            match &e {
+                JobError::Execution(error) => WasmJobResult::of_error(error, e.to_string()),
+                _ => WasmJobResult::failed(e.to_string()),
+            },
+            Hold::none(),
+        ),
     };
-    let reply_payload = serde_json::to_vec(&result).unwrap_or_else(|e| {
-        serde_json::json!({
-            "ok": false,
-            "error": format!("Failed to serialize result: {e}"),
-        })
-        .to_string()
-        .into_bytes()
-    });
+    let reply_payload = result.into_payload(&mut hold, wasm_engine);
     if let Some(reply) = msg.reply {
         if let Err(e) = nats_conn::publish_bounded(
             &app_state.nats,
@@ -477,7 +474,7 @@ async fn process_job(
     budget: Duration,
     kind: Kind,
     class: Class,
-) -> Result<String, JobError> {
+) -> Result<GuestOutput, JobError> {
     let (job, context) = resolve_job(app_state, payload).await.inspect_err(|e| {
         if let JobError::IdentityMismatch {
             claimed_tenant,
@@ -514,6 +511,10 @@ async fn process_job(
             version: job.version,
         })?;
 
+    let class = match (class, job.nested) {
+        (Class::Interactive, true) => Class::Nested,
+        (class, _) => class,
+    };
     let identity = context.identity();
     let invocation = |request_json| Invocation {
         compiled: Arc::clone(&compiled),
@@ -601,7 +602,7 @@ struct AfterHookWork {
     retries: RetryDelays,
 }
 
-fn after_hook_outcome(result: Result<String, JobError>, at_hard_deadline: bool) -> Outcome {
+fn after_hook_outcome(result: Result<GuestOutput, JobError>, at_hard_deadline: bool) -> Outcome {
     match result {
         Ok(_) => Outcome::Ok,
         Err(JobError::Execution(e)) if e.interrupted_by_shutdown(at_hard_deadline) => {
@@ -738,7 +739,13 @@ mod tests {
     fn an_after_hook_is_retried_only_when_a_retry_can_help() {
         let at_hard_deadline = false;
         assert_eq!(
-            after_hook_outcome(Ok("{}".into()), at_hard_deadline),
+            after_hook_outcome(
+                Ok(GuestOutput {
+                    text: "{}".into(),
+                    hold: Hold::none(),
+                }),
+                at_hard_deadline
+            ),
             Outcome::Ok
         );
         assert_eq!(
@@ -801,6 +808,7 @@ mod tests {
                 service_schema: "victim_schema".into(),
                 service_name: Some("victim-service".into()),
                 publishes: None,
+                nested: false,
             },
             ExecutionContext {
                 tenant_id: Uuid::nil(),

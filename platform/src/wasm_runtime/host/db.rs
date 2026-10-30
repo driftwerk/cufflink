@@ -39,10 +39,7 @@ pub(super) fn register(
             ));
 
             match result {
-                Ok(json_str) => {
-                    caller.data_mut().host_response = Some(json_str);
-                    0
-                }
+                Ok(json_str) => caller.data_mut().respond("db_query", json_str),
                 Err(e) => {
                     tracing::error!("[wasm] db_query error: {}", e);
                     -1
@@ -143,10 +140,7 @@ pub(super) fn register(
             };
 
             match serde_json::to_string(&envelope) {
-                Ok(json) => {
-                    caller.data_mut().host_response = Some(json);
-                    0
-                }
+                Ok(json) => caller.data_mut().respond("db_execute_all", json),
                 Err(e) => {
                     tracing::error!("[wasm] db_execute_all: encode failed: {}", e);
                     -1
@@ -188,10 +182,7 @@ pub(super) fn register(
             };
 
             match serde_json::to_string(&envelope) {
-                Ok(json) => {
-                    caller.data_mut().host_response = Some(json);
-                    0
-                }
+                Ok(json) => caller.data_mut().respond("db_query_read_only", json),
                 Err(e) => {
                     tracing::error!("[wasm] db_query_read_only: encode failed: {}", e);
                     -1

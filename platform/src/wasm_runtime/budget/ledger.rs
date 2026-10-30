@@ -1,5 +1,5 @@
 use super::{Class, Reason, ServiceKey};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -105,6 +105,25 @@ fn publish_service(service: &ServiceKey, held: usize) {
     .set(held as f64);
 }
 
+impl Snapshot {
+    fn publish_services(
+        services: &HashMap<ServiceKey, usize>,
+        published: &mut HashSet<ServiceKey>,
+    ) {
+        published.retain(|service| {
+            let held = services.contains_key(service);
+            if !held {
+                publish_service(service, 0);
+            }
+            held
+        });
+        for (service, held) in services {
+            publish_service(service, *held);
+            published.insert(service.clone());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stack {
     Reserved,
@@ -130,6 +149,7 @@ pub(crate) struct Ledger {
     pressure: AtomicBool,
     credited: Notify,
     state: Mutex<State>,
+    published: Mutex<HashSet<ServiceKey>>,
 }
 
 impl Ledger {
@@ -139,6 +159,7 @@ impl Ledger {
             pressure: AtomicBool::new(false),
             credited: Notify::new(),
             state: Mutex::default(),
+            published: Mutex::default(),
         }
     }
 
@@ -163,6 +184,7 @@ impl Ledger {
     pub(crate) fn set_pressure(&self, on: bool) {
         if self.pressure.swap(on, Ordering::SeqCst) && !on {
             self.settled(|state, _| self.grant(state));
+            self.credited.notify_waiters();
         }
     }
 
@@ -183,15 +205,29 @@ impl Ledger {
     }
 
     fn settled<T>(&self, change: impl FnOnce(&mut State, Instant) -> T) -> T {
-        let now = Instant::now();
-        let (answer, snapshot) = {
+        let (answer, credited) = {
             let mut state = self.lock();
-            let answer = change(&mut state, now);
-            (answer, state.snapshot(now))
+            let before = state.in_use;
+            let answer = change(&mut state, Instant::now());
+            (answer, state.in_use < before)
+        };
+        if credited {
+            self.credited.notify_waiters();
+        }
+        answer
+    }
+
+    pub(crate) fn publish(&self) {
+        let (snapshot, services) = {
+            let state = self.lock();
+            (state.snapshot(Instant::now()), state.by_service.clone())
         };
         snapshot.publish();
-        self.credited.notify_waiters();
-        answer
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Snapshot::publish_services(&services, &mut published);
     }
 
     fn stack_for(&self, state: &State) -> (usize, Stack) {
@@ -244,15 +280,13 @@ impl Ledger {
         }
     }
 
-    fn take(&self, state: &mut State, class: Class, service: &ServiceKey, bytes: usize) -> usize {
+    fn take(&self, state: &mut State, class: Class, service: &ServiceKey, bytes: usize) {
         state.in_use += bytes;
         state.by_class[class.index()] += bytes;
-        let held = state.by_service.entry(service.clone()).or_default();
-        *held += bytes;
-        *held
+        *state.by_service.entry(service.clone()).or_default() += bytes;
     }
 
-    fn give(&self, state: &mut State, class: Class, service: &ServiceKey, bytes: usize) -> usize {
+    fn give(&self, state: &mut State, class: Class, service: &ServiceKey, bytes: usize) {
         state.in_use = state.in_use.saturating_sub(bytes);
         let by_class = &mut state.by_class[class.index()];
         *by_class = by_class.saturating_sub(bytes);
@@ -263,7 +297,6 @@ impl Ledger {
         if held == 0 {
             state.by_service.remove(service);
         }
-        held
     }
 
     fn tier(&self, waiter: &Waiter, now: Instant) -> usize {
@@ -279,9 +312,26 @@ impl Ledger {
         }
     }
 
+    fn arrival_tier(class: Class) -> usize {
+        match class {
+            Class::Committed => 0,
+            Class::Interactive | Class::Nested => 2,
+            Class::Background => 3,
+        }
+    }
+
+    fn queued_ahead(&self, state: &State, class: Class, now: Instant) -> bool {
+        let tier = Self::arrival_tier(class);
+        state
+            .queue
+            .iter()
+            .any(|waiter| !waiter.granted.is_closed() && self.tier(waiter, now) <= tier)
+    }
+
     fn grant(&self, state: &mut State) {
         let now = Instant::now();
         for tier in 0..GRANT_TIERS {
+            let mut held_back = false;
             let mut at = 0;
             while let Some(waiter) = state.queue.get(at) {
                 let closed = waiter.granted.is_closed();
@@ -295,6 +345,7 @@ impl Ledger {
                         .admits(state, waiter.class, &waiter.service, waiter.bytes + stack)
                         .is_ok();
                 if !fits {
+                    held_back |= tier <= 1;
                     at += 1;
                     continue;
                 }
@@ -315,16 +366,35 @@ impl Ledger {
                     }
                 }
             }
+            if held_back {
+                return;
+            }
         }
     }
 
-    fn release(&self, class: Class, service: &ServiceKey, bytes: usize) {
-        let held = self.settled(|state, _| {
-            let held = self.give(state, class, service, bytes);
-            self.grant(state);
-            held
+    pub(super) fn grow(&self, class: Class, service: &ServiceKey, extra: usize) -> Verdict {
+        let charged = self.settled(|state, _| match self.allows_growth(state, service, extra) {
+            Err(reason) if self.settings.enforce => Err(reason),
+            allowed => {
+                self.take(state, class, service, extra);
+                Ok(allowed.err())
+            }
         });
-        publish_service(service, held);
+        match charged {
+            Err(reason) => Verdict::Denied(reason),
+            Ok(warned) => warned.map_or(Verdict::Allowed, Verdict::Warned),
+        }
+    }
+
+    pub(super) fn force(&self, class: Class, service: &ServiceKey, bytes: usize) {
+        self.settled(|state, _| self.take(state, class, service, bytes));
+    }
+
+    pub(super) fn release(&self, class: Class, service: &ServiceKey, bytes: usize) {
+        self.settled(|state, _| {
+            self.give(state, class, service, bytes);
+            self.grant(state);
+        });
     }
 
     fn charge(
@@ -360,16 +430,16 @@ impl Ledger {
         service: &ServiceKey,
         bytes: usize,
         checked: bool,
-    ) -> Result<(Stack, usize), Reason> {
+    ) -> Result<Stack, Reason> {
         let (stack, claim) = self.stack_for(state);
         if checked {
             self.admits(state, class, service, bytes + stack)?;
         }
-        let held = self.take(state, class, service, bytes + stack);
+        self.take(state, class, service, bytes + stack);
         if claim == Stack::Claimed {
             state.claimed += 1;
         }
-        Ok((claim, held))
+        Ok(claim)
     }
 
     pub(crate) fn try_reserve(
@@ -378,9 +448,7 @@ impl Ledger {
         service: &ServiceKey,
         bytes: usize,
     ) -> Result<Charge, Reason> {
-        let (claim, held) =
-            self.settled(|state, _| self.debit(state, class, service, bytes, true))?;
-        publish_service(service, held);
+        let claim = self.settled(|state, _| self.debit(state, class, service, bytes, true))?;
         Ok(self.charge(class, service, bytes, claim))
     }
 
@@ -390,10 +458,9 @@ impl Ledger {
         service: &ServiceKey,
         bytes: usize,
     ) -> Option<Charge> {
-        let (claim, held) = self
+        let claim = self
             .settled(|state, _| self.debit(state, class, service, bytes, false))
             .ok()?;
-        publish_service(service, held);
         Some(self.charge(class, service, bytes, claim))
     }
 
@@ -417,10 +484,14 @@ impl Ledger {
     ) -> Result<Charge, Reason> {
         let queued = {
             let waiting = service.clone();
-            self.settled(
-                |state, now| match self.debit(state, class, service, bytes, true) {
-                    Ok((claim, held)) => Ok((claim, held)),
-                    Err(_) => {
+            self.settled(|state, now| {
+                let fast = match self.queued_ahead(state, class, now) {
+                    true => None,
+                    false => self.debit(state, class, service, bytes, true).ok(),
+                };
+                match fast {
+                    Some(claim) => Ok(claim),
+                    None => {
                         let (granted, receiver) = oneshot::channel();
                         let id = state.next_id;
                         state.next_id += 1;
@@ -432,16 +503,14 @@ impl Ledger {
                             since: now,
                             granted,
                         });
+                        self.grant(state);
                         Err((id, receiver))
                     }
-                },
-            )
+                }
+            })
         };
         let mut queued = match queued {
-            Ok((claim, held)) => {
-                publish_service(service, held);
-                return Ok(self.charge(class, service, bytes, claim));
-            }
+            Ok(claim) => return Ok(self.charge(class, service, bytes, claim)),
             Err((id, receiver)) => Queued {
                 ledger: Arc::clone(self),
                 id,
@@ -461,7 +530,6 @@ impl Ledger {
         match answered {
             Some(Ok(stack)) => {
                 queued.settled = true;
-                publish_service(service, self.lock().service(service));
                 Ok(self.charge(class, service, bytes, stack))
             }
             Some(Err(_)) | None => Err(self
@@ -523,13 +591,12 @@ impl Ledger {
     }
 
     pub(crate) fn move_to_residue(&self, class: Class, service: &ServiceKey) {
-        let held = self.settled(|state, _| {
-            let held = self.give(state, class, service, self.settings.stack);
+        self.settled(|state, _| {
+            self.give(state, class, service, self.settings.stack);
             state.in_use += self.settings.stack;
             state.residue += self.settings.stack;
-            held
+            self.grant(state);
         });
-        publish_service(service, held);
     }
 
     pub(crate) fn thread_idle(&self) {
@@ -619,6 +686,20 @@ impl Charge {
         self.peak
     }
 
+    pub(crate) fn account(
+        &self,
+        handler: &str,
+        kind: crate::wasm_runtime::InvocationKind,
+    ) -> super::hold::Account {
+        super::hold::Account::new(
+            Arc::clone(&self.ledger),
+            self.class,
+            self.service.clone(),
+            handler,
+            kind,
+        )
+    }
+
     pub(crate) fn linear(&self) -> usize {
         self.linear
     }
@@ -688,27 +769,10 @@ impl Charge {
                     .release(self.class, &self.service, self.held - wanted);
                 Verdict::Allowed
             }
-            Some(extra) => {
-                let ledger = Arc::clone(&self.ledger);
-                let (class, service) = (self.class, self.service.clone());
-                let charged =
-                    ledger.settled(
-                        |state, _| match ledger.allows_growth(state, &service, extra) {
-                            Err(reason) if ledger.settings.enforce => Err(reason),
-                            allowed => {
-                                let held = ledger.take(state, class, &service, extra);
-                                Ok((held, allowed.err()))
-                            }
-                        },
-                    );
-                match charged {
-                    Err(reason) => return Verdict::Denied(reason),
-                    Ok((held, warned)) => {
-                        publish_service(&service, held);
-                        warned.map_or(Verdict::Allowed, Verdict::Warned)
-                    }
-                }
-            }
+            Some(extra) => match self.ledger.grow(self.class, &self.service, extra) {
+                Verdict::Denied(reason) => return Verdict::Denied(reason),
+                verdict => verdict,
+            },
         };
         self.held = wanted;
         self.linear = linear;
@@ -720,17 +784,14 @@ impl Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        let held = self.ledger.settled(|state, _| {
+        self.ledger.settled(|state, _| {
             if self.stack == Some(Stack::Claimed) {
                 state.claimed = state.claimed.saturating_sub(1);
             }
-            let held = self
-                .ledger
+            self.ledger
                 .give(state, self.class, &self.service, self.held);
             self.ledger.grant(state);
-            held
         });
-        publish_service(&self.service, held);
     }
 }
 
@@ -961,6 +1022,60 @@ mod tests {
         assert!(!fresh.is_finished(), "fresh background comes last");
         drop((aged, interactive));
         drop(fresh.await.expect("join"));
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_large_aged_waiter_is_granted_against_a_stream_of_small_arrivals() {
+        let ledger = ledger(true);
+        let mut small: VecDeque<Charge> = (0..20)
+            .map(|i| {
+                ledger
+                    .try_reserve(Class::Interactive, &service(&format!("s{i}")), 2 * MIB)
+                    .expect("fits")
+            })
+            .collect();
+        let filler = ledger
+            .try_reserve(Class::Interactive, &service("filler"), 25 * MIB)
+            .expect("fits");
+        let aged = tokio::spawn({
+            let ledger = Arc::clone(&ledger);
+            async move {
+                ledger
+                    .reserve(Class::Background, &service("big"), 40 * MIB, None)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut arrivals = Vec::new();
+        for i in 0..40 {
+            if aged.is_finished() {
+                break;
+            }
+            drop(small.pop_front());
+            let ledger = Arc::clone(&ledger);
+            let until = Some(Instant::now() + Duration::from_millis(200));
+            arrivals.push(tokio::spawn(async move {
+                ledger
+                    .reserve(
+                        Class::Interactive,
+                        &service(&format!("n{i}")),
+                        2 * MIB,
+                        until,
+                    )
+                    .await
+                    .ok()
+            }));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let aged = aged
+            .await
+            .expect("join")
+            .expect("the aged waiter is granted");
+        drop((aged, filler, small));
+        for arrival in arrivals {
+            drop(arrival.await.expect("join"));
+        }
         assert_eq!(ledger.in_use(), 0);
     }
 

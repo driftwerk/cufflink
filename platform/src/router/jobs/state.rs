@@ -1,6 +1,8 @@
 use crate::repo::wasm_jobs::{JobStatus, WasmJob};
-use crate::router::guest_response::{decode, GuestResponse};
+use crate::router::guest_response::{answer, parse_output, DecodeError};
+use crate::wasm_runtime::budget::{Hold, Refused};
 use crate::wasm_runtime::ExecutionError;
+use crate::wasm_runtime::GuestOutput;
 use chrono::{DateTime, Utc};
 use cufflink_types::backoff::Backoff;
 use cufflink_types::delivery::DeliveryControl;
@@ -124,20 +126,13 @@ impl Attempt {
     }
 }
 
-fn answer_of(response: &str) -> Option<(u16, Option<DeliveryControl>)> {
-    decode(response.to_string())
-        .ok()
-        .map(|response| match response {
-            GuestResponse::Legacy { status, .. } => (status.as_u16(), None),
-            GuestResponse::V2(response) => (
-                response.status.as_u16(),
-                response.delivery.map(|delivery| *delivery),
-            ),
-        })
-}
-
-fn answered(response: String, job: &WasmJob) -> Attempt {
-    match answer_of(&response) {
+fn answered(response: GuestOutput, job: &WasmJob) -> Result<(Attempt, Hold), Refused> {
+    let answer = match answer(&response) {
+        Ok(answer) => Some((answer.status.as_u16(), answer.delivery)),
+        Err(DecodeError::Invalid(_)) => None,
+        Err(DecodeError::Refused(refused)) => return Err(refused),
+    };
+    let failed = match answer {
         Some((status, Some(DeliveryControl::RetryAfter { retry_after_ms }))) => Attempt::failed(
             JobErrorClass::Explicit {
                 retry_after: Duration::from_millis(retry_after_ms),
@@ -156,40 +151,76 @@ fn answered(response: String, job: &WasmJob) -> Attempt {
                 format!("Handler answered {status}"),
             )
         }
-        _ => Attempt::Completed(serde_json::from_str(&response).unwrap_or(Value::String(response))),
-    }
+        _ => {
+            let (value, hold) = parse_output(response)?;
+            return Ok((Attempt::Completed(value), hold));
+        }
+    };
+    Ok((failed, Hold::none()))
 }
 
 pub fn classify(
+    run: Result<GuestOutput, ExecutionError>,
+    job: &WasmJob,
+    at_hard_deadline: bool,
+    deferrals_allowed: u32,
+    refusal: impl FnOnce(Refused) -> ExecutionError,
+) -> (Attempt, Hold) {
+    let error = match run.map(|response| answered(response, job)) {
+        Ok(Ok(settled)) => return settled,
+        Ok(Err(refused)) => refusal(refused),
+        Err(error) => error,
+    };
+    (
+        unanswered(error, job, at_hard_deadline, deferrals_allowed),
+        Hold::none(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn classified(
     run: Result<String, ExecutionError>,
     job: &WasmJob,
     at_hard_deadline: bool,
     deferrals_allowed: u32,
 ) -> Attempt {
-    match run {
-        Ok(response) => answered(response, job),
-        Err(ExecutionError::Cancelled) => Attempt::LeaseLost,
-        Err(e) if e.interrupted_by_shutdown(at_hard_deadline) => {
-            Attempt::Interrupted(e.to_string())
-        }
-        Err(ExecutionError::Overloaded { retry_after, .. })
+    let run = run.map(|text| GuestOutput {
+        text,
+        hold: Hold::none(),
+    });
+    classify(run, job, at_hard_deadline, deferrals_allowed, |refused| {
+        ExecutionError::Response(refused.to_string())
+    })
+    .0
+}
+
+fn unanswered(
+    error: ExecutionError,
+    job: &WasmJob,
+    at_hard_deadline: bool,
+    deferrals_allowed: u32,
+) -> Attempt {
+    match error {
+        ExecutionError::Cancelled => Attempt::LeaseLost,
+        e if e.interrupted_by_shutdown(at_hard_deadline) => Attempt::Interrupted(e.to_string()),
+        ExecutionError::Overloaded { retry_after, .. }
             if u32::try_from(job.capacity_deferrals).unwrap_or(u32::MAX) < deferrals_allowed =>
         {
             metrics::counter!("cufflink_wasm_job_deferrals_total", "result" => "deferred")
                 .increment(1);
             Attempt::Deferred(retry_after)
         }
-        Err(e @ ExecutionError::Overloaded { .. }) => {
+        e @ ExecutionError::Overloaded { .. } => {
             metrics::counter!("cufflink_wasm_job_deferrals_total", "result" => "counted")
                 .increment(1);
             Attempt::failed(JobErrorClass::Capacity, e.to_string())
         }
-        Err(ExecutionError::DeadlineExceeded { .. }) => Attempt::failed(
+        ExecutionError::DeadlineExceeded { .. } => Attempt::failed(
             JobErrorClass::Timeout,
             format!("Handler exceeded timeout ({}s)", job.timeout_secs),
         ),
-        Err(e @ ExecutionError::Runtime(_)) => Attempt::failed(JobErrorClass::Crash, e.to_string()),
-        Err(e @ ExecutionError::HandlerNotFound(_)) => {
+        e @ ExecutionError::Runtime(_) => Attempt::failed(JobErrorClass::Crash, e.to_string()),
+        e @ ExecutionError::HandlerNotFound(_) => {
             let error = format!("Handler error: {e}");
             Attempt::failed(
                 JobErrorClass::Terminal {
@@ -198,7 +229,7 @@ pub fn classify(
                 error,
             )
         }
-        Err(e) => Attempt::failed(JobErrorClass::HandlerError, format!("Handler error: {e}")),
+        e => Attempt::failed(JobErrorClass::HandlerError, format!("Handler error: {e}")),
     }
 }
 
@@ -294,11 +325,11 @@ pub(crate) mod tests {
         let mut waiting = job(JobStatus::Running, 1, 3);
         waiting.capacity_deferrals = 9;
         assert_eq!(
-            classify(overloaded(), &waiting, false, 10),
+            classified(overloaded(), &waiting, false, 10),
             Attempt::Deferred(Duration::from_secs(2))
         );
         waiting.capacity_deferrals = 10;
-        let Attempt::Failed { class, error } = classify(overloaded(), &waiting, false, 10) else {
+        let Attempt::Failed { class, error } = classified(overloaded(), &waiting, false, 10) else {
             panic!("the eleventh deferral counts");
         };
         assert_eq!(class, JobErrorClass::Capacity);
@@ -309,7 +340,7 @@ pub(crate) mod tests {
             "as a crash is, whatever retry_on says"
         );
         assert_eq!(
-            classify(
+            classified(
                 Err(ExecutionError::TooLarge {
                     requested: 2,
                     share: 1
@@ -550,14 +581,14 @@ pub(crate) mod tests {
         ] {
             for retry_on in [vec![], vec![RetryOn::Timeout]] {
                 assert_eq!(
-                    classify(Ok(response.into()), &retrying(&retry_on), false, 10),
+                    classified(Ok(response.into()), &retrying(&retry_on), false, 10),
                     Attempt::Completed(serde_json::from_str(response).expect("json")),
                     "{response}"
                 );
             }
         }
         assert_eq!(
-            classify(Ok("plain text".into()), &retrying(&[]), false, 10),
+            classified(Ok("plain text".into()), &retrying(&[]), false, 10),
             Attempt::Completed(Value::String("plain text".into()))
         );
     }
@@ -573,7 +604,7 @@ pub(crate) mod tests {
             ),
         ] {
             assert_eq!(
-                classify(Ok(response.into()), &job, false, 10),
+                classified(Ok(response.into()), &job, false, 10),
                 Attempt::failed(
                     JobErrorClass::HandlerError,
                     format!("Handler answered {status}")
@@ -589,7 +620,7 @@ pub(crate) mod tests {
         ] {
             assert!(
                 matches!(
-                    classify(Ok(response.into()), &job, false, 10),
+                    classified(Ok(response.into()), &job, false, 10),
                     Attempt::Completed(_)
                 ),
                 "{response}"
@@ -602,7 +633,7 @@ pub(crate) mod tests {
         for retry_on in retry_sets() {
             let job = retrying(&retry_on);
             assert_eq!(
-                classify(
+                classified(
                     Ok(r#"{"__v":2,"__status":503,"__body":{"error":"busy"},"__delivery":{"retry_after_ms":1500}}"#.into()),
                     &job,
                     false,
@@ -616,7 +647,7 @@ pub(crate) mod tests {
                 )
             );
             assert_eq!(
-                classify(
+                classified(
                     Ok(r#"{"__v":2,"__status":422,"__body":{"error":"unknown book"},"__delivery":{"terminal":"unknown book"}}"#.into()),
                     &job,
                     false,
@@ -642,7 +673,7 @@ pub(crate) mod tests {
             r#"{"__v":2,"__status":503,"__body":{},"__delivery":{"retry_after_ms":"soon"}}"#,
         ] {
             assert_eq!(
-                classify(Ok(response.into()), &job, false, 10),
+                classified(Ok(response.into()), &job, false, 10),
                 Attempt::Completed(serde_json::from_str(response).expect("json")),
                 "{response}"
             );
@@ -658,27 +689,27 @@ pub(crate) mod tests {
             })
         };
         assert_eq!(
-            classify(deadline(), &job, false, 10),
+            classified(deadline(), &job, false, 10),
             Attempt::failed(JobErrorClass::Timeout, "Handler exceeded timeout (900s)")
         );
         assert!(matches!(
-            classify(deadline(), &job, true, 10),
+            classified(deadline(), &job, true, 10),
             Attempt::Interrupted(_)
         ));
         assert!(matches!(
-            classify(Err(ExecutionError::ShuttingDown), &job, false, 10),
+            classified(Err(ExecutionError::ShuttingDown), &job, false, 10),
             Attempt::Interrupted(_)
         ));
         assert_eq!(
-            classify(Err(ExecutionError::Cancelled), &job, false, 10),
+            classified(Err(ExecutionError::Cancelled), &job, false, 10),
             Attempt::LeaseLost
         );
         assert_eq!(
-            classify(Err(ExecutionError::Runtime("join".into())), &job, false, 10),
+            classified(Err(ExecutionError::Runtime("join".into())), &job, false, 10),
             Attempt::failed(JobErrorClass::Crash, "WASM runtime error: join")
         );
         assert_eq!(
-            classify(
+            classified(
                 Err(ExecutionError::Trap("unreachable".into())),
                 &job,
                 false,
@@ -690,7 +721,7 @@ pub(crate) mod tests {
             )
         );
         assert!(matches!(
-            classify(
+            classified(
                 Err(ExecutionError::MemoryLimit {
                     requested: 2,
                     limit: 1
@@ -705,7 +736,7 @@ pub(crate) mod tests {
             }
         ));
         assert!(matches!(
-            classify(Err(ExecutionError::HandlerNotFound("h".into())), &job, false, 10),
+            classified(Err(ExecutionError::HandlerNotFound("h".into())), &job, false, 10),
             Attempt::Failed {
                 class: JobErrorClass::Terminal { .. },
                 error,

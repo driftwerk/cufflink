@@ -23,6 +23,7 @@ use tracing::info;
 use uuid::Uuid;
 use wasmtime::*;
 
+pub(crate) use budget::RouteKey;
 pub use budget::{Admission, Class};
 pub use invocation::{ExecutionError, Invocation, InvocationKind};
 
@@ -210,21 +211,33 @@ pub struct CompiledModule {
 
 pub(crate) struct RouteAdmission<'a> {
     pub handler: &'a str,
+    pub route: budget::RouteKey,
     pub class: Class,
     pub max_concurrent: Option<u32>,
     pub budget: Duration,
 }
 
+impl RouteAdmission<'_> {
+    fn limit(&self) -> Option<(budget::RouteKey, u32)> {
+        self.max_concurrent.map(|max| (self.route, max))
+    }
+}
+
 const WASM_PAGE: u64 = 64 * 1024;
 
 fn initial_memory(module: &Module) -> usize {
-    module
-        .exports()
-        .find_map(|export| match export.ty() {
-            ExternType::Memory(memory) => Some(memory.minimum().saturating_mul(WASM_PAGE)),
-            _ => None,
-        })
-        .map_or(0, |bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
+    let required = module.resources_required();
+    let memory = required
+        .max_initial_memory_size
+        .unwrap_or_default()
+        .saturating_mul(WASM_PAGE)
+        .saturating_mul(u64::from(required.num_memories));
+    let tables = required
+        .max_initial_table_size
+        .unwrap_or_default()
+        .saturating_mul(budget::TABLE_ELEMENT_BYTES as u64)
+        .saturating_mul(u64::from(required.num_tables));
+    usize::try_from(memory.saturating_add(tables)).unwrap_or(usize::MAX)
 }
 
 struct CacheEntry {
@@ -755,7 +768,7 @@ impl WasmEngine {
                     kind: InvocationKind::Route,
                     identity,
                     handler: route.handler,
-                    route_limit: route.max_concurrent,
+                    route: route.limit(),
                     initial_memory: compiled.initial_memory,
                     budget: route.budget,
                 },
@@ -775,7 +788,7 @@ impl WasmEngine {
             kind: InvocationKind::Route,
             identity,
             handler: route.handler,
-            route_limit: route.max_concurrent,
+            route: route.limit(),
             initial_memory: 0,
             budget: route.budget,
         };
@@ -795,6 +808,29 @@ impl WasmEngine {
         self.budget.room(None, None).await
     }
 
+    pub fn publish_gauges(&self) {
+        self.budget.publish();
+    }
+
+    pub(crate) fn hold(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        class: Class,
+        handler: &str,
+        kind: InvocationKind,
+    ) -> budget::Hold {
+        budget::Hold::on(self.budget.account(identity, class, handler, kind))
+    }
+
+    pub fn refusal(&self, refused: budget::Refused, ran: bool) -> ExecutionError {
+        match refused {
+            budget::Refused::Budget(capacity) => {
+                self.budget.refusal(capacity.reason, capacity.holding, ran)
+            }
+            budget::Refused::Cap(cap) => ExecutionError::Response(cap.to_string()),
+        }
+    }
+
     pub fn capacity_deferrals_allowed(&self) -> u32 {
         self.budget.capacity_retries_job()
     }
@@ -810,27 +846,45 @@ impl WasmEngine {
                 kind: inv.kind,
                 identity: &inv.identity,
                 handler: &inv.handler,
-                route_limit: None,
+                route: None,
                 initial_memory: inv.compiled.initial_memory,
                 budget: inv.budget,
             },
             &self.permits,
         );
+        let hard_deadline = async {
+            self.shutdown.cancelled().await;
+            tokio::time::sleep(
+                self.shutdown
+                    .remaining()
+                    .saturating_sub(crate::shutdown::KILL_MARGIN),
+            )
+            .await;
+        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ExecutionError::Cancelled),
-            _ = self.shutdown.cancelled(), if self.budget.waits_outside_budget(inv.class, inv.kind) => {
-                Err(ExecutionError::ShuttingDown)
+            _ = hard_deadline, if self.budget.waits_outside_budget(inv.class, inv.kind) => {
+                Err(self.budget.overloaded(budget::Reason::Memory, false))
             }
             admitted = admitted => admitted,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_text(
+        &self,
+        state: Arc<AppState>,
+        inv: Invocation,
+    ) -> Result<String, ExecutionError> {
+        self.run(state, inv).await.map(|output| output.text)
     }
 
     pub async fn run(
         &self,
         state: Arc<AppState>,
         inv: Invocation,
-    ) -> Result<String, ExecutionError> {
+    ) -> Result<GuestOutput, ExecutionError> {
         let kind = inv.kind.label();
         let started = Instant::now();
         let result = self.run_admitted(state, inv).await;
@@ -850,7 +904,7 @@ impl WasmEngine {
         kind: InvocationKind,
         request: String,
         invocation: impl Fn(String) -> Invocation,
-    ) -> Result<String, ExecutionError> {
+    ) -> Result<GuestOutput, ExecutionError> {
         for _ in 0..self.budget.capacity_retries() {
             let run = self
                 .run(Arc::clone(&state), invocation(request.clone()))
@@ -873,7 +927,7 @@ impl WasmEngine {
         &self,
         state: Arc<AppState>,
         mut inv: Invocation,
-    ) -> Result<String, ExecutionError> {
+    ) -> Result<GuestOutput, ExecutionError> {
         let cancel = inv.cancel.clone().unwrap_or_default();
         let early = match inv.admission.take() {
             Some(admission) => Some(admission),
@@ -925,7 +979,7 @@ impl WasmEngine {
         policies: Arc<PolicySet>,
         deadline: Instant,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<String, ExecutionError> {
+    ) -> Result<GuestOutput, ExecutionError> {
         let (_slots, charge) = admission.into_parts();
         let _span = scoped_span!(
             "wasm_handler",
@@ -936,11 +990,10 @@ impl WasmEngine {
         .entered();
         let kind = inv.kind.label();
 
-        let request = serde_json::from_str::<serde_json::Value>(&inv.request_json).ok();
-        let auth = request
-            .as_ref()
-            .and_then(crate::router::jobs::AuthSnapshot::from_request_auth);
-        let call_depth = request.as_ref().map_or(0, host::inbound_depth);
+        let RequestContext { auth, caller } =
+            serde_json::from_str(&inv.request_json).unwrap_or_default();
+        let call_depth = host::caller_depth(&caller);
+        let auth = crate::router::jobs::AuthSnapshot::from_auth(auth);
         let guest_limits = GuestLimits::new(
             Arc::clone(&self.limits),
             Arc::clone(&policies),
@@ -1011,7 +1064,7 @@ impl WasmEngine {
             .record(store.data().guest_limits.peak_memory() as f64);
         if let Ok(response) = &result {
             metrics::histogram!("cufflink_wasm_response_bytes", "kind" => kind)
-                .record(response.len() as f64);
+                .record(response.text.len() as f64);
         }
         result
     }
@@ -1020,12 +1073,15 @@ impl WasmEngine {
         &self,
         store: &mut Store<HostState>,
         inv: &Invocation,
-    ) -> Result<String, ExecutionError> {
-        let instance = inv
-            .compiled
-            .instance_pre
-            .instantiate(&mut *store)
-            .map_err(|e| classify(store, e, inv.budget, &self.budget))?;
+    ) -> Result<GuestOutput, ExecutionError> {
+        let instance =
+            inv.compiled
+                .instance_pre
+                .instantiate(&mut *store)
+                .map_err(|e| match store.data().guest_limits.budget_denial() {
+                    Some(denial) => unrun(denial, &self.budget),
+                    None => classify(store, e, inv.budget, &self.budget),
+                })?;
 
         let memory = instance
             .get_memory(&mut *store, "memory")
@@ -1060,11 +1116,49 @@ impl WasmEngine {
             .call(&mut *store, (request_ptr as i32, request_len))
             .map_err(|e| classify(store, e, inv.budget, &self.budget))?;
 
-        read_response(
+        let mut hold = store.data().hold();
+        let text = read_response(
             memory.data(&*store),
             response_ptr,
             self.limits.max_response_bytes,
+            |len| hold.grow(len),
         )
+        .map_err(|read| match read {
+            ResponseRead::Invalid(error) => error,
+            ResponseRead::Refused(capacity) => {
+                let limits = &mut store.data_mut().guest_limits;
+                limits.host_refused(budget::Refused::Budget(capacity));
+                limits.budget_denial().map_or_else(
+                    || self.budget.overloaded(capacity.reason, true),
+                    |denial| denied(denial, &self.budget, true),
+                )
+            }
+        })?;
+        Ok(GuestOutput { text, hold })
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+struct RequestContext {
+    #[serde(default)]
+    auth: serde_json::Value,
+    #[serde(default)]
+    caller: serde_json::Value,
+}
+
+pub struct GuestOutput {
+    pub text: String,
+    pub hold: budget::Hold,
+}
+
+enum ResponseRead {
+    Invalid(ExecutionError),
+    Refused(budget::Capacity),
+}
+
+impl From<ExecutionError> for ResponseRead {
+    fn from(error: ExecutionError) -> Self {
+        Self::Invalid(error)
     }
 }
 
@@ -1085,20 +1179,27 @@ fn classify(
                 requested: denied.requested,
                 limit: denied.limit,
             },
-            (None, Some(denial)) if trapped => match memory.share() {
-                Some(share) if denial.holding > share => ExecutionError::TooLarge {
-                    requested: denial.holding,
-                    share,
-                },
-                _ => memory.overloaded(denial.reason, true),
-            },
+            (None, Some(denial)) if trapped => denied(denial, memory, true),
             _ if trapped => ExecutionError::Trap(err.to_string()),
             _ => ExecutionError::Runtime(err.to_string()),
         },
     }
 }
 
-fn read_response(memory: &[u8], ptr: i32, max_bytes: usize) -> Result<String, ExecutionError> {
+fn denied(denial: host::BudgetDenial, memory: &budget::Budget, ran: bool) -> ExecutionError {
+    memory.refusal(denial.reason, denial.holding, ran)
+}
+
+fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError {
+    denied(denial, memory, false)
+}
+
+fn read_response(
+    memory: &[u8],
+    ptr: i32,
+    max_bytes: usize,
+    charge: impl FnOnce(usize) -> Result<(), budget::Capacity>,
+) -> Result<String, ResponseRead> {
     let start = usize::try_from(ptr)
         .map_err(|_| ExecutionError::Response("negative response pointer".into()))?;
     let len_bytes: [u8; 4] = memory
@@ -1115,13 +1216,15 @@ fn read_response(memory: &[u8], ptr: i32, max_bytes: usize) -> Result<String, Ex
         .increment(1);
         return Err(ExecutionError::Response(format!(
             "response of {len} bytes exceeds the {max_bytes} byte cap"
-        )));
+        ))
+        .into());
     }
     let body = memory
         .get(start + 4..start + 4 + len)
         .ok_or_else(|| ExecutionError::Response("response body out of bounds".into()))?;
+    charge(len).map_err(ResponseRead::Refused)?;
     String::from_utf8(body.to_vec())
-        .map_err(|e| ExecutionError::Response(format!("response is not UTF-8: {e}")))
+        .map_err(|e| ExecutionError::Response(format!("response is not UTF-8: {e}")).into())
 }
 
 fn start_epoch_ticker(engine: &Engine, tick: Duration) -> Result<()> {
@@ -1551,18 +1654,31 @@ pub(crate) mod tests {
         let mut memory = vec![0u8; 64];
         memory[8..12].copy_from_slice(&5u32.to_le_bytes());
         memory[12..17].copy_from_slice(b"hello");
-        assert_eq!(read_response(&memory, 8, 64).unwrap(), "hello");
+        let read = |memory: &[u8], ptr, max| read_response(memory, ptr, max, |_| Ok(()));
+        assert!(matches!(read(&memory, 8, 64), Ok(text) if text == "hello"));
+        let refused = budget::Capacity {
+            reason: budget::Reason::Memory,
+            requested: 5,
+            holding: 5,
+        };
         assert!(matches!(
-            read_response(&memory, 8, 4),
-            Err(ExecutionError::Response(msg)) if msg.contains("cap")
+            read_response(&memory, 8, 64, |len| {
+                assert_eq!(len, 5, "charged before the copy");
+                Err(refused)
+            }),
+            Err(ResponseRead::Refused(capacity)) if capacity == refused
+        ));
+        assert!(matches!(
+            read(&memory, 8, 4),
+            Err(ResponseRead::Invalid(ExecutionError::Response(msg))) if msg.contains("cap")
         ));
         memory[8..12].copy_from_slice(&1000u32.to_le_bytes());
         assert!(matches!(
-            read_response(&memory, 8, 4096),
-            Err(ExecutionError::Response(msg)) if msg.contains("out of bounds")
+            read(&memory, 8, 4096),
+            Err(ResponseRead::Invalid(ExecutionError::Response(msg))) if msg.contains("out of bounds")
         ));
-        assert!(read_response(&memory, -1, 64).is_err());
-        assert!(read_response(&memory, 62, 64).is_err());
+        assert!(read(&memory, -1, 64).is_err());
+        assert!(read(&memory, 62, 64).is_err());
     }
 
     const PROBES: &str = r#"
@@ -1607,7 +1723,7 @@ pub(crate) mod tests {
         let state = AppState::minimal(engine.clone()).await;
         for handler in ["oob", "not_utf8", "valid", "neg_len"] {
             let response = engine
-                .run(
+                .run_text(
                     Arc::clone(&state),
                     invocation(
                         Arc::clone(&compiled),
@@ -1655,7 +1771,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&engine, READBACK);
         let state = AppState::minimal(engine.clone()).await;
         let response = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1681,7 +1797,7 @@ pub(crate) mod tests {
         );
         let state = AppState::minimal_with_policies(engine.clone(), &enforce_wasm_limits()).await;
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1705,7 +1821,7 @@ pub(crate) mod tests {
         let state = AppState::minimal(engine.clone()).await;
         let started = Instant::now();
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1738,7 +1854,7 @@ pub(crate) mod tests {
             let (engine, cancel) = (engine.clone(), cancel.clone());
             async move {
                 engine
-                    .run(
+                    .run_text(
                         state,
                         Invocation {
                             cancel: Some(cancel),
@@ -1785,7 +1901,7 @@ pub(crate) mod tests {
             .expect("the only permit");
         let started = Instant::now();
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1827,12 +1943,15 @@ pub(crate) mod tests {
             )
         };
         let err = engine
-            .run(Arc::clone(&state), queued(Some(cancel)))
+            .run_text(Arc::clone(&state), queued(Some(cancel)))
             .await
             .unwrap_err();
         assert!(matches!(err, ExecutionError::Cancelled), "{err}");
         drop(held);
-        let response = engine.run(state, queued(None)).await.expect("response");
+        let response = engine
+            .run_text(state, queued(None))
+            .await
+            .expect("response");
         assert!(!response.is_empty());
     }
 
@@ -1860,6 +1979,11 @@ pub(crate) mod tests {
         let before = refusals();
         let limited = |handler| RouteAdmission {
             handler,
+            route: budget::RouteKey {
+                service_id: identity.service_id,
+                version: 1,
+                index: usize::from(handler == "import"),
+            },
             class: Class::Interactive,
             max_concurrent: Some(2),
             budget: Duration::from_secs(30),
@@ -1900,6 +2024,11 @@ pub(crate) mod tests {
                         &identity,
                         RouteAdmission {
                             handler: "export",
+                            route: budget::RouteKey {
+                                service_id: identity.service_id,
+                                version: 1,
+                                index: 0,
+                            },
                             class: Class::Interactive,
                             max_concurrent: Some(2),
                             budget: Duration::from_secs(30),
@@ -1918,7 +2047,11 @@ pub(crate) mod tests {
     }
 
     fn budgeted(mode: &str, mib: &str) -> WasmEngine {
-        engine_with(WasmLimits {
+        engine_with(budgeted_limits(mode, mib))
+    }
+
+    fn budgeted_limits(mode: &str, mib: &str) -> WasmLimits {
+        WasmLimits {
             budget: budget::BudgetConfig::from_vars(
                 cufflink_settings::fixed(&[
                     ("WASM_MEMORY_BUDGET_MODE", mode),
@@ -1932,7 +2065,7 @@ pub(crate) mod tests {
             )
             .expect("budget"),
             ..WasmLimits::default()
-        })
+        }
     }
 
     fn holding_guest(pages: u32, ms: u32) -> String {
@@ -1965,7 +2098,7 @@ pub(crate) mod tests {
             let (engine, state) = (engine.clone(), Arc::clone(&state));
             async move {
                 engine
-                    .run(
+                    .run_text(
                         state,
                         invocation(
                             compiled,
@@ -2003,6 +2136,74 @@ pub(crate) mod tests {
             "only idle threads' stacks remain"
         );
         (results, peak)
+    }
+
+    #[test]
+    fn execute_reads_only_the_auth_and_the_caller_from_the_request() {
+        let request = r#"{"body":{"rows":[[1],[2]]},"auth":{"sub":"u-1","roles":["a"]},"caller":{"depth":2},"method":"POST"}"#;
+        let RequestContext { auth, caller } = serde_json::from_str(request).expect("context");
+        let full: serde_json::Value = serde_json::from_str(request).expect("request");
+        assert_eq!(host::caller_depth(&caller), 2);
+        let snapshot = crate::router::jobs::AuthSnapshot::from_auth(auth).expect("auth");
+        let expected = crate::router::jobs::AuthSnapshot::from_request_auth(&full).expect("auth");
+        assert_eq!(
+            (snapshot.subject, snapshot.claims),
+            (expected.subject, expected.claims)
+        );
+        for other in [r#""text""#, "null", r#"{"auth":null}"#, "{"] {
+            let RequestContext { auth, caller } = serde_json::from_str(other).unwrap_or_default();
+            assert!(
+                crate::router::jobs::AuthSnapshot::from_auth(auth).is_none(),
+                "{other}"
+            );
+            assert_eq!(host::caller_depth(&caller), 0, "{other}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_waiting_for_memory_at_shutdown_is_answered_unrun_at_the_hard_deadline() {
+        let limits = budgeted_limits("enforce", "64");
+        let shutdown = Shutdown::new(crate::shutdown::KILL_MARGIN + Duration::from_millis(300));
+        let engine = WasmEngine::new(limits, shutdown.clone()).expect("engine");
+        let (_, compiled) = install(&engine, &holding_guest(1, 0));
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let full = ledger
+            .try_reserve(
+                Class::Interactive,
+                &budget::ServiceKey {
+                    tenant: "globex".into(),
+                    service: "loan-service".into(),
+                },
+                60 * MIB,
+            )
+            .expect("fills the budget");
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "hold",
+                            InvocationKind::Subscription,
+                            Duration::from_secs(30),
+                        ),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.trigger();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the drain does not end the wait");
+        let answered = waiting.await.expect("join");
+        assert!(
+            matches!(answered, Err(ExecutionError::Overloaded { ran: false, .. })),
+            "a not-run answer, which a subscription defers and naks: {answered:?}"
+        );
+        drop(full);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2047,7 +2248,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&engine, &holding_guest(1100, 0));
         let state = AppState::minimal(engine.clone()).await;
         let run = |handler: &str| {
-            engine.run(
+            engine.run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -2084,7 +2285,7 @@ pub(crate) mod tests {
             .try_reserve(Class::Interactive, &other, 40 * MIB)
             .expect("fits");
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(small, "hold", InvocationKind::Route, Duration::from_secs(5)),
             )
@@ -2110,7 +2311,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&engine, creep);
         let state = AppState::minimal(engine.clone()).await;
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -2141,7 +2342,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&enforce, &hog);
         let state = AppState::minimal_with_policies(enforce.clone(), &enforce_wasm_limits()).await;
         let err = enforce
-            .run(
+            .run_text(
                 state,
                 invocation(compiled, "hog", InvocationKind::Job, Duration::from_secs(5)),
             )
@@ -2157,7 +2358,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&warn, &hog);
         let state = AppState::minimal(warn.clone()).await;
         let response = warn
-            .run(
+            .run_text(
                 state,
                 invocation(compiled, "hog", InvocationKind::Job, Duration::from_secs(5)),
             )
@@ -2208,7 +2409,7 @@ pub(crate) mod tests {
         let engine = engine();
         let (_, compiled) = install(&engine, &grow_65_mib);
         let run = |state: Arc<AppState>| {
-            engine.run(
+            engine.run_text(
                 state,
                 invocation(
                     Arc::clone(&compiled),
@@ -2244,7 +2445,7 @@ pub(crate) mod tests {
         let (_, hog) = install(&engine, &hog);
         let state = AppState::minimal_with_policies(engine.clone(), &[above_ceiling]).await;
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(hog, "hog", InvocationKind::Job, Duration::from_secs(5)),
             )
@@ -2358,7 +2559,7 @@ pub(crate) mod tests {
         let engine = engine();
         let (_, compiled) = install(&engine, &presigning_guest());
         let call = |state: Arc<AppState>, handler: &str| {
-            engine.run(
+            engine.run_text(
                 state,
                 invocation(
                     Arc::clone(&compiled),
@@ -2449,7 +2650,7 @@ pub(crate) mod tests {
             .await
             .expect("seed image");
         let call = |handler: &str| {
-            engine.run(
+            engine.run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -2532,7 +2733,7 @@ pub(crate) mod tests {
         let engine = engine();
         let (_, compiled) = install(&engine, &fetching_guest());
         let call = |state: Arc<AppState>, handler: &str| {
-            engine.run(
+            engine.run_text(
                 state,
                 invocation(
                     Arc::clone(&compiled),
@@ -2615,7 +2816,7 @@ pub(crate) mod tests {
         let before = reserved();
         let state = AppState::minimal(engine.clone()).await;
         engine
-            .run(
+            .run_text(
                 state,
                 Invocation {
                     publishes: None,
@@ -2641,7 +2842,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
         let state = AppState::minimal(engine.clone()).await;
         let err = engine
-            .run(
+            .run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -2655,7 +2856,7 @@ pub(crate) mod tests {
         assert!(matches!(err, ExecutionError::Response(_)), "{err}");
 
         let err = engine
-            .run(
+            .run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -2680,7 +2881,7 @@ pub(crate) mod tests {
         let state = AppState::minimal(engine.clone()).await;
         engine.shutdown.trigger();
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,

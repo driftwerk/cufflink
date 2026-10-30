@@ -1,6 +1,8 @@
 use crate::errors::PlatformError;
 use crate::registry::RegisteredService;
 use crate::repo::deployments::ExecutionContext;
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Refused};
+use crate::wasm_runtime::{GuestOutput, WasmEngine};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
@@ -18,6 +20,8 @@ pub struct WasmJob {
     pub service_name: Option<String>,
     #[serde(default)]
     pub publishes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested: bool,
 }
 
 impl WasmJob {
@@ -33,7 +37,12 @@ impl WasmJob {
             service_schema: identity.schema,
             service_name: Some(identity.service_name),
             publishes: service.manifest.publishes.clone(),
+            nested: false,
         }
+    }
+
+    pub fn nested(self, nested: bool) -> Self {
+        Self { nested, ..self }
     }
 
     pub fn matches(&self, context: &ExecutionContext) -> bool {
@@ -91,6 +100,22 @@ impl WasmJobResult {
             _ => Self::failed(message),
         }
     }
+
+    pub fn into_payload(self, hold: &mut Hold, engine: &WasmEngine) -> Vec<u8> {
+        match ChargedJson::write(&self, hold) {
+            Ok(text) => text.into_bytes(),
+            Err(ChargedJsonError::Capacity(refused)) => {
+                let error = engine.refusal(refused, true);
+                Self::of_error(&error, error.to_string()).into_payload(&mut Hold::none(), engine)
+            }
+            Err(ChargedJsonError::Syntax(e)) => serde_json::json!({
+                "ok": false,
+                "error": format!("Failed to serialize result: {e}"),
+            })
+            .to_string()
+            .into_bytes(),
+        }
+    }
 }
 
 pub const BUDGET_HEADER: &str = "Cufflink-Budget-Ms";
@@ -110,7 +135,9 @@ pub async fn execute_on_worker(
     service_name: &str,
     job: WasmJob,
     timeout: Duration,
-) -> Result<String, PlatformError> {
+    mut hold: Hold,
+    engine: Option<&WasmEngine>,
+) -> Result<GuestOutput, PlatformError> {
     let subject = format!("cufflink.wasm.{}.{}", service_name, job.handler);
 
     let payload = serde_json::to_vec(&job)
@@ -133,13 +160,24 @@ pub async fn execute_on_worker(
     .map_err(|_| PlatformError::Internal("WASM worker execution timed out".into()))?
     .map_err(|e| PlatformError::Internal(format!("NATS request failed: {}", e)))?;
 
+    hold.grow(reply.payload.len().saturating_mul(2))
+        .map_err(|capacity| match engine {
+            Some(engine) => crate::router::map_execution_error(
+                "WASM",
+                engine.refusal(Refused::Budget(capacity), true),
+            ),
+            None => PlatformError::Internal(format!("WASM worker reply refused: {capacity:?}")),
+        })?;
     let result: WasmJobResult = serde_json::from_slice(&reply.payload)
         .map_err(|e| PlatformError::Internal(format!("Failed to parse worker response: {}", e)))?;
+    drop(reply);
 
     if result.ok {
-        result
+        let text = result
             .response
-            .ok_or_else(|| PlatformError::Internal("Worker returned ok but no response".into()))
+            .ok_or_else(|| PlatformError::Internal("Worker returned ok but no response".into()))?;
+        hold.shrink_to(text.len());
+        Ok(GuestOutput { text, hold })
     } else if let Some(retry_after_ms) = result.retry_after_ms {
         Err(crate::router::retry_later(
             Duration::from_millis(retry_after_ms),
@@ -213,7 +251,18 @@ mod tests {
             service_schema: "stock_service".into(),
             service_name: Some("stock-service".into()),
             publishes: None,
+            nested: false,
         }
+    }
+
+    #[test]
+    fn a_nested_route_says_so_on_the_wire_and_an_older_job_is_interactive() {
+        let wire = serde_json::to_value(job()).expect("wire");
+        assert!(wire.get("nested").is_none(), "{wire}");
+        let nested = serde_json::to_value(job().nested(true)).expect("wire");
+        assert_eq!(nested["nested"], true);
+        let older: WasmJob = serde_json::from_value(wire).expect("older job");
+        assert!(!older.nested);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::caps::HostCaps;
 use super::cgroup::CgroupLimit;
 use super::ledger::Limits;
 use crate::policy::PolicyMode;
@@ -26,6 +27,7 @@ pub struct BudgetConfig {
     pub capacity_retries_job: u32,
     pub pressure_gate: bool,
     pub thread_stack: usize,
+    pub caps: HostCaps,
 }
 
 impl Default for BudgetConfig {
@@ -46,6 +48,7 @@ impl Default for BudgetConfig {
             capacity_retries_job: 10,
             pressure_gate: true,
             thread_stack: 2048 * 1024,
+            caps: HostCaps::default(),
         }
     }
 }
@@ -128,6 +131,7 @@ impl BudgetConfig {
                 .positive("WASM_CAPACITY_RETRIES_JOB", defaults.capacity_retries_job)?,
             pressure_gate: vars.parsed("WASM_MEMORY_PRESSURE_GATE", defaults.pressure_gate)?,
             thread_stack,
+            caps: HostCaps::from_vars(&vars, mode)?,
         })
     }
 

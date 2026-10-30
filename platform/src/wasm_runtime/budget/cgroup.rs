@@ -93,8 +93,7 @@ fn parse_limit(text: &str) -> Option<u64> {
 
 fn v2_limit(root: &Path, mount: &Mount, path: &str) -> Option<CgroupLimit> {
     let top = mount.point.trim_end_matches('/').to_string();
-    let own = cgroup_dir(mount, path);
-    let mut dir = own.clone();
+    let mut dir = cgroup_dir(mount, path);
     if !read(root, &format!("{dir}/cgroup.controllers")).is_some_and(|c| lists_memory(&c)) {
         return None;
     }
@@ -111,7 +110,7 @@ fn v2_limit(root: &Path, mount: &Mount, path: &str) -> Option<CgroupLimit> {
                         bytes,
                         source,
                         file: PathBuf::from(at),
-                        dir: Some(root.join(own.trim_start_matches('/'))),
+                        dir: Some(root.join(dir.trim_start_matches('/'))),
                     });
                 }
             }
@@ -215,8 +214,8 @@ mod tests {
         assert!(limit.file.ends_with("system.slice/memory.max"), "{limit:?}");
         assert_eq!(
             limit.dir,
-            Some(root.path().join("sys/fs/cgroup/system.slice/app.scope")),
-            "the gate reads the process's own cgroup"
+            Some(root.path().join("sys/fs/cgroup/system.slice")),
+            "the gate reads the cgroup whose limit binds"
         );
 
         std::fs::write(
@@ -230,6 +229,10 @@ mod tests {
             (limit.bytes, limit.source),
             (768 * MIB, LimitSource::High),
             "memory.high below memory.max binds"
+        );
+        assert_eq!(
+            limit.dir,
+            Some(root.path().join("sys/fs/cgroup/system.slice/app.scope"))
         );
     }
 

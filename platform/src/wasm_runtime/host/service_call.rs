@@ -221,8 +221,8 @@ fn next_depth(current: u8) -> Result<u8, CallFailure> {
         .ok_or(CallFailure::DepthExceeded)
 }
 
-pub(crate) fn inbound_depth(request: &Value) -> u8 {
-    request["caller"]["depth"]
+pub(crate) fn caller_depth(caller: &Value) -> u8 {
+    caller["depth"]
         .as_u64()
         .map_or(0, |depth| u8::try_from(depth).unwrap_or(u8::MAX))
 }
@@ -611,8 +611,9 @@ pub(super) fn register(
             .increment(1);
             metrics::histogram!("cufflink_service_call_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
-            caller.data_mut().host_response = Some(envelope(&outcome).to_string());
-            0
+            caller
+                .data_mut()
+                .respond_json("service_call", &envelope(&outcome))
         },
     )
 }
@@ -815,9 +816,9 @@ mod tests {
         assert_eq!(next_depth(MAX_CALL_DEPTH - 1), Ok(MAX_CALL_DEPTH));
         assert_eq!(next_depth(MAX_CALL_DEPTH), Err(CallFailure::DepthExceeded));
         assert_eq!(next_depth(u8::MAX), Err(CallFailure::DepthExceeded));
-        assert_eq!(inbound_depth(&json!({"caller": {"depth": 3}})), 3);
-        assert_eq!(inbound_depth(&json!({"caller": {"depth": 900}})), u8::MAX);
-        assert_eq!(inbound_depth(&json!({"auth": null})), 0);
+        assert_eq!(caller_depth(&json!({"depth": 3})), 3);
+        assert_eq!(caller_depth(&json!({"depth": 900})), u8::MAX);
+        assert_eq!(caller_depth(&Value::Null), 0);
     }
 
     #[test]

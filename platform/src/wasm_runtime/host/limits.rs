@@ -1,5 +1,5 @@
 use crate::policy::{PolicyKey, PolicyMode, PolicySet, Violation};
-use crate::wasm_runtime::budget::{Charge, Denied, Reason, Verdict};
+use crate::wasm_runtime::budget::{Account, Charge, Denied, Hold, Reason, Refused, Verdict};
 use crate::wasm_runtime::{InvocationKind, WasmLimits};
 use std::sync::Arc;
 use wasmtime::ResourceLimiter;
@@ -16,6 +16,7 @@ pub(crate) struct BudgetDenial {
     pub reason: Reason,
     pub requested: usize,
     pub holding: usize,
+    pub host: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub(crate) struct GuestLimits {
     memory_verdict: Option<bool>,
     table_warned: bool,
     charge: Option<Charge>,
+    account: Option<Account>,
     budget_denial: Option<BudgetDenial>,
 }
 
@@ -45,6 +47,9 @@ impl GuestLimits {
         charge: Option<Charge>,
     ) -> Self {
         let memory_cap = limits.memory_cap(&policies);
+        let account = charge
+            .as_ref()
+            .map(|charge| charge.account(&context.handler, context.kind));
         Self {
             limits,
             policies,
@@ -55,7 +60,26 @@ impl GuestLimits {
             memory_verdict: None,
             table_warned: false,
             charge,
+            account,
             budget_denial: None,
+        }
+    }
+
+    pub(crate) fn hold(&self) -> Hold {
+        Hold::on(self.account.clone())
+    }
+
+    pub(crate) fn host_refused(&mut self, refused: Refused) {
+        if let Refused::Budget(capacity) = refused {
+            let grown = self.charge.as_ref().map_or(0, |charge| {
+                charge.holding_with(charge.linear(), charge.tables())
+            });
+            self.budget_denial = Some(BudgetDenial {
+                reason: capacity.reason,
+                requested: capacity.requested,
+                holding: grown.saturating_add(capacity.holding),
+                host: true,
+            });
         }
     }
 
@@ -68,9 +92,13 @@ impl GuestLimits {
     }
 
     pub(crate) fn sample(&self) -> Option<usize> {
-        self.charge
-            .as_ref()
-            .map(|charge| charge.peak() + self.budget_denial.map_or(0, |denial| denial.requested))
+        self.charge.as_ref().map(|charge| {
+            charge.peak()
+                + self
+                    .budget_denial
+                    .filter(|denial| !denial.host)
+                    .map_or(0, |denial| denial.requested)
+        })
     }
 
     fn judge(
@@ -101,6 +129,7 @@ impl GuestLimits {
                 reason,
                 requested,
                 holding,
+                host: false,
             });
         }
         allowed

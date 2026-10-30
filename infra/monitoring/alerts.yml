@@ -1,0 +1,70 @@
+groups:
+  - name: cufflink-guest-memory
+    rules:
+      - alert: CufflinkGuestMemoryHigh
+        expr: sum without (class) (cufflink_wasm_memory_in_use_bytes) / cufflink_wasm_memory_budget_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Guests hold more than 80% of the guest memory budget
+          description: '{{ $labels.instance }} has held {{ $value | humanizePercentage }} of its budget for 5 minutes.'
+
+      - alert: CufflinkGuestAdmissionRefused
+        expr: increase(cufflink_wasm_admission_refused_total{mode="enforce"}[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Guest work was refused for capacity
+          description: '{{ $labels.tenant }}/{{ $labels.service }} ({{ $labels.class }}) was refused for {{ $labels.reason }}.'
+
+      - alert: CufflinkGuestAdmissionWouldRefuse
+        expr: increase(cufflink_wasm_admission_refused_total{mode="warn"}[5m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: Guest work would have been refused under enforce
+          description: '{{ $labels.tenant }}/{{ $labels.service }} ({{ $labels.class }}) would have been refused for {{ $labels.reason }}; the soak signal before enforcing.'
+
+      - alert: CufflinkGuestMemoryDenied
+        expr: increase(cufflink_wasm_memory_denied_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A guest or a host call was denied memory
+          description: '{{ $labels.tenant }}/{{ $labels.service }} was denied a {{ $labels.what }} allocation for {{ $labels.reason }} ({{ $labels.mode }}).'
+
+      - alert: CufflinkBackgroundStarved
+        expr: cufflink_wasm_admission_oldest_wait_seconds{class="background"} > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Background work has waited more than 5 minutes for memory
+          description: 'The oldest background waiter on {{ $labels.instance }} has waited {{ $value | humanizeDuration }}.'
+
+      - alert: CufflinkGuestLedgerLeak
+        expr: sum by (job, instance) (cufflink_wasm_memory_in_use_bytes{class!="stack_residue"}) > 0 and on (job, instance) sum by (job, instance) (cufflink_wasm_inflight) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: The guest memory ledger holds charges with nothing in flight
+          description: '{{ $labels.instance }} has held {{ $value | humanize1024 }}B for 10 minutes with no guest running.'
+
+      - alert: CufflinkProcessMemoryPressure
+        expr: cufflink_process_memory_unreclaimable_bytes / cufflink_process_memory_limit_bytes > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The process is near its memory limit
+          description: '{{ $labels.instance }} has used {{ $value | humanizePercentage }} of its limit for 5 minutes.'
+
+      - alert: CufflinkProcessOomKill
+        expr: increase(cufflink_process_memory_events_total{event="oom_kill"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: The kernel killed a process in this container for memory
+          description: '{{ $labels.instance }} recorded an oom_kill.'

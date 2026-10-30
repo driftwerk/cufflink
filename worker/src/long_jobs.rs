@@ -16,6 +16,7 @@ use cufflink_platform::router::jobs::state::{
 use cufflink_platform::router::jobs::{
     count_transition, dead_letter, enqueued_under, fail_lost, JOB_RETENTION,
 };
+use cufflink_platform::wasm_runtime::budget::Hold;
 use cufflink_platform::wasm_runtime::{Class, Invocation, InvocationKind, WasmEngine};
 use cufflink_platform::AppState;
 use cufflink_telemetry::Kind;
@@ -338,7 +339,7 @@ impl LongJobs {
                     let _ = span.set_parent(enqueued_under);
                 }
                 async {
-                    let attempt = self.execute(&claim, claimed_at).await;
+                    let (attempt, _response) = self.execute(&claim, claimed_at).await;
                     self.conclude(&claim, attempt).await
                 }
                 .instrument(span)
@@ -382,7 +383,7 @@ impl LongJobs {
         }
     }
 
-    async fn execute(&self, claim: &Claim, claimed_at: Instant) -> Attempt {
+    async fn execute(&self, claim: &Claim, claimed_at: Instant) -> (Attempt, Hold) {
         let lost = CancellationToken::new();
         let lease_lost = async {
             hold_lease(self.lease, claimed_at, || {
@@ -398,18 +399,18 @@ impl LongJobs {
             Either::Right(((), attempt)) => attempt.await,
         };
         if lost.is_cancelled() {
-            Attempt::LeaseLost
+            (Attempt::LeaseLost, Hold::none())
         } else {
             attempt
         }
     }
 
-    async fn attempt(&self, job: &WasmJob, lost: &CancellationToken) -> Attempt {
+    async fn attempt(&self, job: &WasmJob, lost: &CancellationToken) -> (Attempt, Hold) {
         let (service_id, version) = (job.service_id, job.service_version);
         let lookup = execution_context(self.pool(), service_id, version).await;
         let context = match job_context(lookup, job) {
             Ok(context) => context,
-            Err(attempt) => return attempt,
+            Err(attempt) => return (attempt, Hold::none()),
         };
         context
             .identity()
@@ -421,11 +422,14 @@ impl LongJobs {
             .get_module(service_id, version, context.wasm_hash.as_deref())
             .await
         else {
-            return Attempt::failed(
-                JobErrorClass::HandlerError,
-                format!(
-                    "WASM module for service {service_id} v{version} not loaded on this worker"
+            return (
+                Attempt::failed(
+                    JobErrorClass::HandlerError,
+                    format!(
+                        "WASM module for service {service_id} v{version} not loaded on this worker"
+                    ),
                 ),
+                Hold::none(),
             );
         };
         let run = self
@@ -455,6 +459,7 @@ impl LongJobs {
             job,
             self.app_state.shutdown.hard_deadline_reached(),
             self.wasm_engine.capacity_deferrals_allowed(),
+            |refused| self.wasm_engine.refusal(refused, true),
         )
     }
 

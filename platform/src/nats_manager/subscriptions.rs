@@ -11,11 +11,13 @@ use crate::nats_manager::pump::{
 use crate::nats_manager::reconciler::{DesiredLoop, RunningLoop, Served, WorkSpec};
 use crate::nats_manager::subjects::{is_valid_publish_subject, PLATFORM_INBOX_PREFIX};
 use crate::registry::ServiceIdentity;
-use crate::router::guest_response::{self, GuestResponse};
+use crate::router::guest_response::{self, DecodeError};
 use crate::schedules::work::ScheduleWork;
 use crate::shutdown::DrainOutcome;
 use crate::tenant_sessions::{Purpose, Statements};
-use crate::wasm_runtime::{Class, ExecutionError, Invocation, InvocationKind};
+use crate::wasm_runtime::{
+    Class, ExecutionError, GuestOutput, Invocation, InvocationKind, WasmEngine,
+};
 use crate::AppState;
 use async_nats::jetstream;
 use async_nats::HeaderMap;
@@ -513,7 +515,7 @@ impl From<eyre::Report> for HandlerFailure {
 }
 
 enum HandlerOutcome {
-    Rpc(Result<String, HandlerFailure>),
+    Rpc(Result<GuestOutput, HandlerFailure>),
     SideEffect(eyre::Result<()>),
 }
 
@@ -534,9 +536,11 @@ impl HandlerOutcome {
         }
     }
 
-    fn outcome(&self, ack: AckMode) -> Outcome {
+    fn outcome(&self, ack: AckMode, engine: Option<&WasmEngine>) -> Outcome {
         match self {
-            HandlerOutcome::Rpc(Ok(response)) if ack == AckMode::OnSuccess => answered(response),
+            HandlerOutcome::Rpc(Ok(response)) if ack == AckMode::OnSuccess => {
+                answered(response, engine)
+            }
             HandlerOutcome::Rpc(Ok(_)) | HandlerOutcome::SideEffect(Ok(())) => Outcome::Ok,
             HandlerOutcome::Rpc(Err(failure)) => failure.outcome(),
             HandlerOutcome::SideEffect(Err(e)) => Outcome::Retry {
@@ -547,18 +551,28 @@ impl HandlerOutcome {
     }
 }
 
-pub(crate) fn answered(response: &str) -> Outcome {
-    let (status, delivery) = match guest_response::decode(response.to_string()) {
-        Ok(GuestResponse::Legacy { status, .. }) => (status, None),
-        Ok(GuestResponse::V2(v2)) => (v2.status, v2.delivery),
-        Err(e) => {
+pub(crate) fn answered(response: &GuestOutput, engine: Option<&WasmEngine>) -> Outcome {
+    let (status, delivery) = match guest_response::answer(response) {
+        Ok(answer) => (answer.status, answer.delivery),
+        Err(DecodeError::Invalid(e)) => {
             return Outcome::Retry {
                 after: None,
                 reason: format!("handler answered an {e}"),
             }
         }
+        Err(DecodeError::Refused(refused)) => {
+            return match engine.map(|engine| engine.refusal(refused, true)) {
+                Some(ExecutionError::Overloaded { retry_after, .. }) => {
+                    Outcome::Deferred { after: retry_after }
+                }
+                other => Outcome::Retry {
+                    after: None,
+                    reason: other.map_or_else(|| refused.to_string(), |e| e.to_string()),
+                },
+            }
+        }
     };
-    match delivery.map(|delivery| *delivery) {
+    match delivery {
         Some(DeliveryControl::RetryAfter { retry_after_ms }) => Outcome::Retry {
             after: Some(Duration::from_millis(retry_after_ms).min(RETRY_AFTER_MAX)),
             reason: format!("handler asked to be retried ({status})"),
@@ -622,7 +636,7 @@ async fn handle_message(
     .instrument(handler_span.clone())
     .await;
 
-    let outcome = handled.outcome(ctx.ack);
+    let outcome = handled.outcome(ctx.ack, ctx.state.wasm_engine.as_ref());
     let failed = handled.error().or_else(|| match &outcome {
         Outcome::Retry { reason, .. } | Outcome::Terminal { reason } => Some(reason.clone()),
         _ => None,
@@ -636,7 +650,7 @@ async fn handle_message(
 
     match (reply_inbox.as_deref(), handled) {
         (Some(inbox), HandlerOutcome::Rpc(Ok(response))) => {
-            publish_reply(&ctx.state.nats, inbox, response).await;
+            publish_reply(&ctx.state.nats, inbox, response.text).await;
         }
         (Some(inbox), HandlerOutcome::Rpc(Err(HandlerFailure::Failed(e)))) => {
             publish_reply(&ctx.state.nats, inbox, error_envelope(&e.to_string())).await;
@@ -713,7 +727,7 @@ async fn handle_wasm(
     ctx: &SubscriptionContext,
     event: &Value,
     meta: &MessageMeta,
-) -> Result<String, HandlerFailure> {
+) -> Result<GuestOutput, HandlerFailure> {
     run_handler(
         &ctx.state,
         Run {
@@ -736,7 +750,7 @@ async fn handle_wasm(
 pub(crate) async fn run_handler(
     state: &Arc<AppState>,
     run: Run<'_>,
-) -> Result<String, HandlerFailure> {
+) -> Result<GuestOutput, HandlerFailure> {
     let (tenant_slug, service_name, handler_name, what) = (
         run.identity.tenant_slug.as_str(),
         run.identity.service_name.as_str(),
@@ -789,7 +803,7 @@ pub(crate) async fn run_handler(
     );
 
     let identity = service.identity();
-    let response_str = wasm_engine
+    let response = wasm_engine
         .run_retrying_capacity(
             state.clone(),
             InvocationKind::Subscription,
@@ -840,10 +854,10 @@ pub(crate) async fn run_handler(
         "WASM {} handler '{}' completed: {}",
         what,
         handler_name,
-        response_preview(&response_str)
+        response_preview(&response.text)
     );
 
-    Ok(response_str)
+    Ok(response)
 }
 
 fn response_preview(response: &str) -> String {
@@ -1155,7 +1169,7 @@ mod tests {
             ))))
         };
         for ack in [AckMode::Always, AckMode::OnSuccess] {
-            assert_eq!(interrupted().outcome(ack), Outcome::Interrupted);
+            assert_eq!(interrupted().outcome(ack, None), Outcome::Interrupted);
         }
         assert_eq!(
             interrupted().error().as_deref(),
@@ -1386,6 +1400,18 @@ mod task_tracking_tests {
 #[cfg(test)]
 mod delivery_tests {
     use super::*;
+    use crate::wasm_runtime::budget::Hold;
+
+    fn output(text: &str) -> GuestOutput {
+        GuestOutput {
+            text: text.to_string(),
+            hold: Hold::none(),
+        }
+    }
+
+    fn answered_text(text: &str) -> Outcome {
+        answered(&output(text), None)
+    }
     use cufflink_types::ConsumerSpec;
 
     fn retried(outcome: Outcome) -> Option<Option<Duration>> {
@@ -1406,14 +1432,14 @@ mod delivery_tests {
             "plain text",
             "",
         ] {
-            assert_eq!(answered(ok), Outcome::Ok, "{ok}");
+            assert_eq!(answered_text(ok), Outcome::Ok, "{ok}");
         }
         for (failed, status) in [
             (r#"{"__status":500,"__body":{"error":"x"}}"#, 500),
             (r#"{"__v":2,"__status":503,"__body":{"error":"x"}}"#, 503),
         ] {
             assert_eq!(
-                answered(failed),
+                answered_text(failed),
                 Outcome::Retry {
                     after: None,
                     reason: format!("handler answered {status}"),
@@ -1425,7 +1451,7 @@ mod delivery_tests {
             (r#"{"__v":2,"__status":422,"__body":{"error":"x"}}"#, 422),
         ] {
             assert_eq!(
-                answered(rejected),
+                answered_text(rejected),
                 Outcome::Terminal {
                     reason: format!("handler rejected the message with {status}"),
                 }
@@ -1436,13 +1462,13 @@ mod delivery_tests {
     #[test]
     fn what_the_handler_asks_for_outweighs_its_status() {
         assert_eq!(
-            retried(answered(
+            retried(answered_text(
                 r#"{"__v":2,"__status":503,"__body":{},"__delivery":{"retry_after_ms":1500}}"#
             )),
             Some(Some(Duration::from_millis(1500)))
         );
         assert_eq!(
-            retried(answered(
+            retried(answered_text(
                 r#"{"__v":2,"__status":200,"__body":{},"__delivery":{"retry_after_ms":0}}"#
             )),
             Some(Some(Duration::ZERO))
@@ -1454,7 +1480,7 @@ mod delivery_tests {
             (3_599_999, Duration::from_millis(3_599_999)),
         ] {
             assert_eq!(
-                retried(answered(&format!(
+                retried(answered_text(&format!(
                     r#"{{"__v":2,"__status":503,"__body":{{}},"__delivery":{{"retry_after_ms":{asked_ms}}}}}"#
                 ))),
                 Some(Some(waits)),
@@ -1466,7 +1492,7 @@ mod delivery_tests {
             "a wait the server can count"
         );
         assert_eq!(
-            answered(
+            answered_text(
                 r#"{"__v":2,"__status":500,"__body":{},"__delivery":{"terminal":"unknown book"}}"#
             ),
             Outcome::Terminal {
@@ -1482,10 +1508,14 @@ mod delivery_tests {
             r#"{"__v":2,"__status":200,"__delivery":{"retry_after_ms":"soon"}}"#,
             r#"{"__v":2,"__status":200,"__delivery":{"terminal":"a","retry_after_ms":1}}"#,
         ] {
-            assert_eq!(retried(answered(unreadable)), Some(None), "{unreadable}");
+            assert_eq!(
+                retried(answered_text(unreadable)),
+                Some(None),
+                "{unreadable}"
+            );
         }
         assert_eq!(
-            answered(r#"{"__status":500,"__delivery":{"terminal":"x"}}"#),
+            answered_text(r#"{"__status":500,"__delivery":{"terminal":"x"}}"#),
             Outcome::Retry {
                 after: None,
                 reason: "handler answered 500".into()
@@ -1496,13 +1526,16 @@ mod delivery_tests {
 
     #[test]
     fn under_always_an_answer_is_a_success() {
-        let failed = || HandlerOutcome::Rpc(Ok(r#"{"__status":500}"#.to_string()));
-        assert_eq!(failed().outcome(AckMode::Always), Outcome::Ok);
-        assert!(retried(failed().outcome(AckMode::OnSuccess)).is_some());
+        let failed = || HandlerOutcome::Rpc(Ok(output(r#"{"__status":500}"#)));
+        assert_eq!(failed().outcome(AckMode::Always, None), Outcome::Ok);
+        assert!(retried(failed().outcome(AckMode::OnSuccess, None)).is_some());
         let built_in = || HandlerOutcome::SideEffect(Err(eyre::eyre!("no such table")));
         for ack in [AckMode::Always, AckMode::OnSuccess] {
-            assert_eq!(retried(built_in().outcome(ack)), Some(None));
-            assert_eq!(HandlerOutcome::SideEffect(Ok(())).outcome(ack), Outcome::Ok);
+            assert_eq!(retried(built_in().outcome(ack, None)), Some(None));
+            assert_eq!(
+                HandlerOutcome::SideEffect(Ok(())).outcome(ack, None),
+                Outcome::Ok
+            );
         }
     }
 

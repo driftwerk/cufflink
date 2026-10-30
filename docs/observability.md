@@ -223,7 +223,8 @@ With that in place, and the collector and the stores on internal addresses only,
 | `otel-collector-tenant.yaml` | [A runner's collector](deployment.md#a-runners-collector), for where more than one tenant's code runs: everything it receives is forwarded to the collector above as the telemetry of the one tenant its `CUFFLINK_TENANT` names. The compose stack declares it under the profile `tenant-collector` and does not start it |
 | `loki-config.yaml` | OTLP ingestion with the stream labels `service_name`, `service_namespace`, `cufflink_component` and `deployment_environment_name`; everything else a line carries (`detected_level`, `service_version`, `cufflink_handler`, `cufflink_kind`, `trace_id`, `span_id`) is structured metadata. Volume, level detection and patterns are on, which Logs Drilldown needs; lines are kept 30 days |
 | `tempo.yaml` | Span metrics and service graphs written to Prometheus with exemplars, and local blocks for TraceQL metrics, which Traces Drilldown needs; traces are kept 7 days |
-| `prometheus.yml` | Scrapes of the platform (`platform:8080`) and the worker (`wasm-worker:8081`), under the external label `cluster: cufflink`: set the labels that name your own environment. Prometheus is started with `--web.enable-remote-write-receiver` and `--enable-feature=exemplar-storage`, for what Tempo writes |
+| `prometheus.yml` | Scrapes of the platform (`platform:8080`) and the worker (`wasm-worker:8081`), under the external label `cluster: cufflink`: set the labels that name your own environment. Prometheus is started with `--web.enable-remote-write-receiver` and `--enable-feature=exemplar-storage`, for what Tempo writes. It loads `alerts.yml` |
+| `alerts.yml` | The [alerts](#alerts) on guest memory, checked with `promtool check rules` in CI |
 | `grafana-datasources.yaml` | The datasources under the fixed uids `prometheus`, `loki` and `tempo`, linked to each other: a log line to its trace, a trace to its lines and its metrics, an exemplar to its trace |
 | `grafana-dashboards.yaml`, `dashboards/` | The dashboards below, one Grafana folder for each directory, not editable in Grafana |
 
@@ -278,6 +279,23 @@ Every query of a Tenants dashboard names the tenant (`service_namespace="$tenant
 The tenant and service lists are the tenants and services that logged within the dashboard's time range: widen the range when one is not listed. Preview tenants (`preview-…`) are listed once "Preview tenants" is set to `include`.
 
 Tempo's service graph draws a node for each service name and labels its series with the tenant (`service_namespace`), so two tenants' services of the same name are one node there until the graph is filtered by `service_namespace`: it is a view across tenants, for whoever operates the platform.
+
+### Alerts
+
+`alerts.yml` holds these rules. Routing them (Alertmanager, or your own) is yours to set.
+
+| Alert | Fires when | For |
+|-------|------------|-----|
+| `CufflinkGuestMemoryHigh` | Guests hold more than 80 % of the guest memory budget | 5 m |
+| `CufflinkGuestAdmissionRefused` | Any invocation was refused for capacity under `enforce` | at once |
+| `CufflinkGuestAdmissionWouldRefuse` | Under `warn`, any invocation would have been refused: the signal to watch before enforcing | at once |
+| `CufflinkGuestMemoryDenied` | A guest's growth or a host buffer was denied, or under `warn` would have been | at once |
+| `CufflinkBackgroundStarved` | The oldest background waiter has waited more than 5 minutes | 5 m |
+| `CufflinkGuestLedgerLeak` | The ledger holds charges other than stack residues while no guest runs: a charge that was never credited | 10 m |
+| `CufflinkProcessMemoryPressure` | Unreclaimable memory is above 90 % of the container's limit | 5 m |
+| `CufflinkProcessOomKill` | The kernel killed a process in the container for memory | at once |
+
+Stack residues are left out of the leak rule, because non-guest blocking work keeps threads, and so their residues, alive with nothing in flight.
 
 ## Probes
 
@@ -387,13 +405,14 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_wasm_handler_duration_seconds` | histogram | `kind`, `result` (`ok`, `error`, `timeout`, `trap`, `memory_limit`, `shutdown`, `cancelled`, `overloaded`, `too_large`) | Guest execution time and outcome |
 | `cufflink_wasm_inflight` | gauge | `kind` | Guests executing |
 | `cufflink_wasm_queue_wait_seconds` | histogram | `kind` | Wait for an execution slot (`WASM_MAX_CONCURRENT`) |
-| `cufflink_wasm_admission_refused_total` | counter | `tenant`, `service`, `class` (`interactive`, `nested`, `committed`, `background`), `reason` (`memory`, `service_share`, `service_concurrency`, `route_concurrency`), `mode` (`warn`, `enforce`) | Invocations refused unrun for capacity, or under `warn` those that would have waited; logged at most once a minute per tenant, service and reason under target `cufflink::wasm::budget` |
+| `cufflink_wasm_admission_refused_total` | counter | `tenant`, `service`, `class` (`interactive`, `nested`, `committed`, `background`), `reason` (`memory`, `service_share`, `service_concurrency`, `route_concurrency`, `pressure`), `mode` (`warn`, `enforce`) | Invocations refused unrun for capacity, or under `warn` those that would have waited; logged at most once a minute per tenant, service and reason under target `cufflink::wasm::budget`. `pressure` is the gate on the container's unreclaimable memory. Under `warn` an invocation that would have waited is admitted at once, so later counts can include refusals that only that over-admission caused: read them as an upper bound |
 | `cufflink_wasm_admission_wait_seconds` | histogram | `class`, `result` (`admitted`, `refused`) | Arrival to admission; `cufflink_wasm_queue_wait_seconds` is kept one release as an alias |
 | `cufflink_wasm_admission_waiters` | gauge | `class` | Invocations waiting for memory |
 | `cufflink_wasm_memory_budget_bytes` | gauge | — | The guest memory budget in force (0 when off) |
-| `cufflink_wasm_memory_in_use_bytes` | gauge | `class`, and `stack_residue` | What the budget's ledger holds: reservations, linear memory, tables, and the stacks of blocking threads that ran a guest |
-| `cufflink_wasm_memory_service_bytes` | gauge | `tenant`, `service` | The same per service |
-| `cufflink_wasm_memory_denied_total` | counter | `tenant`, `service`, `kind`, `reason`, `what` (`grow`, `table`), `mode` | Growth past the budget or a service's share; denied under `enforce`, counted under `warn` |
+| `cufflink_wasm_memory_in_use_bytes` | gauge | `class`, and `stack_residue` | What the budget's ledger holds: reservations, linear memory, tables, the host's buffers for a guest (request bodies, parsed JSON, host-call responses, the guest's response until it is sent), and the stacks of blocking threads that ran a guest; set at every change and at scrape |
+| `cufflink_wasm_memory_service_bytes` | gauge | `tenant`, `service` | The same per service; set at scrape |
+| `cufflink_wasm_memory_denied_total` | counter | `tenant`, `service`, `kind`, `reason`, `what` (`grow`, `table`, `host`), `mode` | Growth or a host buffer past the budget or a service's share; denied under `enforce`, counted under `warn` (an upper bound, as above) |
+| `cufflink_wasm_host_cap_total` | counter | `path`, `cap` (`response`, `fanout`, `image_input`, `image_pixels`, `image_targets`) | Host calls past a host cap: refused under `enforce`, counted under `warn` |
 | `cufflink_wasm_estimate_bytes` | histogram | `kind` | Memory reserved at admission |
 | `cufflink_wasm_admission_oldest_wait_seconds` | gauge | `class` | Age of the oldest invocation waiting for memory; for `background`, starvation shows here |
 | `cufflink_wasm_capacity_retries_total` | counter | `kind` | Subscriptions and worker after-hooks run again in place after a mid-run capacity denial |

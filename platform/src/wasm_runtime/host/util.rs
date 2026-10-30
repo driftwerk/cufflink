@@ -1,5 +1,5 @@
 use super::{
-    block_on_bounded, read_guest_bytes, read_guest_string, wrap, write_guest_bytes, HostIoError,
+    block_on_bounded, copy_host_response, read_guest_bytes, read_guest_string, wrap, HostIoError,
     HostState,
 };
 use serde::de::DeserializeOwned;
@@ -19,22 +19,14 @@ where
     Request: DeserializeOwned,
     Response: Serialize,
 {
-    caller.data_mut().host_response = None;
+    caller.data_mut().clear_host_response();
     let bytes = host_try!(read_guest_bytes(caller, host_fn, ptr, len));
     let response = match serde_json::from_slice::<Request>(&bytes) {
         Ok(request) => handle(caller.data(), request),
         Err(e) => malformed(format!("malformed {host_fn} request: {e}")),
     };
-    match serde_json::to_string(&response) {
-        Ok(json) => {
-            caller.data_mut().host_response = Some(json);
-            0
-        }
-        Err(e) => {
-            tracing::error!("[wasm] {host_fn}: encode failed: {e}");
-            -1
-        }
-    }
+    drop(bytes);
+    caller.data_mut().respond_json(host_fn, &response)
 }
 
 pub(super) fn ended<E>(ended: HostIoError<E>, waited: impl FnOnce(String) -> E) -> E {
@@ -54,8 +46,9 @@ pub(super) fn register(
         names,
         "set_response",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
-            if let Ok(s) = read_guest_string(&mut caller, "set_response", ptr, len) {
-                caller.data_mut().host_response = Some(s);
+            if let Ok(text) = read_guest_string(&mut caller, "set_response", ptr, len) {
+                let (text, hold) = text.into_parts();
+                caller.data_mut().set_charged_response(text, hold);
             }
         },
     )?;
@@ -65,18 +58,7 @@ pub(super) fn register(
         names,
         "get_host_response",
         |mut caller: Caller<'_, HostState>, buf_ptr: i32, buf_len: i32| -> i32 {
-            let Some(resp) = caller.data_mut().host_response.take() else {
-                return 0;
-            };
-            let written = write_guest_bytes(
-                &mut caller,
-                "get_host_response",
-                buf_ptr,
-                buf_len,
-                resp.as_bytes(),
-            );
-            caller.data_mut().host_response = Some(resp);
-            match written {
+            match copy_host_response(&mut caller, buf_ptr, buf_len) {
                 Ok(n) => n as i32,
                 Err(e) => e.code(),
             }
@@ -87,12 +69,7 @@ pub(super) fn register(
         linker,
         names,
         "get_host_response_len",
-        |caller: Caller<'_, HostState>| -> i32 {
-            match &caller.data().host_response {
-                Some(resp) => resp.len() as i32,
-                None => 0,
-            }
-        },
+        |caller: Caller<'_, HostState>| -> i32 { caller.data().host_response_len() as i32 },
     )?;
 
     wrap(
@@ -101,8 +78,7 @@ pub(super) fn register(
         "generate_uuid",
         |mut caller: Caller<'_, HostState>| -> i32 {
             let id = uuid::Uuid::new_v4().to_string();
-            caller.data_mut().host_response = Some(id);
-            0
+            caller.data_mut().respond("generate_uuid", id)
         },
     )?;
 
@@ -112,8 +88,7 @@ pub(super) fn register(
         "current_time",
         |mut caller: Caller<'_, HostState>| -> i32 {
             let now = chrono::Utc::now().to_rfc3339();
-            caller.data_mut().host_response = Some(now);
-            0
+            caller.data_mut().respond("current_time", now)
         },
     )?;
 
@@ -123,8 +98,7 @@ pub(super) fn register(
         "context_tenant",
         |mut caller: Caller<'_, HostState>| -> i32 {
             let slug = caller.data().identity.tenant_slug.clone();
-            caller.data_mut().host_response = Some(slug);
-            0
+            caller.data_mut().respond("context_tenant", slug)
         },
     )?;
 
@@ -156,12 +130,11 @@ pub(super) fn register(
             });
 
             match result {
-                Ok(Some(val)) => {
-                    caller.data_mut().host_response = Some(val.expose().to_string());
-                    0
-                }
+                Ok(Some(val)) => caller
+                    .data_mut()
+                    .respond("get_config", val.expose().to_string()),
                 Ok(None) => {
-                    caller.data_mut().host_response = None;
+                    caller.data_mut().clear_host_response();
                     0
                 }
                 Err(e) => {
@@ -379,7 +352,7 @@ mod envelope_tests {
         let (_, compiled) = install(&engine, MALFORMED);
         let state = AppState::minimal(engine.clone()).await;
         let answered = |handler: &'static str| {
-            let run = engine.run(
+            let run = engine.run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),

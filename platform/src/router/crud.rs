@@ -13,6 +13,7 @@ use crate::router::authz::{
 use crate::router::bind::{self, SqlValue};
 use crate::router::crud_pk::{parse_pk, PkValue};
 use crate::router::filtering::ListParams;
+use crate::router::guest_response::parse_output;
 use crate::router::map_execution_error;
 use crate::router::postures::ServiceCaller;
 use crate::router::query::{
@@ -23,6 +24,7 @@ use crate::schema_manager::adopt::{AdoptedColumn, AdoptedSchema};
 use crate::schema_manager::introspect::TypeKind;
 use crate::tenant_catalog::TenantEntry;
 use crate::tenant_sessions::{Purpose, ServiceSessions, Statements};
+use crate::wasm_runtime::budget::{ChargedJsonError, Hold};
 use crate::wasm_runtime::{Class, Invocation, InvocationKind};
 use crate::AppState;
 use axum::{
@@ -73,8 +75,50 @@ pub(crate) async fn execute_hook_as(
     auth_json: Option<Value>,
     call: Option<&ServiceCaller>,
 ) -> PlatformResult<Value> {
+    let request = hook_request(
+        state, kind, class, service, hook_name, body, auth_json, call,
+    )?;
+    run_hook(state, kind, class, service, hook_name, request, call).await
+}
+
+pub(crate) struct HookRequest {
+    text: String,
+    hold: Hold,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hook_request(
+    state: &AppState,
+    kind: InvocationKind,
+    class: Class,
+    service: &RegisteredService,
+    hook_name: &str,
+    body: Value,
+    auth_json: Option<Value>,
+    call: Option<&ServiceCaller>,
+) -> PlatformResult<HookRequest> {
+    let mut hold = state
+        .wasm_engine
+        .as_ref()
+        .map_or_else(Hold::none, |engine| {
+            engine.hold(&service.identity(), class, hook_name, kind)
+        });
+    let text = hook_request_text(body, hook_name, service, auth_json, call, &mut hold)
+        .map_err(|e| crate::router::request_refused(state, "Hook", e))?;
+    Ok(HookRequest { text, hold })
+}
+
+async fn run_hook(
+    state: &Arc<AppState>,
+    kind: InvocationKind,
+    class: Class,
+    service: &RegisteredService,
+    hook_name: &str,
+    request: HookRequest,
+    call: Option<&ServiceCaller>,
+) -> PlatformResult<Value> {
     let budget = ServiceCaller::bound(call, HOOK_BUDGET);
-    let request_str = hook_request_text(body, hook_name, service, auth_json, call)?;
+    let HookRequest { text, hold } = request;
 
     tracing::debug!(
         "Executing hook '{}' for {}/{}",
@@ -83,16 +127,24 @@ pub(crate) async fn execute_hook_as(
         service.manifest.name
     );
 
+    let engine = state.wasm_engine.as_ref();
     let worker_routed = kind != InvocationKind::OnMigrate
         && state
             .config
             .is_worker_routed(&service.manifest.name, hook_name);
-    let response_str = if worker_routed {
-        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, request_str);
-        crate::worker_dispatch::execute_on_worker(&state.nats, &service.manifest.name, job, budget)
-            .await?
+    let output = if worker_routed {
+        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, text);
+        crate::worker_dispatch::execute_on_worker(
+            &state.nats,
+            &service.manifest.name,
+            job,
+            budget,
+            hold.sibling(),
+            engine,
+        )
+        .await?
     } else {
-        let wasm_engine = state.wasm_engine.as_ref().ok_or_else(|| {
+        let wasm_engine = engine.ok_or_else(|| {
             PlatformError::Internal(format!(
                 "Hook '{}' declared on service '{}' but the WASM runtime is unavailable on \
                  this platform instance",
@@ -121,7 +173,7 @@ pub(crate) async fn execute_hook_as(
                 Invocation {
                     compiled,
                     handler: hook_name.to_string(),
-                    request_json: request_str,
+                    request_json: text,
                     identity: service.identity(),
                     publishes: service.manifest.publishes.clone(),
                     extensions: service.manifest.extensions.clone(),
@@ -136,10 +188,12 @@ pub(crate) async fn execute_hook_as(
             .await
             .map_err(|e| map_execution_error("Hook", e))?
     };
+    drop(hold);
 
-    let response: Value =
-        serde_json::from_str(&response_str).unwrap_or_else(|_| Value::String(response_str.clone()));
-
+    let (response, _response) = parse_output(output).map_err(|refused| match engine {
+        Some(engine) => map_execution_error("Hook", engine.refusal(refused, true)),
+        None => PlatformError::Internal(format!("Hook execution error: {refused}")),
+    })?;
     interpret_hook_response(response)
 }
 
@@ -219,46 +273,39 @@ pub(crate) fn hook_request_text(
     service: &RegisteredService,
     auth_json: Option<Value>,
     call: Option<&ServiceCaller>,
-) -> PlatformResult<String> {
-    crate::router::guest_text(&wrap_hook_request(
-        body, hook_name, service, auth_json, call,
-    ))
+    hold: &mut Hold,
+) -> Result<String, ChargedJsonError> {
+    crate::router::charged_guest_text(
+        &wrap_hook_request(body, hook_name, service, auth_json, call),
+        hold,
+    )
 }
 
 async fn execute_after_hook(
     state: &Arc<AppState>,
     service: &RegisteredService,
     hook_name: &str,
-    body: Value,
-    auth_json: Option<Value>,
+    request: HookRequest,
     call: Option<&ServiceCaller>,
 ) {
     if state
         .config
         .is_worker_routed(&service.manifest.name, hook_name)
     {
-        let request_str = match hook_request_text(body, hook_name, service, auth_json, call) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Failed to serialize after-hook request: {}", e);
-                return;
-            }
-        };
-        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, request_str);
+        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, request.text);
         if let Err(e) =
             crate::worker_dispatch::publish_async_job(&state.jetstream, &service.manifest.name, job)
                 .await
         {
             tracing::warn!("Failed to publish async after-hook '{}': {}", hook_name, e);
         }
-    } else if let Err(e) = execute_hook_as(
+    } else if let Err(e) = run_hook(
+        state,
         InvocationKind::Hook,
         Class::Committed,
-        state,
         service,
         hook_name,
-        body,
-        auth_json,
+        request,
         call,
     )
     .await
@@ -2022,9 +2069,25 @@ fn spawn_after_hook(
     auth_json: Option<Value>,
     call: Option<ServiceCaller>,
 ) {
+    let request = match hook_request(
+        &state,
+        InvocationKind::Hook,
+        Class::Committed,
+        &service,
+        &hook_name,
+        body,
+        auth_json,
+        call.as_ref(),
+    ) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::warn!("after hook '{}' error: {}", hook_name, e);
+            return;
+        }
+    };
     let shutdown = state.shutdown.clone();
     shutdown.spawn("after_hook", async move {
-        execute_after_hook(&state, &service, &hook_name, body, auth_json, call.as_ref()).await;
+        execute_after_hook(&state, &service, &hook_name, request, call.as_ref()).await;
     });
 }
 
@@ -2240,7 +2303,8 @@ mod wrap_hook_request_tests {
             ),
         ] {
             assert_eq!(
-                hook_request_text(body, hook, &fake_service(), auth, None).expect("text"),
+                hook_request_text(body, hook, &fake_service(), auth, None, &mut Hold::none())
+                    .expect("text"),
                 text
             );
         }
@@ -2353,7 +2417,10 @@ mod wrap_hook_request_tests {
             wrapped["caller"],
             json!({"service": "pricing", "on_behalf_of": null, "depth": 3})
         );
-        assert_eq!(crate::wasm_runtime::host::inbound_depth(&wrapped), 3);
+        assert_eq!(
+            crate::wasm_runtime::host::caller_depth(&wrapped["caller"]),
+            3
+        );
     }
 
     #[test]

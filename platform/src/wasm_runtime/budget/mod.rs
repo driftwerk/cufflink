@@ -1,15 +1,24 @@
+mod caps;
 mod cgroup;
 mod config;
 mod estimates;
+mod hold;
+mod json;
 mod ledger;
 mod pressure;
 mod slots;
 mod stack;
 
+pub(crate) use caps::{base64_len, s3_host_bytes, IMAGE_BYTES_PER_PIXEL, IMAGE_MAX_SIDE};
+pub use caps::{CapExceeded, HostCaps};
 pub use cgroup::{detect as detect_cgroup, CgroupLimit, LimitSource};
 pub use config::{thread_stack_bytes, BudgetConfig};
+pub(crate) use hold::{Account, Capped, Drawing};
+pub use hold::{Capacity, Hold, Meter, Refused};
+pub(crate) use json::stepped;
+pub use json::{ChargedJson, ChargedJsonError, Parsed};
 pub use ledger::Limits;
-pub(crate) use ledger::{Charge, Verdict, TABLE_ELEMENT_BYTES};
+pub(crate) use ledger::{Charge, Ledger, Verdict, TABLE_ELEMENT_BYTES};
 pub(crate) use stack::enter as enter_thread;
 
 use super::{ExecutionError, InvocationKind};
@@ -18,7 +27,7 @@ use crate::policy::record::{LogThrottle, LOG_THROTTLE};
 use crate::policy::PolicyMode;
 use crate::registry::ServiceIdentity;
 use estimates::Estimates;
-use ledger::Ledger;
+pub(crate) use slots::RouteKey;
 use slots::{RouteSlots, ServiceSlots};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -218,7 +227,7 @@ pub(crate) struct Ticket<'a> {
     pub kind: InvocationKind,
     pub identity: &'a ServiceIdentity,
     pub handler: &'a str,
-    pub route_limit: Option<u32>,
+    pub route: Option<(RouteKey, u32)>,
     pub initial_memory: usize,
     pub budget: Duration,
 }
@@ -317,6 +326,30 @@ impl Budget {
         }
     }
 
+    pub(crate) fn account(
+        &self,
+        identity: &ServiceIdentity,
+        class: Class,
+        handler: &str,
+        kind: InvocationKind,
+    ) -> Option<Account> {
+        self.ledger.as_ref().map(|ledger| {
+            Account::new(
+                Arc::clone(ledger),
+                class,
+                ServiceKey::of(identity),
+                handler,
+                kind,
+            )
+        })
+    }
+
+    pub(crate) fn publish(&self) {
+        if let Some(ledger) = &self.ledger {
+            ledger.publish();
+        }
+    }
+
     pub(crate) fn share(&self) -> Option<usize> {
         self.ledger.as_ref().map(|ledger| ledger.limits().service)
     }
@@ -339,6 +372,16 @@ impl Budget {
     #[cfg(test)]
     pub(crate) fn ledger(&self) -> Option<&Arc<Ledger>> {
         self.ledger.as_ref()
+    }
+
+    pub(crate) fn refusal(&self, reason: Reason, holding: usize, ran: bool) -> ExecutionError {
+        match self.share() {
+            Some(share) if holding > share => ExecutionError::TooLarge {
+                requested: holding,
+                share,
+            },
+            _ => self.overloaded(reason, ran),
+        }
     }
 
     pub(crate) fn overloaded(&self, reason: Reason, ran: bool) -> ExecutionError {
@@ -481,11 +524,9 @@ impl Budget {
         ticket: &Ticket<'_>,
         until: Option<Instant>,
     ) -> Result<Option<OwnedSemaphorePermit>, ExecutionError> {
-        match ticket.route_limit {
-            Some(max) => {
-                let semaphore =
-                    self.routes
-                        .semaphore(ticket.identity.service_id, ticket.handler, max);
+        match ticket.route {
+            Some((key, max)) => {
+                let semaphore = self.routes.semaphore(key, max);
                 self.slot(ticket, semaphore, Reason::RouteConcurrency, until, true)
                     .await
             }
@@ -606,9 +647,24 @@ impl Budget {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+fn sets_mmap_threshold(var: impl Fn(&str) -> Option<String>) -> bool {
+    let budgeted = var("WASM_MEMORY_BUDGET_MODE")
+        .and_then(|mode| mode.parse::<PolicyMode>().ok())
+        .unwrap_or(PolicyMode::Warn)
+        != PolicyMode::Off;
+    let operator_set = var("MALLOC_MMAP_THRESHOLD_").is_some()
+        || var("GLIBC_TUNABLES")
+            .is_some_and(|tunables| tunables.contains("glibc.malloc.mmap_threshold"));
+    budgeted && !operator_set
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn return_large_blocks_to_the_kernel() {
     const ONE_MIB: libc::c_int = 1024 * 1024;
+    if !sets_mmap_threshold(cufflink_settings::process_var) {
+        return;
+    }
     // SAFETY: mallopt only sets an allocator parameter, and runs before the runtime starts.
     if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, ONE_MIB) } == 0 {
         tracing::warn!(target: "cufflink::wasm::budget", "mallopt(M_MMAP_THRESHOLD) was refused");
@@ -632,4 +688,61 @@ pub fn runtime() -> eyre::Result<tokio::runtime::Runtime> {
         )
         .build()
         .map_err(|e| eyre::eyre!("build the runtime: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sets_mmap_threshold;
+
+    #[test]
+    fn the_mmap_threshold_is_set_only_under_a_budget_and_never_over_the_operators() {
+        let with = |pairs: &'static [(&'static str, &'static str)]| {
+            sets_mmap_threshold(cufflink_settings::fixed(pairs))
+        };
+        assert!(with(&[]));
+        assert!(with(&[("WASM_MEMORY_BUDGET_MODE", "enforce")]));
+        assert!(!with(&[("WASM_MEMORY_BUDGET_MODE", "off")]));
+        assert!(!with(&[("MALLOC_MMAP_THRESHOLD_", "4194304")]));
+        assert!(!with(&[(
+            "GLIBC_TUNABLES",
+            "glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=4194304"
+        )]));
+        assert!(with(&[("GLIBC_TUNABLES", "glibc.malloc.arena_max=2")]));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::ledger::{Ledger, Limits, Settings};
+    use super::{Account, Class, Hold, ServiceKey};
+    use crate::wasm_runtime::InvocationKind;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    pub(crate) const MIB: usize = 1024 * 1024;
+
+    pub(crate) fn hold(budget: usize) -> (Arc<Ledger>, Hold) {
+        let ledger = Arc::new(Ledger::new(Settings {
+            limits: Limits {
+                budget,
+                admit: budget,
+                service: budget,
+                background: budget,
+            },
+            enforce: true,
+            stack: MIB,
+            aging: Duration::from_millis(100),
+        }));
+        let account = Account::new(
+            Arc::clone(&ledger),
+            Class::Interactive,
+            ServiceKey {
+                tenant: "acme".into(),
+                service: "catalog-service".into(),
+            },
+            "list",
+            InvocationKind::Route,
+        );
+        (ledger, Hold::on(Some(account)))
+    }
 }

@@ -17,15 +17,21 @@ impl RouteSlot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RouteKey {
+    pub service_id: Uuid,
+    pub version: i32,
+    pub index: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct RouteSlots {
-    slots: Mutex<HashMap<(Uuid, String), RouteSlot>>,
+    slots: Mutex<HashMap<RouteKey, RouteSlot>>,
 }
 
 impl RouteSlots {
-    pub(crate) fn semaphore(&self, service_id: Uuid, handler: &str, max: u32) -> Arc<Semaphore> {
+    pub(crate) fn semaphore(&self, key: RouteKey, max: u32) -> Arc<Semaphore> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = (service_id, handler.to_string());
         if let Some(slot) = slots.get(&key).filter(|slot| slot.max == max) {
             return Arc::clone(&slot.semaphore);
         }
@@ -94,18 +100,32 @@ impl ServiceSlots {
 mod tests {
     use super::*;
 
+    fn key(service_id: Uuid, version: i32, index: usize) -> RouteKey {
+        RouteKey {
+            service_id,
+            version,
+            index,
+        }
+    }
+
     #[test]
-    fn a_route_keeps_its_slots_until_its_limit_changes() {
+    fn a_route_keeps_its_slots_and_routes_sharing_a_handler_keep_their_own() {
         let slots = RouteSlots::default();
         let id = Uuid::new_v4();
-        let first = slots.semaphore(id, "export", 2);
-        assert!(Arc::ptr_eq(&first, &slots.semaphore(id, "export", 2)));
-        assert!(!Arc::ptr_eq(&first, &slots.semaphore(id, "import", 2)));
+        let first = slots.semaphore(key(id, 1, 0), 2);
+        assert!(Arc::ptr_eq(&first, &slots.semaphore(key(id, 1, 0), 2)));
+        let sibling = slots.semaphore(key(id, 1, 1), 5);
+        assert!(!Arc::ptr_eq(&first, &sibling));
+        assert!(
+            Arc::ptr_eq(&first, &slots.semaphore(key(id, 1, 0), 2)),
+            "a sibling route on the same handler leaves this one's slots alone"
+        );
+        assert_eq!(sibling.available_permits(), 5);
         assert!(!Arc::ptr_eq(
             &first,
-            &slots.semaphore(Uuid::new_v4(), "export", 2)
+            &slots.semaphore(key(Uuid::new_v4(), 1, 0), 2)
         ));
-        let redeployed = slots.semaphore(id, "export", 3);
+        let redeployed = slots.semaphore(key(id, 2, 0), 3);
         assert!(!Arc::ptr_eq(&first, &redeployed));
         assert_eq!(redeployed.available_permits(), 3);
     }
@@ -131,16 +151,19 @@ mod tests {
     #[test]
     fn idle_routes_are_pruned_and_busy_ones_kept() {
         let slots = RouteSlots::default();
-        let busy = slots.semaphore(Uuid::nil(), "busy", 1);
+        let busy = slots.semaphore(key(Uuid::nil(), 1, 0), 1);
         let held = Arc::clone(&busy)
             .try_acquire_owned()
             .expect("the only slot");
         (0..PRUNE_ABOVE).for_each(|n| {
-            slots.semaphore(Uuid::new_v4(), &n.to_string(), 1);
+            slots.semaphore(key(Uuid::new_v4(), 1, n), 1);
         });
         let len = slots.slots.lock().expect("slots").len();
         assert!(len < PRUNE_ABOVE, "{len}");
-        assert!(Arc::ptr_eq(&busy, &slots.semaphore(Uuid::nil(), "busy", 1)));
+        assert!(Arc::ptr_eq(
+            &busy,
+            &slots.semaphore(key(Uuid::nil(), 1, 0), 1)
+        ));
         drop(held);
     }
 }

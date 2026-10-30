@@ -51,6 +51,7 @@ validate() {
   check loki "$(image loki)" -config.file=/etc/loki/local-config.yaml -verify-config
   check tempo "$(image tempo)" -config.file=/etc/tempo.yaml -config.verify=true
   check prometheus --entrypoint promtool "$(image prometheus)" check config /etc/prometheus/prometheus.yml
+  check prometheus --entrypoint promtool "$(image prometheus)" check rules /etc/prometheus/alerts.yml
 }
 
 start() {

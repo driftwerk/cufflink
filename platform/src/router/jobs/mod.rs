@@ -38,11 +38,14 @@ pub struct AuthSnapshot {
 
 impl AuthSnapshot {
     pub fn from_request_auth(request_json: &Value) -> Option<Self> {
-        let auth = request_json.get("auth")?;
+        Self::from_auth(request_json.get("auth")?.clone())
+    }
+
+    pub fn from_auth(auth: Value) -> Option<Self> {
         let subject = auth.get("sub")?.as_str()?.to_string();
         Some(Self {
             subject,
-            claims: auth.clone(),
+            claims: auth,
         })
     }
 }

@@ -240,7 +240,7 @@ async fn run_inline(ctx: &ScheduleContext, request: &GuestRequest) -> Outcome {
     )
     .await;
     match ran {
-        Ok(response) => answered(&response),
+        Ok(response) => answered(&response, ctx.state.wasm_engine.as_ref()),
         Err(failure) => failure.outcome(),
     }
 }

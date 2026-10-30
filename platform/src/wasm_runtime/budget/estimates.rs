@@ -50,7 +50,10 @@ impl Estimates {
                     .map(|(_, peak)| *peak)
                     .max()
             })
-            .unwrap_or_else(|| initial.saturating_add(COLD_HEADROOM).max(self.cold))
+            .map_or_else(
+                || initial.saturating_add(COLD_HEADROOM).max(self.cold),
+                |warm| warm.max(initial),
+            )
             .min(cap)
     }
 
@@ -124,6 +127,11 @@ mod tests {
         estimates.record(id, "h", 3 * MIB);
         assert_eq!(estimates.estimate(id, "h", 0, 512 * MIB), 3 * MIB);
         assert_eq!(estimates.estimate(id, "other", 0, 512 * MIB), 32 * MIB);
+        assert_eq!(
+            estimates.estimate(id, "h", 8 * MIB, 512 * MIB),
+            8 * MIB,
+            "never below the module's initial memory and tables"
+        );
     }
 
     #[test]

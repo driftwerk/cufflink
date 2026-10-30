@@ -162,6 +162,7 @@ impl HookService {
             service_schema: self.service.schema(),
             service_name: Some("hook-svc".into()),
             publishes: None,
+            nested: false,
         }
     }
 

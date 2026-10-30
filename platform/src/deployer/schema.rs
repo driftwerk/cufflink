@@ -528,6 +528,7 @@ mod tests {
             &service,
             None,
             None,
+            &mut crate::wasm_runtime::budget::Hold::none(),
         )
         .expect("text")
     }

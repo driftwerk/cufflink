@@ -9,6 +9,7 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     metrics::gauge!("cufflink_services_total").set(services.len() as f64);
     if let Some(engine) = &state.wasm_engine {
         metrics::gauge!("cufflink_wasm_module_cache_entries").set(engine.cache_len() as f64);
+        engine.publish_gauges();
     }
     metrics::gauge!("cufflink_consumer_loops").set(state.subscription_tasks.loop_count() as f64);
     crate::telemetry::record_pool_gauges(&state);

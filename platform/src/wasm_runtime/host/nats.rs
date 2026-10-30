@@ -371,7 +371,9 @@ pub(super) fn register(
             if !authorize_nats_send(caller.data(), &subject) {
                 return -1;
             }
-            let payload = payload_buf.into();
+            let (subject, _subject_held) = subject.into_parts();
+            let (payload, _payload_held) = payload_buf.into_parts();
+            let payload = payload.into();
 
             let nats = caller.data().app_state.nats.clone();
 
@@ -426,6 +428,8 @@ pub(super) fn register(
             if !authorize_nats_send(caller.data(), &subject) {
                 return -1;
             }
+            let (subject, _subject_held) = subject.into_parts();
+            let (payload, _payload_held) = payload.into_parts();
 
             let nats = caller.data().app_state.nats.clone();
 
@@ -468,10 +472,7 @@ pub(super) fn register(
             });
 
             match result {
-                Ok(response_str) => {
-                    caller.data_mut().host_response = Some(response_str);
-                    0
-                }
+                Ok(response_str) => caller.data_mut().respond("nats_request", response_str),
                 Err(e) => {
                     tracing::error!("[wasm] nats_request error: {}", e);
                     -1
