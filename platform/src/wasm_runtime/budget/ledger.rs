@@ -144,6 +144,84 @@ pub(crate) enum Verdict {
     Denied(Reason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limit {
+    Pressure,
+    Ceiling,
+    Service,
+    Background,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Breach {
+    pressure: bool,
+    ceiling: bool,
+    service: bool,
+    background: bool,
+}
+
+impl Breach {
+    fn reason(self) -> Option<Reason> {
+        if self.pressure {
+            Some(Reason::Pressure)
+        } else if self.ceiling {
+            Some(Reason::Memory)
+        } else if self.service {
+            Some(Reason::ServiceShare)
+        } else if self.background {
+            Some(Reason::Memory)
+        } else {
+            None
+        }
+    }
+
+    fn narrowest(self) -> Option<Limit> {
+        if self.service {
+            Some(Limit::Service)
+        } else if self.background {
+            Some(Limit::Background)
+        } else if self.ceiling {
+            Some(Limit::Ceiling)
+        } else if self.pressure {
+            Some(Limit::Pressure)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+struct HeldBack {
+    all: bool,
+    background: bool,
+    services: HashSet<ServiceKey>,
+}
+
+impl HeldBack {
+    fn hold(&mut self, limit: Limit, service: &ServiceKey) {
+        match limit {
+            Limit::Pressure => {}
+            Limit::Ceiling => self.all = true,
+            Limit::Background => self.background = true,
+            Limit::Service => {
+                self.services.insert(service.clone());
+            }
+        }
+    }
+
+    fn holds(&self, waiter: &Waiter) -> bool {
+        self.all
+            || (self.background && waiter.class == Class::Background)
+            || self.services.contains(&waiter.service)
+    }
+
+    fn join(&mut self, other: HeldBack) {
+        self.all |= other.all;
+        self.background |= other.background;
+        self.services.extend(other.services);
+    }
+}
+
 pub(crate) struct Ledger {
     settings: Settings,
     pressure: AtomicBool,
@@ -237,6 +315,21 @@ impl Ledger {
         }
     }
 
+    fn breach(&self, state: &State, class: Class, service: &ServiceKey, bytes: usize) -> Breach {
+        let limits = self.settings.limits;
+        let ceiling = match class {
+            Class::Nested => limits.budget,
+            _ => limits.admit,
+        };
+        Breach {
+            pressure: class.gated_by_pressure() && self.pressure.load(Ordering::SeqCst),
+            ceiling: state.in_use + bytes > ceiling,
+            service: state.service(service) + bytes > limits.service,
+            background: class == Class::Background
+                && state.by_class[Class::Background.index()] + bytes > limits.background,
+        }
+    }
+
     fn admits(
         &self,
         state: &State,
@@ -244,24 +337,9 @@ impl Ledger {
         service: &ServiceKey,
         bytes: usize,
     ) -> Result<(), Reason> {
-        let limits = self.settings.limits;
-        let ceiling = match class {
-            Class::Nested => limits.budget,
-            _ => limits.admit,
-        };
-        if class.gated_by_pressure() && self.pressure.load(Ordering::SeqCst) {
-            Err(Reason::Pressure)
-        } else if state.in_use + bytes > ceiling {
-            Err(Reason::Memory)
-        } else if state.service(service) + bytes > limits.service {
-            Err(Reason::ServiceShare)
-        } else if class == Class::Background
-            && state.by_class[Class::Background.index()] + bytes > limits.background
-        {
-            Err(Reason::Memory)
-        } else {
-            Ok(())
-        }
+        self.breach(state, class, service, bytes)
+            .reason()
+            .map_or(Ok(()), Err)
     }
 
     fn allows_growth(
@@ -330,22 +408,27 @@ impl Ledger {
 
     fn grant(&self, state: &mut State) {
         let now = Instant::now();
+        let mut held = HeldBack::default();
         for tier in 0..GRANT_TIERS {
-            let mut held_back = false;
+            let mut blocked = HeldBack::default();
             let mut at = 0;
             while let Some(waiter) = state.queue.get(at) {
                 let closed = waiter.granted.is_closed();
-                if !closed && self.tier(waiter, now) != tier {
+                if !closed && (self.tier(waiter, now) != tier || held.holds(waiter)) {
                     at += 1;
                     continue;
                 }
                 let (stack, claim) = self.stack_for(state);
-                let fits = closed
-                    || self
-                        .admits(state, waiter.class, &waiter.service, waiter.bytes + stack)
-                        .is_ok();
-                if !fits {
-                    held_back |= tier <= 1;
+                let breach = match closed {
+                    true => Breach::default(),
+                    false => {
+                        self.breach(state, waiter.class, &waiter.service, waiter.bytes + stack)
+                    }
+                };
+                if let Some(limit) = breach.narrowest() {
+                    if tier <= 1 {
+                        blocked.hold(limit, &waiter.service);
+                    }
                     at += 1;
                     continue;
                 }
@@ -366,9 +449,7 @@ impl Ledger {
                     }
                 }
             }
-            if held_back {
-                return;
-            }
+            held.join(blocked);
         }
     }
 
@@ -1023,6 +1104,76 @@ mod tests {
         drop((aged, interactive));
         drop(fresh.await.expect("join"));
         assert_eq!(ledger.in_use(), 0);
+    }
+
+    fn waiting(
+        ledger: &Arc<Ledger>,
+        class: Class,
+        name: &'static str,
+        bytes: usize,
+    ) -> tokio::task::JoinHandle<Result<Charge, Reason>> {
+        let ledger = Arc::clone(ledger);
+        tokio::spawn(async move { ledger.reserve(class, &service(name), bytes, None).await })
+    }
+
+    async fn granted(waiter: tokio::task::JoinHandle<Result<Charge, Reason>>) -> Charge {
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("granted in time")
+            .expect("join")
+            .expect("granted")
+    }
+
+    #[tokio::test]
+    async fn a_committed_waiter_past_its_service_share_holds_back_only_that_service() {
+        for committed in [12 * MIB, 49 * MIB] {
+            let ledger = ledger(true);
+            let held = ledger
+                .try_reserve(Class::Interactive, &service("a"), 40 * MIB)
+                .expect("fits");
+            let first = waiting(&ledger, Class::Committed, "a", committed);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let same = waiting(&ledger, Class::Interactive, "a", 2 * MIB);
+            let other = granted(waiting(&ledger, Class::Interactive, "b", 4 * MIB)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !first.is_finished() && !same.is_finished(),
+                "the service's own interactive work waits behind its committed work"
+            );
+            drop(held);
+            drop(granted(first).await);
+            drop((granted(same).await, other));
+            assert_eq!(ledger.in_use(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_aged_waiter_past_the_background_share_holds_back_only_background() {
+        for aged in [10 * MIB, 20 * MIB] {
+            let ledger = ledger(true);
+            let backlog: Vec<Charge> = ["a", "b"]
+                .into_iter()
+                .map(|name| {
+                    ledger
+                        .try_reserve(Class::Background, &service(name), 34 * MIB)
+                        .expect("fits")
+                })
+                .collect();
+            let first = waiting(&ledger, Class::Background, "c", aged);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let fresh = waiting(&ledger, Class::Background, "d", 2 * MIB);
+            let interactive = granted(waiting(&ledger, Class::Interactive, "e", 4 * MIB)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !first.is_finished() && !fresh.is_finished(),
+                "fresh background waits behind aged background"
+            );
+            drop(backlog);
+            let first = granted(first).await;
+            let fresh = granted(fresh).await;
+            drop((first, fresh, interactive));
+            assert_eq!(ledger.in_use(), 0);
+        }
     }
 
     #[tokio::test]
