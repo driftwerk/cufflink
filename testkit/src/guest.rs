@@ -7,9 +7,15 @@ const STRINGS: &[(&str, &str)] = &[
     ("OK", r#"{\"ok\":true}"#),
     ("SELECT_ONE", "SELECT 1"),
     ("GATE", "SELECT pg_advisory_xact_lock(4242)"),
+    ("GATE_TWO", "SELECT pg_advisory_xact_lock(2)"),
+    ("GATE_THREE", "SELECT pg_advisory_xact_lock(3)"),
     (
         "INSERT_HOOKED",
         "INSERT INTO items (title) VALUES ('hooked')",
+    ),
+    (
+        "INSERT_DELIVERY",
+        "INSERT INTO deliveries (handler) VALUES ('answer_big_gated')",
     ),
     (
         "BIG_QUERY",
@@ -126,6 +132,27 @@ $DATA
     (i32.store8 (i32.const 25165824) (i32.const 1))
     (drop (call $db_execute (i32.const $GATE_OFF) (i32.const $GATE_LEN)))
     (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func $fill_gated (result i32)
+    (loop $more
+      (br_if $more (i32.ne (memory.grow (i32.const 1)) (i32.const -1))))
+    (drop (call $db_execute (i32.const $GATE_OFF) (i32.const $GATE_LEN)))
+    (drop (call $db_execute (i32.const $INSERT_HOOKED_OFF) (i32.const $INSERT_HOOKED_LEN)))
+    (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))
+  (func (export "fill_gated") (param i32 i32) (result i32)
+    (call $fill_gated))
+  (func (export "gate_then_fill_gated") (param i32 i32) (result i32)
+    (drop (call $db_execute (i32.const $GATE_THREE_OFF) (i32.const $GATE_THREE_LEN)))
+    (call $fill_gated))
+  (func (export "answer_big_gated") (param i32 i32) (result i32)
+    (local $out i32)
+    (local.set $out (call $alloc (i32.const 3145732)))
+    (i32.store (local.get $out) (i32.const 3145728))
+    (i32.store8 (i32.add (local.get $out) (i32.const 4)) (i32.const 34))
+    (memory.fill (i32.add (local.get $out) (i32.const 5)) (i32.const 120) (i32.const 3145726))
+    (i32.store8 (i32.add (local.get $out) (i32.const 3145731)) (i32.const 34))
+    (drop (call $db_execute (i32.const $GATE_TWO_OFF) (i32.const $GATE_TWO_LEN)))
+    (drop (call $db_execute (i32.const $INSERT_DELIVERY_OFF) (i32.const $INSERT_DELIVERY_LEN)))
+    (local.get $out))
   (func (export "grow_24") (param i32 i32) (result i32)
     (if (i32.eq (memory.grow (i32.const 384)) (i32.const -1)) (then (unreachable)))
     (i32.store8 (i32.const 25165824) (i32.const 1))

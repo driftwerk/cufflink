@@ -498,7 +498,7 @@ pub(crate) async fn execute(
             &service.name,
             job,
             budget,
-            reply,
+            &reply,
             Some(wasm_engine),
         )
         .await

@@ -505,7 +505,7 @@ cannot read:
 | `s3_download_many`, `http_fetch_many` | At most `HOST_FANOUT_MAX_ITEMS` (128) items. Each item takes a sub-charge of its size (`head`, or `HOST_HTTP_MAX_RESPONSE_BYTES` for HTTP) before it starts. **Results stay in input order**, since guests index them by position. Item *i* is written to the response text once items 0 to *i − 1* are written; a result that finishes early waits under its own sub-charge. The total stays under the response cap. Golden tests compare both envelopes byte for byte with today's |
 | `image_transform`, `_multi` | Source objects of at most `IMAGE_MAX_INPUT_MB` (32), read as `s3_download` reads. The header's dimensions are read before decoding, and `width × height × IMAGE_BYTES_PER_PIXEL` is taken as a sub-charge moved into the `spawn_blocking` decode (section 2.2). `image::Limits` caps each side at 16 384 pixels and sets `max_alloc` to the sub-charge. Images over the pixel cap are refused. **`_multi` takes at most `IMAGE_MAX_TARGETS` (16) targets.** Today it encodes every output into a `Vec<Vec<u8>>`, each buffer pre-allocated at a quarter of the raw size, and holds them all until the uploads finish. Instead, each output is encoded under its own sub-charge, charged by its buffer's capacity, then uploaded and dropped before the next is encoded. The uploads happen in the same order and the answer (the sizes) is the same. **The one behaviour difference:** today every output is encoded before anything is uploaded, so an encode failure on any target uploads nothing. With one target at a time, an encode failure on a later target leaves the earlier targets' outputs uploaded, and the call fails as it does today. The release notes and `docs/building-on-cufflink.md` say so. The cap is the smaller of `IMAGE_MAX_PIXELS` (40 megapixels) and the service share ÷ 20 bytes: 40 MP is about 800 MB at 20 bytes a pixel, more than a 2 GiB container's service share, so there the share decides (about 37 MP) |
 | `redis_get`, `redis_mget` | Detailed below the table |
-| CRUD hooks | The hook request is built through `ChargedJson::to_value`. A detached in-process after-hook (`spawn_after_hook`) holds its request **text**, written and charged before it is spawned, not the row's `Value`. The charge is held while it waits for a slot (section 3.2) and until it runs |
+| CRUD hooks | The hook request is built through `ChargedJson::to_value`. A detached in-process after-hook holds its request **text**, not the row's `Value`. Under `enforce` the text is written and charged, refusably, before the write commits (section 4). The charge is held while the hook waits for a slot (section 3.2) and until it runs, and it counts against no committed run of its service (section 14) |
 | Multipart bodies | `body::multipart` copies each field out of the body. Each copy is charged as it is read, against the route's reservation, and so is the `MultipartField` list `ChargedJson::to_value` builds from them |
 | `service_call` | The callee's body is reserved at `HOST_HTTP_MAX_RESPONSE_BYTES` before it is collected, then shrunk to its length. It is encoded into the envelope without the `to_vec` copy. The envelope is charged through `set_host_response` |
 | Host-call inputs | The copy is charged before copying (section 2.2); a parse of it through `ChargedJson` |
@@ -810,6 +810,9 @@ are released if the deadline passes:
   - Under `enforce` they wait for a slot outside their handler budget,
     for up to `WASM_COMMITTED_WAIT_SECS` (300).
   - Past that they are dropped and logged, as a failed after-hook is today.
+  - Their request texts, already charged before the write committed, do
+    not count against their service's share while they wait (section 14),
+    so kept texts cannot stop the hooks that would free them.
   - The slow path for bulk after-hooks remains worker routing, which is
     durable.
 
@@ -1036,10 +1039,24 @@ labelled `overloaded`, and `ExecutionError::TooLarge`, labelled
 | Route, `_fn`, before-hook | `PlatformError::RetryLater`: 503, `Retry-After: WASM_ADMISSION_RETRY_AFTER_SECS` (2), `{"error": "guest capacity exhausted; the request was not run"}` | 503 with `Retry-After`, `{"error": "guest capacity exhausted while the request ran; it may have been partly applied"}` |
 | Service call (nested) | the callee's 503 reaches the caller's guest as the call's response | the same |
 | Worker request/reply | `WasmJobResult` gains `retry_after_ms: Option<u64>` and `ran: Option<bool>` (`serde(default)`, skipped when `None`). The platform answers as above when they are set. An older platform ignores them and answers 500; an older worker never sets them | the same |
-| After-hook in process | never refused at once. Under `enforce` it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today | logged like any hook failure |
-| `on_migrate` | never refused; it waits its budget, as today | fails the deploy as any error does |
+| After-hook in process | its write is refused while its text cannot be held: 503 with `Retry-After`, the write not committed. The write's other refusals are unchanged. The hook itself is never refused once its write commits. Under `enforce` it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today | logged like any hook failure |
+| `on_migrate` | its text is never refused; it waits its budget, as today | fails the deploy as any error does |
 | SSE reducer | waits at most the reducer's budget, then the event is dropped and counted `reducer_error`, as any reducer failure is today | the same |
 | Subscription, job, worker after-hook | never refused (section 3.5) | section 3.5 |
+
+**Refusable until the effect is durable, unrefusable after.** Before a
+write commits, its after-hook's text is charged refusably, and a refusal
+answers 503 with nothing committed, so nothing is dropped. Mid-run growth
+and host-call buffers stay refusable, and the guest sees `-1` or traps.
+Once the guest has returned, or the write has committed, every buffer that
+only delivers the result is charged past the budget and is never refused:
+hook and `on_migrate` text, `read_response`, the worker reply's decode,
+`guest_response`'s decode and render, `ChargedBody`, `into_payload`, a
+hook's `parse_output` and the subscription decode. A size bound remains:
+`max_response_bytes` caps the response text, and a tree or rendered body
+that alone passes the service share is refused as too large, whatever else
+is running. A size refusal does not depend on load, so no retry cures it
+and a finished message is not redelivered for it (section 14).
 
 Every `ExecutionError` is a 500 today, a timeout included. The maintainer
 chose 503 for a mid-run denial (question 8). Its message says the handler
@@ -1749,22 +1766,52 @@ Recorded as the change was built, each with its reason.
   work itself, and nested work is not gated (section 3.8), so holding it
   would free nothing for the waiter. An arrival still joins the queue when
   a waiter of its tier or above waits; `grant` then decides.
-- **Committed request text is never refused.** The request text of an
-  after-hook, in process or published to the worker, and of `on_migrate`
-  is charged past the share when it must be. The hook is then kept and
-  waits for its run, rather than being dropped before it is queued. Until
-  the service is back within its share, its other growth and host buffers
-  are refused, as they would be at the share.
+- **Refusable until durable.** Section 4 states the rule. It replaces the
+  earlier behaviour, where a hook's text was charged past the share after
+  the commit and a reply could be refused after its handler had finished.
+- **A hook's text is written before the commit.** Under `enforce`, a create
+  or update with an in-process or worker after-hook runs in a transaction
+  and writes the exact text after its statement and before its commit, and
+  a delete writes it before its statement. A refusal rolls the write back,
+  and the answer is 503 `ran: false`: a before-hook may have run by then,
+  but `ran` describes the request's effect, and a before-hook already runs
+  subject to the write failing. The exact text is used rather than a bound
+  taken before the before-hook, because a bound would either refuse small
+  updates of large rows or undercharge them. Under `off` and `warn` nothing
+  is refused, so single writes stay autocommit, with no extra round trips.
+- **A kept text costs what it takes.** `ChargedJson` charges in 1 MiB steps,
+  so each text is shrunk to its capacity once written, rather than holding
+  at least 1 MiB for as long as its hook waits.
+- **Kept text and the share.** Kept text counts against the share for
+  everything except a committed run of the same service, both in admission
+  and in growth, and always counts toward the ceiling. Excluding only a
+  hook's own text would still deadlock once several texts queue. A service
+  can therefore hold up to its share in committed runs and up to its share
+  in kept text at once, twice its share, bounded by the ceiling. A text is
+  kept only if it fits the share and `all kept text + this text + one
+  estimate + a stack` fits the admit threshold, so the last queued hook can
+  always run; the texts drain one hook at a time. That check ignores memory
+  in use by running guests, which frees itself, so a write is not refused
+  because guests are busy now.
+- **A bulk write's texts are written before its commit**, each in turn,
+  rather than as each hook takes its slot. Building them lazily would keep
+  the `Value` trees of the rows alive in detached tasks, which cost more
+  than the text (section 1.4), uncharged or charged at tree cost. So a bulk
+  write is all or nothing: if every text cannot be held, it answers 503
+  `ran: false`, or 500 too large when the texts' total passes the share,
+  which no retry cures, and nothing commits. 1000 small rows cost 1000
+  small texts, since each is shrunk as above.
 - **Shutdown while waiting.** Committed or background work still waiting
   for memory at the hard deadline ends `NotStarted`, never as a capacity
   refusal. A message is naked at once under both ack modes, without
   counting toward the capacity bound or being dead-lettered, and a job is
   released.
 - **Fairness is per service, not per tenant.** A tenant whose services are
-  busy at once can hold the whole budget. A tenant share was not added:
-  below 100 % it would cut a single-tenant platform's budget, the common
-  deployment, and at 100 % it does nothing. An operator lowers
-  `WASM_MEMORY_SERVICE_SHARE_PERCENT` instead.
+  busy at once can hold the whole budget. The owner signed off on
+  documenting this for this release, with no per-tenant cap. A tenant share
+  was not added: below 100 % it would cut a single-tenant platform's
+  budget, the common deployment, and at 100 % it does nothing. An operator
+  lowers `WASM_MEMORY_SERVICE_SHARE_PERCENT` instead.
 - **`warn` counts.** Under `warn` a denial is counted where `enforce` would
   have refused. A host buffer forced past the budget raises the ledger, so
   later checks in the same window see it, and the count is an upper bound
@@ -1780,6 +1827,19 @@ Recorded as the change was built, each with its reason.
   length, before parsing.
 - **A worker's reply** is charged at twice its payload while it is decoded
   (the payload and the response it carries), then shrunk to the response.
+  It is never refused for what else is running, since the guest has
+  returned.
+- **A delivered buffer's size refusal is at the share**, not the host
+  response cap. Response text is forced, bounded by `max_response_bytes`,
+  which `enforce` clamps to the share. Its decoded tree is not forced
+  unbounded: a tree costs 40 to 50 times its text at worst and slots are
+  released before decoding (section 1.4), so a hold that alone passes the
+  share is refused as too large (500, `too_large`) and counted under `warn`.
+  A lower tree cap would refuse legitimate replies, since a tree of small
+  records costs about 7.5 times its text.
+- **An unreadable answer settles.** A handler whose answer's tree passes
+  the share is treated as one whose answer is not JSON: acknowledged, and
+  never redelivered. A `__status` in such an answer is not seen.
 - **A hook's answer** is charged until the hook returns. A before-hook's
   returned body, used by the write that follows, is not charged after that.
 
@@ -1820,16 +1880,19 @@ Recorded as the change was built, each with its reason.
   checked against the cap, and twice it is reserved, since redis-rs holds
   the reply frame and the decoded value together. The second reads each
   value up to its measured length and one byte more. A value that grew in
-  between fails the call with `-1`. `redis_mget` takes at most
+  between is measured again, up to three reads in all, and only then fails
+  the call with `-1`, logged at `debug` since it is a harmless race.
+  `redis_mget` takes at most
   `HOST_FANOUT_MAX_ITEMS` keys. The connection's read buffer keeps the
   capacity of the largest reply it parsed, which the host reserve holds.
 - **Under `warn`, Redis reads are plain `GET` and `MGET`**, as under `off`,
   and their result is measured when it is answered.
-- **`service_call`** reserves the callee's response limit, at most the host
-  response cap under `enforce`, and reads no more than that, since the
-  HTTP client reads the body in one piece. The charge then shrinks to the
-  body. A larger response fails the call with a transport error rather
-  than a cap refusal.
+- **`service_call`** reserves the callee's response limit and reads no more
+  than that, since the HTTP client reads the body in one piece. Under
+  `enforce` the limit is at most three quarters of the host response cap
+  less 64 KiB, since the envelope base64-encodes the body and carries its
+  headers. The charge then shrinks to the body. A larger response fails the
+  call with a transport error rather than a cap refusal.
 - **Image work's threads.** Decoding and encoding run on blocking-pool
   threads whose stacks are not charged when they have never run a guest.
   One runs per image call in flight, so they are bounded by the guests in

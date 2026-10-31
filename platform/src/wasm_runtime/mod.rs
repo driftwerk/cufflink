@@ -832,6 +832,14 @@ impl WasmEngine {
         }
     }
 
+    pub(crate) fn kept_hold(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        handler: &str,
+    ) -> budget::Hold {
+        self.budget.kept(identity, handler)
+    }
+
     pub fn refusal(&self, refused: budget::Refused, ran: bool) -> ExecutionError {
         match refused {
             budget::Refused::Budget(capacity) => {
@@ -1126,24 +1134,13 @@ impl WasmEngine {
             .call(&mut *store, (request_ptr as i32, request_len))
             .map_err(|e| classify(store, e, inv.budget, &self.budget))?;
 
-        let mut hold = store.data().hold();
+        let mut hold = store.data().hold().delivering();
         let text = read_response(
             memory.data(&*store),
             response_ptr,
             self.limits.max_response_bytes,
-            |len| hold.grow(len),
-        )
-        .map_err(|read| match read {
-            ResponseRead::Invalid(error) => error,
-            ResponseRead::Refused(capacity) => {
-                let limits = &mut store.data_mut().guest_limits;
-                limits.host_refused(budget::Refused::Budget(capacity));
-                limits.budget_denial().map_or_else(
-                    || self.budget.overloaded(capacity.reason, true),
-                    |denial| denied(denial, &self.budget, true),
-                )
-            }
-        })?;
+            |len| hold.force(len),
+        )?;
         Ok(GuestOutput { text, hold })
     }
 }
@@ -1159,17 +1156,6 @@ struct RequestContext {
 pub struct GuestOutput {
     pub text: String,
     pub hold: budget::Hold,
-}
-
-enum ResponseRead {
-    Invalid(ExecutionError),
-    Refused(budget::Capacity),
-}
-
-impl From<ExecutionError> for ResponseRead {
-    fn from(error: ExecutionError) -> Self {
-        Self::Invalid(error)
-    }
 }
 
 fn classify(
@@ -1208,8 +1194,8 @@ fn read_response(
     memory: &[u8],
     ptr: i32,
     max_bytes: usize,
-    charge: impl FnOnce(usize) -> Result<(), budget::Capacity>,
-) -> Result<String, ResponseRead> {
+    charge: impl FnOnce(usize),
+) -> Result<String, ExecutionError> {
     let start = usize::try_from(ptr)
         .map_err(|_| ExecutionError::Response("negative response pointer".into()))?;
     let len_bytes: [u8; 4] = memory
@@ -1226,15 +1212,14 @@ fn read_response(
         .increment(1);
         return Err(ExecutionError::Response(format!(
             "response of {len} bytes exceeds the {max_bytes} byte cap"
-        ))
-        .into());
+        )));
     }
     let body = memory
         .get(start + 4..start + 4 + len)
         .ok_or_else(|| ExecutionError::Response("response body out of bounds".into()))?;
-    charge(len).map_err(ResponseRead::Refused)?;
+    charge(len);
     String::from_utf8(body.to_vec())
-        .map_err(|e| ExecutionError::Response(format!("response is not UTF-8: {e}")).into())
+        .map_err(|e| ExecutionError::Response(format!("response is not UTF-8: {e}")))
 }
 
 fn start_epoch_ticker(engine: &Engine, tick: Duration) -> Result<()> {
@@ -1670,28 +1655,20 @@ pub(crate) mod tests {
         let mut memory = vec![0u8; 64];
         memory[8..12].copy_from_slice(&5u32.to_le_bytes());
         memory[12..17].copy_from_slice(b"hello");
-        let read = |memory: &[u8], ptr, max| read_response(memory, ptr, max, |_| Ok(()));
+        let read = |memory: &[u8], ptr, max| read_response(memory, ptr, max, |_| ());
         assert!(matches!(read(&memory, 8, 64), Ok(text) if text == "hello"));
-        let refused = budget::Capacity {
-            reason: budget::Reason::Memory,
-            requested: 5,
-            holding: 5,
-        };
-        assert!(matches!(
-            read_response(&memory, 8, 64, |len| {
-                assert_eq!(len, 5, "charged before the copy");
-                Err(refused)
-            }),
-            Err(ResponseRead::Refused(capacity)) if capacity == refused
-        ));
+        read_response(&memory, 8, 64, |len| {
+            assert_eq!(len, 5, "charged before the copy");
+        })
+        .expect("read");
         assert!(matches!(
             read(&memory, 8, 4),
-            Err(ResponseRead::Invalid(ExecutionError::Response(msg))) if msg.contains("cap")
+            Err(ExecutionError::Response(msg)) if msg.contains("cap")
         ));
         memory[8..12].copy_from_slice(&1000u32.to_le_bytes());
         assert!(matches!(
             read(&memory, 8, 4096),
-            Err(ResponseRead::Invalid(ExecutionError::Response(msg))) if msg.contains("out of bounds")
+            Err(ExecutionError::Response(msg)) if msg.contains("out of bounds")
         ));
         assert!(read(&memory, -1, 64).is_err());
         assert!(read(&memory, 62, 64).is_err());

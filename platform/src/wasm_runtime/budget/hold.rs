@@ -69,10 +69,17 @@ impl Account {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terms {
+    Refusable,
+    Unrefused,
+    Kept { room: usize },
+}
+
 pub struct Hold {
     account: Option<Account>,
     bytes: usize,
-    refusable: bool,
+    terms: Terms,
 }
 
 impl std::fmt::Debug for Hold {
@@ -89,7 +96,7 @@ impl Hold {
         Self {
             account: None,
             bytes: 0,
-            refusable: true,
+            terms: Terms::Refusable,
         }
     }
 
@@ -97,7 +104,7 @@ impl Hold {
         Self {
             account,
             bytes: 0,
-            refusable: true,
+            terms: Terms::Refusable,
         }
     }
 
@@ -105,7 +112,15 @@ impl Hold {
         Self {
             account,
             bytes: 0,
-            refusable: false,
+            terms: Terms::Unrefused,
+        }
+    }
+
+    pub(crate) fn kept(account: Option<Account>, room: usize) -> Self {
+        Self {
+            account,
+            bytes: 0,
+            terms: Terms::Kept { room },
         }
     }
 
@@ -113,8 +128,12 @@ impl Hold {
         Self {
             account: self.account.clone(),
             bytes: 0,
-            refusable: self.refusable,
+            terms: self.terms,
         }
+    }
+
+    pub(crate) fn delivering(&self) -> Self {
+        Self::unrefused(self.account.clone())
     }
 
     pub(crate) fn share(&self) -> Option<usize> {
@@ -131,14 +150,14 @@ impl Hold {
         let Some(account) = self.account.as_ref().filter(|_| extra > 0) else {
             return Ok(());
         };
-        if !self.refusable {
-            self.force(extra);
-            return Ok(());
-        }
-        match account
-            .ledger()
-            .grow(account.class(), account.service(), extra)
-        {
+        let holding = self.bytes.saturating_add(extra);
+        let (ledger, class, service) = (account.ledger(), account.class(), account.service());
+        let verdict = match self.terms {
+            Terms::Refusable => ledger.grow(class, service, extra),
+            Terms::Unrefused => ledger.deliver(class, service, extra, holding),
+            Terms::Kept { room } => ledger.keep(class, service, extra, room),
+        };
+        match verdict {
             Verdict::Allowed => {}
             Verdict::Warned(reason) => account.record(reason, PolicyMode::Warn, extra),
             Verdict::Denied(reason) => {
@@ -146,7 +165,7 @@ impl Hold {
                 return Err(Capacity {
                     reason,
                     requested: extra,
-                    holding: self.bytes.saturating_add(extra),
+                    holding,
                 });
             }
         }
@@ -172,9 +191,11 @@ impl Hold {
     fn give_back(&mut self, bytes: usize) {
         self.bytes -= bytes;
         if let Some(account) = &self.account {
-            account
-                .ledger()
-                .release(account.class(), account.service(), bytes);
+            let (ledger, class, service) = (account.ledger(), account.class(), account.service());
+            match self.terms {
+                Terms::Kept { .. } => ledger.release_kept(class, service, bytes),
+                Terms::Refusable | Terms::Unrefused => ledger.release(class, service, bytes),
+            }
         }
     }
 }
@@ -191,6 +212,18 @@ impl Drop for Hold {
 pub enum Refused {
     Budget(Capacity),
     Cap(CapExceeded),
+}
+
+impl Refused {
+    pub(crate) fn beside(self, held: usize) -> Self {
+        match self {
+            Self::Budget(capacity) => Self::Budget(Capacity {
+                holding: capacity.holding.saturating_add(held),
+                ..capacity
+            }),
+            Self::Cap(cap) => Self::Cap(cap),
+        }
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -332,15 +365,58 @@ mod tests {
     }
 
     #[test]
-    fn an_unrefused_hold_and_its_siblings_charge_past_the_share() {
+    fn a_delivering_hold_and_its_siblings_charge_past_the_share() {
+        let (ledger, account) = owned(true);
+        let mut full = Hold::on(Some(account));
+        full.grow(50 * MIB).expect("at the share");
+        let mut hold = full.delivering();
+        hold.grow(MIB).expect("past the share");
+        let mut sibling = hold.sibling();
+        sibling.grow(MIB).expect("past the share");
+        hold.force(MIB);
+        assert_eq!(ledger.in_use(), 53 * MIB);
+        drop((full, hold, sibling));
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_delivering_hold_is_refused_when_it_alone_passes_the_share() {
         let (ledger, account) = owned(true);
         let mut hold = Hold::unrefused(Some(account));
         hold.grow(50 * MIB).expect("at the share");
-        let mut sibling = hold.sibling();
-        sibling.grow(MIB).expect("never refused");
-        assert_eq!(ledger.in_use(), 51 * MIB);
-        drop((hold, sibling));
+        let refused = hold.grow(1).expect_err("alone past the share");
+        assert_eq!(refused.reason, Reason::ServiceShare);
+        assert_eq!(refused.holding, 50 * MIB + 1);
+        assert_eq!(ledger.in_use(), 50 * MIB);
+    }
+
+    #[test]
+    fn a_kept_hold_is_refused_at_the_share_and_gives_back_what_it_kept() {
+        let (ledger, account) = owned(true);
+        let mut kept = Hold::kept(Some(account), 4 * MIB);
+        kept.grow(48 * MIB).expect("fits");
+        let mut tree = kept.sibling();
+        let refused = tree.grow(3 * MIB).expect_err("past the share");
+        assert_eq!(refused.reason, Reason::ServiceShare);
+        kept.shrink_to(MIB);
+        tree.grow(3 * MIB).expect("fits now");
+        drop(tree);
+        assert_eq!(ledger.in_use(), MIB);
+        drop(kept);
         assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_refusal_beside_what_else_is_wanted_names_all_of_it() {
+        let refused = Refused::Budget(Capacity {
+            reason: Reason::ServiceShare,
+            requested: MIB,
+            holding: 2 * MIB,
+        });
+        let Refused::Budget(capacity) = refused.beside(3 * MIB) else {
+            panic!("a budget refusal");
+        };
+        assert_eq!(capacity.holding, 5 * MIB);
     }
 
     #[test]

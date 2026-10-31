@@ -39,6 +39,8 @@ struct State {
     in_use: usize,
     by_class: [usize; Class::ALL.len()],
     by_service: HashMap<ServiceKey, usize>,
+    kept: HashMap<ServiceKey, usize>,
+    kept_total: usize,
     residue: usize,
     threads: usize,
     busy: usize,
@@ -50,6 +52,32 @@ struct State {
 impl State {
     fn service(&self, service: &ServiceKey) -> usize {
         self.by_service.get(service).copied().unwrap_or_default()
+    }
+
+    fn against_share(&self, class: Class, service: &ServiceKey) -> usize {
+        let held = self.service(service);
+        match class {
+            Class::Committed => {
+                held.saturating_sub(self.kept.get(service).copied().unwrap_or_default())
+            }
+            Class::Interactive | Class::Nested | Class::Background => held,
+        }
+    }
+
+    fn keep(&mut self, service: &ServiceKey, bytes: usize) {
+        *self.kept.entry(service.clone()).or_default() += bytes;
+        self.kept_total += bytes;
+    }
+
+    fn unkeep(&mut self, service: &ServiceKey, bytes: usize) {
+        self.kept_total = self.kept_total.saturating_sub(bytes);
+        let kept = self.kept.get_mut(service).map_or(0, |kept| {
+            *kept = kept.saturating_sub(bytes);
+            *kept
+        });
+        if kept == 0 {
+            self.kept.remove(service);
+        }
     }
 
     fn idle_threads(&self) -> usize {
@@ -324,7 +352,7 @@ impl Ledger {
         Breach {
             pressure: class.gated_by_pressure() && self.pressure.load(Ordering::SeqCst),
             ceiling: state.in_use + bytes > ceiling,
-            service: state.service(service) + bytes > limits.service,
+            service: state.against_share(class, service) + bytes > limits.service,
             background: class == Class::Background
                 && state.by_class[Class::Background.index()] + bytes > limits.background,
         }
@@ -342,20 +370,44 @@ impl Ledger {
             .map_or(Ok(()), Err)
     }
 
-    fn allows_growth(
-        &self,
-        state: &State,
-        service: &ServiceKey,
-        bytes: usize,
-    ) -> Result<(), Reason> {
+    fn fits(&self, state: &State, held: usize, bytes: usize) -> Result<(), Reason> {
         let limits = self.settings.limits;
         if state.in_use + bytes > limits.budget {
             Err(Reason::Memory)
-        } else if state.service(service) + bytes > limits.service {
+        } else if held + bytes > limits.service {
             Err(Reason::ServiceShare)
         } else {
             Ok(())
         }
+    }
+
+    fn allows_keeping(
+        &self,
+        state: &State,
+        service: &ServiceKey,
+        bytes: usize,
+        room: usize,
+    ) -> Result<(), Reason> {
+        self.fits(state, state.service(service), bytes)?;
+        let crowded = state.kept_total + bytes + room + self.settings.stack;
+        match crowded > self.settings.limits.admit {
+            true => Err(Reason::Memory),
+            false => Ok(()),
+        }
+    }
+
+    fn debit_unless(
+        &self,
+        allowed: impl FnOnce(&State) -> Result<(), Reason>,
+        debit: impl FnOnce(&mut State),
+    ) -> Verdict {
+        self.settled(|state, _| match allowed(state) {
+            Err(reason) if self.settings.enforce => Verdict::Denied(reason),
+            allowed => {
+                debit(state);
+                allowed.err().map_or(Verdict::Allowed, Verdict::Warned)
+            }
+        })
     }
 
     fn take(&self, state: &mut State, class: Class, service: &ServiceKey, bytes: usize) {
@@ -454,17 +506,42 @@ impl Ledger {
     }
 
     pub(super) fn grow(&self, class: Class, service: &ServiceKey, extra: usize) -> Verdict {
-        let charged = self.settled(|state, _| match self.allows_growth(state, service, extra) {
-            Err(reason) if self.settings.enforce => Err(reason),
-            allowed => {
+        self.debit_unless(
+            |state| self.fits(state, state.against_share(class, service), extra),
+            |state| self.take(state, class, service, extra),
+        )
+    }
+
+    pub(super) fn keep(
+        &self,
+        class: Class,
+        service: &ServiceKey,
+        extra: usize,
+        room: usize,
+    ) -> Verdict {
+        self.debit_unless(
+            |state| self.allows_keeping(state, service, extra, room),
+            |state| {
                 self.take(state, class, service, extra);
-                Ok(allowed.err())
-            }
-        });
-        match charged {
-            Err(reason) => Verdict::Denied(reason),
-            Ok(warned) => warned.map_or(Verdict::Allowed, Verdict::Warned),
-        }
+                state.keep(service, extra);
+            },
+        )
+    }
+
+    pub(super) fn deliver(
+        &self,
+        class: Class,
+        service: &ServiceKey,
+        extra: usize,
+        holding: usize,
+    ) -> Verdict {
+        self.debit_unless(
+            |_| match holding > self.settings.limits.service {
+                true => Err(Reason::ServiceShare),
+                false => Ok(()),
+            },
+            |state| self.take(state, class, service, extra),
+        )
     }
 
     pub(super) fn force(&self, class: Class, service: &ServiceKey, bytes: usize) {
@@ -473,6 +550,14 @@ impl Ledger {
 
     pub(super) fn release(&self, class: Class, service: &ServiceKey, bytes: usize) {
         self.settled(|state, _| {
+            self.give(state, class, service, bytes);
+            self.grant(state);
+        });
+    }
+
+    pub(super) fn release_kept(&self, class: Class, service: &ServiceKey, bytes: usize) {
+        self.settled(|state, _| {
+            state.unkeep(service, bytes);
             self.give(state, class, service, bytes);
             self.grant(state);
         });
@@ -985,6 +1070,145 @@ mod tests {
         ));
         drop((held, nested));
         assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn kept_text_leaves_a_committed_run_the_whole_of_its_share() {
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        assert_eq!(
+            ledger.keep(Class::Committed, &catalog, 48 * MIB, 4 * MIB),
+            Verdict::Allowed
+        );
+        let until = Instant::now() + Duration::from_millis(10);
+        let run = ledger
+            .reserve(Class::Committed, &catalog, 4 * MIB, Some(until))
+            .await
+            .expect("the kept text does not count against the run");
+        assert_eq!(ledger.in_use(), 52 * MIB + STACK);
+        drop(run);
+        ledger.release_kept(Class::Committed, &catalog, 48 * MIB);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_texts_past_what_a_run_leaves_of_the_share_all_drain() {
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        for _ in 0..6 {
+            ledger.keep(Class::Committed, &catalog, 8 * MIB, 4 * MIB);
+        }
+        for _ in 0..6 {
+            let until = Instant::now() + Duration::from_millis(10);
+            ledger
+                .reserve(Class::Committed, &catalog, 4 * MIB, Some(until))
+                .await
+                .expect("each hook is admitted past the other hooks' texts");
+            ledger.release_kept(Class::Committed, &catalog, 8 * MIB);
+        }
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn kept_text_counts_against_the_share_for_everything_but_committed_work() {
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        ledger.keep(Class::Committed, &catalog, 48 * MIB, 4 * MIB);
+        for class in [Class::Interactive, Class::Background, Class::Nested] {
+            assert!(matches!(
+                ledger.try_reserve(class, &catalog, 4 * MIB),
+                Err(Reason::ServiceShare)
+            ));
+            assert_eq!(
+                ledger.grow(class, &catalog, 3 * MIB),
+                Verdict::Denied(Reason::ServiceShare)
+            );
+        }
+        assert_eq!(
+            ledger.grow(Class::Committed, &catalog, 3 * MIB),
+            Verdict::Allowed,
+            "a hook's growth is not held to the texts either"
+        );
+    }
+
+    #[test]
+    fn kept_text_counts_toward_the_ceiling_for_committed_work_too() {
+        let ledger = ledger(true);
+        ledger.keep(Class::Committed, &service("a"), 45 * MIB, 4 * MIB);
+        ledger.keep(Class::Committed, &service("b"), 40 * MIB, 4 * MIB);
+        assert!(matches!(
+            ledger.try_reserve(Class::Committed, &service("a"), 8 * MIB),
+            Err(Reason::Memory)
+        ));
+    }
+
+    #[test]
+    fn text_is_kept_within_the_share_and_leaves_one_run_room_among_the_texts() {
+        let ledger = ledger(true);
+        let (a, b) = (service("a"), service("b"));
+        assert_eq!(
+            ledger.keep(Class::Committed, &a, 51 * MIB, 0),
+            Verdict::Denied(Reason::ServiceShare)
+        );
+        assert_eq!(ledger.in_use(), 0, "a refusal keeps nothing");
+        assert_eq!(
+            ledger.keep(Class::Committed, &a, 45 * MIB, 8 * MIB),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            ledger.keep(Class::Committed, &b, 40 * MIB, 8 * MIB),
+            Verdict::Denied(Reason::Memory),
+            "85 MiB of text leaves no 8 MiB run under the 90 MiB ceiling"
+        );
+        assert_eq!(
+            ledger.keep(Class::Committed, &b, 40 * MIB, 4 * MIB),
+            Verdict::Allowed
+        );
+
+        let busy = super::tests::ledger(true);
+        let _running = busy
+            .try_reserve(Class::Interactive, &b, 49 * MIB)
+            .expect("fits");
+        let _other = busy
+            .try_reserve(Class::Interactive, &service("c"), 30 * MIB)
+            .expect("fits");
+        assert_eq!(
+            busy.keep(Class::Committed, &a, 4 * MIB, 16 * MIB),
+            Verdict::Allowed,
+            "what runs now frees itself, so only text counts toward that room"
+        );
+
+        let warned = super::tests::ledger(false);
+        assert_eq!(
+            warned.keep(Class::Committed, &a, 51 * MIB, 0),
+            Verdict::Warned(Reason::ServiceShare)
+        );
+        assert_eq!(warned.in_use(), 51 * MIB);
+    }
+
+    #[test]
+    fn a_delivered_buffer_is_refused_only_for_its_own_size() {
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        let _full = ledger
+            .try_reserve(Class::Interactive, &catalog, 49 * MIB)
+            .expect("fits");
+        assert_eq!(
+            ledger.deliver(Class::Interactive, &catalog, 10 * MIB, 10 * MIB),
+            Verdict::Allowed,
+            "past the share and held anyway"
+        );
+        assert_eq!(ledger.in_use(), 60 * MIB);
+        assert_eq!(
+            ledger.deliver(Class::Interactive, &catalog, MIB, 51 * MIB),
+            Verdict::Denied(Reason::ServiceShare),
+            "alone past the share"
+        );
+        assert_eq!(ledger.in_use(), 60 * MIB);
+        assert_eq!(
+            super::tests::ledger(false).deliver(Class::Interactive, &catalog, MIB, 51 * MIB),
+            Verdict::Warned(Reason::ServiceShare)
+        );
     }
 
     #[test]

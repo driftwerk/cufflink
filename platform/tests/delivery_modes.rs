@@ -80,9 +80,17 @@ async fn deployed(handlers: &[(&str, Value)]) -> Option<Deployed> {
 }
 
 async fn deployed_with(handlers: &[(&str, Value)], env: &[(&str, &str)]) -> Option<Deployed> {
+    let wasm = common::sdk::sdk_guest("eventing", Profile::Debug)?;
+    deployed_module(handlers, env, wasm).await
+}
+
+async fn deployed_module(
+    handlers: &[(&str, Value)],
+    env: &[(&str, &str)],
+    wasm: Vec<u8>,
+) -> Option<Deployed> {
     let infra = common::infra().await?;
     let nats_url = infra.require_nats()?;
-    let wasm = common::sdk::sdk_guest("eventing", Profile::Debug)?;
     let mut db = infra.create_database().await;
     let platform = PlatformProcess::start(&db.url, Some(nats_url), env).await;
     platform.wait_ready().await;
@@ -610,6 +618,77 @@ async fn an_ack_always_message_denied_mid_run_is_run_again_in_place_then_deferre
     );
     assert_eq!(deployed.counted("grow", "dead_letter").await, 0.0);
     assert!(deployed.dead_letters("grow").await.is_empty());
+}
+
+async fn a_finished_handler_is_settled_once_with_its_service_at_its_share(delivery: Value) {
+    let env = [
+        ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+        ("WASM_MEMORY_BUDGET_MB", "64"),
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40"),
+        ("WASM_MEMORY_BACKGROUND_SHARE_PERCENT", "100"),
+        ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+        ("WASM_THREAD_STACK_KB", "1024"),
+        ("WASM_CAPACITY_RETRIES", "1"),
+        ("WASM_ADMISSION_RETRY_AFTER_MS", "50"),
+    ];
+    let Some(deployed) = deployed_module(
+        &[
+            ("answer_big_gated", delivery),
+            ("fill_gated", json!({"ack": "always"})),
+        ],
+        &env,
+        common::guest::module_bytes(),
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant_db = deployed.db.tenant_url(&deployed.tenant.slug);
+    let answering = common::Gate::closed_at(&tenant_db, 2).await;
+    let filling = common::Gate::closed(&tenant_db).await;
+    deployed.publish("answer_big_gated", "{}").await;
+    until("the handler waits at its gate", async || {
+        answering.waiting().await == 1
+    })
+    .await;
+    deployed.publish("fill_gated", "{}").await;
+    until("the service is at its share", async || {
+        filling.waiting().await == 1
+    })
+    .await;
+
+    answering.open().await;
+    deployed.until_settled("answer_big_gated").await;
+    assert_eq!(deployed.deliveries("answer_big_gated").await, 1);
+    assert_eq!(
+        deployed
+            .consumer("answer_big_gated")
+            .await
+            .delivered
+            .consumer_sequence,
+        1,
+        "its 3 MiB answer is past what is left of the share, and it is read all the same"
+    );
+    assert_eq!(deployed.counted("answer_big_gated", "deferred").await, 0.0);
+    assert_eq!(
+        deployed
+            .metric("cufflink_wasm_capacity_retries_total")
+            .await,
+        0.0
+    );
+    filling.open().await;
+}
+
+#[tokio::test]
+async fn an_on_success_message_that_ran_is_acked_with_its_service_at_its_share() {
+    a_finished_handler_is_settled_once_with_its_service_at_its_share(on_success(json!({}))).await;
+}
+
+#[tokio::test]
+async fn an_ack_always_message_that_ran_is_acked_with_its_service_at_its_share() {
+    a_finished_handler_is_settled_once_with_its_service_at_its_share(json!({"ack": "always"}))
+        .await;
 }
 
 #[tokio::test]

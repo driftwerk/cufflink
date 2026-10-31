@@ -243,6 +243,47 @@ async fn hooked(client: &tokio_postgres::Client, schema: &str) -> i64 {
         .get(0)
 }
 
+async fn items(client: &tokio_postgres::Client, schema: &str) -> i64 {
+    client
+        .query_one(
+            &format!("SELECT count(*) FROM {schema}.items WHERE title <> 'hooked'"),
+            &[],
+        )
+        .await
+        .expect("items")
+        .get(0)
+}
+
+async fn written(platform: &PlatformProcess, tenant: &common::Tenant, row: &Value) -> (u16, Value) {
+    platform
+        .send(
+            reqwest::Method::POST,
+            &format!("/svc/{}/catalog-service/items", tenant.slug),
+            &format!("ApiKey {}", tenant.api_key),
+            Some(row),
+        )
+        .await
+}
+
+async fn batched(
+    platform: &PlatformProcess,
+    tenant: &common::Tenant,
+    titles: &[&str],
+) -> (u16, Value) {
+    let operations: Vec<Value> = titles
+        .iter()
+        .map(|title| json!({"action": "create", "data": {"title": title}}))
+        .collect();
+    platform
+        .send(
+            reqwest::Method::POST,
+            &format!("/svc/{}/catalog-service/items/batch", tenant.slug),
+            &format!("ApiKey {}", tenant.api_key),
+            Some(&json!({"operations": operations})),
+        )
+        .await
+}
+
 const SOON: Duration = Duration::from_secs(10);
 
 async fn eventually(what: &str, reached: impl AsyncFnMut() -> bool) {
@@ -382,14 +423,7 @@ async fn an_after_hook_started_with_the_budget_full_runs_once_room_frees() {
     let rows = tenant_db(&db, &catalog).await;
     let holding = held(&platform, &db, &loans, "loan-service", "hold_gated_56").await;
 
-    let (status, body) = platform
-        .send(
-            reqwest::Method::POST,
-            &format!("/svc/{}/catalog-service/items", catalog.slug),
-            &format!("ApiKey {}", catalog.api_key),
-            Some(&json!({"title": "written"})),
-        )
-        .await;
+    let (status, body) = written(&platform, &catalog, &json!({"title": "written"})).await;
     assert_eq!(status, 200, "{body}");
     eventually("the hook waits for memory", async || {
         gauge(
@@ -412,68 +446,183 @@ async fn an_after_hook_started_with_the_budget_full_runs_once_room_frees() {
 
 #[tokio::test]
 async fn an_after_hook_of_a_service_at_its_share_is_kept_and_runs_once_room_frees() {
-    let Some((platform, mut db)) = small(&[("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40")]).await
+    let Some((platform, mut db)) = small(&[
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40"),
+        ("WASM_MAX_CONCURRENT_PER_SERVICE", "2"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+    ])
+    .await
     else {
         return;
     };
-    let share: usize = 64 * 1024 * 1024 / 100 * 40;
     let catalog = db.mint_tenant().await;
-    let mut manifest = common::wasm_manifest("catalog-service", &[("hold_gated_24", "/hold")]);
-    manifest["tables"][0]["hooks"] = json!({"after_create": "insert_hooked"});
+    let mut manifest = common::wasm_manifest("catalog-service", &[("answer_big_gated", "/answer")]);
+    manifest["tables"][0]["hooks"] = json!({"after_create": "gate_then_fill_gated"});
     deployed(&platform, &catalog, &manifest).await;
     let rows = tenant_db(&db, &catalog).await;
-    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
-    let charged = gauge(
-        &platform,
-        "cufflink_wasm_memory_service_bytes",
-        &[("tenant", catalog.slug.as_str())],
-    )
-    .await as usize;
-    let past_what_is_left = share.saturating_sub(charged) + 64 * 1024;
+    let tenant_url = db.tenant_url(&catalog.slug);
+    let answering = common::Gate::closed_at(&tenant_url, 2).await;
+    let filling = common::Gate::closed(&tenant_url).await;
+    let hooking = common::Gate::closed_at(&tenant_url, 3).await;
+    let holder = tokio::spawn(answered(
+        platform
+            .http
+            .post(platform.fn_url(&catalog, "catalog-service", "answer_big_gated"))
+            .json(&json!({})),
+    ));
+    eventually("the holder waits at its gate", async || {
+        answering.waiting().await == 1
+    })
+    .await;
 
-    let (status, body) = platform
-        .send(
-            reqwest::Method::POST,
-            &format!("/svc/{}/catalog-service/items", catalog.slug),
-            &format!("ApiKey {}", catalog.api_key),
-            Some(&json!({"title": "x".repeat(past_what_is_left)})),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    eventually("the hook waits for its share", async || {
-        gauge(
-            &platform,
-            "cufflink_wasm_admission_waiters",
-            &[("class", "committed")],
-        )
-        .await
-            >= 1.0
+    for _ in 0..2 {
+        let (status, body) = written(&platform, &catalog, &json!({"title": "written"})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    eventually("one hook takes the only committed slot", async || {
+        hooking.waiting().await == 1
+    })
+    .await;
+    hooking.open().await;
+    eventually("that hook fills the share", async || {
+        filling.waiting().await == 1
     })
     .await;
     assert_eq!(hooked(&rows, "catalog_service").await, 0);
 
-    holding.gate.open().await;
-    let holder = holding.call.await.expect("the holder");
+    answering.open().await;
+    let holder = holder.await.expect("the holder");
     assert_eq!(
-        holder.status, 503,
-        "the kept text took the service past its share, so its answer was refused: {}",
+        holder.status, 200,
+        "its 3 MiB answer is past what is left of the share, and it is read all the same: {}",
         holder.body
     );
     assert_eq!(
         gauge(
             &platform,
             "cufflink_wasm_memory_denied_total",
-            &[
-                ("tenant", catalog.slug.as_str()),
-                ("reason", "service_share"),
-                ("what", "host")
-            ]
+            &[("tenant", catalog.slug.as_str()), ("what", "host")]
         )
         .await,
-        1.0
+        0.0
     );
+
+    filling.open().await;
+    eventually("both hooks ran", async || {
+        hooked(&rows, "catalog_service").await == 2
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_write_whose_hook_text_cannot_be_held_is_refused_and_commits_nothing() {
+    let Some((platform, mut db)) = small(&[("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40")]).await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[("hold_gated_24", "/hold")]);
+    manifest["tables"][0]["hooks"] = json!({"after_create": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    let rows = tenant_db(&db, &catalog).await;
+    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
+
+    let not_run = json!({"error": "guest capacity exhausted; the request was not run"});
+    let title = "x".repeat(4 * 1024 * 1024);
+    let (status, body) = written(&platform, &catalog, &json!({"title": title})).await;
+    assert_eq!((status, &body), (503, &not_run));
+    let (status, body) = batched(&platform, &catalog, &[title.as_str()]).await;
+    assert_eq!((status, &body), (503, &not_run));
+    assert_eq!(items(&rows, "catalog_service").await, 0);
+
+    holding.release().await;
+    let big = "x".repeat(1024 * 1024);
+    let (status, _) = batched(&platform, &catalog, &[big.as_str(); 16]).await;
+    assert_eq!(status, 500, "32 MiB of text is past a 25.6 MiB share");
+    assert_eq!(items(&rows, "catalog_service").await, 0);
+
+    let (status, body) = written(&platform, &catalog, &json!({"title": "written"})).await;
+    assert_eq!(status, 200, "{body}");
     eventually("the hook ran", async || {
         hooked(&rows, "catalog_service").await == 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn queued_hook_texts_past_what_a_run_leaves_of_the_share_all_drain() {
+    let Some((platform, mut db)) = small(&[
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40"),
+        ("WASM_MAX_CONCURRENT", "1"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "16"),
+    ])
+    .await
+    else {
+        return;
+    };
+    const MIB: usize = 1024 * 1024;
+    let (share, estimate) = (64 * MIB / 100 * 40, 16 * MIB);
+    let catalog = db.mint_tenant().await;
+    let loans = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[]);
+    manifest["tables"][0]["hooks"] = json!({"after_create": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    deployed(
+        &platform,
+        &loans,
+        &common::wasm_manifest("loan-service", &[("gate", "/gate")]),
+    )
+    .await;
+    let rows = tenant_db(&db, &catalog).await;
+    let holding = held(&platform, &db, &loans, "loan-service", "gate").await;
+
+    let title = "x".repeat(MIB + MIB * 2 / 5);
+    for _ in 0..5 {
+        let (status, body) = written(&platform, &catalog, &json!({"title": title})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let kept = gauge(
+        &platform,
+        "cufflink_wasm_memory_service_bytes",
+        &[("tenant", catalog.slug.as_str())],
+    )
+    .await as usize;
+    assert!(
+        kept / 5 * 4 + estimate > share,
+        "the other texts and a run do not fit the share: {kept}"
+    );
+    assert_eq!(hooked(&rows, "catalog_service").await, 0);
+
+    holding.release().await;
+    eventually("every hook ran", async || {
+        hooked(&rows, "catalog_service").await == 5
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_batch_of_small_rows_keeps_what_its_texts_take_and_no_more() {
+    let Some((platform, mut db)) = small(&[
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40"),
+        ("WASM_MAX_CONCURRENT_PER_SERVICE", "2"),
+    ])
+    .await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[]);
+    manifest["tables"][0]["hooks"] = json!({"after_create": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    let rows = tenant_db(&db, &catalog).await;
+
+    let (status, body) = batched(&platform, &catalog, &["written"; 40]).await;
+    assert_eq!(
+        status, 200,
+        "a 1 MiB step a text would pass the share: {body}"
+    );
+    eventually("every hook ran", async || {
+        hooked(&rows, "catalog_service").await == 40
     })
     .await;
 }

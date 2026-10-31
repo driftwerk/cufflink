@@ -1,5 +1,5 @@
 use crate::repo::wasm_jobs::{JobStatus, WasmJob};
-use crate::router::guest_response::{answer, parse_output, DecodeError};
+use crate::router::guest_response::{answer, parse_output};
 use crate::wasm_runtime::budget::{Hold, Refused};
 use crate::wasm_runtime::ExecutionError;
 use crate::wasm_runtime::GuestOutput;
@@ -127,11 +127,9 @@ impl Attempt {
 }
 
 fn answered(response: GuestOutput, job: &WasmJob) -> Result<(Attempt, Hold), Refused> {
-    let answer = match answer(&response) {
-        Ok(answer) => Some((answer.status.as_u16(), answer.delivery)),
-        Err(DecodeError::Invalid(_)) => None,
-        Err(DecodeError::Refused(refused)) => return Err(refused),
-    };
+    let answer = answer(&response)
+        .ok()
+        .map(|answer| (answer.status.as_u16(), answer.delivery));
     let failed = match answer {
         Some((status, Some(DeliveryControl::RetryAfter { retry_after_ms }))) => Attempt::failed(
             JobErrorClass::Explicit {

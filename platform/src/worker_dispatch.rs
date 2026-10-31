@@ -135,7 +135,7 @@ pub async fn execute_on_worker(
     service_name: &str,
     job: WasmJob,
     timeout: Duration,
-    mut hold: Hold,
+    hold: &Hold,
     engine: Option<&WasmEngine>,
 ) -> Result<GuestOutput, PlatformError> {
     let subject = format!("cufflink.wasm.{}.{}", service_name, job.handler);
@@ -160,6 +160,7 @@ pub async fn execute_on_worker(
     .map_err(|_| PlatformError::Internal("WASM worker execution timed out".into()))?
     .map_err(|e| PlatformError::Internal(format!("NATS request failed: {}", e)))?;
 
+    let mut hold = hold.delivering();
     hold.grow(reply.payload.len().saturating_mul(2))
         .map_err(|capacity| match engine {
             Some(engine) => crate::router::map_execution_error(

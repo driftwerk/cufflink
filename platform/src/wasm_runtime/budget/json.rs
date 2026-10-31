@@ -30,6 +30,15 @@ impl fmt::Display for ChargedJsonError {
 
 impl std::error::Error for ChargedJsonError {}
 
+impl ChargedJsonError {
+    pub(crate) fn beside(self, held: usize) -> Self {
+        match self {
+            Self::Capacity(refused) => Self::Capacity(refused.beside(held)),
+            syntax => syntax,
+        }
+    }
+}
+
 struct Tally<'m, M: Meter + ?Sized> {
     meter: &'m mut M,
     used: usize,

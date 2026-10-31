@@ -138,15 +138,19 @@ pub(crate) fn decode(output: GuestOutput) -> Result<(GuestResponse, Hold), Decod
     decode_value(value, &mut hold).map(|response| (response, hold))
 }
 
-pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, DecodeError> {
+pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError> {
     let mut hold = output.hold.sibling();
+    let unreadable = || GuestResponse::Legacy {
+        status: StatusCode::OK,
+        body: Value::Null,
+    };
     let response = match ChargedJson::parse(output.text.as_bytes(), &mut hold) {
-        Ok(parsed) => decode_value(parsed.value, &mut hold)?,
-        Err(ChargedJsonError::Syntax(_)) => GuestResponse::Legacy {
-            status: StatusCode::OK,
-            body: Value::Null,
+        Ok(parsed) => match decode_value(parsed.value, &mut hold) {
+            Ok(response) => response,
+            Err(DecodeError::Invalid(error)) => return Err(error),
+            Err(DecodeError::Refused(_)) => unreadable(),
         },
-        Err(ChargedJsonError::Capacity(refused)) => return Err(DecodeError::Refused(refused)),
+        Err(_) => unreadable(),
     };
     Ok(match response {
         GuestResponse::Legacy { status, .. } => Answer {

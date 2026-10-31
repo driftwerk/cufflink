@@ -346,6 +346,16 @@ impl Budget {
         })
     }
 
+    pub(crate) fn kept(&self, identity: &ServiceIdentity, handler: &str) -> Hold {
+        let room = self.ledger.as_ref().map_or(0, |ledger| {
+            self.estimate(ledger, Class::Committed, identity, handler, 0)
+        });
+        Hold::kept(
+            self.account(identity, Class::Committed, handler, InvocationKind::Hook),
+            room,
+        )
+    }
+
     pub(crate) fn publish(&self) {
         if let Some(ledger) = &self.ledger {
             ledger.publish();

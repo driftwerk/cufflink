@@ -169,7 +169,13 @@ been. A later release makes `enforce` the default. Under `enforce`:
 - a message of an `ack: always` subscription denied memory mid-run is run
   again rather than acked, so it may run twice;
 - a route denied memory mid-run is answered `503`, saying the request may
-  have been partly applied.
+  have been partly applied;
+- a write with an after-hook runs in a transaction, and is answered `503`,
+  with nothing committed, when the hook's request text cannot be held. Once
+  the write has committed the hook is never refused; it waits for its run;
+- a request or message whose guest has returned is always delivered: its
+  reply is never refused for what else is running. Only an answer that
+  alone passes the service share is refused, as too large.
 
 Memory the host makes for guests is charged before it is made: request
 and response bodies, and the results of host calls (database rows,
@@ -185,16 +191,17 @@ answered as before. Under `enforce`:
 - `redis_get` and `redis_mget` measure the values first (`STRLEN` in one
   `MULTI`), refuse a read whose values together pass the cap, reserve
   them, and then read them (`EXISTS` and `GETRANGE` in a second `MULTI`).
-  A value that grew between the two answers the call `-1`, as an error the
-  guest may retry. `redis_mget` takes at most `HOST_FANOUT_MAX_ITEMS`
+  A value that keeps growing between the two, over three reads, answers
+  the call `-1`, as an error the guest may retry. `redis_mget` takes at most `HOST_FANOUT_MAX_ITEMS`
   (128) keys. The Redis user needs `MULTI`, `EXEC`, `STRLEN`, `EXISTS` and
   `GETRANGE`; an ACL that allows only `GET` and `MGET` refuses these
   reads. Redis 7 or later is required for them to answer exactly as `GET`
   does when a key expires during the read; on Redis 6 the platform logs a
   warning at startup and such a key may read as `""` rather than nil.
   Under `warn` and `off`, the reads stay plain `GET` and `MGET`;
-- `service_call` reads a callee's response only up to the cap, so a
-  larger one fails the call with a transport error.
+- `service_call` reads a callee's response only up to what its envelope
+  can carry under the cap, about three quarters of it, so a larger one
+  fails the call with a transport error.
 
 The budget is shared fairly between services, not tenants: each service
 may hold at most `WASM_MEMORY_SERVICE_SHARE_PERCENT` (50) of it, so a

@@ -11,13 +11,11 @@ use crate::nats_manager::pump::{
 use crate::nats_manager::reconciler::{DesiredLoop, RunningLoop, Served, WorkSpec};
 use crate::nats_manager::subjects::{is_valid_publish_subject, PLATFORM_INBOX_PREFIX};
 use crate::registry::ServiceIdentity;
-use crate::router::guest_response::{self, DecodeError};
+use crate::router::guest_response;
 use crate::schedules::work::ScheduleWork;
 use crate::shutdown::DrainOutcome;
 use crate::tenant_sessions::{Purpose, Statements};
-use crate::wasm_runtime::{
-    Class, ExecutionError, GuestOutput, Invocation, InvocationKind, WasmEngine,
-};
+use crate::wasm_runtime::{Class, ExecutionError, GuestOutput, Invocation, InvocationKind};
 use crate::AppState;
 use async_nats::jetstream;
 use async_nats::HeaderMap;
@@ -539,11 +537,9 @@ impl HandlerOutcome {
         }
     }
 
-    fn outcome(&self, ack: AckMode, engine: Option<&WasmEngine>) -> Outcome {
+    fn outcome(&self, ack: AckMode) -> Outcome {
         match self {
-            HandlerOutcome::Rpc(Ok(response)) if ack == AckMode::OnSuccess => {
-                answered(response, engine)
-            }
+            HandlerOutcome::Rpc(Ok(response)) if ack == AckMode::OnSuccess => answered(response),
             HandlerOutcome::Rpc(Ok(_)) | HandlerOutcome::SideEffect(Ok(())) => Outcome::Ok,
             HandlerOutcome::Rpc(Err(failure)) => failure.outcome(),
             HandlerOutcome::SideEffect(Err(e)) => Outcome::Retry {
@@ -554,24 +550,13 @@ impl HandlerOutcome {
     }
 }
 
-pub(crate) fn answered(response: &GuestOutput, engine: Option<&WasmEngine>) -> Outcome {
+pub(crate) fn answered(response: &GuestOutput) -> Outcome {
     let (status, delivery) = match guest_response::answer(response) {
         Ok(answer) => (answer.status, answer.delivery),
-        Err(DecodeError::Invalid(e)) => {
+        Err(e) => {
             return Outcome::Retry {
                 after: None,
                 reason: format!("handler answered an {e}"),
-            }
-        }
-        Err(DecodeError::Refused(refused)) => {
-            return match engine.map(|engine| engine.refusal(refused, true)) {
-                Some(ExecutionError::Overloaded { retry_after, .. }) => {
-                    Outcome::Deferred { after: retry_after }
-                }
-                other => Outcome::Retry {
-                    after: None,
-                    reason: other.map_or_else(|| refused.to_string(), |e| e.to_string()),
-                },
             }
         }
     };
@@ -639,7 +624,7 @@ async fn handle_message(
     .instrument(handler_span.clone())
     .await;
 
-    let outcome = handled.outcome(ctx.ack, ctx.state.wasm_engine.as_ref());
+    let outcome = handled.outcome(ctx.ack);
     let failed = handled.error().or_else(|| match &outcome {
         Outcome::Retry { reason, .. } | Outcome::Terminal { reason } => Some(reason.clone()),
         _ => None,
@@ -1179,7 +1164,7 @@ mod tests {
             ))))
         };
         for ack in [AckMode::Always, AckMode::OnSuccess] {
-            assert_eq!(interrupted().outcome(ack, None), Outcome::Interrupted);
+            assert_eq!(interrupted().outcome(ack), Outcome::Interrupted);
         }
         assert_eq!(
             interrupted().error().as_deref(),
@@ -1419,8 +1404,31 @@ mod delivery_tests {
         }
     }
 
+    #[test]
+    fn a_finished_handler_is_settled_however_full_its_service_is() {
+        use crate::wasm_runtime::budget::testing;
+
+        let (ledger, mut full) = testing::hold(4 * testing::MIB);
+        full.grow(4 * testing::MIB).expect("the budget");
+        let finished = |text: &str| {
+            HandlerOutcome::Rpc(Ok(GuestOutput {
+                text: text.to_string(),
+                hold: full.delivering(),
+            }))
+        };
+        for ack in [AckMode::Always, AckMode::OnSuccess] {
+            assert_eq!(finished(r#"{"ok":true}"#).outcome(ack), Outcome::Ok);
+        }
+        assert_eq!(
+            finished(&format!("\"{}\"", "x".repeat(5 * testing::MIB))).outcome(AckMode::OnSuccess),
+            Outcome::Ok,
+            "an answer too large to read is settled as an unreadable one is"
+        );
+        assert_eq!(ledger.in_use(), 4 * testing::MIB);
+    }
+
     fn answered_text(text: &str) -> Outcome {
-        answered(&output(text), None)
+        answered(&output(text))
     }
     use cufflink_types::ConsumerSpec;
 
@@ -1537,15 +1545,12 @@ mod delivery_tests {
     #[test]
     fn under_always_an_answer_is_a_success() {
         let failed = || HandlerOutcome::Rpc(Ok(output(r#"{"__status":500}"#)));
-        assert_eq!(failed().outcome(AckMode::Always, None), Outcome::Ok);
-        assert!(retried(failed().outcome(AckMode::OnSuccess, None)).is_some());
+        assert_eq!(failed().outcome(AckMode::Always), Outcome::Ok);
+        assert!(retried(failed().outcome(AckMode::OnSuccess)).is_some());
         let built_in = || HandlerOutcome::SideEffect(Err(eyre::eyre!("no such table")));
         for ack in [AckMode::Always, AckMode::OnSuccess] {
-            assert_eq!(retried(built_in().outcome(ack, None)), Some(None));
-            assert_eq!(
-                HandlerOutcome::SideEffect(Ok(())).outcome(ack, None),
-                Outcome::Ok
-            );
+            assert_eq!(retried(built_in().outcome(ack)), Some(None));
+            assert_eq!(HandlerOutcome::SideEffect(Ok(())).outcome(ack), Outcome::Ok);
         }
     }
 
