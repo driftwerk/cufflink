@@ -782,26 +782,40 @@ async fn a_batch_is_measured_by_the_hooks_it_keeps_and_not_by_its_rows() {
 
 #[tokio::test]
 async fn concurrent_large_answers_are_all_delivered_and_give_their_room_back() {
+    const ANSWERS: i64 = 6;
     let Some((platform, mut db)) = small(&[
         ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
         ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
         ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "16"),
-        ("WASM_ADMISSION_WAIT_MS", "5000"),
+        ("MAX_CONNS_PER_TENANT", "8"),
     ])
     .await
     else {
         return;
     };
     let catalog = db.mint_tenant().await;
-    let manifest = common::wasm_manifest("catalog-service", &[("answer_some_records", "/records")]);
+    let manifest = common::wasm_manifest(
+        "catalog-service",
+        &[("answer_some_records_gated", "/records")],
+    );
     deployed(&platform, &catalog, &manifest).await;
-    let url = platform.fn_url(&catalog, "catalog-service", "answer_some_records");
-    let answers = futures_util::future::join_all(
-        (0..6).map(|_| answered(platform.http.post(&url).json(&json!({})))),
-    )
+    let gate = common::Gate::closed(&db.tenant_url(&catalog.slug)).await;
+    let url = platform.fn_url(&catalog, "catalog-service", "answer_some_records_gated");
+    let calls: Vec<_> = (0..ANSWERS)
+        .map(|_| tokio::spawn(answered(platform.http.post(&url).json(&json!({})))))
+        .collect();
+    eventually("every guest is running", async || {
+        gate.waiting().await == ANSWERS
+    })
     .await;
-    for answer in answers {
-        assert_eq!(answer.status, 200, "{}", answer.body);
+    gate.open().await;
+    for call in calls {
+        let answer = call.await.expect("the call");
+        assert_eq!(
+            answer.status, 200,
+            "after {:?}, retry after {:?}: {}",
+            answer.took, answer.retry_after, answer.body
+        );
     }
     eventually("every delivery's room is back", async || {
         gauge(
