@@ -245,6 +245,18 @@ These process changes apply in every mode, `off` included:
   for the budget, `WASM_THREAD_STACK_KB` included) stops the process at
   startup rather than falling back to a default.
 
+These response changes also apply in every mode, `off` included:
+
+- a `__content_type` or `__stream.content_type` past 8 KiB is an invalid
+  answer, as any other header value past 8 KiB already was;
+- a `__stream` bucket or key past 1 KiB, the most S3 and GCS allow, is an
+  invalid answer;
+- an error about a header, an HTTP method or a multipart part quotes at most
+  the first 64 characters of the name;
+- `cufflink_guest_header_dropped_total` labels a header dropped by prefix
+  with that prefix (`proxy-`, `access-control-`), not its full name. A
+  dashboard or alert keyed on a full name needs updating.
+
 Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 
 `cufflink services list --features` prints what each deployed service
