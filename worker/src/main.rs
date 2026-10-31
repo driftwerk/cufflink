@@ -608,7 +608,7 @@ struct AfterHookWork {
 
 fn after_hook_outcome(result: Result<GuestOutput, JobError>, at_hard_deadline: bool) -> Outcome {
     match result {
-        Ok(_) | Err(JobError::Execution(ExecutionError::Oversized { .. })) => Outcome::Ok,
+        Ok(_) | Err(JobError::Execution(ExecutionError::Undelivered { .. })) => Outcome::Ok,
         Err(JobError::Execution(ExecutionError::NotStarted)) => Outcome::NotStarted,
         Err(JobError::Execution(e)) if e.interrupted_by_shutdown(at_hard_deadline) => {
             Outcome::Interrupted
@@ -764,7 +764,7 @@ mod tests {
         );
         assert_eq!(
             after_hook_outcome(
-                Err(JobError::Execution(ExecutionError::Oversized {
+                Err(JobError::Execution(ExecutionError::Undelivered {
                     reason: "past the cap".into(),
                     answer: cufflink_platform::router::guest_response::Answer {
                         status: axum::http::StatusCode::OK,

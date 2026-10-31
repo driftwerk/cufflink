@@ -34,6 +34,13 @@ platform or worker past its container's limit.
   container with the defaults: budget 1433.6 MiB, overrun 307.2 MiB,
   response 64 MiB, 1804.8 MiB in all, which leaves 243.2 MiB for the
   platform's own heap. Startup warns when the three reach the limit.
+- **The largest answer.** An answer whose text, tree and render alone pass
+  the smaller of the overrun and the service share is refused as too large
+  at any load: its effects stand and a route answers `500`. On 2 GiB that
+  is 307 MiB, about 32 MiB of text of small records, or strings up to
+  `WASM_MAX_RESPONSE_MB`. At the 128 MiB floor, for containers up to
+  853 MiB, it is about 13 MiB of records or 42 MiB of strings. Raise
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB`, below the reserve, to deliver more.
 - **What the reserve holds:** the process's baseline, compiled modules, the
   core threads' stacks and fragmentation. The host buffers of host calls,
   requests and responses are charged to the budget. On glibc startup sets

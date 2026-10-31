@@ -1381,7 +1381,7 @@ mod tests {
         assert_eq!(ledger.in_use(), 60 * MIB);
         assert_eq!(
             super::tests::ledger(false).deliver(Class::Interactive, &catalog, MIB, 51 * MIB),
-            Verdict::Warned(Reason::ServiceShare)
+            Verdict::Warned(Reason::DeliveryLimit)
         );
     }
 

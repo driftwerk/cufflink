@@ -209,7 +209,7 @@ fn unanswered(
 ) -> Attempt {
     match error {
         ExecutionError::Cancelled => Attempt::LeaseLost,
-        ExecutionError::Oversized { reason, answer } => {
+        ExecutionError::Undelivered { reason, answer } => {
             failed_by(answer, job).unwrap_or_else(|| finished_unread(reason))
         }
         e if e.interrupted_by_shutdown(at_hard_deadline) => Attempt::Interrupted(e.to_string()),
@@ -361,8 +361,8 @@ pub(crate) mod tests {
             ),
             Attempt::failed(
                 JobErrorClass::HandlerError,
-                "Handler error: WASM guest needs more memory than its service may hold \
-                 (requested 2 bytes, service share 1 bytes)"
+                "Handler error: WASM guest needs more memory than it may hold \
+                 (requested 2 bytes, limit 1 bytes)"
             ),
             "no retry cures what can never fit"
         );
@@ -622,7 +622,7 @@ pub(crate) mod tests {
     #[test]
     fn a_job_answering_past_the_response_cap_ends_as_it_says() {
         let oversized = |status: u16| {
-            Err(ExecutionError::Oversized {
+            Err(ExecutionError::Undelivered {
                 reason: "past the cap".into(),
                 answer: Answer {
                     status: axum::http::StatusCode::from_u16(status).expect("a status"),

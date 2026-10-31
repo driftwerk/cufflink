@@ -179,9 +179,12 @@ been. A later release makes `enforce` the default. Under `enforce`:
   and dropped, and not retried. Route work that must happen to a worker;
 - a request or message whose guest has returned is delivered: it takes
   room up to `WASM_MEMORY_DELIVERY_OVERRUN_MB` past the budget, in turn, and
-  is never refused for what else is running. Only an answer that alone
-  passes the smaller of the overrun and the service share is refused, as
-  too large. A subscription, schedule or
+  is never refused for what else is running. Only an answer whose text,
+  tree and render alone pass the smaller of the overrun and the service
+  share is refused, as too large: its effects stand and a route answers
+  `500`. By default that is 128 MiB up to an 853 MiB container and 15 % of
+  the limit above it; raise `WASM_MEMORY_DELIVERY_OVERRUN_MB` to deliver
+  larger answers. A subscription, schedule or
   job is still settled by the `__status` and `__delivery` of such an
   answer, and a job that succeeded fails terminally with its result
   unread, rather than running again;

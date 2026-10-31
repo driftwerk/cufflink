@@ -832,7 +832,7 @@ pub(crate) async fn run_handler(
         .await
         .map_err(|e| {
             let e = match e {
-                ExecutionError::Oversized { reason, answer } => {
+                ExecutionError::Undelivered { reason, answer } => {
                     return HandlerFailure::Settled {
                         outcome: settled_by(answer),
                         reason: eyre::eyre!("WASM execution error: {reason}"),

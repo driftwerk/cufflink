@@ -100,8 +100,8 @@ pub enum ExecutionError {
     MemoryLimit { requested: usize, limit: usize },
     #[error("WASM guest returned an invalid response: {0}")]
     Response(String),
-    #[error("WASM guest returned an invalid response: {reason}")]
-    Oversized { reason: String, answer: Answer },
+    #[error("{reason}")]
+    Undelivered { reason: String, answer: Answer },
     #[error("Handler '{0}' not found in WASM module")]
     HandlerNotFound(String),
     #[error("WASM trap: {0}")]
@@ -109,8 +109,8 @@ pub enum ExecutionError {
     #[error("WASM runtime error: {0}")]
     Runtime(String),
     #[error(
-        "WASM guest needs more memory than its service may hold (requested {requested} bytes, \
-         service share {share} bytes)"
+        "WASM guest needs more memory than it may hold (requested {requested} bytes, limit \
+         {share} bytes)"
     )]
     TooLarge { requested: usize, share: usize },
     #[error("WASM guest capacity exhausted ({reason})")]
@@ -140,7 +140,7 @@ impl ExecutionError {
             ExecutionError::Overloaded { .. } => "overloaded",
             ExecutionError::TooLarge { .. } => "too_large",
             ExecutionError::Response(_)
-            | ExecutionError::Oversized { .. }
+            | ExecutionError::Undelivered { .. }
             | ExecutionError::HandlerNotFound(_)
             | ExecutionError::Runtime(_) => "error",
         }

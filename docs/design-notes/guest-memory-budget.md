@@ -1851,13 +1851,26 @@ Recorded as the change was built, each with its reason.
   slots are released before decoding (section 1.4), so a hold that alone
   passes the limit is refused as too large (500, `too_large`) and counted
   under `warn`, as is its text, tree and render together. That does not
-  depend on load, so no retry cures it. The limit is lower than the share
-  on a default container: a tree of small records costs about 7.5 times its
-  text, which with the text and the render makes 9.5 times, so on 2 GiB an
-  answer of such records stops being deliverable near 32 MiB of text rather
-  than at the response cap, and an operator raises the overrun, below the
-  reserve, to deliver more. Strings are unaffected: an
-  answer of one string costs three times its text.
+  depend on load, so no retry cures it.
+  The limit is what an operator sizes with
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB`, which can rise to just below the
+  reserve. By default it is the overrun, which is below the share on every
+  container of 512 MiB or more: 15 % of the limit above 853 MiB, and 128 MiB
+  from there down to 512 MiB, below which the smaller share rules. What fits
+  it depends on the answer's shape, since a hold counts text, tree and
+  render together. One long string costs three times its text, so strings
+  reach `WASM_MAX_RESPONSE_MB` (64) from a 1.28 GiB container up, and stop
+  at about 42 MiB of text below that. Small records cost about 9.5 times
+  theirs: about 32 MiB of text on 2 GiB and 13 MiB at the 128 MiB floor.
+  The worst shape, about 97 times, is about 3 MiB of text on 2 GiB and
+  1.3 MiB at that floor.
+  What a finished request then gets: its effects stand, and its answer is
+  not delivered. A route answers 500 (`too_large`), with no `Retry-After`;
+  a subscription or schedule settles by the status and `__delivery` read
+  from the bytes (below), and an RPC caller gets an error envelope; a job
+  that answered success fails `Terminal`, naming its result as unreadable;
+  a before-hook's request fails with nothing from the write committed; an
+  after-hook's answer is not read, so it is unaffected.
 - **A delivery takes a room below a ceiling.** Forcing every finished
   guest's tree would have no global bound: each hold is checked only
   against its own size, slots are already released, and a burst of small
@@ -1879,7 +1892,12 @@ Recorded as the change was built, each with its reason.
   guest, so a callee's answer cannot deadlock a caller waiting in a host
   call, and no holder of a room waits for another. What can hold the band
   is a rendered body a slow client has not read, which transport timeouts
-  end. The room is unattributed, so it causes no share denial, and is held
+  end. A wait that is still queued at the hard deadline, less
+  `KILL_MARGIN`, ends there as `ExecutionError::Undelivered`, not
+  `NotStarted`: the guest ran, so a nack would run finished work again. It
+  settles as an answer past the response cap does, below, with no tree, so
+  no redelivery follows from the shutdown. A route still open then answers
+  500 saying the guest finished. The room is unattributed, so it causes no share denial, and is held
   beside the tree's own charges rather than drawn from, which overstates
   `in_use` for the length of a decode and never understates it. It ends
   when the hold drops or when the body is rendered. A worker's reply takes
@@ -1917,7 +1935,7 @@ Recorded as the change was built, each with its reason.
   cure it on a retry, and the job's effects have happened.
 - **An answer past `WASM_MAX_RESPONSE_MB`** is the same case with no copy
   made: `read_response` reads the outline over linear memory and returns
-  `ExecutionError::Oversized`, so a subscription or schedule settles by the
+  `ExecutionError::Undelivered`, so a subscription or schedule settles by the
   answer, a job as above, and a worker after-hook is acked. A route still
   answers 500. Only an out-of-bounds, non-UTF-8 or invalid response stays
   an ordinary failure, which is retried.

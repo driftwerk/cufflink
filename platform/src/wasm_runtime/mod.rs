@@ -857,6 +857,16 @@ impl WasmEngine {
         self.budget.capacity_retries_job()
     }
 
+    async fn hard_deadline(&self) {
+        self.shutdown.cancelled().await;
+        tokio::time::sleep(
+            self.shutdown
+                .remaining()
+                .saturating_sub(crate::shutdown::KILL_MARGIN),
+        )
+        .await;
+    }
+
     async fn admit(
         &self,
         inv: &Invocation,
@@ -874,19 +884,10 @@ impl WasmEngine {
             },
             &self.permits,
         );
-        let hard_deadline = async {
-            self.shutdown.cancelled().await;
-            tokio::time::sleep(
-                self.shutdown
-                    .remaining()
-                    .saturating_sub(crate::shutdown::KILL_MARGIN),
-            )
-            .await;
-        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ExecutionError::Cancelled),
-            _ = hard_deadline, if self.budget.waits_outside_budget(inv.class, inv.kind) => {
+            _ = self.hard_deadline(), if self.budget.waits_outside_budget(inv.class, inv.kind) => {
                 Err(ExecutionError::NotStarted)
             }
             admitted = admitted => admitted,
@@ -920,8 +921,20 @@ impl WasmEngine {
         match result {
             Ok(mut output) => {
                 let room = budget::ChargedJson::delivery_bound(output.text.as_bytes());
-                output.hold.make_room(room).await;
-                Ok(output)
+                let placed = tokio::select! {
+                    biased;
+                    () = output.hold.make_room(room) => true,
+                    () = self.hard_deadline() => false,
+                };
+                match placed {
+                    true => Ok(output),
+                    false => Err(undelivered(
+                        "the guest finished, but the platform shut down before its answer could \
+                         be delivered"
+                            .to_string(),
+                        output.text.as_bytes(),
+                    )),
+                }
             }
             failed => failed,
         }
@@ -1208,6 +1221,13 @@ fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError 
     denied(denial, memory, false)
 }
 
+fn undelivered(reason: String, text: &[u8]) -> ExecutionError {
+    match crate::router::guest_response::outline(text) {
+        Ok(answer) => ExecutionError::Undelivered { reason, answer },
+        Err(_) => ExecutionError::Response(reason),
+    }
+}
+
 fn read_response(
     memory: &[u8],
     ptr: i32,
@@ -1230,12 +1250,10 @@ fn read_response(
         .increment(1);
         let reason = format!("response of {len} bytes exceeds the {max_bytes} byte cap");
         return Err(match memory.get(start + 4..start + 4 + len) {
-            Some(text) if std::str::from_utf8(text).is_ok() => {
-                match crate::router::guest_response::outline(text) {
-                    Ok(answer) => ExecutionError::Oversized { reason, answer },
-                    Err(_) => ExecutionError::Response(reason),
-                }
-            }
+            Some(text) if std::str::from_utf8(text).is_ok() => undelivered(
+                format!("WASM guest returned an invalid response: {reason}"),
+                text,
+            ),
             _ => ExecutionError::Response(reason),
         });
     }
@@ -1688,7 +1706,7 @@ pub(crate) mod tests {
         .expect("read");
         assert!(matches!(
             read(&memory, 8, 4),
-            Err(ExecutionError::Oversized { reason, .. }) if reason.contains("cap")
+            Err(ExecutionError::Undelivered { reason, .. }) if reason.contains("cap")
         ));
         memory[12] = 0xff;
         assert!(matches!(
@@ -2159,6 +2177,48 @@ pub(crate) mod tests {
         holder.join().expect("join");
         let text = blocked.await.expect("join").expect("delivered");
         assert_eq!(text.len(), 8 * MIB);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_with_no_room_at_the_hard_deadline_is_undelivered_and_settled() {
+        let shutdown = Shutdown::new(crate::shutdown::KILL_MARGIN + Duration::from_millis(300));
+        let engine = WasmEngine::new(narrow("13", "1"), shutdown.clone()).expect("engine");
+        let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
+        let state = AppState::minimal(engine.clone()).await;
+        let mut inv = invocation(
+            compiled,
+            "h",
+            InvocationKind::Subscription,
+            Duration::from_secs(30),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        inv.admission = Some(engine.admit(&inv, &cancel).await.expect("admitted"));
+        let mut band = engine.kept_hold(&inv.identity, "h", 0);
+        band.force(14 * MIB);
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.run_text(state, inv).await }
+        });
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        while ledger.delivery_waiters() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        shutdown.trigger();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the drain does not end the wait");
+        let answered = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the hard deadline ends the wait")
+            .expect("join");
+        assert!(
+            matches!(
+                &answered,
+                Err(ExecutionError::Undelivered { reason, answer })
+                    if reason.contains("shut down") && answer.status == 200
+            ),
+            "the guest finished, so it is never answered as not run: {answered:?}"
+        );
+        assert_eq!(ledger.delivery_waiters(), 0);
     }
 
     #[test]
@@ -3125,7 +3185,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ExecutionError::Oversized { .. }), "{err}");
+        assert!(matches!(err, ExecutionError::Undelivered { .. }), "{err}");
 
         let err = engine
             .run_text(
