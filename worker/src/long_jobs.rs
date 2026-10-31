@@ -459,7 +459,6 @@ impl LongJobs {
             job,
             self.app_state.shutdown.hard_deadline_reached(),
             self.wasm_engine.capacity_deferrals_allowed(),
-            |refused| self.wasm_engine.refusal(refused, true),
         )
     }
 

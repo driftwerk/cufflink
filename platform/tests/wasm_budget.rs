@@ -537,8 +537,17 @@ async fn a_write_whose_hook_text_cannot_be_held_is_refused_and_commits_nothing()
 
     holding.release().await;
     let big = "x".repeat(1024 * 1024);
-    let (status, _) = batched(&platform, &catalog, &[big.as_str(); 16]).await;
-    assert_eq!(status, 500, "32 MiB of text is past a 25.6 MiB share");
+    let (status, body) = batched(&platform, &catalog, &[big.as_str(); 16]).await;
+    assert_eq!(
+        status, 413,
+        "32 MiB of text is past a 25.6 MiB share: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("nothing was committed")),
+        "{body}"
+    );
     assert_eq!(items(&rows, "catalog_service").await, 0);
 
     let (status, body) = written(&platform, &catalog, &json!({"title": "written"})).await;
@@ -547,6 +556,307 @@ async fn a_write_whose_hook_text_cannot_be_held_is_refused_and_commits_nothing()
         hooked(&rows, "catalog_service").await == 1
     })
     .await;
+}
+
+#[tokio::test]
+async fn an_update_or_delete_whose_hook_text_cannot_be_held_is_refused_and_changes_nothing() {
+    let Some((platform, mut db)) = small(&[("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40")]).await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[("hold_gated_24", "/hold")]);
+    manifest["tables"][0]["hooks"] =
+        json!({"after_update": "insert_hooked", "after_delete": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    let rows = tenant_db(&db, &catalog).await;
+    let (status, row) = written(&platform, &catalog, &json!({"title": "kept"})).await;
+    assert_eq!(status, 200, "{row}");
+    let id = row["id"].as_str().expect("id");
+    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
+
+    let not_run = json!({"error": "guest capacity exhausted; the request was not run"});
+    let url = format!("/svc/{}/catalog-service/items/{id}", catalog.slug);
+    let key = format!("ApiKey {}", catalog.api_key);
+    let title = "x".repeat(4 * 1024 * 1024);
+    let changed = json!({"title": title});
+    let (status, body) = platform
+        .send(reqwest::Method::PUT, &url, &key, Some(&changed))
+        .await;
+    assert_eq!((status, &body), (503, &not_run));
+    let (status, body) = platform
+        .send(reqwest::Method::DELETE, &url, &key, None)
+        .await;
+    assert_eq!((status, &body), (503, &not_run));
+    let titled = |title: &'static str| {
+        let rows = &rows;
+        async move {
+            rows.query_one(
+                "SELECT count(*) FROM catalog_service.items WHERE title = $1",
+                &[&title],
+            )
+            .await
+            .expect("items")
+            .get::<_, i64>(0)
+        }
+    };
+    assert_eq!(titled("kept").await, 1, "neither write took effect");
+
+    holding.release().await;
+    let (status, body) = platform
+        .send(
+            reqwest::Method::PUT,
+            &url,
+            &key,
+            Some(&json!({"title": "kept"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = platform
+        .send(reqwest::Method::DELETE, &url, &key, None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    eventually("both hooks ran", async || titled("hooked").await == 2).await;
+    assert_eq!(titled("kept").await, 0);
+}
+
+async fn a_row_too_deep_for_its_hook_text(mode: &str) {
+    let Some((platform, mut db)) = small(&[("WASM_MEMORY_BUDGET_MODE", mode)]).await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[]);
+    manifest["tables"][0]["hooks"] =
+        json!({"after_create": "insert_hooked", "after_update": "insert_hooked"});
+    manifest["tables"][0]["columns"]
+        .as_array_mut()
+        .expect("columns")
+        .push(json!({
+            "name": "meta",
+            "column_type": "jsonb",
+            "primary_key": false,
+            "nullable": true,
+            "auto_generate": false
+        }));
+    deployed(&platform, &catalog, &manifest).await;
+    let rows = tenant_db(&db, &catalog).await;
+    let deep = (0..125).fold(json!(1), |inner, _| Value::Array(vec![inner]));
+    let (status, row) = written(&platform, &catalog, &json!({"title": "deep", "meta": deep})).await;
+    assert_eq!(status, 200, "{mode}: {row}");
+    let id = row["id"].as_str().expect("id");
+
+    let key = format!("ApiKey {}", catalog.api_key);
+    let (status, body) = platform
+        .send(
+            reqwest::Method::PUT,
+            &format!("/svc/{}/catalog-service/items/{id}", catalog.slug),
+            &key,
+            Some(&json!({"title": "updated"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{mode}: {body}");
+
+    let (status, body) = platform
+        .send(
+            reqwest::Method::POST,
+            &format!("/svc/{}/catalog-service/items/batch", catalog.slug),
+            &key,
+            Some(&json!({"operations": [
+                {"action": "update", "id": id, "data": {"title": "batched"}},
+                {"action": "create", "data": {"title": "shallow"}},
+            ]})),
+        )
+        .await;
+    assert_eq!(status, 200, "{mode}: {body}");
+    assert_eq!(items(&rows, "catalog_service").await, 2);
+    let batched: i64 = rows
+        .query_one(
+            "SELECT count(*) FROM catalog_service.items WHERE title = 'batched'",
+            &[],
+        )
+        .await
+        .expect("items")
+        .get(0);
+    assert_eq!(batched, 1, "{mode}: the batch committed");
+    eventually("the shallow row's hook ran", async || {
+        hooked(&rows, "catalog_service").await == 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_row_too_deep_for_its_hook_text_is_written_and_its_hook_dropped_under_off() {
+    a_row_too_deep_for_its_hook_text("off").await;
+}
+
+#[tokio::test]
+async fn a_row_too_deep_for_its_hook_text_is_written_and_its_hook_dropped_under_warn() {
+    a_row_too_deep_for_its_hook_text("warn").await;
+}
+
+#[tokio::test]
+async fn a_row_too_deep_for_its_hook_text_is_written_and_its_hook_dropped_under_enforce() {
+    a_row_too_deep_for_its_hook_text("enforce").await;
+}
+
+#[tokio::test]
+async fn a_write_refused_after_its_before_hook_ran_says_so() {
+    let Some((platform, mut db)) = small(&[
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "50"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+    ])
+    .await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[("hold_gated_24", "/hold")]);
+    manifest["tables"][0]["hooks"] =
+        json!({"before_create": "insert_hooked", "after_create": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    let rows = tenant_db(&db, &catalog).await;
+    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
+    let title = "x".repeat(1024 * 1024);
+    let (status, body) = written(&platform, &catalog, &json!({"title": title})).await;
+    assert_eq!(
+        (status, &body),
+        (
+            503,
+            &json!({"error": "guest capacity exhausted after the request's before-hook ran; \
+                              nothing from the write was committed"})
+        )
+    );
+    assert_eq!(
+        hooked(&rows, "catalog_service").await,
+        1,
+        "the before-hook ran"
+    );
+    assert_eq!(items(&rows, "catalog_service").await, 0);
+    holding.release().await;
+}
+
+#[tokio::test]
+async fn a_batch_is_measured_by_the_hooks_it_keeps_and_not_by_its_rows() {
+    let Some((platform, mut db)) = small(&[("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40")]).await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[("hold_gated_24", "/hold")]);
+    manifest["tables"][0]["hooks"] = json!({"after_create": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    let big = "x".repeat(1024 * 1024);
+    let mut ids = Vec::new();
+    for _ in 0..16 {
+        let (status, body) = written(&platform, &catalog, &json!({"title": "seed"})).await;
+        assert_eq!(status, 200, "{body}");
+        ids.push(body["id"].as_str().expect("id").to_string());
+    }
+    let rows = tenant_db(&db, &catalog).await;
+    eventually("seed hooks ran", async || {
+        hooked(&rows, "catalog_service").await == 16
+    })
+    .await;
+    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
+    let operations: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"action": "update", "id": id, "data": {"title": big}}))
+        .chain([json!({"action": "create", "data": {"title": "tiny"}})])
+        .collect();
+    let batch = json!({"operations": operations});
+    let url = format!("/svc/{}/catalog-service/items/batch", catalog.slug);
+    let key = format!("ApiKey {}", catalog.api_key);
+    let send = || platform.send(reqwest::Method::POST, &url, &key, Some(&batch));
+    let (status, body) = send().await;
+    assert_eq!(
+        (status, &body),
+        (
+            503,
+            &json!({"error": "guest capacity exhausted; the request was not run"})
+        )
+    );
+    holding.release().await;
+    let (status, body) = send().await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn concurrent_large_answers_are_all_delivered_and_give_their_room_back() {
+    let Some((platform, mut db)) = small(&[
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "8"),
+        ("WASM_ADMISSION_WAIT_MS", "5000"),
+    ])
+    .await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let manifest = common::wasm_manifest("catalog-service", &[("answer_some_records", "/records")]);
+    deployed(&platform, &catalog, &manifest).await;
+    let url = platform.fn_url(&catalog, "catalog-service", "answer_some_records");
+    let answers = futures_util::future::join_all(
+        (0..6).map(|_| answered(platform.http.post(&url).json(&json!({})))),
+    )
+    .await;
+    for answer in answers {
+        assert_eq!(answer.status, 200, "{}", answer.body);
+    }
+    eventually("every delivery's room is back", async || {
+        gauge(
+            &platform,
+            "cufflink_wasm_memory_in_use_bytes",
+            &[("class", "delivery")],
+        )
+        .await
+            == 0.0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_large_answer_waits_for_room_holding_no_slot_and_is_delivered() {
+    let Some((platform, mut db)) = small(&[
+        ("WASM_MEMORY_BUDGET_MB", "36"),
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "1"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+        ("WASM_MAX_CONCURRENT", "2"),
+    ])
+    .await
+    else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let manifest = common::wasm_manifest(
+        "catalog-service",
+        &[
+            ("hold_gated_24", "/hold"),
+            ("answer_some_records", "/records"),
+        ],
+    );
+    deployed(&platform, &catalog, &manifest).await;
+    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
+    let records = tokio::spawn(answered(
+        platform
+            .http
+            .post(platform.fn_url(&catalog, "catalog-service", "answer_some_records"))
+            .json(&json!({})),
+    ));
+    eventually("the answer waits for its room", async || {
+        gauge(
+            &platform,
+            "cufflink_wasm_admission_waiters",
+            &[("class", "delivery")],
+        )
+        .await
+            == 1.0
+    })
+    .await;
+    holding.release().await;
+    let answer = records.await.expect("the answer");
+    assert_eq!(answer.status, 200, "{}", answer.body);
 }
 
 #[tokio::test]

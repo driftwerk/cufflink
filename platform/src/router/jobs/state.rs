@@ -1,6 +1,6 @@
 use crate::repo::wasm_jobs::{JobStatus, WasmJob};
-use crate::router::guest_response::{answer, parse_output};
-use crate::wasm_runtime::budget::{Hold, Refused};
+use crate::router::guest_response::{answer, parse_output, Answer};
+use crate::wasm_runtime::budget::Hold;
 use crate::wasm_runtime::ExecutionError;
 use crate::wasm_runtime::GuestOutput;
 use chrono::{DateTime, Utc};
@@ -126,35 +126,50 @@ impl Attempt {
     }
 }
 
-fn answered(response: GuestOutput, job: &WasmJob) -> Result<(Attempt, Hold), Refused> {
-    let answer = answer(&response)
-        .ok()
-        .map(|answer| (answer.status.as_u16(), answer.delivery));
-    let failed = match answer {
-        Some((status, Some(DeliveryControl::RetryAfter { retry_after_ms }))) => Attempt::failed(
+fn failed_by(answer: Answer, job: &WasmJob) -> Option<Attempt> {
+    let status = answer.status.as_u16();
+    match answer.delivery {
+        Some(DeliveryControl::RetryAfter { retry_after_ms }) => Some(Attempt::failed(
             JobErrorClass::Explicit {
                 retry_after: Duration::from_millis(retry_after_ms),
             },
             format!("Handler asked for another attempt ({status})"),
-        ),
-        Some((_, Some(DeliveryControl::Terminal { terminal }))) => Attempt::failed(
+        )),
+        Some(DeliveryControl::Terminal { terminal }) => Some(Attempt::failed(
             JobErrorClass::Terminal {
                 reason: terminal.clone(),
             },
             terminal,
-        ),
-        Some((status, None)) if status >= 500 && job.retry_on.contains(&RetryOn::Error) => {
-            Attempt::failed(
-                JobErrorClass::HandlerError,
-                format!("Handler answered {status}"),
-            )
-        }
-        _ => {
-            let (value, hold) = parse_output(response)?;
-            return Ok((Attempt::Completed(value), hold));
-        }
-    };
-    Ok((failed, Hold::none()))
+        )),
+        None if status >= 500 && job.retry_on.contains(&RetryOn::Error) => Some(Attempt::failed(
+            JobErrorClass::HandlerError,
+            format!("Handler answered {status}"),
+        )),
+        None => None,
+    }
+}
+
+fn finished_unread(reason: impl std::fmt::Display) -> Attempt {
+    let reason = format!("the job finished, but its result could not be read: {reason}");
+    Attempt::failed(
+        JobErrorClass::Terminal {
+            reason: reason.clone(),
+        },
+        reason,
+    )
+}
+
+fn answered(response: GuestOutput, job: &WasmJob) -> (Attempt, Hold) {
+    match answer(&response)
+        .ok()
+        .and_then(|answer| failed_by(answer, job))
+    {
+        Some(failed) => (failed, Hold::none()),
+        None => match parse_output(response) {
+            Ok((value, hold)) => (Attempt::Completed(value), hold),
+            Err(refused) => (finished_unread(refused), Hold::none()),
+        },
+    }
 }
 
 pub fn classify(
@@ -162,17 +177,14 @@ pub fn classify(
     job: &WasmJob,
     at_hard_deadline: bool,
     deferrals_allowed: u32,
-    refusal: impl FnOnce(Refused) -> ExecutionError,
 ) -> (Attempt, Hold) {
-    let error = match run.map(|response| answered(response, job)) {
-        Ok(Ok(settled)) => return settled,
-        Ok(Err(refused)) => refusal(refused),
-        Err(error) => error,
-    };
-    (
-        unanswered(error, job, at_hard_deadline, deferrals_allowed),
-        Hold::none(),
-    )
+    match run {
+        Ok(response) => answered(response, job),
+        Err(error) => (
+            unanswered(error, job, at_hard_deadline, deferrals_allowed),
+            Hold::none(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -186,10 +198,7 @@ pub(crate) fn classified(
         text,
         hold: Hold::none(),
     });
-    classify(run, job, at_hard_deadline, deferrals_allowed, |refused| {
-        ExecutionError::Response(refused.to_string())
-    })
-    .0
+    classify(run, job, at_hard_deadline, deferrals_allowed).0
 }
 
 fn unanswered(
@@ -200,6 +209,9 @@ fn unanswered(
 ) -> Attempt {
     match error {
         ExecutionError::Cancelled => Attempt::LeaseLost,
+        ExecutionError::Oversized { reason, answer } => {
+            failed_by(answer, job).unwrap_or_else(|| finished_unread(reason))
+        }
         e if e.interrupted_by_shutdown(at_hard_deadline) => Attempt::Interrupted(e.to_string()),
         ExecutionError::Overloaded { retry_after, .. }
             if u32::try_from(job.capacity_deferrals).unwrap_or(u32::MAX) < deferrals_allowed =>
@@ -567,6 +579,72 @@ pub(crate) mod tests {
             retry_on: retry_on.to_vec(),
             ..job(JobStatus::Running, 1, 3)
         }
+    }
+
+    fn too_large(text: &str) -> (Attempt, Hold) {
+        use crate::wasm_runtime::budget::testing;
+        let (_ledger, base) = testing::hold(4 * testing::MIB);
+        let output = GuestOutput {
+            text: text.to_string(),
+            hold: base.delivering(),
+        };
+        classify(Ok(output), &retrying(&[RetryOn::Error]), false, 10)
+    }
+
+    #[test]
+    fn a_finished_job_too_large_to_read_ends_and_is_not_run_again() {
+        let text = format!("\"{}\"", "x".repeat(5 * 1024 * 1024));
+        let (attempt, _) = too_large(&text);
+        let Attempt::Failed { class, error } = attempt else {
+            panic!("expected a failure, got {attempt:?}");
+        };
+        assert!(matches!(class, JobErrorClass::Terminal { .. }));
+        assert!(error.contains("finished"), "{error}");
+        assert!(matches!(
+            decide(&class, 1, &[RetryOn::Error]),
+            JobDecision::Fail
+        ));
+    }
+
+    #[test]
+    fn a_failed_job_too_large_to_read_is_still_its_handlers_failure() {
+        let pad = "x".repeat(5 * 1024 * 1024);
+        let (attempt, _) = too_large(&format!(r#"{{"__status":500,"__body":"{pad}"}}"#));
+        assert!(matches!(
+            attempt,
+            Attempt::Failed {
+                class: JobErrorClass::HandlerError,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_job_answering_past_the_response_cap_ends_as_it_says() {
+        let oversized = |status: u16| {
+            Err(ExecutionError::Oversized {
+                reason: "past the cap".into(),
+                answer: Answer {
+                    status: axum::http::StatusCode::from_u16(status).expect("a status"),
+                    delivery: None,
+                },
+            })
+        };
+        let job = retrying(&[RetryOn::Error]);
+        assert!(matches!(
+            classified(oversized(200), &job, false, 10),
+            Attempt::Failed {
+                class: JobErrorClass::Terminal { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            classified(oversized(500), &job, false, 10),
+            Attempt::Failed {
+                class: JobErrorClass::HandlerError,
+                ..
+            }
+        ));
     }
 
     #[test]

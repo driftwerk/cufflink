@@ -1039,7 +1039,7 @@ labelled `overloaded`, and `ExecutionError::TooLarge`, labelled
 | Route, `_fn`, before-hook | `PlatformError::RetryLater`: 503, `Retry-After: WASM_ADMISSION_RETRY_AFTER_SECS` (2), `{"error": "guest capacity exhausted; the request was not run"}` | 503 with `Retry-After`, `{"error": "guest capacity exhausted while the request ran; it may have been partly applied"}` |
 | Service call (nested) | the callee's 503 reaches the caller's guest as the call's response | the same |
 | Worker request/reply | `WasmJobResult` gains `retry_after_ms: Option<u64>` and `ran: Option<bool>` (`serde(default)`, skipped when `None`). The platform answers as above when they are set. An older platform ignores them and answers 500; an older worker never sets them | the same |
-| After-hook in process | its write is refused while its text cannot be held: 503 with `Retry-After`, the write not committed. The write's other refusals are unchanged. The hook itself is never refused once its write commits. Under `enforce` it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today | logged like any hook failure |
+| After-hook in process | its write is refused while its text cannot be held: 503 with `Retry-After`, the write not committed, or 413 when the text alone passes the share. When a before-hook ran, the 503 says so and that nothing from the write was committed. The write's other refusals are unchanged. Once its write commits an in-process hook runs at most once: it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot and memory, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today, and it is not retried | logged like any hook failure, not retried |
 | `on_migrate` | its text is never refused; it waits its budget, as today | fails the deploy as any error does |
 | SSE reducer | waits at most the reducer's budget, then the event is dropped and counted `reducer_error`, as any reducer failure is today | the same |
 | Subscription, job, worker after-hook | never refused (section 3.5) | section 3.5 |
@@ -1052,11 +1052,13 @@ Once the guest has returned, or the write has committed, every buffer that
 only delivers the result is charged past the budget and is never refused:
 hook and `on_migrate` text, `read_response`, the worker reply's decode,
 `guest_response`'s decode and render, `ChargedBody`, `into_payload`, a
-hook's `parse_output` and the subscription decode. A size bound remains:
+hook's `parse_output` and the subscription decode. Such a buffer waits for
+room instead (section 14), which is not a refusal. A size bound remains:
 `max_response_bytes` caps the response text, and a tree or rendered body
 that alone passes the service share is refused as too large, whatever else
-is running. A size refusal does not depend on load, so no retry cures it
-and a finished message is not redelivered for it (section 14).
+is running. A size refusal does not depend on load, so no retry cures it,
+and a finished message or job is settled by what it answered rather than
+run again for it (section 14).
 
 Every `ExecutionError` is a 500 today, a timeout included. The maintainer
 chose 503 for a mid-run denial (question 8). Its message says the handler
@@ -1158,6 +1160,7 @@ environment still overrides it.
 | `WASM_MEMORY_HOST_RESERVE_MB` | `max(256, 30 % of limit)` | Section 5.2 |
 | `WASM_MEMORY_SERVICE_SHARE_PERCENT` | `50` | Section 3.4 |
 | `WASM_MEMORY_BACKGROUND_SHARE_PERCENT` | `75` | Section 3.4 |
+| `WASM_MEMORY_DELIVERY_OVERRUN_MB` | half the reserve | Section 14 |
 | `WASM_MEMORY_ADMIT_PERCENT` | `90` | Section 3.4 |
 | `WASM_MEMORY_COLD_ESTIMATE_MB` | `32` | Section 2.5 |
 | `WASM_ESTIMATE_MAX_AGE_SECS` / `WASM_ESTIMATE_MAP_MAX` | `600` / `4096` | Section 2.5 |
@@ -1773,12 +1776,16 @@ Recorded as the change was built, each with its reason.
   or update with an in-process or worker after-hook runs in a transaction
   and writes the exact text after its statement and before its commit, and
   a delete writes it before its statement. A refusal rolls the write back,
-  and the answer is 503 `ran: false`: a before-hook may have run by then,
-  but `ran` describes the request's effect, and a before-hook already runs
-  subject to the write failing. The exact text is used rather than a bound
-  taken before the before-hook, because a bound would either refuse small
-  updates of large rows or undercharge them. Under `off` and `warn` nothing
-  is refused, so single writes stay autocommit, with no extra round trips.
+  and the answer is 503, or 413 when the text alone passes the share. `ran`
+  is true when a before-hook has run, because a retry runs it again, and
+  the message then says that nothing from the write was committed. The
+  exact text is used rather than a bound taken before the before-hook,
+  because a bound would either refuse small updates of large rows or
+  undercharge them. Under `off` and `warn` nothing is refused, so single
+  writes stay autocommit, with no extra round trips. A text that cannot be
+  written at all, for a row nested too deeply for the hook's envelope, is
+  no capacity refusal in any mode: the write stands and the hook is logged
+  and dropped, as a hook failure is.
 - **A kept text costs what it takes.** `ChargedJson` charges in 1 MiB steps,
   so each text is shrunk to its capacity once written, rather than holding
   at least 1 MiB for as long as its hook waits.
@@ -1792,15 +1799,22 @@ Recorded as the change was built, each with its reason.
   estimate + a stack` fits the admit threshold, so the last queued hook can
   always run; the texts drain one hook at a time. That check ignores memory
   in use by running guests, which frees itself, so a write is not refused
-  because guests are busy now.
+  because guests are busy now. The estimate is the handler's when the text
+  is kept, with the module's initial memory, as admission computes it. The
+  guarantee ends there: a handler whose estimate rises after its text was
+  kept can need more room than was kept for it, and when nothing else frees
+  that room it waits out `WASM_COMMITTED_WAIT_SECS` and is dropped. An
+  in-process after-hook is therefore at-most-once, and work that must
+  happen is routed to a worker, which redelivers it.
 - **A bulk write's texts are written before its commit**, each in turn,
   rather than as each hook takes its slot. Building them lazily would keep
   the `Value` trees of the rows alive in detached tasks, which cost more
   than the text (section 1.4), uncharged or charged at tree cost. So a bulk
-  write is all or nothing: if every text cannot be held, it answers 503
-  `ran: false`, or 500 too large when the texts' total passes the share,
-  which no retry cures, and nothing commits. 1000 small rows cost 1000
-  small texts, since each is shrunk as above.
+  write is all or nothing: if every text cannot be held, it answers 503,
+  or 413 when the total of the texts of the operations that have a hook
+  passes the share, which no retry cures, and nothing commits. Operations
+  with no hook write no text and are not measured. 1000 small rows cost
+  1000 small texts, since each is shrunk as above.
 - **Shutdown while waiting.** Committed or background work still waiting
   for memory at the hard deadline ends `NotStarted`, never as a capacity
   refusal. A message is naked at once under both ack modes, without
@@ -1830,16 +1844,83 @@ Recorded as the change was built, each with its reason.
   It is never refused for what else is running, since the guest has
   returned.
 - **A delivered buffer's size refusal is at the share**, not the host
-  response cap. Response text is forced, bounded by `max_response_bytes`,
-  which `enforce` clamps to the share. Its decoded tree is not forced
-  unbounded: a tree costs 40 to 50 times its text at worst and slots are
-  released before decoding (section 1.4), so a hold that alone passes the
-  share is refused as too large (500, `too_large`) and counted under `warn`.
-  A lower tree cap would refuse legitimate replies, since a tree of small
-  records costs about 7.5 times its text.
-- **An unreadable answer settles.** A handler whose answer's tree passes
-  the share is treated as one whose answer is not JSON: acknowledged, and
-  never redelivered. A `__status` in such an answer is not seen.
+  response cap. Response text is forced, bounded by `max_response_bytes`;
+  `enforce` does not clamp that cap, so text alone can pass the share and
+  its tree is then refused. A tree costs about 95 times its text at worst
+  (683 KiB of `{"":0}` builds 65 MiB), and slots are released before
+  decoding (section 1.4), so a hold that alone passes the share is refused
+  as too large (500, `too_large`) and counted under `warn`. A lower tree
+  cap would refuse legitimate replies, since a tree of small records costs
+  about 7.5 times its text.
+- **A delivery waits for room below a ceiling.** Forcing every finished
+  guest's tree would have no global bound: each hold is checked only
+  against the share, slots are already released, and a burst of small
+  texts could build several budgets' worth of trees. The ceiling is the
+  budget plus `WASM_MEMORY_DELIVERY_OVERRUN_MB`, by default half the host
+  reserve and always below it. When a guest returns, `WasmEngine::run`
+  takes a room of `ChargedJson::delivery_bound(text)`, at most the share
+  and less what it already holds, while `in_use + room` fits the ceiling,
+  and otherwise queues for it, holding no slot, store or linear memory.
+  The bound is three times the
+  text, for the input, the strings and the render, plus each `{`, `[` and
+  `,` at the tree's worst cost and two steps; a test holds it above the
+  real peak on every shape, and it costs one scan of the text. Guests stop
+  at the budget, so the band above it holds deliveries alone, and a
+  delivery that fits the overrun always gets it without any guest freeing
+  anything. This caps what the review's "one over-budget decode at a time"
+  caps, and lets small decodes pass each other. The room is unattributed,
+  so it causes no share denial, and is held beside the tree's own charges
+  rather than drawn from, which overstates `in_use` for the length of a
+  decode, never understates it. It ends when the hold drops or when the
+  body is rendered. A room larger than the overrun needs guests to free
+  memory, so while one queues no new guest is admitted, and `in_use` falls.
+  Only such a room waits on guests, and it can wait in vain: finished
+  answers waiting for rooms of their own hold their text, and enough of
+  them can fill the band between them. So the wait ends after
+  `WASM_COMMITTED_WAIT_SECS`, and the answer is then handled as one past
+  the response cap, below: the bound holds, and nothing hangs. A nested
+  service call's callee waits inside its caller's host call, so a caller
+  holding the room itself waits for its host-call timeout, and a
+  subscription's wait can pass `ack_wait`, in which case the message is
+  redelivered. A worker's reply and the audit parse of a request body take
+  a room the same way, since each builds a tree with its guest gone: the
+  reply then answers 500, and the audit record carries no body.
+  HTTP fan-out items are charged refusably past their reservation, so a
+  base64 body larger than the reservation cannot pass the budget.
+- **The response copy.** `read_response` copies the text beside the linear
+  memory it came from, so for that moment the text counts twice. Past the
+  ceiling, copies take turns on a mutex held until the store is dropped,
+  which waits only on a copy and a drop, never on memory. So at most one
+  copy is over the ceiling at once, and dropping the store then frees at
+  least what the copy charged.
+- **The bound.** Under `enforce`, what the ledger counts never passes
+  `budget + overrun + max_response_bytes`. On a 2 GiB container with the
+  defaults that is limit 2048 MiB, reserve 614.4, budget 1433.6, overrun
+  307.2, one response 64: 1804.8 MiB, which leaves 243.2 MiB of the limit
+  for the platform's own heap (baseline, compiled modules, core stacks,
+  fragmentation). Budget plus overrun is also the pressure gate's line, the
+  limit less half the reserve. Startup warns when the three sizes reach the
+  limit. `on_migrate`'s request is the one text charged outside this, a
+  small envelope of one deploy.
+- **An answer too large to read still says what it says.** A subscription,
+  schedule or job whose answer's tree cannot be built reads `__v`,
+  `__status` and `__delivery` from the bytes with no tree, as
+  `RequestContext` does, by the same status rules as the tree: a 500 is
+  retried, `__delivery` is obeyed and an invalid envelope is an invalid
+  answer. Other envelope fields are not checked in that reading, so an
+  invalid `__headers` in such an answer goes unseen, and of a key repeated
+  in it nothing is read, so it reads as a legacy 200.
+- **A finished job is not run again for its output.** A job that answered
+  success and whose output cannot be read fails as `Terminal`, with an
+  error saying it finished and its result could not be read. Nothing would
+  cure it on a retry, and the job's effects have happened.
+- **An answer past `WASM_MAX_RESPONSE_MB`** is the same case with no copy
+  made: `read_response` reads the outline over linear memory and returns
+  `ExecutionError::Oversized`, so a subscription or schedule settles by the
+  answer, a job as above, and a worker after-hook is acked. A route still
+  answers 500. An answer whose wait for room ended takes the same path.
+  Only an out-of-bounds, non-UTF-8 or invalid response stays an ordinary
+  failure, which is retried.
 - **A hook's answer** is charged until the hook returns. A before-hook's
   returned body, used by the write that follows, is not charged after that.
 
@@ -1892,7 +1973,10 @@ Recorded as the change was built, each with its reason.
   `enforce` the limit is at most three quarters of the host response cap
   less 64 KiB, since the envelope base64-encodes the body and carries its
   headers. The charge then shrinks to the body. A larger response fails the
-  call with a transport error rather than a cap refusal.
+  call with a transport error rather than a cap refusal. The allowance
+  assumes the headers an HTTP client accepts; a callee in the same process
+  is not limited to them, and headers past 64 KiB are refused at the
+  envelope's charge, as any over-cap host result is.
 - **Image work's threads.** Decoding and encoding run on blocking-pool
   threads whose stacks are not charged when they have never run a guest.
   One runs per image call in flight, so they are bounded by the guests in

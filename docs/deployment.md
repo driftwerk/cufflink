@@ -28,6 +28,12 @@ platform or worker past its container's limit.
   ones included. For many light concurrent guests, raise the container's
   memory, lower `WASM_THREAD_STACK_KB` (at least 1024; it sets every runtime
   thread's stack), or lower `WASM_MAX_CONCURRENT`.
+- **The most it can reach.** Under `enforce`, guests and what the host
+  holds for them never pass the budget, `WASM_MEMORY_DELIVERY_OVERRUN_MB`
+  (half the reserve) and one response (`WASM_MAX_RESPONSE_MB`). On a 2 GiB
+  container with the defaults: budget 1433.6 MiB, overrun 307.2 MiB,
+  response 64 MiB, 1804.8 MiB in all, which leaves 243.2 MiB for the
+  platform's own heap. Startup warns when the three reach the limit.
 - **What the reserve holds:** the process's baseline, compiled modules, the
   core threads' stacks and fragmentation. The host buffers of host calls,
   requests and responses are charged to the budget. On glibc startup sets

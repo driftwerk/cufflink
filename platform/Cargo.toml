@@ -35,7 +35,7 @@ postgres-protocol = { workspace = true }
 async-nats = { workspace = true }
 
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }

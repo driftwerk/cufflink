@@ -1,5 +1,5 @@
 use super::caps::{CapExceeded, HostCaps};
-use super::ledger::{Ledger, Verdict};
+use super::ledger::{Delivery, Ledger, NoRoom, Verdict};
 use super::{Class, Denied, Reason, ServiceKey};
 use crate::policy::PolicyMode;
 use crate::wasm_runtime::InvocationKind;
@@ -80,6 +80,7 @@ pub struct Hold {
     account: Option<Account>,
     bytes: usize,
     terms: Terms,
+    delivery: Option<Delivery>,
 }
 
 impl std::fmt::Debug for Hold {
@@ -97,6 +98,7 @@ impl Hold {
             account: None,
             bytes: 0,
             terms: Terms::Refusable,
+            delivery: None,
         }
     }
 
@@ -105,6 +107,7 @@ impl Hold {
             account,
             bytes: 0,
             terms: Terms::Refusable,
+            delivery: None,
         }
     }
 
@@ -113,6 +116,7 @@ impl Hold {
             account,
             bytes: 0,
             terms: Terms::Unrefused,
+            delivery: None,
         }
     }
 
@@ -121,6 +125,7 @@ impl Hold {
             account,
             bytes: 0,
             terms: Terms::Kept { room },
+            delivery: None,
         }
     }
 
@@ -129,11 +134,29 @@ impl Hold {
             account: self.account.clone(),
             bytes: 0,
             terms: self.terms,
+            delivery: None,
         }
     }
 
     pub(crate) fn delivering(&self) -> Self {
         Self::unrefused(self.account.clone())
+    }
+
+    pub(crate) async fn make_room(&mut self, bytes: usize) -> Result<(), NoRoom> {
+        if let Some(account) = &self.account {
+            self.delivery = account.ledger().delivery(bytes, self.bytes).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn delivered(&mut self) {
+        self.delivery = None;
+    }
+
+    pub(crate) fn past_the_ceiling(&self) -> bool {
+        self.account
+            .as_ref()
+            .is_some_and(|account| account.ledger().past_the_ceiling())
     }
 
     pub(crate) fn share(&self) -> Option<usize> {
@@ -175,9 +198,11 @@ impl Hold {
 
     pub(crate) fn force(&mut self, extra: usize) {
         if let Some(account) = self.account.as_ref().filter(|_| extra > 0) {
-            account
-                .ledger()
-                .force(account.class(), account.service(), extra);
+            let (ledger, class, service) = (account.ledger(), account.class(), account.service());
+            match self.terms {
+                Terms::Kept { .. } => ledger.force_kept(class, service, extra),
+                Terms::Refusable | Terms::Unrefused => ledger.force(class, service, extra),
+            }
             self.bytes += extra;
         }
     }
@@ -215,10 +240,10 @@ pub enum Refused {
 }
 
 impl Refused {
-    pub(crate) fn beside(self, held: usize) -> Self {
+    pub(crate) fn needing(self, bytes: usize) -> Self {
         match self {
             Self::Budget(capacity) => Self::Budget(Capacity {
-                holding: capacity.holding.saturating_add(held),
+                holding: capacity.holding.max(bytes),
                 ..capacity
             }),
             Self::Cap(cap) => Self::Cap(cap),
@@ -333,10 +358,12 @@ mod tests {
                 admit: 90 * MIB,
                 service: 50 * MIB,
                 background: 75 * MIB,
+                overrun: 20 * MIB,
             },
             enforce,
             stack: MIB,
             aging: Duration::from_millis(100),
+            delivery_wait: Duration::from_secs(60),
         }));
         let account = Account::new(
             Arc::clone(&ledger),
@@ -406,17 +433,50 @@ mod tests {
         assert_eq!(ledger.in_use(), 0);
     }
 
+    #[tokio::test]
+    async fn a_hold_ends_its_delivery_with_its_tree_or_when_its_text_is_rendered() {
+        use super::super::testing;
+
+        let (ledger, base) = testing::hold(64 * MIB);
+        let mut hold = base.delivering();
+        hold.make_room(8 * MIB).await.expect("room");
+        assert_eq!(ledger.delivering(), 8 * MIB);
+        drop(hold);
+        assert_eq!(ledger.delivering(), 0);
+
+        let mut hold = base.delivering();
+        hold.make_room(8 * MIB).await.expect("room");
+        hold.delivered();
+        assert_eq!(ledger.delivering(), 0);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
     #[test]
-    fn a_refusal_beside_what_else_is_wanted_names_all_of_it() {
-        let refused = Refused::Budget(Capacity {
-            reason: Reason::ServiceShare,
-            requested: MIB,
-            holding: 2 * MIB,
-        });
-        let Refused::Budget(capacity) = refused.beside(3 * MIB) else {
-            panic!("a budget refusal");
+    fn a_refusal_needing_more_than_it_held_names_what_is_needed() {
+        let refused = |holding| {
+            Refused::Budget(Capacity {
+                reason: Reason::ServiceShare,
+                requested: MIB,
+                holding,
+            })
         };
-        assert_eq!(capacity.holding, 5 * MIB);
+        let needed = |refused: Refused| match refused {
+            Refused::Budget(capacity) => capacity.holding,
+            Refused::Cap(_) => panic!("a budget refusal"),
+        };
+        assert_eq!(needed(refused(2 * MIB).needing(3 * MIB)), 3 * MIB);
+        assert_eq!(needed(refused(4 * MIB).needing(3 * MIB)), 4 * MIB);
+    }
+
+    #[test]
+    fn a_forced_charge_on_a_kept_hold_is_credited_as_kept() {
+        let (ledger, account) = owned(true);
+        let mut kept = Hold::kept(Some(account), 4 * MIB);
+        kept.grow(MIB).expect("fits");
+        kept.force(MIB);
+        drop(kept);
+        assert_eq!(ledger.in_use(), 0);
+        assert_eq!(ledger.kept_total(), 0, "nothing is left marked as kept");
     }
 
     #[test]

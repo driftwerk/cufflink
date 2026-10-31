@@ -16,7 +16,7 @@ use eyre::Result;
 use host::{GuestLimits, HostState, HostStateInit, NatsPublishPolicy};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::info;
@@ -107,15 +107,16 @@ impl WasmLimits {
         )?;
         let max_memory_bytes =
             env_var("WASM_MAX_MEMORY_MB", defaults.max_memory_bytes / MIB)? * MIB;
-        budget.log_startup(max_memory_bytes);
+        let max_response_bytes =
+            env_var("WASM_MAX_RESPONSE_MB", defaults.max_response_bytes / MIB)? * MIB;
+        budget.log_startup(max_memory_bytes, max_response_bytes);
         let limits = Self {
             max_memory_bytes: budget.clamped_memory_cap(max_memory_bytes),
             max_tables: env_var("WASM_MAX_TABLES", defaults.max_tables)?,
             max_table_elements: env_var("WASM_MAX_TABLE_ELEMENTS", defaults.max_table_elements)?,
             max_instances: env_var("WASM_MAX_INSTANCES", defaults.max_instances)?,
             max_guest_len: env_var("WASM_MAX_GUEST_LEN_MB", defaults.max_guest_len / MIB)? * MIB,
-            max_response_bytes: env_var("WASM_MAX_RESPONSE_MB", defaults.max_response_bytes / MIB)?
-                * MIB,
+            max_response_bytes,
             max_concurrent,
             epoch_tick: Duration::from_millis(env_var(
                 "WASM_EPOCH_TICK_MS",
@@ -346,6 +347,7 @@ pub struct WasmEngine {
     host_fn_names: Arc<HashSet<&'static str>>,
     limits: Arc<WasmLimits>,
     permits: Arc<Semaphore>,
+    copies: Arc<Mutex<()>>,
     budget: Arc<budget::Budget>,
     modules: Arc<ModuleCache>,
     storage: Arc<RwLock<Option<S3Storage>>>,
@@ -378,6 +380,7 @@ impl WasmEngine {
             linker: Arc::new(linker),
             host_fn_names: Arc::new(host_fn_names),
             permits: Arc::new(Semaphore::new(limits.max_concurrent)),
+            copies: Arc::default(),
             budget: Arc::new(memory_budget),
             modules: Arc::new(ModuleCache::new(limits.module_cache_max)),
             limits: Arc::new(limits),
@@ -836,8 +839,9 @@ impl WasmEngine {
         &self,
         identity: &crate::registry::ServiceIdentity,
         handler: &str,
+        initial_memory: usize,
     ) -> budget::Hold {
-        self.budget.kept(identity, handler)
+        self.budget.kept(identity, handler, initial_memory)
     }
 
     pub fn refusal(&self, refused: budget::Refused, ran: bool) -> ExecutionError {
@@ -913,7 +917,16 @@ impl WasmEngine {
             "result" => label,
         )
         .record(started.elapsed().as_secs_f64());
-        result
+        match result {
+            Ok(mut output) => {
+                let room = budget::ChargedJson::delivery_bound(output.text.as_bytes());
+                match output.hold.make_room(room).await {
+                    Ok(()) => Ok(output),
+                    Err(no_room) => Err(oversized(no_room.to_string(), output.text.as_bytes())),
+                }
+            }
+            failed => failed,
+        }
     }
 
     pub async fn run_retrying_capacity(
@@ -999,6 +1012,7 @@ impl WasmEngine {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<GuestOutput, ExecutionError> {
         let (_slots, charge) = admission.into_parts();
+        let mut copying = None;
         let _span = scoped_span!(
             "wasm_handler",
             inv.scope(),
@@ -1067,7 +1081,7 @@ impl WasmEngine {
             .guest_limits
             .charge_mut()
             .map(budget::enter_thread);
-        let result = self.call_handler(&mut store, inv);
+        let result = self.call_handler(&mut store, inv, &mut copying);
         store
             .data_mut()
             .db
@@ -1087,10 +1101,11 @@ impl WasmEngine {
         result
     }
 
-    fn call_handler(
-        &self,
+    fn call_handler<'engine>(
+        &'engine self,
         store: &mut Store<HostState>,
         inv: &Invocation,
+        copying: &mut Option<MutexGuard<'engine, ()>>,
     ) -> Result<GuestOutput, ExecutionError> {
         let instance =
             inv.compiled
@@ -1139,7 +1154,12 @@ impl WasmEngine {
             memory.data(&*store),
             response_ptr,
             self.limits.max_response_bytes,
-            |len| hold.force(len),
+            |len| {
+                hold.force(len);
+                if hold.past_the_ceiling() {
+                    *copying = Some(self.copies.lock().unwrap_or_else(PoisonError::into_inner));
+                }
+            },
         )?;
         Ok(GuestOutput { text, hold })
     }
@@ -1190,6 +1210,13 @@ fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError 
     denied(denial, memory, false)
 }
 
+fn oversized(reason: String, text: &[u8]) -> ExecutionError {
+    match crate::router::guest_response::outline(text) {
+        Ok(answer) => ExecutionError::Oversized { reason, answer },
+        Err(_) => ExecutionError::Response(reason),
+    }
+}
+
 fn read_response(
     memory: &[u8],
     ptr: i32,
@@ -1210,9 +1237,11 @@ fn read_response(
             "mode" => "enforce",
         )
         .increment(1);
-        return Err(ExecutionError::Response(format!(
-            "response of {len} bytes exceeds the {max_bytes} byte cap"
-        )));
+        let reason = format!("response of {len} bytes exceeds the {max_bytes} byte cap");
+        return Err(match memory.get(start + 4..start + 4 + len) {
+            Some(text) if std::str::from_utf8(text).is_ok() => oversized(reason, text),
+            _ => ExecutionError::Response(reason),
+        });
     }
     let body = memory
         .get(start + 4..start + 4 + len)
@@ -1663,12 +1692,21 @@ pub(crate) mod tests {
         .expect("read");
         assert!(matches!(
             read(&memory, 8, 4),
+            Err(ExecutionError::Oversized { reason, .. }) if reason.contains("cap")
+        ));
+        memory[12] = 0xff;
+        assert!(matches!(
+            read(&memory, 8, 4),
             Err(ExecutionError::Response(msg)) if msg.contains("cap")
         ));
         memory[8..12].copy_from_slice(&1000u32.to_le_bytes());
         assert!(matches!(
             read(&memory, 8, 4096),
             Err(ExecutionError::Response(msg)) if msg.contains("out of bounds")
+        ));
+        assert!(matches!(
+            read(&memory, 8, 4),
+            Err(ExecutionError::Response(msg)) if msg.contains("cap")
         ));
         assert!(read(&memory, -1, 64).is_err());
         assert!(read(&memory, 62, 64).is_err());
@@ -2059,6 +2097,114 @@ pub(crate) mod tests {
             .expect("budget"),
             ..WasmLimits::default()
         }
+    }
+
+    fn narrow(mib: &str, overrun: &str) -> WasmLimits {
+        WasmLimits {
+            budget: budget::BudgetConfig {
+                committed_wait: Duration::from_millis(10),
+                ..budget::BudgetConfig::from_vars(
+                    cufflink_settings::fixed(&[
+                        ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+                        ("WASM_MEMORY_BUDGET_MB", mib),
+                        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", overrun),
+                        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+                        ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+                        ("WASM_MEMORY_COLD_ESTIMATE_MB", "1"),
+                        ("WASM_THREAD_STACK_KB", "1024"),
+                    ]),
+                    None,
+                    256,
+                )
+                .expect("budget")
+            },
+            ..WasmLimits::default()
+        }
+    }
+
+    const ANSWER_8_MIB: &str = "(drop (memory.grow (i32.const 130))) (i32.store (i32.const 512) (i32.const 8388608)) (i32.const 512)";
+    const ANSWER_1_MIB: &str = "(drop (memory.grow (i32.const 20))) (i32.store (i32.const 512) (i32.const 1048576)) (i32.const 512)";
+
+    #[tokio::test]
+    async fn a_response_copied_past_the_ceiling_waits_for_the_copy_before_it() {
+        let engine = engine_with(narrow("12", "1"));
+        let (_, small) = install(&engine, &guest("h", "(call $respond_ok)"));
+        let (_, large) = install(&engine, &guest("h", ANSWER_8_MIB));
+        let state = AppState::minimal(engine.clone()).await;
+        let (held, turn_taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let copies = Arc::clone(&engine.copies);
+        let holder = std::thread::spawn(move || {
+            let _turn = copies.lock().expect("unheld");
+            held.send(()).expect("the test waits");
+            released.recv().ok();
+        });
+        turn_taken.recv().expect("the turn is taken");
+        let run = |compiled: Arc<CompiledModule>| {
+            let (engine, state) = (engine.clone(), Arc::clone(&state));
+            tokio::spawn(async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "h",
+                            InvocationKind::Route,
+                            Duration::from_secs(10),
+                        ),
+                    )
+                    .await
+            })
+        };
+        run(small)
+            .await
+            .expect("join")
+            .expect("under the ceiling a copy takes no turn");
+        let blocked = run(large);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!blocked.is_finished(), "past the ceiling it waits its turn");
+        release.send(()).expect("the holder waits");
+        holder.join().expect("join");
+        let text = blocked.await.expect("join").expect("delivered");
+        assert_eq!(text.len(), 8 * MIB);
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_no_room_within_its_wait_is_settled_as_too_large_to_read() {
+        let engine = engine_with(narrow("13", "1"));
+        let (_, compiled) = install(&engine, &guest("h", ANSWER_1_MIB));
+        let state = AppState::minimal(engine.clone()).await;
+        let inv = invocation(
+            compiled,
+            "h",
+            InvocationKind::Route,
+            Duration::from_secs(10),
+        );
+        let mut filled = engine.kept_hold(&inv.identity, "h", 0);
+        filled.force(10 * MIB);
+        let err = engine.run_text(state, inv).await.unwrap_err();
+        assert!(matches!(err, ExecutionError::Oversized { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_kept_text_leaves_room_for_the_modules_initial_memory() {
+        let engine = budgeted("enforce", "64");
+        let identity = crate::registry::ServiceIdentity {
+            tenant_id: Uuid::nil(),
+            tenant_slug: "acme".to_string(),
+            service_id: Uuid::new_v4(),
+            schema: "test_service".to_string(),
+            service_name: "test-service".to_string(),
+        };
+        let kept = |initial_memory| {
+            let mut hold = engine.kept_hold(&identity, "h", initial_memory);
+            hold.grow(20 * MIB)
+        };
+        assert!(kept(0).is_ok());
+        assert!(
+            kept(48 * MIB).is_err(),
+            "what admission will reserve for the hook does not fit beside it"
+        );
     }
 
     fn holding_guest(pages: u32, ms: u32) -> String {
@@ -3004,7 +3150,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ExecutionError::Response(_)), "{err}");
+        assert!(matches!(err, ExecutionError::Oversized { .. }), "{err}");
 
         let err = engine
             .run_text(

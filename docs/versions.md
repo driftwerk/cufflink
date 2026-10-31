@@ -170,12 +170,22 @@ been. A later release makes `enforce` the default. Under `enforce`:
   again rather than acked, so it may run twice;
 - a route denied memory mid-run is answered `503`, saying the request may
   have been partly applied;
-- a write with an after-hook runs in a transaction, and is answered `503`,
-  with nothing committed, when the hook's request text cannot be held. Once
-  the write has committed the hook is never refused; it waits for its run;
-- a request or message whose guest has returned is always delivered: its
-  reply is never refused for what else is running. Only an answer that
-  alone passes the service share is refused, as too large.
+- a write with an after-hook runs in a transaction, and is answered `503`
+  with nothing committed when the hook's request text cannot be held, or
+  `413` when the text alone passes the service share. A `503` after a
+  before-hook ran says so, since a retry runs that hook again;
+- in-process after-hooks are at-most-once: one that cannot start within
+  `WASM_COMMITTED_WAIT_SECS` (300), or is denied memory mid-run, is logged
+  and dropped, and not retried. Route work that must happen to a worker;
+- a request or message whose guest has returned is delivered: it may wait
+  for room, up to `WASM_MEMORY_DELIVERY_OVERRUN_MB` past the budget, and is
+  never refused for what else is running. Only an answer that alone passes
+  the service share is refused, as too large. A subscription, schedule or
+  job is still settled by the `__status` and `__delivery` of such an
+  answer, and a job that succeeded fails terminally with its result
+  unread, rather than running again;
+- the most memory guests can reach is the budget, the overrun and one
+  response ([sizing](deployment.md#guest-memory-budget));
 
 Memory the host makes for guests is charged before it is made: request
 and response bodies, and the results of host calls (database rows,

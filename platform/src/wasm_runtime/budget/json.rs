@@ -12,6 +12,7 @@ const BTREE_MIN: usize = 5;
 const LEAF: usize = 16 + BTREE_CAPACITY * (STRING + VALUE);
 const INTERNAL: usize = LEAF + (BTREE_CAPACITY + 1) * std::mem::size_of::<usize>();
 const SMALL_VEC: usize = 4;
+const ENTRY: usize = 192;
 
 #[derive(Debug)]
 pub enum ChargedJsonError {
@@ -29,15 +30,6 @@ impl fmt::Display for ChargedJsonError {
 }
 
 impl std::error::Error for ChargedJsonError {}
-
-impl ChargedJsonError {
-    pub(crate) fn beside(self, held: usize) -> Self {
-        match self {
-            Self::Capacity(refused) => Self::Capacity(refused.beside(held)),
-            syntax => syntax,
-        }
-    }
-}
 
 struct Tally<'m, M: Meter + ?Sized> {
     meter: &'m mut M,
@@ -366,6 +358,19 @@ impl ChargedJson {
         parsed
     }
 
+    pub(crate) fn delivery_bound(text: &[u8]) -> usize {
+        let structure: usize = text
+            .iter()
+            .map(|byte| match byte {
+                b'{' => LEAF,
+                b'[' => SMALL_VEC * VALUE,
+                b',' => ENTRY,
+                _ => 0,
+            })
+            .sum();
+        text.len() * 3 + structure + 2 * STEP
+    }
+
     pub fn measure<T: Serialize + ?Sized>(value: &T) -> usize {
         let mut counter = Counter(0);
         match serde_json::to_writer(&mut counter, value) {
@@ -381,6 +386,56 @@ mod tests {
     use super::super::Reason;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_delivery_bound_covers_a_tree_and_its_render_for_every_shape() {
+        let repeated = |item: &str, count: usize| format!("[{}]", vec![item; count].join(","));
+        let wide = |keys: usize| {
+            let entries: Vec<String> = (0..keys).map(|key| format!("\"{key}\":0")).collect();
+            format!("{{{}}}", entries.join(","))
+        };
+        let quoted = format!("\"{}\"", "x".repeat(STEP));
+        let shapes = [
+            "0".to_string(),
+            "{}".to_string(),
+            quoted,
+            repeated(r#"{"":0}"#, 100_000),
+            repeated("[0]", 100_000),
+            repeated("0", 1_000_000),
+            repeated(r#"{"":{"":0}}"#, 10_000),
+            repeated(r#""a,b,c""#, 10_000),
+            wide(11),
+            wide(12),
+            wide(26),
+            wide(100_000),
+        ];
+        for text in shapes {
+            let bound = ChargedJson::delivery_bound(text.as_bytes());
+            let mut limit = Limit {
+                used: 0,
+                limit: usize::MAX,
+            };
+            let parsed = ChargedJson::parse(text.as_bytes(), &mut limit).expect("parses");
+            let needed = parsed.cost + text.len();
+            assert!(needed <= bound, "{needed} past {bound}: {:.40}", text);
+        }
+    }
+
+    #[test]
+    fn a_tree_of_small_records_costs_up_to_95_times_its_text() {
+        let text = format!("[{}]", vec![r#"{"":0}"#; 100_000].join(","));
+        let mut limit = Limit {
+            used: 0,
+            limit: usize::MAX,
+        };
+        let parsed = ChargedJson::parse(text.as_bytes(), &mut limit).expect("parses");
+        assert!(
+            parsed.held > 90 * text.len(),
+            "{} for {}",
+            parsed.held,
+            text.len()
+        );
+    }
 
     struct Limit {
         used: usize,

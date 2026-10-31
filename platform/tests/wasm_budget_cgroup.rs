@@ -147,6 +147,27 @@ async fn a_linear_burst_stays_inside_the_limit() {
 
 #[tokio::test]
 #[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a memory limit; run by the memory-limit CI job"]
+async fn concurrent_large_answers_stay_inside_the_limit() {
+    let limited = limited(
+        common::wasm_manifest("catalog-service", &[("answer_many_records", "/records")]),
+        &[("WASM_ADMISSION_WAIT_MS", "5000")],
+    )
+    .await;
+    let answers = futures_util::future::join_all(
+        (0..8).map(|_| limited.post("answer_many_records", json!({}))),
+    )
+    .await;
+    let statuses: Vec<u16> = answers.iter().map(|(status, _)| *status).collect();
+    assert!(
+        statuses.iter().all(|status| matches!(status, 200 | 503)),
+        "{statuses:?}"
+    );
+    assert!(statuses.contains(&200), "{statuses:?}");
+    limited.survived().await;
+}
+
+#[tokio::test]
+#[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a memory limit; run by the memory-limit CI job"]
 async fn large_bodies_and_an_oversized_query_stay_inside_the_limit() {
     let mut manifest = common::wasm_manifest(
         "catalog-service",

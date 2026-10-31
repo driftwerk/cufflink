@@ -20,6 +20,7 @@ pub use hold::{Capacity, Hold, Meter, Refused};
 pub(crate) use json::stepped;
 pub use json::{ChargedJson, ChargedJsonError, Parsed};
 pub use ledger::Limits;
+pub use ledger::NoRoom;
 pub(crate) use ledger::{Charge, Ledger, Verdict, TABLE_ELEMENT_BYTES};
 pub(crate) use stack::enter as enter_thread;
 
@@ -296,6 +297,7 @@ impl Budget {
                     enforce: config.enforces(),
                     stack: config.thread_stack,
                     aging: config.background_aging,
+                    delivery_wait: config.committed_wait,
                 }))
             }),
             estimates: Estimates::new(
@@ -346,9 +348,14 @@ impl Budget {
         })
     }
 
-    pub(crate) fn kept(&self, identity: &ServiceIdentity, handler: &str) -> Hold {
+    pub(crate) fn kept(
+        &self,
+        identity: &ServiceIdentity,
+        handler: &str,
+        initial_memory: usize,
+    ) -> Hold {
         let room = self.ledger.as_ref().map_or(0, |ledger| {
-            self.estimate(ledger, Class::Committed, identity, handler, 0)
+            self.estimate(ledger, Class::Committed, identity, handler, initial_memory)
         });
         Hold::kept(
             self.account(identity, Class::Committed, handler, InvocationKind::Hook),
@@ -748,10 +755,12 @@ pub(crate) mod testing {
                 admit: budget,
                 service: budget,
                 background: budget,
+                overrun: budget / 4,
             },
             enforce: true,
             stack: MIB,
             aging: Duration::from_millis(100),
+            delivery_wait: Duration::from_secs(60),
         }));
         let account = Account::new(
             Arc::clone(&ledger),

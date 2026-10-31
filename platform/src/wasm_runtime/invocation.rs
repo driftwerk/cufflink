@@ -1,5 +1,6 @@
 use super::CompiledModule;
 use crate::registry::ServiceIdentity;
+use crate::router::guest_response::Answer;
 use cufflink_telemetry::{Kind, Scope};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -99,6 +100,8 @@ pub enum ExecutionError {
     MemoryLimit { requested: usize, limit: usize },
     #[error("WASM guest returned an invalid response: {0}")]
     Response(String),
+    #[error("WASM guest returned an invalid response: {reason}")]
+    Oversized { reason: String, answer: Answer },
     #[error("Handler '{0}' not found in WASM module")]
     HandlerNotFound(String),
     #[error("WASM trap: {0}")]
@@ -137,6 +140,7 @@ impl ExecutionError {
             ExecutionError::Overloaded { .. } => "overloaded",
             ExecutionError::TooLarge { .. } => "too_large",
             ExecutionError::Response(_)
+            | ExecutionError::Oversized { .. }
             | ExecutionError::HandlerNotFound(_)
             | ExecutionError::Runtime(_) => "error",
         }

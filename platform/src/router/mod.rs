@@ -6,7 +6,7 @@ pub mod custom;
 pub(crate) mod error_profile;
 pub mod filtering;
 pub mod graphql;
-pub(crate) mod guest_response;
+pub mod guest_response;
 pub mod jobs;
 pub mod meta;
 pub(crate) mod postures;
@@ -74,6 +74,15 @@ pub(crate) fn retry_later(after: std::time::Duration, ran: bool) -> PlatformErro
             }
         }
         .to_string(),
+        after,
+    }
+}
+
+pub(crate) fn retry_uncommitted(after: std::time::Duration) -> PlatformError {
+    PlatformError::RetryLater {
+        message: "guest capacity exhausted after the request's before-hook ran; nothing from \
+                  the write was committed"
+            .to_string(),
         after,
     }
 }

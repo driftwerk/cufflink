@@ -24,8 +24,8 @@ use crate::schema_manager::adopt::{AdoptedColumn, AdoptedSchema};
 use crate::schema_manager::introspect::TypeKind;
 use crate::tenant_catalog::TenantEntry;
 use crate::tenant_sessions::{Purpose, ServiceSessions, Statements};
-use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold};
-use crate::wasm_runtime::{Class, Invocation, InvocationKind, WasmEngine};
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Refused};
+use crate::wasm_runtime::{Class, ExecutionError, Invocation, InvocationKind, WasmEngine};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, RawQuery, State},
@@ -114,6 +114,8 @@ struct Keeper<'a> {
     service: &'a RegisteredService,
     auth: Value,
     call: Option<&'a ServiceCaller>,
+    before_ran: bool,
+    initial_memory: usize,
 }
 
 impl<'a> Keeper<'a> {
@@ -122,12 +124,30 @@ impl<'a> Keeper<'a> {
         service: &'a RegisteredService,
         auth_user: &Option<crate::auth::AuthUser>,
         call: Option<&'a ServiceCaller>,
+        before_ran: bool,
     ) -> Keeper<'a> {
+        let initial_memory = match state
+            .wasm_engine
+            .as_ref()
+            .filter(|engine| engine.admits_before_running())
+        {
+            Some(engine) => engine
+                .get_module(
+                    service.service_id,
+                    service.version,
+                    service.wasm_hash.as_deref(),
+                )
+                .await
+                .map_or(0, |compiled| compiled.initial_memory),
+            None => 0,
+        };
         Keeper {
             auth: guest_auth_json(state, auth_user, service.tenant_id).await,
             state,
             service,
             call,
+            before_ran,
+            initial_memory,
         }
     }
 
@@ -138,26 +158,52 @@ impl<'a> Keeper<'a> {
             .is_some_and(WasmEngine::admits_before_running)
     }
 
-    fn keep(&self, name: &str, body: Value) -> Result<KeptHook, ChargedJsonError> {
+    fn keep(&self, name: &str, body: Value) -> Result<Option<KeptHook>, Refused> {
         let hold = self
             .state
             .wasm_engine
             .as_ref()
             .map_or_else(Hold::none, |engine| {
-                engine.kept_hold(&self.service.identity(), name)
+                engine.kept_hold(&self.service.identity(), name, self.initial_memory)
             });
-        hook_request(
+        match hook_request(
             body,
             name,
             self.service,
             hold,
             Some(self.auth.clone()),
             self.call,
-        )
-        .map(|request| KeptHook {
-            name: name.to_string(),
-            request,
-        })
+        ) {
+            Ok(request) => Ok(Some(KeptHook {
+                name: name.to_string(),
+                request,
+            })),
+            Err(ChargedJsonError::Capacity(refused)) => Err(refused),
+            Err(ChargedJsonError::Syntax(e)) => {
+                tracing::warn!("after hook '{}' error: {}", name, e);
+                Ok(None)
+            }
+        }
+    }
+
+    fn refused(&self, refused: Refused, needs: usize) -> PlatformError {
+        let Some(engine) = self.state.wasm_engine.as_ref() else {
+            return PlatformError::Internal(format!("Hook request refused: {refused}"));
+        };
+        match engine.refusal(refused.needing(needs), self.before_ran) {
+            ExecutionError::TooLarge { requested, share } => {
+                PlatformError::PayloadTooLarge(format!(
+                    "the after-hook requests of this write take {requested} bytes, more than \
+                     the {share} bytes its service may hold; nothing was committed"
+                ))
+            }
+            ExecutionError::Overloaded {
+                retry_after,
+                ran: true,
+                ..
+            } => crate::router::retry_uncommitted(retry_after),
+            error => crate::router::map_execution_error("Hook", error),
+        }
     }
 }
 
@@ -169,6 +215,7 @@ struct AfterHook<'a> {
 impl<'a> AfterHook<'a> {
     async fn of(
         name: Option<&'a str>,
+        before_ran: bool,
         state: &'a Arc<AppState>,
         service: &'a RegisteredService,
         auth_user: &Option<crate::auth::AuthUser>,
@@ -176,17 +223,17 @@ impl<'a> AfterHook<'a> {
     ) -> Option<AfterHook<'a>> {
         match name {
             Some(name) => Some(AfterHook {
-                keeper: Keeper::new(state, service, auth_user, call).await,
+                keeper: Keeper::new(state, service, auth_user, call, before_ran).await,
                 name,
             }),
             None => None,
         }
     }
 
-    fn keep(&self, body: Value) -> PlatformResult<KeptHook> {
+    fn keep(&self, body: Value) -> PlatformResult<Option<KeptHook>> {
         self.keeper
             .keep(self.name, body)
-            .map_err(|e| crate::router::request_refused(self.keeper.state, "Hook", e))
+            .map_err(|refused| self.keeper.refused(refused, 0))
     }
 }
 
@@ -1222,6 +1269,10 @@ pub(crate) async fn create_handler(
             .hooks
             .as_ref()
             .and_then(|hooks| hooks.after_create.as_deref()),
+        table
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.before_create.is_some()),
         &state,
         &service,
         &auth_user,
@@ -1243,6 +1294,7 @@ pub(crate) async fn create_handler(
                 ))
             })
             .transpose()
+            .map(Option::flatten)
     };
     let mut client = tenant_pool.get().await?;
     let (result, emission, kept) =
@@ -1465,6 +1517,10 @@ pub(crate) async fn update_handler(
             .hooks
             .as_ref()
             .and_then(|hooks| hooks.after_update.as_deref()),
+        table
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.before_update.is_some()),
         &state,
         &service,
         &auth_user,
@@ -1488,6 +1544,7 @@ pub(crate) async fn update_handler(
                 ))
             })
             .transpose()
+            .map(Option::flatten)
     };
     let mut client = tenant_pool.get().await?;
     let (updated, kept) =
@@ -1635,6 +1692,10 @@ pub(crate) async fn delete_handler(
             .hooks
             .as_ref()
             .and_then(|hooks| hooks.after_delete.as_deref()),
+        table
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.before_delete.is_some()),
         &state,
         &service,
         &auth_user,
@@ -1653,7 +1714,8 @@ pub(crate) async fn delete_handler(
                 &rows,
             ))
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     let mut client = tenant_pool.get().await?;
     if outlet.enforced() {
         let txn = client.transaction().await?;
@@ -1819,9 +1881,12 @@ pub(crate) async fn batch_handler(
     )
     .await?;
 
-    let keeper = match table.hooks.as_ref().is_some_and(fires_after) {
-        true => Some(Keeper::new(&state, &service, &auth_user, call.as_ref()).await),
-        false => None,
+    let keeper = match table.hooks.as_ref().filter(|hooks| fires_after(hooks)) {
+        Some(hooks) => {
+            let before_ran = batch.operations.iter().any(|op| fires_before(op, hooks));
+            Some(Keeper::new(&state, &service, &auth_user, call.as_ref(), before_ran).await)
+        }
+        None => None,
     };
     let mut client = tenant_pool.get().await?;
     let txn = client.transaction().await?;
@@ -2105,23 +2170,31 @@ fn fires_after(hooks: &cufflink_types::TableHooks) -> bool {
     hooks.after_create.is_some() || hooks.after_update.is_some() || hooks.after_delete.is_some()
 }
 
-fn keep_batch_after_hooks(
-    keeper: &Keeper<'_>,
-    table: &TableDefinition,
-    table_name: &str,
-    operations: &[BatchOperation],
-    batch_rows: &BatchRows,
-    prepared: &[PreparedOp],
-    op_results: &[Option<Value>],
-) -> PlatformResult<Vec<KeptHook>> {
-    let Some(ref hooks) = table.hooks else {
-        return Ok(Vec::new());
-    };
-    let mut kept = Vec::with_capacity(operations.len());
-    for ((op, prepared_op), result) in operations.iter().zip(prepared).zip(op_results) {
-        let (hook, body) = match prepared_op {
+fn fires_before(op: &BatchOperation, hooks: &cufflink_types::TableHooks) -> bool {
+    match op {
+        BatchOperation::Create { .. } => hooks.before_create.is_some(),
+        BatchOperation::Update { .. } => hooks.before_update.is_some(),
+        BatchOperation::Delete { .. } => hooks.before_delete.is_some(),
+    }
+}
+
+struct BatchHooks<'a> {
+    hooks: &'a cufflink_types::TableHooks,
+    table_name: &'a str,
+    batch_rows: &'a BatchRows,
+}
+
+impl<'a> BatchHooks<'a> {
+    fn body(
+        &self,
+        op: &BatchOperation,
+        prepared: &PreparedOp,
+        result: &Option<Value>,
+    ) -> Option<(&'a str, Value)> {
+        let table_name = self.table_name;
+        let (hook, body) = match prepared {
             PreparedOp::Create { data, .. } => (
-                &hooks.after_create,
+                &self.hooks.after_create,
                 json!({
                     "hook": "after_create",
                     "table": table_name,
@@ -2130,7 +2203,7 @@ fn keep_batch_after_hooks(
                 }),
             ),
             PreparedOp::Update { id, data } => (
-                &hooks.after_update,
+                &self.hooks.after_update,
                 json!({
                     "hook": "after_update",
                     "table": table_name,
@@ -2140,7 +2213,7 @@ fn keep_batch_after_hooks(
                 }),
             ),
             PreparedOp::Delete { id, existing } => (
-                &hooks.after_delete,
+                &self.hooks.after_delete,
                 json!({
                     "hook": "after_delete",
                     "table": table_name,
@@ -2149,30 +2222,48 @@ fn keep_batch_after_hooks(
                 }),
             ),
         };
-        if let Some(hook_name) = hook {
-            let body = match batch_rows.of(op) {
+        hook.as_deref().map(|name| {
+            let body = match self.batch_rows.of(op) {
                 Ok(rows) => with_scope(body, rows),
                 Err(_) => body,
             };
-            kept.push(keeper.keep(hook_name, body).map_err(|e| {
-                let wanted = batch_text(prepared, op_results);
-                crate::router::request_refused(keeper.state, "Hook", e.beside(wanted))
-            })?);
-        }
+            (name, body)
+        })
     }
-    Ok(kept)
 }
 
-fn batch_text(prepared: &[PreparedOp], op_results: &[Option<Value>]) -> usize {
-    let rows: usize = prepared
-        .iter()
-        .map(|op| match op {
-            PreparedOp::Create { data, .. } => ChargedJson::measure(data),
-            PreparedOp::Update { data, .. } => ChargedJson::measure(data),
-            PreparedOp::Delete { existing, .. } => ChargedJson::measure(existing),
+fn keep_batch_after_hooks(
+    keeper: &Keeper<'_>,
+    table: &TableDefinition,
+    table_name: &str,
+    operations: &[BatchOperation],
+    batch_rows: &BatchRows,
+    prepared: &[PreparedOp],
+    op_results: &[Option<Value>],
+) -> PlatformResult<Vec<KeptHook>> {
+    let Some(hooks) = table.hooks.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let batch = BatchHooks {
+        hooks,
+        table_name,
+        batch_rows,
+    };
+    let bodies = || {
+        operations
+            .iter()
+            .zip(prepared)
+            .zip(op_results)
+            .filter_map(|((op, prepared), result)| batch.body(op, prepared, result))
+    };
+    bodies()
+        .map(|(name, body)| keeper.keep(name, body))
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|refused| {
+            let needs = bodies().map(|(_, body)| ChargedJson::measure(&body)).sum();
+            keeper.refused(refused, needs)
         })
-        .sum();
-    rows.saturating_add(ChargedJson::measure(op_results))
 }
 
 fn keeps_first(after: Option<&AfterHook<'_>>) -> bool {
@@ -2411,6 +2502,18 @@ mod wrap_hook_request_tests {
                 text
             );
         }
+    }
+
+    #[test]
+    fn a_row_too_deep_for_its_envelope_fails_as_syntax_and_never_as_capacity() {
+        let deep = (0..125).fold(json!(1), |inner, _| Value::Array(vec![inner]));
+        let row: Value = serde_json::from_str(&json!({"meta": deep}).to_string())
+            .expect("the request body parses");
+        let body = json!({"hook": "after_create", "table": "items", "data": row, "result": row});
+        assert!(matches!(
+            hook_request(body, "h", &fake_service(), Hold::none(), None, None),
+            Err(ChargedJsonError::Syntax(_))
+        ));
     }
 
     #[test]

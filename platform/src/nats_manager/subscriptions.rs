@@ -492,6 +492,10 @@ pub(crate) enum HandlerFailure {
         after: Duration,
         reason: eyre::Report,
     },
+    Settled {
+        outcome: Outcome,
+        reason: eyre::Report,
+    },
 }
 
 impl HandlerFailure {
@@ -500,6 +504,7 @@ impl HandlerFailure {
             HandlerFailure::Interrupted(_) => Outcome::Interrupted,
             HandlerFailure::NotStarted(_) => Outcome::NotStarted,
             HandlerFailure::Deferred { after, .. } => Outcome::Deferred { after: *after },
+            HandlerFailure::Settled { outcome, .. } => outcome.clone(),
             HandlerFailure::Failed(e) => Outcome::Retry {
                 after: None,
                 reason: e.to_string(),
@@ -531,7 +536,8 @@ impl HandlerOutcome {
                 HandlerFailure::Interrupted(e)
                 | HandlerFailure::NotStarted(e)
                 | HandlerFailure::Failed(e)
-                | HandlerFailure::Deferred { reason: e, .. },
+                | HandlerFailure::Deferred { reason: e, .. }
+                | HandlerFailure::Settled { reason: e, .. },
             ))
             | HandlerOutcome::SideEffect(Err(e)) => Some(e.to_string()),
         }
@@ -551,15 +557,17 @@ impl HandlerOutcome {
 }
 
 pub(crate) fn answered(response: &GuestOutput) -> Outcome {
-    let (status, delivery) = match guest_response::answer(response) {
-        Ok(answer) => (answer.status, answer.delivery),
-        Err(e) => {
-            return Outcome::Retry {
-                after: None,
-                reason: format!("handler answered an {e}"),
-            }
-        }
-    };
+    match guest_response::answer(response) {
+        Ok(answer) => settled_by(answer),
+        Err(e) => Outcome::Retry {
+            after: None,
+            reason: format!("handler answered an {e}"),
+        },
+    }
+}
+
+fn settled_by(answer: guest_response::Answer) -> Outcome {
+    let guest_response::Answer { status, delivery } = answer;
     match delivery {
         Some(DeliveryControl::RetryAfter { retry_after_ms }) => Outcome::Retry {
             after: Some(Duration::from_millis(retry_after_ms).min(RETRY_AFTER_MAX)),
@@ -640,7 +648,12 @@ async fn handle_message(
         (Some(inbox), HandlerOutcome::Rpc(Ok(response))) => {
             publish_reply(&ctx.state.nats, inbox, response.text).await;
         }
-        (Some(inbox), HandlerOutcome::Rpc(Err(HandlerFailure::Failed(e)))) => {
+        (
+            Some(inbox),
+            HandlerOutcome::Rpc(Err(
+                HandlerFailure::Failed(e) | HandlerFailure::Settled { reason: e, .. },
+            )),
+        ) => {
             publish_reply(&ctx.state.nats, inbox, error_envelope(&e.to_string())).await;
         }
         (Some(inbox), HandlerOutcome::Rpc(Err(HandlerFailure::Interrupted(e)))) => {
@@ -818,6 +831,15 @@ pub(crate) async fn run_handler(
         )
         .await
         .map_err(|e| {
+            let e = match e {
+                ExecutionError::Oversized { reason, answer } => {
+                    return HandlerFailure::Settled {
+                        outcome: settled_by(answer),
+                        reason: eyre::eyre!("WASM execution error: {reason}"),
+                    }
+                }
+                e => e,
+            };
             let interrupted = e.interrupted_by_shutdown(state.shutdown.hard_deadline_reached());
             let not_started = matches!(e, ExecutionError::NotStarted);
             let deferred = match &e {
@@ -1422,9 +1444,60 @@ mod delivery_tests {
         assert_eq!(
             finished(&format!("\"{}\"", "x".repeat(5 * testing::MIB))).outcome(AckMode::OnSuccess),
             Outcome::Ok,
-            "an answer too large to read is settled as an unreadable one is"
+            "an answer too large to read and with nothing to say is settled"
         );
         assert_eq!(ledger.in_use(), 4 * testing::MIB);
+    }
+
+    #[test]
+    fn a_large_answer_says_the_same_with_a_budget_as_without_one() {
+        use crate::wasm_runtime::budget::testing;
+
+        let (_ledger, base) = testing::hold(4 * testing::MIB);
+        let pad = "x".repeat(5 * testing::MIB);
+        for raw in [
+            format!(r#"{{"__status":500,"__body":"{pad}"}}"#),
+            format!(r#"{{"__status":422,"__body":"{pad}"}}"#),
+            format!(
+                r#"{{"__v":2,"__status":200,"__delivery":{{"terminal":"poison"}},"__body":"{pad}"}}"#
+            ),
+            format!(
+                r#"{{"__v":2,"__status":200,"__delivery":{{"retry_after_ms":10}},"__body":"{pad}"}}"#
+            ),
+            format!(r#"{{"__v":2,"__status":99,"__body":"{pad}"}}"#),
+        ] {
+            let refused = GuestOutput {
+                text: raw.clone(),
+                hold: base.delivering(),
+            };
+            assert_eq!(answered(&refused), answered(&output(&raw)));
+        }
+    }
+
+    #[test]
+    fn an_answer_past_the_response_cap_settles_as_it_says() {
+        let failure = |status: u16, delivery| HandlerFailure::Settled {
+            outcome: settled_by(guest_response::Answer {
+                status: axum::http::StatusCode::from_u16(status).expect("a status"),
+                delivery,
+            }),
+            reason: eyre::eyre!("past the cap"),
+        };
+        assert_eq!(failure(200, None).outcome(), Outcome::Ok);
+        assert!(matches!(
+            failure(503, None).outcome(),
+            Outcome::Retry { .. }
+        ));
+        assert!(matches!(
+            failure(
+                200,
+                Some(DeliveryControl::Terminal {
+                    terminal: "poison".into()
+                })
+            )
+            .outcome(),
+            Outcome::Terminal { .. }
+        ));
     }
 
     fn answered_text(text: &str) -> Outcome {

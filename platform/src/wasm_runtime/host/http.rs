@@ -8,7 +8,7 @@ use crate::egress::{
     EgressDenied, EgressError, EgressGuard, EgressPolicy, EgressTarget, OutboundRequest,
 };
 use crate::policy::PolicySet;
-use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Refused};
+use crate::wasm_runtime::budget::{Capacity, ChargedJson, ChargedJsonError, Hold, Refused};
 use cufflink_types::host::http::{
     FetchRequestV2, FetchResponseV2, HttpErrorEnvelope, HttpErrorKind, MultipartPart,
 };
@@ -150,7 +150,8 @@ pub(super) fn register(
                             .await
                         {
                             Ok(response) => {
-                                held_at(&mut held, ChargedJson::measure(&response));
+                                held_at(&mut held, ChargedJson::measure(&response))
+                                    .map_err(Refused::Budget)?;
                                 BatchResult::ok(response)
                             }
                             Err(e) => {
@@ -191,10 +192,13 @@ fn fetch_reservation(max_response_bytes: u64) -> usize {
     usize::try_from(max_response_bytes).unwrap_or(usize::MAX)
 }
 
-fn held_at(held: &mut Hold, bytes: usize) {
+fn held_at(held: &mut Hold, bytes: usize) -> Result<(), Capacity> {
     match bytes.checked_sub(held.bytes()) {
-        Some(extra) => held.force(extra),
-        None => held.shrink_to(bytes),
+        Some(extra) => held.grow(extra),
+        None => {
+            held.shrink_to(bytes);
+            Ok(())
+        }
     }
 }
 
@@ -1435,13 +1439,17 @@ mod fanout_tests {
     fn a_finished_item_keeps_only_what_its_result_measures() {
         let (ledger, mut held) = testing::hold(64 * MIB);
         held.grow(10 * MIB).expect("fits");
-        held_at(&mut held, 2048);
+        held_at(&mut held, 2048).expect("smaller");
         assert_eq!(ledger.in_use(), 2048);
-        held_at(&mut held, 12 * MIB);
+        held_at(&mut held, 12 * MIB).expect("fits");
         assert_eq!(
             ledger.in_use(),
             12 * MIB,
             "a base64 body larger than the reservation"
+        );
+        assert!(
+            held_at(&mut held, 65 * MIB).is_err(),
+            "a host buffer stays refusable"
         );
     }
 }

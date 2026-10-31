@@ -101,6 +101,16 @@ impl BudgetConfig {
         let background = percent(&vars, "WASM_MEMORY_BACKGROUND_SHARE_PERCENT", 75)?;
         let admit = percent(&vars, "WASM_MEMORY_ADMIT_PERCENT", 90)?;
         let share = |bytes: usize, percent: usize| bytes / 100 * percent;
+        let overrun = match vars.get("WASM_MEMORY_DELIVERY_OVERRUN_MB") {
+            Some(_) => vars.positive("WASM_MEMORY_DELIVERY_OVERRUN_MB", 1usize)? * MIB,
+            None => reserve / 2,
+        };
+        if overrun >= reserve {
+            return Err(eyre!(
+                "WASM_MEMORY_DELIVERY_OVERRUN_MB must be below the host reserve of {} MiB",
+                reserve / MIB
+            ));
+        }
         Ok(Self {
             limits: budget
                 .filter(|_| mode != PolicyMode::Off)
@@ -109,6 +119,7 @@ impl BudgetConfig {
                     admit: share(budget, admit),
                     service: share(budget, service),
                     background: share(budget, background),
+                    overrun,
                 }),
             mode,
             limit,
@@ -146,7 +157,7 @@ impl BudgetConfig {
         }
     }
 
-    pub fn log_startup(&self, max_memory: usize) {
+    pub fn log_startup(&self, max_memory: usize, max_response: usize) {
         match (&self.limits, &self.limit) {
             (None, _) if self.mode == PolicyMode::Off => {
                 tracing::info!(target: "cufflink::wasm::budget", "Guest memory budget is off")
@@ -173,8 +184,19 @@ impl BudgetConfig {
                     service_share = limits.service,
                     background_share = limits.background,
                     admit = limits.admit,
+                    delivery_overrun = limits.overrun,
                     "Guest memory budget"
                 );
+                let most = limits.budget + limits.overrun + max_response;
+                if limit.as_ref().is_some_and(|limit| {
+                    usize::try_from(limit.bytes).is_ok_and(|limit| most >= limit)
+                }) {
+                    tracing::warn!(
+                        target: "cufflink::wasm::budget",
+                        most,
+                        "The budget, the delivery overrun and one response reach the memory limit"
+                    );
+                }
                 if max_memory > limits.service {
                     let clamped = self.enforces();
                     tracing::warn!(
@@ -208,6 +230,23 @@ mod tests {
 
     fn config(pairs: &[(&str, &str)], cgroup: Option<CgroupLimit>) -> Result<BudgetConfig> {
         BudgetConfig::from_vars(cufflink_settings::fixed(pairs), cgroup, 256)
+    }
+
+    #[test]
+    fn a_delivery_overrun_defaults_to_half_the_reserve_and_stays_below_it() {
+        let overrun = |pairs: &[(&str, &str)]| {
+            config(pairs, limit(2048)).map(|config| config.limits.map(|limits| limits.overrun))
+        };
+        assert_eq!(
+            overrun(&[]).expect("default"),
+            Some(2048 * MIB / 10 * 3 / 2)
+        );
+        assert_eq!(
+            overrun(&[("WASM_MEMORY_DELIVERY_OVERRUN_MB", "100")]).expect("set"),
+            Some(100 * MIB)
+        );
+        let refused = overrun(&[("WASM_MEMORY_DELIVERY_OVERRUN_MB", "700")]);
+        assert!(refused.is_err_and(|e| e.to_string().contains("below the host reserve")));
     }
 
     #[test]
