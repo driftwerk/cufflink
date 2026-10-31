@@ -920,10 +920,8 @@ impl WasmEngine {
         match result {
             Ok(mut output) => {
                 let room = budget::ChargedJson::delivery_bound(output.text.as_bytes());
-                match output.hold.make_room(room).await {
-                    Ok(()) => Ok(output),
-                    Err(no_room) => Err(oversized(no_room.to_string(), output.text.as_bytes())),
-                }
+                output.hold.make_room(room).await;
+                Ok(output)
             }
             failed => failed,
         }
@@ -1210,13 +1208,6 @@ fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError 
     denied(denial, memory, false)
 }
 
-fn oversized(reason: String, text: &[u8]) -> ExecutionError {
-    match crate::router::guest_response::outline(text) {
-        Ok(answer) => ExecutionError::Oversized { reason, answer },
-        Err(_) => ExecutionError::Response(reason),
-    }
-}
-
 fn read_response(
     memory: &[u8],
     ptr: i32,
@@ -1239,7 +1230,12 @@ fn read_response(
         .increment(1);
         let reason = format!("response of {len} bytes exceeds the {max_bytes} byte cap");
         return Err(match memory.get(start + 4..start + 4 + len) {
-            Some(text) if std::str::from_utf8(text).is_ok() => oversized(reason, text),
+            Some(text) if std::str::from_utf8(text).is_ok() => {
+                match crate::router::guest_response::outline(text) {
+                    Ok(answer) => ExecutionError::Oversized { reason, answer },
+                    Err(_) => ExecutionError::Response(reason),
+                }
+            }
             _ => ExecutionError::Response(reason),
         });
     }
@@ -2101,29 +2097,25 @@ pub(crate) mod tests {
 
     fn narrow(mib: &str, overrun: &str) -> WasmLimits {
         WasmLimits {
-            budget: budget::BudgetConfig {
-                committed_wait: Duration::from_millis(10),
-                ..budget::BudgetConfig::from_vars(
-                    cufflink_settings::fixed(&[
-                        ("WASM_MEMORY_BUDGET_MODE", "enforce"),
-                        ("WASM_MEMORY_BUDGET_MB", mib),
-                        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", overrun),
-                        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
-                        ("WASM_MEMORY_ADMIT_PERCENT", "100"),
-                        ("WASM_MEMORY_COLD_ESTIMATE_MB", "1"),
-                        ("WASM_THREAD_STACK_KB", "1024"),
-                    ]),
-                    None,
-                    256,
-                )
-                .expect("budget")
-            },
+            budget: budget::BudgetConfig::from_vars(
+                cufflink_settings::fixed(&[
+                    ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+                    ("WASM_MEMORY_BUDGET_MB", mib),
+                    ("WASM_MEMORY_DELIVERY_OVERRUN_MB", overrun),
+                    ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+                    ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+                    ("WASM_MEMORY_COLD_ESTIMATE_MB", "1"),
+                    ("WASM_THREAD_STACK_KB", "1024"),
+                ]),
+                None,
+                256,
+            )
+            .expect("budget"),
             ..WasmLimits::default()
         }
     }
 
     const ANSWER_8_MIB: &str = "(drop (memory.grow (i32.const 130))) (i32.store (i32.const 512) (i32.const 8388608)) (i32.const 512)";
-    const ANSWER_1_MIB: &str = "(drop (memory.grow (i32.const 20))) (i32.store (i32.const 512) (i32.const 1048576)) (i32.const 512)";
 
     #[tokio::test]
     async fn a_response_copied_past_the_ceiling_waits_for_the_copy_before_it() {
@@ -2167,23 +2159,6 @@ pub(crate) mod tests {
         holder.join().expect("join");
         let text = blocked.await.expect("join").expect("delivered");
         assert_eq!(text.len(), 8 * MIB);
-    }
-
-    #[tokio::test]
-    async fn an_answer_with_no_room_within_its_wait_is_settled_as_too_large_to_read() {
-        let engine = engine_with(narrow("13", "1"));
-        let (_, compiled) = install(&engine, &guest("h", ANSWER_1_MIB));
-        let state = AppState::minimal(engine.clone()).await;
-        let inv = invocation(
-            compiled,
-            "h",
-            InvocationKind::Route,
-            Duration::from_secs(10),
-        );
-        let mut filled = engine.kept_hold(&inv.identity, "h", 0);
-        filled.force(10 * MIB);
-        let err = engine.run_text(state, inv).await.unwrap_err();
-        assert!(matches!(err, ExecutionError::Oversized { .. }), "{err}");
     }
 
     #[test]

@@ -20,7 +20,6 @@ pub use hold::{Capacity, Hold, Meter, Refused};
 pub(crate) use json::stepped;
 pub use json::{ChargedJson, ChargedJsonError, Parsed};
 pub use ledger::Limits;
-pub use ledger::NoRoom;
 pub(crate) use ledger::{Charge, Ledger, Verdict, TABLE_ELEMENT_BYTES};
 pub(crate) use stack::enter as enter_thread;
 
@@ -91,6 +90,7 @@ pub enum Reason {
     ServiceConcurrency,
     RouteConcurrency,
     Pressure,
+    DeliveryLimit,
 }
 
 impl Reason {
@@ -101,6 +101,7 @@ impl Reason {
             Reason::ServiceConcurrency => "service_concurrency",
             Reason::RouteConcurrency => "route_concurrency",
             Reason::Pressure => "pressure",
+            Reason::DeliveryLimit => "delivery_limit",
         }
     }
 }
@@ -297,7 +298,6 @@ impl Budget {
                     enforce: config.enforces(),
                     stack: config.thread_stack,
                     aging: config.background_aging,
-                    delivery_wait: config.committed_wait,
                 }))
             }),
             estimates: Estimates::new(
@@ -369,10 +369,6 @@ impl Budget {
         }
     }
 
-    pub(crate) fn share(&self) -> Option<usize> {
-        self.ledger.as_ref().map(|ledger| ledger.limits().service)
-    }
-
     pub(crate) fn enforces(&self) -> bool {
         self.config.enforces()
     }
@@ -394,7 +390,11 @@ impl Budget {
     }
 
     pub(crate) fn refusal(&self, reason: Reason, holding: usize, ran: bool) -> ExecutionError {
-        match self.share() {
+        let limit = self.ledger.as_ref().map(|ledger| match reason {
+            Reason::DeliveryLimit => ledger.limits().delivery(),
+            _ => ledger.limits().service,
+        });
+        match limit {
             Some(share) if holding > share => ExecutionError::TooLarge {
                 requested: holding,
                 share,
@@ -755,12 +755,11 @@ pub(crate) mod testing {
                 admit: budget,
                 service: budget,
                 background: budget,
-                overrun: budget / 4,
+                overrun: budget,
             },
             enforce: true,
             stack: MIB,
             aging: Duration::from_millis(100),
-            delivery_wait: Duration::from_secs(60),
         }));
         let account = Account::new(
             Arc::clone(&ledger),

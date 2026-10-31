@@ -785,7 +785,7 @@ async fn concurrent_large_answers_are_all_delivered_and_give_their_room_back() {
     let Some((platform, mut db)) = small(&[
         ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
         ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
-        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "8"),
+        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "16"),
         ("WASM_ADMISSION_WAIT_MS", "5000"),
     ])
     .await
@@ -816,13 +816,12 @@ async fn concurrent_large_answers_are_all_delivered_and_give_their_room_back() {
 }
 
 #[tokio::test]
-async fn a_large_answer_waits_for_room_holding_no_slot_and_is_delivered() {
+async fn a_large_answer_is_delivered_beside_a_full_budget() {
     let Some((platform, mut db)) = small(&[
         ("WASM_MEMORY_BUDGET_MB", "36"),
         ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
-        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "1"),
+        ("WASM_MEMORY_DELIVERY_OVERRUN_MB", "16"),
         ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
-        ("WASM_MAX_CONCURRENT", "2"),
     ])
     .await
     else {
@@ -838,25 +837,33 @@ async fn a_large_answer_waits_for_room_holding_no_slot_and_is_delivered() {
     );
     deployed(&platform, &catalog, &manifest).await;
     let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
-    let records = tokio::spawn(answered(
+    let answer = answered(
         platform
             .http
             .post(platform.fn_url(&catalog, "catalog-service", "answer_some_records"))
             .json(&json!({})),
-    ));
-    eventually("the answer waits for its room", async || {
-        gauge(
-            &platform,
-            "cufflink_wasm_admission_waiters",
-            &[("class", "delivery")],
-        )
-        .await
-            == 1.0
-    })
+    )
     .await;
-    holding.release().await;
-    let answer = records.await.expect("the answer");
     assert_eq!(answer.status, 200, "{}", answer.body);
+    holding.release().await;
+}
+
+#[tokio::test]
+async fn an_answer_past_the_delivery_limit_is_too_large_at_any_load() {
+    let Some((platform, mut db)) = small(&[("WASM_MEMORY_DELIVERY_OVERRUN_MB", "4")]).await else {
+        return;
+    };
+    let catalog = db.mint_tenant().await;
+    let manifest = common::wasm_manifest("catalog-service", &[("answer_some_records", "/records")]);
+    deployed(&platform, &catalog, &manifest).await;
+    let answer = answered(
+        platform
+            .http
+            .post(platform.fn_url(&catalog, "catalog-service", "answer_some_records"))
+            .json(&json!({})),
+    )
+    .await;
+    assert_eq!(answer.status, 500, "{}", answer.body);
 }
 
 #[tokio::test]

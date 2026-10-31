@@ -1055,8 +1055,8 @@ hook and `on_migrate` text, `read_response`, the worker reply's decode,
 hook's `parse_output` and the subscription decode. Such a buffer waits for
 room instead (section 14), which is not a refusal. A size bound remains:
 `max_response_bytes` caps the response text, and a tree or rendered body
-that alone passes the service share is refused as too large, whatever else
-is running. A size refusal does not depend on load, so no retry cures it,
+that alone passes the delivery limit (section 14) is refused as too large,
+whatever else is running. A size refusal does not depend on load, so no retry cures it,
 and a finished message or job is settled by what it answered rather than
 run again for it (section 14).
 
@@ -1843,50 +1843,51 @@ Recorded as the change was built, each with its reason.
   (the payload and the response it carries), then shrunk to the response.
   It is never refused for what else is running, since the guest has
   returned.
-- **A delivered buffer's size refusal is at the share**, not the host
-  response cap. Response text is forced, bounded by `max_response_bytes`;
-  `enforce` does not clamp that cap, so text alone can pass the share and
-  its tree is then refused. A tree costs about 95 times its text at worst
-  (683 KiB of `{"":0}` builds 65 MiB), and slots are released before
-  decoding (section 1.4), so a hold that alone passes the share is refused
-  as too large (500, `too_large`) and counted under `warn`. A lower tree
-  cap would refuse legitimate replies, since a tree of small records costs
-  about 7.5 times its text.
-- **A delivery waits for room below a ceiling.** Forcing every finished
+- **A delivered buffer's size refusal is at the delivery limit**, the
+  smaller of the service share and `WASM_MEMORY_DELIVERY_OVERRUN_MB`, not
+  the host response cap. Response text is forced, bounded by
+  `max_response_bytes`; `enforce` does not clamp that cap. A tree costs
+  about 95 times its text at worst (683 KiB of `{"":0}` builds 65 MiB), and
+  slots are released before decoding (section 1.4), so a hold that alone
+  passes the limit is refused as too large (500, `too_large`) and counted
+  under `warn`, as is its text, tree and render together. That does not
+  depend on load, so no retry cures it. The limit is lower than the share
+  on a default container: a tree of small records costs about 7.5 times its
+  text, which with the text and the render makes 9.5 times, so on 2 GiB an
+  answer of such records stops being deliverable near 32 MiB of text rather
+  than at the response cap, and an operator raises the overrun, below the
+  reserve, to deliver more. Strings are unaffected: an
+  answer of one string costs three times its text.
+- **A delivery takes a room below a ceiling.** Forcing every finished
   guest's tree would have no global bound: each hold is checked only
-  against the share, slots are already released, and a burst of small
+  against its own size, slots are already released, and a burst of small
   texts could build several budgets' worth of trees. The ceiling is the
   budget plus `WASM_MEMORY_DELIVERY_OVERRUN_MB`, by default half the host
   reserve and always below it. When a guest returns, `WasmEngine::run`
-  takes a room of `ChargedJson::delivery_bound(text)`, at most the share
-  and less what it already holds, while `in_use + room` fits the ceiling,
-  and otherwise queues for it, holding no slot, store or linear memory.
-  The bound is three times the
-  text, for the input, the strings and the render, plus each `{`, `[` and
-  `,` at the tree's worst cost and two steps; a test holds it above the
-  real peak on every shape, and it costs one scan of the text. Guests stop
-  at the budget, so the band above it holds deliveries alone, and a
-  delivery that fits the overrun always gets it without any guest freeing
-  anything. This caps what the review's "one over-budget decode at a time"
-  caps, and lets small decodes pass each other. The room is unattributed,
-  so it causes no share denial, and is held beside the tree's own charges
-  rather than drawn from, which overstates `in_use` for the length of a
-  decode, never understates it. It ends when the hold drops or when the
-  body is rendered. A room larger than the overrun needs guests to free
-  memory, so while one queues no new guest is admitted, and `in_use` falls.
-  Only such a room waits on guests, and it can wait in vain: finished
-  answers waiting for rooms of their own hold their text, and enough of
-  them can fill the band between them. So the wait ends after
-  `WASM_COMMITTED_WAIT_SECS`, and the answer is then handled as one past
-  the response cap, below: the bound holds, and nothing hangs. A nested
-  service call's callee waits inside its caller's host call, so a caller
-  holding the room itself waits for its host-call timeout, and a
-  subscription's wait can pass `ack_wait`, in which case the message is
-  redelivered. A worker's reply and the audit parse of a request body take
-  a room the same way, since each builds a tree with its guest gone: the
-  reply then answers 500, and the audit record carries no body.
-  HTTP fan-out items are charged refusably past their reservation, so a
-  base64 body larger than the reservation cannot pass the budget.
+  takes a room of `ChargedJson::delivery_bound(text)`, at most the delivery
+  limit and less what it already holds, while `in_use + room` fits the
+  ceiling, and otherwise queues for it in arrival order, holding no slot,
+  store or linear memory. The bound is three times the text, for the input,
+  the strings and the render, plus each `{`, `[` and `,` at the tree's
+  worst cost and two steps; a test holds it above the real peak on every
+  shape, and it costs one scan of the text.
+  This is what a review asked for as "one over-budget decode at a time",
+  with small decodes allowed to share the band. It cannot stall, and it
+  needs no deadline: guests and the text of queued answers stop at the
+  budget, a room is at most the overrun, so a room fits once the rooms
+  ahead of it are done, whatever guests hold. A delivery never waits on a
+  guest, so a callee's answer cannot deadlock a caller waiting in a host
+  call, and no holder of a room waits for another. What can hold the band
+  is a rendered body a slow client has not read, which transport timeouts
+  end. The room is unattributed, so it causes no share denial, and is held
+  beside the tree's own charges rather than drawn from, which overstates
+  `in_use` for the length of a decode and never understates it. It ends
+  when the hold drops or when the body is rendered. A worker's reply takes
+  a room the same way, since it builds a tree with its guest gone. The
+  audit parse of a request body takes none: it draws on what the request
+  reserved before the guest ran. HTTP fan-out items are charged refusably
+  past their reservation, so a base64 body larger than the reservation
+  cannot pass the budget.
 - **The response copy.** `read_response` copies the text beside the linear
   memory it came from, so for that moment the text counts twice. Past the
   ceiling, copies take turns on a mutex held until the store is dropped,
@@ -1918,9 +1919,8 @@ Recorded as the change was built, each with its reason.
   made: `read_response` reads the outline over linear memory and returns
   `ExecutionError::Oversized`, so a subscription or schedule settles by the
   answer, a job as above, and a worker after-hook is acked. A route still
-  answers 500. An answer whose wait for room ended takes the same path.
-  Only an out-of-bounds, non-UTF-8 or invalid response stays an ordinary
-  failure, which is retried.
+  answers 500. Only an out-of-bounds, non-UTF-8 or invalid response stays
+  an ordinary failure, which is retried.
 - **A hook's answer** is charged until the hook returns. A before-hook's
   returned body, used by the write that follows, is not charged after that.
 

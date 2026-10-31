@@ -24,7 +24,6 @@ pub(crate) struct Settings {
     pub enforce: bool,
     pub stack: usize,
     pub aging: Duration,
-    pub delivery_wait: Duration,
 }
 
 struct Waiter {
@@ -130,6 +129,12 @@ struct Snapshot {
     waiters: [usize; Class::ALL.len()],
     delivery_waiters: usize,
     oldest: [Duration; Class::ALL.len()],
+}
+
+impl Limits {
+    pub(crate) fn delivery(&self) -> usize {
+        self.service.min(self.overrun)
+    }
 }
 
 impl Snapshot {
@@ -495,11 +500,10 @@ impl Ledger {
 
     fn queued_ahead(&self, state: &State, class: Class, now: Instant) -> bool {
         let tier = Self::arrival_tier(class);
-        !state.deliveries.is_empty()
-            || state
-                .queue
-                .iter()
-                .any(|waiter| !waiter.granted.is_closed() && self.tier(waiter, now) <= tier)
+        state
+            .queue
+            .iter()
+            .any(|waiter| !waiter.granted.is_closed() && self.tier(waiter, now) <= tier)
     }
 
     fn delivery_fits(&self, state: &State, bytes: usize) -> bool {
@@ -507,32 +511,28 @@ impl Ledger {
         state.in_use + bytes <= limits.budget + limits.overrun
     }
 
-    fn grant_deliveries(&self, state: &mut State) -> bool {
-        let mut at = 0;
-        while let Some(waiter) = state.deliveries.get(at) {
-            if waiter.granted.is_closed() || self.delivery_fits(state, waiter.bytes) {
-                let Some(waiter) = state.deliveries.remove(at) else {
-                    break;
-                };
-                if !waiter.granted.is_closed() {
-                    state.open_delivery(waiter.bytes);
-                    if waiter.granted.send(()).is_err() {
-                        state.close_delivery(waiter.bytes);
-                    }
+    fn grant_deliveries(&self, state: &mut State) {
+        while let Some(waiter) = state.deliveries.front() {
+            let gone = waiter.granted.is_closed();
+            if !gone && !self.delivery_fits(state, waiter.bytes) {
+                break;
+            }
+            let Some(waiter) = state.deliveries.pop_front() else {
+                break;
+            };
+            if !gone {
+                state.open_delivery(waiter.bytes);
+                if waiter.granted.send(()).is_err() {
+                    state.close_delivery(waiter.bytes);
                 }
-            } else {
-                at += 1;
             }
         }
-        !state.deliveries.is_empty()
     }
 
     fn grant(&self, state: &mut State) {
         let now = Instant::now();
-        let mut held = HeldBack {
-            all: self.grant_deliveries(state),
-            ..HeldBack::default()
-        };
+        self.grant_deliveries(state);
+        let mut held = HeldBack::default();
         for tier in 0..GRANT_TIERS {
             let mut blocked = HeldBack::default();
             let mut at = 0;
@@ -608,8 +608,8 @@ impl Ledger {
         holding: usize,
     ) -> Verdict {
         self.debit_unless(
-            |_| match holding > self.settings.limits.service {
-                true => Err(Reason::ServiceShare),
+            |_| match holding > self.settings.limits.delivery() {
+                true => Err(Reason::DeliveryLimit),
                 false => Ok(()),
             },
             |state| self.take(state, class, service, extra),
@@ -636,15 +636,15 @@ impl Ledger {
         self: &Arc<Self>,
         wanted: usize,
         holding: usize,
-    ) -> Result<Option<Delivery>, NoRoom> {
+    ) -> Option<Delivery> {
         if !self.settings.enforce {
-            return Ok(None);
+            return None;
         }
         let bytes = wanted
-            .min(self.settings.limits.service)
+            .min(self.settings.limits.delivery())
             .saturating_sub(holding);
         let waiting = self.settled(|state, _| {
-            if self.delivery_fits(state, bytes) {
+            if state.deliveries.is_empty() && self.delivery_fits(state, bytes) {
                 state.open_delivery(bytes);
                 return None;
             }
@@ -663,16 +663,13 @@ impl Ledger {
             })
         });
         if let Some(mut waiting) = waiting {
-            tokio::time::timeout(self.settings.delivery_wait, &mut waiting.receiver)
-                .await
-                .map_err(|_| NoRoom)?
-                .map_err(|_| NoRoom)?;
+            (&mut waiting.receiver).await.ok()?;
             waiting.settled = true;
         }
-        Ok(Some(Delivery {
+        Some(Delivery {
             ledger: Arc::clone(self),
             bytes,
-        }))
+        })
     }
 
     pub(super) fn release(&self, class: Class, service: &ServiceKey, bytes: usize) {
@@ -908,10 +905,6 @@ impl Ledger {
         });
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("no room to deliver the answer within the wait for it")]
-pub struct NoRoom;
 
 struct WaitingDelivery {
     ledger: Arc<Ledger>,
@@ -1150,26 +1143,17 @@ mod tests {
     const STACK: usize = MIB;
 
     fn ledger(enforce: bool) -> Arc<Ledger> {
-        patient(enforce, Duration::from_secs(60))
-    }
-
-    fn impatient() -> Arc<Ledger> {
-        patient(true, Duration::from_millis(10))
-    }
-
-    fn patient(enforce: bool, delivery_wait: Duration) -> Arc<Ledger> {
         Arc::new(Ledger::new(Settings {
             limits: Limits {
                 budget: 100 * MIB,
                 admit: 90 * MIB,
                 service: 50 * MIB,
                 background: 75 * MIB,
-                overrun: 20 * MIB,
+                overrun: 50 * MIB,
             },
             enforce,
             stack: STACK,
             aging: Duration::from_millis(100),
-            delivery_wait,
         }))
     }
 
@@ -1391,7 +1375,7 @@ mod tests {
         assert_eq!(ledger.in_use(), 60 * MIB);
         assert_eq!(
             ledger.deliver(Class::Interactive, &catalog, MIB, 51 * MIB),
-            Verdict::Denied(Reason::ServiceShare),
+            Verdict::Denied(Reason::DeliveryLimit),
             "alone past the share"
         );
         assert_eq!(ledger.in_use(), 60 * MIB);
@@ -1418,141 +1402,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_room_that_cannot_fit_ends_its_wait_and_leaves_the_queue() {
-        let ledger = impatient();
-        let catalog = service("catalog-service");
-        ledger.force(Class::Interactive, &catalog, 100 * MIB);
-        assert_eq!(ledger.delivery(45 * MIB, 0).await.err(), Some(NoRoom));
-        assert_eq!(ledger.delivery_waiters(), 0);
-        assert_eq!(ledger.delivering(), 0);
-        assert!(
-            ledger
-                .try_reserve(Class::Interactive, &service("other"), MIB)
-                .is_err(),
-            "the budget is full"
-        );
-        ledger.release(Class::Interactive, &catalog, 20 * MIB);
-        assert!(ledger
-            .try_reserve(Class::Interactive, &service("other"), MIB)
-            .is_ok());
-    }
-
-    #[tokio::test]
     async fn a_delivery_counts_what_it_already_holds_towards_its_room() {
         let ledger = ledger(true);
         let catalog = service("catalog-service");
         ledger.force(Class::Interactive, &catalog, 50 * MIB);
-        let delivery = ledger
-            .delivery(200 * MIB, 50 * MIB)
-            .await
-            .expect("alone it always fits")
-            .expect("enforced");
-        assert_eq!(ledger.delivering(), 0, "the share is held already");
+        let delivery = ledger.delivery(200 * MIB, 50 * MIB).await;
+        assert!(delivery.is_some());
+        assert_eq!(ledger.delivering(), 0, "the whole limit is held already");
         drop(delivery);
-        let delivery = ledger
-            .delivery(30 * MIB, 10 * MIB)
-            .await
-            .expect("fits")
-            .expect("enforced");
+        let delivery = ledger.delivery(30 * MIB, 10 * MIB).await;
         assert_eq!(ledger.delivering(), 20 * MIB);
         drop(delivery);
     }
 
     #[tokio::test]
-    async fn a_delivery_takes_the_band_above_the_budget_and_waits_while_it_is_full() {
-        let ledger = impatient();
+    async fn a_delivery_takes_the_band_above_a_full_budget_and_waits_while_it_is_full() {
+        let ledger = ledger(true);
         let catalog = service("catalog-service");
         ledger.force(Class::Interactive, &catalog, 100 * MIB);
-        let first = ledger
-            .delivery(15 * MIB, 0)
-            .await
-            .expect("fits")
-            .expect("enforced");
-        assert_eq!(ledger.in_use(), 115 * MIB);
-        assert_eq!(
-            ledger.delivery(15 * MIB, 0).await.err(),
-            Some(NoRoom),
-            "115 + 15 passes the 120 MiB ceiling"
+        let first = ledger.delivery(35 * MIB, 0).await;
+        assert_eq!(ledger.in_use(), 135 * MIB);
+        let mut second = Box::pin(ledger.delivery(35 * MIB, 0));
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "135 + 35 passes the 150 MiB ceiling"
         );
+        assert_eq!(ledger.delivery_waiters(), 1);
+        drop(second);
         assert_eq!(
             ledger.delivery_waiters(),
             0,
             "a dropped wait leaves the queue"
         );
         drop(first);
-        let second = ledger.delivery(15 * MIB, 0).await.expect("room again");
-        drop(second);
+        let third = ledger.delivery(35 * MIB, 0).await;
+        assert_eq!(
+            ledger.delivering(),
+            35 * MIB,
+            "the first gave its room back"
+        );
+        drop(third);
         assert_eq!(ledger.in_use(), 100 * MIB);
-        assert_eq!(ledger.delivering(), 0);
     }
 
     #[tokio::test]
-    async fn a_delivery_past_the_overrun_holds_new_guests_back_until_it_fits() {
+    async fn a_large_delivery_is_not_overtaken_by_small_ones() {
         let ledger = ledger(true);
-        let (catalog, other) = (service("catalog-service"), service("other"));
-        ledger.force(Class::Interactive, &catalog, 80 * MIB);
-        let waiting = tokio::spawn({
-            let ledger = Arc::clone(&ledger);
-            async move { ledger.delivery(45 * MIB, 0).await }
-        });
-        while ledger.delivery_waiters() == 0 {
-            tokio::task::yield_now().await;
-        }
-        let until = Instant::now() + Duration::from_millis(10);
+        let catalog = service("catalog-service");
+        ledger.force(Class::Interactive, &catalog, 100 * MIB);
+        let first = ledger.delivery(40 * MIB, 0).await;
+        let mut large = Box::pin(ledger.delivery(45 * MIB, 0));
+        assert!(large.as_mut().now_or_never().is_none());
+        let mut small = Box::pin(ledger.delivery(MIB, 0));
         assert!(
-            ledger
-                .reserve(Class::Interactive, &other, 4 * MIB, Some(until))
-                .await
-                .is_err(),
-            "a guest that fits waits behind the delivery"
+            small.as_mut().now_or_never().is_none(),
+            "it would fit, and waits its turn"
         );
-        ledger.release(Class::Interactive, &catalog, 10 * MIB);
-        let delivery = waiting.await.expect("join").expect("granted");
-        assert!(delivery.is_some());
-        assert_eq!(ledger.in_use(), 115 * MIB);
-        drop(delivery);
-        assert!(ledger
-            .try_reserve(Class::Interactive, &other, 4 * MIB)
-            .is_ok());
+        drop(first);
+        assert!(large.await.is_some());
+        assert!(small.await.is_some());
     }
 
     #[tokio::test]
     async fn a_delivery_granted_to_a_caller_that_has_gone_is_given_back() {
         let ledger = ledger(true);
         let catalog = service("catalog-service");
-        ledger.force(Class::Interactive, &catalog, 110 * MIB);
-        let mut delivery = Box::pin(ledger.delivery(15 * MIB, 0));
+        ledger.force(Class::Interactive, &catalog, 130 * MIB);
+        let mut delivery = Box::pin(ledger.delivery(25 * MIB, 0));
         assert!(delivery.as_mut().now_or_never().is_none());
         ledger.release(Class::Interactive, &catalog, 10 * MIB);
-        assert_eq!(ledger.delivering(), 15 * MIB, "granted, not yet received");
+        assert_eq!(ledger.delivering(), 25 * MIB, "granted, not yet received");
         drop(delivery);
         assert_eq!(ledger.delivering(), 0);
-        assert_eq!(ledger.in_use(), 100 * MIB);
+        assert_eq!(ledger.in_use(), 120 * MIB);
     }
 
     #[tokio::test]
-    async fn only_enforce_waits_for_delivery_and_a_delivery_never_passes_the_share() {
+    async fn only_enforce_takes_a_room_and_a_room_never_passes_the_limit() {
         let warned = ledger(false);
-        assert!(matches!(warned.delivery(200 * MIB, 0).await, Ok(None)));
+        assert!(warned.delivery(200 * MIB, 0).await.is_none());
         assert_eq!(warned.in_use(), 0);
 
         let ledger = ledger(true);
-        let delivery = ledger.delivery(200 * MIB, 0).await.expect("fits");
+        ledger.force(Class::Interactive, &service("catalog-service"), 100 * MIB);
+        let delivery = ledger.delivery(200 * MIB, 0).now_or_never().flatten();
+        assert!(delivery.is_some(), "a room never waits on a full budget");
         assert_eq!(ledger.delivering(), 50 * MIB, "a tree past it is refused");
-        drop(delivery);
+    }
+
+    #[test]
+    fn a_tree_is_refused_alone_past_the_smaller_of_the_share_and_the_overrun() {
+        let limits = |service, overrun| Limits {
+            budget: 100 * MIB,
+            admit: 90 * MIB,
+            service,
+            background: 75 * MIB,
+            overrun,
+        };
+        assert_eq!(limits(50 * MIB, 20 * MIB).delivery(), 20 * MIB);
+        assert_eq!(limits(50 * MIB, 200 * MIB).delivery(), 50 * MIB);
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        assert_eq!(
+            ledger.deliver(Class::Interactive, &catalog, MIB, 50 * MIB),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            ledger.deliver(Class::Interactive, &catalog, MIB, 50 * MIB + 1),
+            Verdict::Denied(Reason::DeliveryLimit)
+        );
     }
 
     #[test]
     fn only_enforce_is_past_the_ceiling_and_only_above_it() {
         let catalog = service("catalog-service");
         let ledger = ledger(true);
-        ledger.force(Class::Interactive, &catalog, 120 * MIB);
+        ledger.force(Class::Interactive, &catalog, 150 * MIB);
         assert!(!ledger.past_the_ceiling());
         ledger.force(Class::Interactive, &catalog, 1);
         assert!(ledger.past_the_ceiling());
 
         let warned = super::tests::ledger(false);
-        warned.force(Class::Interactive, &catalog, 121 * MIB);
+        warned.force(Class::Interactive, &catalog, 151 * MIB);
         assert!(!warned.past_the_ceiling());
     }
 

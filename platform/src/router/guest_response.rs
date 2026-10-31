@@ -822,9 +822,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finished_guests_trees_wait_for_room_under_the_ceiling() {
+    async fn finished_guests_trees_take_turns_under_the_ceiling() {
         let budget = 100 * MIB;
-        let ceiling = budget + budget / 4;
+        let ceiling = 2 * budget;
         let (ledger, base) = testing::hold(budget);
         let mut running = base.sibling();
         running.grow(budget).expect("other guests fill the budget");
@@ -833,34 +833,37 @@ mod tests {
             let mut hold = base.delivering();
             hold.force(text.len());
             hold.make_room(ChargedJson::delivery_bound(text.as_bytes()))
-                .await
-                .expect("room within its wait");
-            parse_output(GuestOutput {
+                .await;
+            let tree = parse_output(GuestOutput {
                 text: text.clone(),
                 hold,
             })
-            .expect("never refused for what else is running")
+            .expect("never refused for what else is running");
+            tokio::task::yield_now().await;
+            let held = ledger.in_use() - ledger.delivering();
+            drop(tree);
+            held
         };
-        let soon = std::time::Duration::from_millis(10);
-        assert!(
-            tokio::time::timeout(soon, delivery()).await.is_err(),
-            "no room for its tree beside a full budget"
-        );
+        let held = futures_util::future::join_all((0..8).map(|_| delivery())).await;
+        for held in held {
+            assert!(held > budget, "built beside a full budget");
+            assert!(held <= ceiling, "{} MiB", held / MIB);
+        }
+        assert_eq!(ledger.delivering(), 0);
         drop(running);
-
-        let first = delivery().await;
-        assert!(ledger.in_use() - ledger.delivering() <= ceiling);
-        let mut held = first.1;
-        held.delivered();
-        assert!(
-            tokio::time::timeout(soon, delivery()).await.is_err(),
-            "a second tree does not fit beside the first"
-        );
-        drop((first.0, held));
         assert_eq!(ledger.in_use(), 0);
-        let (_value, second) = delivery().await;
-        assert!(ledger.in_use() - ledger.delivering() <= ceiling);
-        drop(second);
+    }
+
+    #[tokio::test]
+    async fn a_body_waiting_on_its_client_holds_its_text_and_no_room() {
+        let (ledger, base) = testing::hold(64 * MIB);
+        let mut hold = base.delivering();
+        hold.force(MIB);
+        hold.make_room(8 * MIB).await;
+        let body = ChargedBody::wrap(Body::empty(), hold);
+        assert_eq!(ledger.delivering(), 0);
+        assert_eq!(ledger.in_use(), MIB);
+        drop(body);
         assert_eq!(ledger.in_use(), 0);
     }
 
@@ -868,7 +871,7 @@ mod tests {
     async fn a_rendered_body_ends_the_room_its_tree_was_built_in() {
         let (ledger, base) = testing::hold(64 * MIB);
         let mut hold = base.delivering();
-        hold.make_room(8 * MIB).await.expect("room");
+        hold.make_room(8 * MIB).await;
         assert_eq!(ledger.delivering(), 8 * MIB);
         let (response, hold) = decode(GuestOutput {
             text: r#"{"ok":true}"#.to_string(),

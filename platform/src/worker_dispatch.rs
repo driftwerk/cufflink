@@ -162,8 +162,7 @@ pub async fn execute_on_worker(
 
     let mut hold = hold.delivering();
     hold.make_room(ChargedJson::delivery_bound(&reply.payload) + reply.payload.len())
-        .await
-        .map_err(|no_room| PlatformError::Internal(format!("WASM worker reply: {no_room}")))?;
+        .await;
     hold.grow(reply.payload.len().saturating_mul(2))
         .map_err(|capacity| match engine {
             Some(engine) => crate::router::map_execution_error(

@@ -368,18 +368,10 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
     let sink = Sink::of(state, &tenant, &service);
     match audit {
         Some(mut reservation) => {
-            let room = reservation
-                .make_room(ChargedJson::delivery_bound(&body))
-                .await;
             let left = reservation.bytes();
             let mut drawing = Drawing::from(&mut reservation, left);
-            let data = room
-                .ok()
-                .and_then(|()| {
-                    parse_body(&body, &mut drawing)
-                        .or_else(|_| parse_body(&body, &mut Hold::none()))
-                        .ok()
-                })
+            let data = parse_body(&body, &mut drawing)
+                .or_else(|_| parse_body(&body, &mut Hold::none()))
                 .map_or(Value::Null, |parsed| parsed.value);
             sink.record_drawing(&recorded(data), &mut drawing);
         }

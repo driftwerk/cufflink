@@ -177,10 +177,11 @@ been. A later release makes `enforce` the default. Under `enforce`:
 - in-process after-hooks are at-most-once: one that cannot start within
   `WASM_COMMITTED_WAIT_SECS` (300), or is denied memory mid-run, is logged
   and dropped, and not retried. Route work that must happen to a worker;
-- a request or message whose guest has returned is delivered: it may wait
-  for room, up to `WASM_MEMORY_DELIVERY_OVERRUN_MB` past the budget, and is
-  never refused for what else is running. Only an answer that alone passes
-  the service share is refused, as too large. A subscription, schedule or
+- a request or message whose guest has returned is delivered: it takes
+  room up to `WASM_MEMORY_DELIVERY_OVERRUN_MB` past the budget, in turn, and
+  is never refused for what else is running. Only an answer that alone
+  passes the smaller of the overrun and the service share is refused, as
+  too large. A subscription, schedule or
   job is still settled by the `__status` and `__delivery` of such an
   answer, and a job that succeeded fails terminally with its result
   unread, rather than running again;

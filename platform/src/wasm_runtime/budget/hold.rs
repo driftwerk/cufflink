@@ -1,5 +1,5 @@
 use super::caps::{CapExceeded, HostCaps};
-use super::ledger::{Delivery, Ledger, NoRoom, Verdict};
+use super::ledger::{Delivery, Ledger, Verdict};
 use super::{Class, Denied, Reason, ServiceKey};
 use crate::policy::PolicyMode;
 use crate::wasm_runtime::InvocationKind;
@@ -142,11 +142,10 @@ impl Hold {
         Self::unrefused(self.account.clone())
     }
 
-    pub(crate) async fn make_room(&mut self, bytes: usize) -> Result<(), NoRoom> {
+    pub(crate) async fn make_room(&mut self, bytes: usize) {
         if let Some(account) = &self.account {
-            self.delivery = account.ledger().delivery(bytes, self.bytes).await?;
+            self.delivery = account.ledger().delivery(bytes, self.bytes).await;
         }
-        Ok(())
     }
 
     pub(crate) fn delivered(&mut self) {
@@ -358,12 +357,11 @@ mod tests {
                 admit: 90 * MIB,
                 service: 50 * MIB,
                 background: 75 * MIB,
-                overrun: 20 * MIB,
+                overrun: 50 * MIB,
             },
             enforce,
             stack: MIB,
             aging: Duration::from_millis(100),
-            delivery_wait: Duration::from_secs(60),
         }));
         let account = Account::new(
             Arc::clone(&ledger),
@@ -412,7 +410,7 @@ mod tests {
         let mut hold = Hold::unrefused(Some(account));
         hold.grow(50 * MIB).expect("at the share");
         let refused = hold.grow(1).expect_err("alone past the share");
-        assert_eq!(refused.reason, Reason::ServiceShare);
+        assert_eq!(refused.reason, Reason::DeliveryLimit);
         assert_eq!(refused.holding, 50 * MIB + 1);
         assert_eq!(ledger.in_use(), 50 * MIB);
     }
@@ -439,13 +437,13 @@ mod tests {
 
         let (ledger, base) = testing::hold(64 * MIB);
         let mut hold = base.delivering();
-        hold.make_room(8 * MIB).await.expect("room");
+        hold.make_room(8 * MIB).await;
         assert_eq!(ledger.delivering(), 8 * MIB);
         drop(hold);
         assert_eq!(ledger.delivering(), 0);
 
         let mut hold = base.delivering();
-        hold.make_room(8 * MIB).await.expect("room");
+        hold.make_room(8 * MIB).await;
         hold.delivered();
         assert_eq!(ledger.delivering(), 0);
         assert_eq!(ledger.in_use(), 0);
@@ -474,6 +472,7 @@ mod tests {
         let mut kept = Hold::kept(Some(account), 4 * MIB);
         kept.grow(MIB).expect("fits");
         kept.force(MIB);
+        assert_eq!(ledger.kept_total(), 2 * MIB);
         drop(kept);
         assert_eq!(ledger.in_use(), 0);
         assert_eq!(ledger.kept_total(), 0, "nothing is left marked as kept");

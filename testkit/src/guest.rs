@@ -172,7 +172,7 @@ $DATA
   (func (export "answer_some_records") (param i32 i32) (result i32)
     (call $records (i32.const 18724)))
   (func (export "answer_many_records") (param i32 i32) (result i32)
-    (call $records (i32.const 300000)))
+    (call $records (i32.const 150000)))
   (func (export "grow_24") (param i32 i32) (result i32)
     (if (i32.eq (memory.grow (i32.const 384)) (i32.const -1)) (then (unreachable)))
     (i32.store8 (i32.const 25165824) (i32.const 1))
