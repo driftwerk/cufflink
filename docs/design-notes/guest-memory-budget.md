@@ -1972,7 +1972,10 @@ Recorded as the change was built, each with its reason.
   no more than that, a dropped header is counted and logged by the entry
   that denied it, never by the guest's name, and an event stream keeps its
   hold until its body ends, since `initial` and `state` live as long as it
-  does.
+  does. One other copy goes uncharged, for less time: while a host call
+  runs, an error it logs or returns can quote what the guest gave it, such
+  as a storage key or a URL, up to `max_guest_len`. A method or a part name
+  in such an error stops at 64 characters.
 - **A finished job is not run again for its output.** A job that answered
   success and whose output cannot be read fails as `Terminal`, with an
   error saying it finished and its result could not be read. Nothing would

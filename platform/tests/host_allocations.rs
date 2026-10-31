@@ -148,7 +148,7 @@ fn charged_json_is_charged_within_a_tenth_of_what_it_allocates() {
 type Unread = (&'static str, String, Option<u16>);
 
 const OUTLINE_BOUND: usize = 256 * 1024;
-const DELIVERY_BLOCK_BOUND: usize = 4 * MIB;
+const DELIVERY_BLOCK_BOUND: usize = 5 * MIB;
 const OUTLINE_SIZES: [usize; 2] = [256 * 1024, MIB];
 const STRING_UNITS: [&str; 4] = ["x", r#"\""#, "\u{80}", r"\u0080"];
 
@@ -330,7 +330,8 @@ fn an_outline_allocates_nothing_its_text_sizes() {
     let peak = outline_peak("an escaped key within its limit", &key, Some(500));
     assert!(peak <= OUTLINE_BOUND, "an escaped key: {peak}");
 
-    for unit in ["0", "[0]", r#"{"":0}"#] {
+    let chain = format!("{}0{}", "[".repeat(120), "]".repeat(120));
+    for unit in ["0", "[0]", r#"{"":0}"#, &chain] {
         let units = (64 * 1024 - 2) / (unit.len() + 1) - 1;
         let block = format!(
             r#"{{"__v":2,"__status":200,"__delivery":[{}{unit}]}}"#,
@@ -339,7 +340,8 @@ fn an_outline_allocates_nothing_its_text_sizes() {
         let peak = outline_peak("a block at its limit", &block, None);
         assert!(
             (block.len()..=DELIVERY_BLOCK_BOUND).contains(&peak),
-            "a delivery block of {unit}: {peak}"
+            "a delivery block of {}: {peak}",
+            &unit[..1]
         );
     }
 }

@@ -366,7 +366,7 @@ impl GuestEgress {
             "PUT" => reqwest::Method::PUT,
             "DELETE" => reqwest::Method::DELETE,
             "PATCH" => reqwest::Method::PATCH,
-            _ => return Err(format!("Unsupported HTTP method: {}", method)),
+            _ => return Err(format!("Unsupported HTTP method: {method:.64}")),
         };
         let headers = headers
             .iter()
@@ -614,7 +614,7 @@ fn plan(
         .contains(&method.as_str())
         .then(|| reqwest::Method::from_bytes(method.as_bytes()).ok())
         .flatten()
-        .ok_or_else(|| invalid(format!("unsupported HTTP method: {}", request.method)))?;
+        .ok_or_else(|| invalid(format!("unsupported HTTP method: {:.64}", request.method)))?;
     let mut headers = request
         .headers
         .iter()
@@ -696,7 +696,7 @@ fn part_head(part: &MultipartPart, boundary: &str) -> Result<String, HttpErrorEn
         .map(|content_type| {
             HeaderValue::from_str(content_type)
                 .map(|_| format!("Content-Type: {content_type}\r\n"))
-                .map_err(|_| invalid(format!("invalid content type of part {}", part.name)))
+                .map_err(|_| invalid(format!("invalid content type of part {:.64}", part.name)))
         })
         .transpose()?
         .unwrap_or_default();
@@ -799,6 +799,19 @@ mod v2_tests {
 
     fn refused(request: FetchRequestV2) -> HttpErrorKind {
         planned(request).expect_err("refused").kind
+    }
+
+    #[test]
+    fn an_invalid_request_quotes_a_bounded_part_of_what_it_was_given() {
+        let long = "\u{e9}".repeat(1024 * 1024);
+        let method = planned(request(&long, "https://example.com/")).expect_err("refused");
+        assert!(method.message.len() <= 256, "{}", method.message.len());
+        let unsendable = MultipartPart {
+            content_type: Some("\n".into()),
+            ..part(&long, b"x")
+        };
+        let part = form(&[unsendable], BOUNDARY).expect_err("refused");
+        assert!(part.message.len() <= 256, "{}", part.message.len());
     }
 
     fn part(name: &str, body: &[u8]) -> MultipartPart {
