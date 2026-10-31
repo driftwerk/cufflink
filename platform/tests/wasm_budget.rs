@@ -411,6 +411,55 @@ async fn an_after_hook_started_with_the_budget_full_runs_once_room_frees() {
 }
 
 #[tokio::test]
+async fn an_after_hook_of_a_service_at_its_share_is_kept_and_runs_once_room_frees() {
+    let Some((platform, mut db)) = small(&[("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40")]).await
+    else {
+        return;
+    };
+    let share: usize = 64 * 1024 * 1024 / 100 * 40;
+    let catalog = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("catalog-service", &[("hold_gated_24", "/hold")]);
+    manifest["tables"][0]["hooks"] = json!({"after_create": "insert_hooked"});
+    deployed(&platform, &catalog, &manifest).await;
+    let rows = tenant_db(&db, &catalog).await;
+    let holding = held(&platform, &db, &catalog, "catalog-service", "hold_gated_24").await;
+    let charged = gauge(
+        &platform,
+        "cufflink_wasm_memory_service_bytes",
+        &[("tenant", catalog.slug.as_str())],
+    )
+    .await as usize;
+    let past_what_is_left = share.saturating_sub(charged) + 64 * 1024;
+
+    let (status, body) = platform
+        .send(
+            reqwest::Method::POST,
+            &format!("/svc/{}/catalog-service/items", catalog.slug),
+            &format!("ApiKey {}", catalog.api_key),
+            Some(&json!({"title": "x".repeat(past_what_is_left)})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    eventually("the hook waits for its share", async || {
+        gauge(
+            &platform,
+            "cufflink_wasm_admission_waiters",
+            &[("class", "committed")],
+        )
+        .await
+            >= 1.0
+    })
+    .await;
+    assert_eq!(hooked(&rows, "catalog_service").await, 0);
+
+    holding.release().await;
+    eventually("the hook ran", async || {
+        hooked(&rows, "catalog_service").await == 1
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_bulk_writes_after_hooks_hold_at_most_half_of_their_services_slots() {
     let Some((platform, mut db)) = small(&[
         ("WASM_MAX_CONCURRENT_PER_SERVICE", "4"),

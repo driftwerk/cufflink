@@ -6,6 +6,11 @@ use tokio_postgres::{Client, NoTls};
 
 pub const GATE_KEY: i64 = 4242;
 
+fn halves(key: i64) -> (i64, i64) {
+    const LOW: i64 = 0xffff_ffff;
+    ((key >> 32) & LOW, key & LOW)
+}
+
 pub struct Gate {
     client: Client,
     key: i64,
@@ -29,12 +34,14 @@ impl Gate {
     }
 
     pub async fn waiting(&self) -> i64 {
+        let (high, low) = halves(self.key);
         self.client
             .query_one(
                 "SELECT count(*) FROM pg_locks
-                  WHERE locktype = 'advisory' AND objid::bigint = $1 AND NOT granted
+                  WHERE locktype = 'advisory' AND objsubid = 1
+                    AND classid::bigint = $1 AND objid::bigint = $2 AND NOT granted
                     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
-                &[&self.key],
+                &[&high, &low],
             )
             .await
             .expect("pg_locks")
@@ -51,6 +58,13 @@ impl Gate {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_key_is_matched_by_both_of_its_halves() {
+        assert_eq!(super::halves(4242), (0, 4242));
+        assert_eq!(super::halves((1 << 32) + 5), (1, 5));
+        assert_eq!(super::halves(-1), (0xffff_ffff, 0xffff_ffff));
+    }
+
     #[test]
     fn the_guest_waits_on_the_gates_key() {
         assert!(crate::guest::module_wat()

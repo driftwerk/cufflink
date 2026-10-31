@@ -501,10 +501,9 @@ async fn a_result_past_the_response_cap_stops_the_statement_and_returns_its_sess
         response: 64 * 1024,
         ..HostCaps::default()
     };
-    let sql = "SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 10000000) AS g";
+    let sql = "SELECT generate_series(1, 10000000) AS g, repeat('x', 100) AS pad";
     let mut hold = Hold::none();
     let rows = RowText::legacy(&mut hold, &caps, "db_query");
-    let started = Instant::now();
     let mut session = guest(&fixture.pool, "capped").await;
     let failed = run_guest_statement(&mut session, BUDGET, GuestStatement::Query(sql, &rows))
         .await
@@ -512,11 +511,23 @@ async fn a_result_past_the_response_cap_stops_the_statement_and_returns_its_sess
         .expect("past the cap");
     assert!(failed.to_string().contains("response cap"), "{failed}");
     assert!(rows.refused().is_some());
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the portal stopped: {:?}",
-        started.elapsed()
-    );
+    let (observer, connection) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls)
+        .await
+        .expect("an observer");
+    tokio::spawn(connection);
+    common::until("the portal stopped", Duration::from_secs(10), async || {
+        observer
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND state = 'active'",
+                &[&fixture.backend_pid],
+            )
+            .await
+            .expect("pg_stat_activity")
+            .get::<_, i64>(0)
+            == 0
+    })
+    .await
+    .expect("no statement left running");
     session.release(&CancellationToken::new());
     fixture.assert_clean().await;
 }

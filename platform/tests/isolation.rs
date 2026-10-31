@@ -5,7 +5,8 @@ use cufflink_platform::policy::PolicyMode;
 use cufflink_platform::redis_conn::RedisHandle;
 use cufflink_platform::repo::deployments::{self, ActivateVersion};
 use cufflink_platform::repo::tenants::NewTenant;
-use cufflink_platform::wasm_runtime::redis_scope::{self, KeyPlan, Reading};
+use cufflink_platform::wasm_runtime::budget::{Hold, HostCaps, Refused};
+use cufflink_platform::wasm_runtime::redis_scope::{self, KeyPlan, ReadError, Reading};
 use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
@@ -130,12 +131,13 @@ async fn redis_warn_dual_read_serves_pre_migration_keys() {
         return;
     };
     let redis = RedisHandle::connect_in_background(url).expect("redis url");
-    for reading in [Reading::Plain, Reading::Whole, Reading::Upto(1024)] {
+    let caps = capped(1024);
+    for reading in [Reading::Plain, Reading::of(&caps, "redis_get")] {
         dual_read(&redis, reading).await;
     }
 }
 
-async fn dual_read(redis: &RedisHandle, reading: Reading) {
+async fn dual_read(redis: &RedisHandle, reading: Reading<'_>) {
     let redis = redis.clone();
     let tenant = Uuid::new_v4();
     let legacy_key = format!("feature_flags:{tenant}:checkout");
@@ -150,7 +152,7 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
     redis_scope::set(&redis, &plan(PolicyMode::Off), "legacy", None)
         .await
         .expect("pre-migration write");
-    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
+    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading, &mut Hold::none())
         .await
         .expect("read");
     assert_eq!(read.value.as_deref(), Some("legacy"));
@@ -161,7 +163,7 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
         .iter()
         .map(|key| redis_scope::plan(PolicyMode::Warn, tenant, key).expect("plan"))
         .collect();
-    let many = redis_scope::mget(&redis, &plans, reading)
+    let many = redis_scope::mget(&redis, &plans, reading, &mut Hold::none())
         .await
         .expect("mget");
     assert_eq!(many.value, vec![Some("legacy".to_string()), None]);
@@ -170,17 +172,22 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
     redis_scope::set(&redis, &plan(PolicyMode::Warn), "rewritten", Some(60))
         .await
         .expect("write");
-    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
+    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading, &mut Hold::none())
         .await
         .expect("read");
     assert_eq!(read.value.as_deref(), Some("rewritten"));
     assert!(!read.from_fallback, "the tenant key wins once written");
-    let enforced = redis_scope::get(&redis, &plan(PolicyMode::Enforce), reading)
-        .await
-        .expect("read");
+    let enforced = redis_scope::get(
+        &redis,
+        &plan(PolicyMode::Enforce),
+        reading,
+        &mut Hold::none(),
+    )
+    .await
+    .expect("read");
     assert_eq!(enforced.value.as_deref(), Some("rewritten"));
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Off), reading)
+        redis_scope::get(&redis, &plan(PolicyMode::Off), reading, &mut Hold::none())
             .await
             .expect("read")
             .value
@@ -193,15 +200,20 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
         .await
         .expect("delete");
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Enforce), reading)
-            .await
-            .expect("read")
-            .value,
+        redis_scope::get(
+            &redis,
+            &plan(PolicyMode::Enforce),
+            reading,
+            &mut Hold::none()
+        )
+        .await
+        .expect("read")
+        .value,
         None,
         "a warn-mode delete removes the tenant's key"
     );
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Off), reading)
+        redis_scope::get(&redis, &plan(PolicyMode::Off), reading, &mut Hold::none())
             .await
             .expect("read")
             .value
@@ -209,7 +221,7 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
         Some("legacy"),
         "and never the unprefixed key, which may be another tenant's"
     );
-    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
+    let read = redis_scope::get(&redis, &plan(PolicyMode::Warn), reading, &mut Hold::none())
         .await
         .expect("read");
     assert_eq!(
@@ -220,7 +232,7 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
         },
         "a deleted key does not come back from the unprefixed one"
     );
-    let many = redis_scope::mget(&redis, &plans, reading)
+    let many = redis_scope::mget(&redis, &plans, reading, &mut Hold::none())
         .await
         .expect("mget");
     assert_eq!(many.value, vec![None, None]);
@@ -246,7 +258,7 @@ async fn dual_read(redis: &RedisHandle, reading: Reading) {
         .await
         .expect("write");
     assert_eq!(
-        redis_scope::get(&redis, &plan(PolicyMode::Warn), reading)
+        redis_scope::get(&redis, &plan(PolicyMode::Warn), reading, &mut Hold::none())
             .await
             .expect("read")
             .value
@@ -518,43 +530,53 @@ async fn bounded_redis_reads_answer_as_get_and_mget_do() {
         .await
         .expect("fixtures");
 
-    let names = ["missing", "empty", "list", "at_cap", "past_cap"];
-    let plans: Vec<KeyPlan> = names.iter().map(|name| plan(name)).collect();
-    let plain = redis_scope::mget(&redis, &plans, Reading::Plain)
-        .await
-        .expect("mget");
-    for reading in [Reading::Whole, Reading::Upto(16)] {
-        let bounded = redis_scope::mget(&redis, &plans, reading)
-            .await
-            .expect("bounded mget");
-        for (i, name) in names.iter().enumerate() {
-            let expected = match (reading, *name) {
-                (Reading::Upto(_), "past_cap") => Some("b".repeat(17)),
-                _ => plain.value[i].clone(),
-            };
-            assert_eq!(bounded.value[i], expected, "{reading:?} mget {name}");
-        }
-        for name in names {
-            let single = plan(name);
-            let get = |reading| redis_scope::get(&redis, &single, reading);
-            match (get(Reading::Plain).await, get(reading).await) {
-                (Ok(plain), Ok(bounded)) if name == "past_cap" => {
-                    assert_eq!(plain.value.as_deref().map(str::len), Some(17));
-                    assert_eq!(
-                        bounded.value.as_deref().map(str::len),
-                        Some(17),
-                        "{reading:?}"
-                    );
-                }
-                (Ok(plain), Ok(bounded)) => assert_eq!(plain, bounded, "{reading:?} get {name}"),
-                (Err(plain), Err(bounded)) => {
-                    assert_eq!(plain.to_string(), bounded.to_string(), "{reading:?} {name}")
-                }
-                other => panic!("{reading:?} get {name}: {other:?}"),
-            }
-        }
-    }
+    let caps = capped(16);
+    let bounded = Reading::of(&caps, "redis_mget");
+    let mget = async |names: &[&str], reading| {
+        let plans: Vec<KeyPlan> = names.iter().map(|name| plan(name)).collect();
+        redis_scope::mget(&redis, &plans, reading, &mut Hold::none()).await
+    };
+    let fitting = ["missing", "empty", "list", "at_cap"];
+    let plain = mget(&fitting, Reading::Plain).await.expect("mget");
+    assert_eq!(
+        mget(&fitting, bounded).await.expect("bounded mget"),
+        plain,
+        "every key at or under the cap"
+    );
     assert_eq!(plain.value[0], None);
     assert_eq!(plain.value[1].as_deref(), Some(""));
     assert_eq!(plain.value[2], None, "MGET answers nil for a wrong type");
+    for over in [&["past_cap"][..], &["at_cap", "empty", "at_cap"]] {
+        assert!(
+            matches!(
+                mget(over, bounded).await,
+                Err(ReadError::Refused(Refused::Cap(_)))
+            ),
+            "{over:?} is past the cap and is not read"
+        );
+    }
+
+    for name in fitting.into_iter().chain(["past_cap"]) {
+        let single = plan(name);
+        let get =
+            async |reading| redis_scope::get(&redis, &single, reading, &mut Hold::none()).await;
+        match (get(Reading::Plain).await, get(bounded).await) {
+            (Ok(plain), Err(ReadError::Refused(Refused::Cap(_)))) if name == "past_cap" => {
+                assert_eq!(plain.value.as_deref().map(str::len), Some(17));
+            }
+            (Ok(plain), Ok(bounded)) => assert_eq!(plain, bounded, "get {name}"),
+            (Err(plain), Err(bounded)) => {
+                assert_eq!(plain.to_string(), bounded.to_string(), "{name}")
+            }
+            other => panic!("get {name}: {other:?}"),
+        }
+    }
+}
+
+fn capped(response: usize) -> HostCaps {
+    HostCaps {
+        mode: PolicyMode::Enforce,
+        response,
+        ..HostCaps::default()
+    }
 }

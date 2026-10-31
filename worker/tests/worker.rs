@@ -880,6 +880,80 @@ async fn an_after_hook_fetched_with_no_room_waits_for_it_and_runs_once() {
     );
 }
 
+#[tokio::test]
+async fn an_after_hook_denied_on_every_delivery_is_dead_lettered_for_capacity() {
+    use cufflink_platform::nats_manager::dlq::{DELIVERIES_HEADER, REASON_HEADER};
+
+    let Some(infra) = infra::infra().await else {
+        return;
+    };
+    let Some(nats_url) = infra.require_nats() else {
+        return;
+    };
+    let mut db = infra.create_migrated_database().await;
+    let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
+    let _turn = exclusive_jetstream(&js).await;
+
+    let hooks = HookService::deploy(infra, &mut db).await;
+    let env: Vec<(&str, &str)> = budgeted("72")
+        .into_iter()
+        .chain([
+            ("WORKER_AFTER_HOOK_CONCURRENCY", "2"),
+            ("WASM_CAPACITY_RETRIES", "1"),
+            ("WASM_ADMISSION_RETRY_AFTER_MS", "50"),
+        ])
+        .collect();
+    let worker = Worker::start_in(hooks.storage_dir.clone(), &db, nats_url, &env).await;
+    worker.process.wait_ready().await;
+    let gate = cufflink_testkit::Gate::closed(&db.tenant_url(&hooks.tenant.slug)).await;
+    hooks.publish(&js, hooks.job("hold_gated_56", "{}")).await;
+    cufflink_testkit::until("the holder waits at the gate", SOON, async || {
+        gate.waiting().await == 1
+    })
+    .await
+    .expect("in time");
+
+    hooks
+        .publish(&js, hooks.job("big_query_or_trap", "{}"))
+        .await;
+    let letter = dead_letter(
+        &js,
+        format!("cufflink.dlq.{}.>", hooks.tenant.slug),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("dead-lettered once its deliveries run out");
+    let headers = letter.headers.as_ref().expect("headers");
+    assert_eq!(
+        letter.subject.as_str(),
+        format!(
+            "cufflink.dlq.{}.hook-svc.hook.big_query_or_trap",
+            hooks.tenant.slug
+        )
+    );
+    assert_eq!(
+        headers.get(REASON_HEADER).map(|v| v.as_str()),
+        Some("capacity")
+    );
+    assert_eq!(
+        headers.get(DELIVERIES_HEADER).map(|v| v.as_str()),
+        Some("3")
+    );
+    assert_eq!(
+        worker
+            .process
+            .metric(
+                "cufflink_wasm_capacity_retries_total",
+                &[("kind", "worker_route")]
+            )
+            .await,
+        Some(3.0),
+        "each delivery ran once more before it was deferred"
+    );
+
+    gate.open().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn worker_nak_on_shutdown_redelivers_immediately() {

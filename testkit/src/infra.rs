@@ -286,7 +286,7 @@ async fn spawn_nats_server() -> Option<String> {
 
 async fn start_nats_server(bin: &str, dir: &Path) -> Option<(Child, String)> {
     let mut child = Command::new(bin)
-        .args(["-js", "-p", "0", "--store_dir"])
+        .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--store_dir"])
         .arg(dir)
         .arg("--ports_file_dir")
         .arg(dir)

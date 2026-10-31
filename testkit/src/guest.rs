@@ -19,6 +19,8 @@ const STRINGS: &[(&str, &str)] = &[
         "PAST_A_MIB",
         "SELECT repeat('x',1000) FROM generate_series(1,1100)",
     ),
+    ("BIG_KEY", "big"),
+    ("BIG_KEYS", r#"[\"big\",\"big\",\"big\"]"#),
     ("SAID", SAID),
     (
         "INSERT_SLOW",
@@ -70,6 +72,8 @@ const TEMPLATE: &str = r#"
   (import "env" "nats_publish" (func $nats_publish (param i32 i32 i32 i32) (result i32)))
   (import "env" "cufflink_log" (func $log (param i32 i32 i32)))
   (import "env" "util_sleep_ms" (func $sleep_ms (param i32) (result i32)))
+  (import "env" "redis_get" (func $redis_get (param i32 i32) (result i32)))
+  (import "env" "redis_mget" (func $redis_mget (param i32 i32) (result i32)))
   (memory (export "memory") 2)
   (global $heap (mut i32) (i32.const 4096))
 $DATA
@@ -146,6 +150,18 @@ $DATA
       (else (call $respond (i32.const $OK_OFF) (i32.const $OK_LEN)))))
   (func (export "big_query") (param i32 i32) (result i32)
     (if (result i32) (i32.eq (call $db_query (i32.const $BIG_QUERY_OFF) (i32.const $BIG_QUERY_LEN)) (i32.const -1))
+      (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
+      (else (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))))
+  (func (export "big_query_or_trap") (param i32 i32) (result i32)
+    (if (i32.eq (call $db_query (i32.const $BIG_QUERY_OFF) (i32.const $BIG_QUERY_LEN)) (i32.const -1))
+      (then (unreachable)))
+    (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))
+  (func (export "redis_get_big") (param i32 i32) (result i32)
+    (if (result i32) (i32.eq (call $redis_get (i32.const $BIG_KEY_OFF) (i32.const $BIG_KEY_LEN)) (i32.const -1))
+      (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
+      (else (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))))
+  (func (export "redis_mget_big") (param i32 i32) (result i32)
+    (if (result i32) (i32.eq (call $redis_mget (i32.const $BIG_KEYS_OFF) (i32.const $BIG_KEYS_LEN)) (i32.const -1))
       (then (call $respond (i32.const $RC_MINUS_ONE_OFF) (i32.const $RC_MINUS_ONE_LEN)))
       (else (call $respond (i32.const $RC_ZERO_OFF) (i32.const $RC_ZERO_LEN)))))
   (func (export "query_past_a_mib") (param i32 i32) (result i32)
