@@ -845,7 +845,7 @@ mod tests {
         let delivery = || async {
             let mut hold = base.delivering();
             hold.force(text.len());
-            hold.make_room(ChargedJson::delivery_bound(text.as_bytes()))
+            hold.make_room(|| ChargedJson::delivery_bound(text.as_bytes()))
                 .await;
             let tree = parse_output(GuestOutput {
                 text: text.clone(),
@@ -872,7 +872,7 @@ mod tests {
         let (ledger, base) = testing::hold(64 * MIB);
         let mut hold = base.delivering();
         hold.force(MIB);
-        hold.make_room(8 * MIB).await;
+        hold.make_room(|| 8 * MIB).await;
         let body = ChargedBody::wrap(Body::empty(), hold);
         assert_eq!(ledger.delivering(), 0);
         assert_eq!(ledger.in_use(), MIB);
@@ -884,7 +884,7 @@ mod tests {
     async fn a_rendered_body_ends_the_room_its_tree_was_built_in() {
         let (ledger, base) = testing::hold(64 * MIB);
         let mut hold = base.delivering();
-        hold.make_room(8 * MIB).await;
+        hold.make_room(|| 8 * MIB).await;
         assert_eq!(ledger.delivering(), 8 * MIB);
         let (response, hold) = decode(GuestOutput {
             text: r#"{"ok":true}"#.to_string(),
