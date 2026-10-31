@@ -30,7 +30,7 @@ fn event(cgroup: &Path, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("memory.events has no {name}"))
 }
 
-async fn limited(routes: &[(&str, &str)]) -> Limited {
+async fn limited(manifest: Value) -> Limited {
     assert!(
         std::env::var(PLATFORM_LAUNCHER).is_ok_and(|launcher| !launcher.trim().is_empty()),
         "{PLATFORM_LAUNCHER} is not set: {IGNORED}"
@@ -59,7 +59,6 @@ async fn limited(routes: &[(&str, &str)]) -> Limited {
         "the platform is in the scope"
     );
     let tenant = db.mint_tenant().await;
-    let manifest = common::wasm_manifest("catalog-service", routes);
     let (status, body) = platform.deploy(&tenant, &manifest).await;
     assert_eq!(status, 200, "deploy failed: {body}");
     Limited {
@@ -102,7 +101,11 @@ impl Limited {
 #[tokio::test]
 #[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a memory limit; run by the memory-limit CI job"]
 async fn a_linear_burst_stays_inside_the_limit() {
-    let limited = limited(&[("hold_48", "/hold_48")]).await;
+    let limited = limited(common::wasm_manifest(
+        "catalog-service",
+        &[("hold_48", "/hold_48")],
+    ))
+    .await;
     let empty = json!({});
     let answers =
         futures_util::future::join_all((0..20).map(|_| limited.post("hold_48", &empty))).await;
@@ -116,7 +119,12 @@ async fn a_linear_burst_stays_inside_the_limit() {
 #[tokio::test]
 #[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a memory limit; run by the memory-limit CI job"]
 async fn large_bodies_and_an_oversized_query_stay_inside_the_limit() {
-    let limited = limited(&[("echo", "/echo"), ("big_query", "/big_query")]).await;
+    let mut manifest = common::wasm_manifest(
+        "catalog-service",
+        &[("echo", "/echo"), ("big_query", "/big_query")],
+    );
+    manifest["custom_routes"][0]["body_limit_bytes"] = json!(32 * 1024 * 1024);
+    let limited = limited(manifest).await;
     let body = json!({ "pad": "x".repeat(16 * 1024 * 1024) });
     let echoes = futures_util::future::join_all((0..4).map(|_| limited.post("echo", &body))).await;
     for (status, answer) in &echoes {
@@ -137,7 +145,11 @@ async fn large_bodies_and_an_oversized_query_stay_inside_the_limit() {
 #[tokio::test]
 #[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a memory limit; run by the memory-limit CI job"]
 async fn teardown_stops_the_scope() {
-    let limited = limited(&[("echo", "/echo")]).await;
+    let limited = limited(common::wasm_manifest(
+        "catalog-service",
+        &[("echo", "/echo")],
+    ))
+    .await;
     let scope = limited.platform.scope().cloned().expect("a scope");
     assert!(scope.active());
     drop(limited);
