@@ -452,9 +452,9 @@ impl GuestEgress {
 fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), String> {
     Ok((
         HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| format!("invalid header name {name}: {e}"))?,
+            .map_err(|e| format!("invalid header name {name:.64}: {e}"))?,
         HeaderValue::from_str(value)
-            .map_err(|e| format!("invalid header value for {name}: {e}"))?,
+            .map_err(|e| format!("invalid header value for {name:.64}: {e}"))?,
     ))
 }
 
@@ -812,6 +812,10 @@ mod v2_tests {
         };
         let part = form(&[unsendable], BOUNDARY).expect_err("refused");
         assert!(part.message.len() <= 256, "{}", part.message.len());
+        let name = header(&long, "v").expect_err("refused");
+        assert!(name.len() <= 256, "{}", name.len());
+        let value = header("x-a", "\n").expect_err("refused");
+        assert!(value.len() <= 256, "{}", value.len());
     }
 
     fn part(name: &str, body: &[u8]) -> MultipartPart {

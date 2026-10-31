@@ -254,8 +254,12 @@ These response changes also apply in every mode, `off` included:
 - an error about a header, an HTTP method or a multipart part quotes at most
   the first 64 characters of the name;
 - `cufflink_guest_header_dropped_total` labels a header dropped by prefix
-  with that prefix (`proxy-`, `access-control-`), not its full name. A
-  dashboard or alert keyed on a full name needs updating.
+  with that prefix (`proxy-`, `access-control-`), not its full name, and the
+  warn log's `header` field does the same. A dashboard or alert keyed on a
+  full name needs updating;
+- a `__delivery` terminal reason past 64 KiB is cut to its first 64 KiB;
+- a stored object's content type past 8 KiB is not served, and the object
+  goes out as `application/octet-stream`.
 
 Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 

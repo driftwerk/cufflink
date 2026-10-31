@@ -192,7 +192,9 @@ rewritten, and services without a profile keep `{"error": …}`.
   ```
 
   It must be idempotent for messages the snapshot already reflects. Its
-  state is capped at 64 KiB; a failing reduction drops the message.
+  state is capped at 64 KiB; a failing reduction drops the message. Under
+  `WASM_MEMORY_BUDGET_MODE=enforce` the opening is capped too: `state` at
+  64 KiB and all it retains, `initial` included, at 1 MiB.
 - The stream ends on disconnect, `timeout_secs` (default 300, at most 3600),
   a reduction with `close`, or shutdown, with no closing event. Any other
   response from the handler is returned as usual and frees the slot.

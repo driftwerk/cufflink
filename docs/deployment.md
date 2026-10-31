@@ -61,6 +61,12 @@ platform or worker past its container's limit.
   `M_MMAP_THRESHOLD` to 1 MiB unless the mode is `off`, so freed buffers of
   a mebibyte or more go back to the kernel; `MALLOC_MMAP_THRESHOLD_` or
   `GLIBC_TUNABLES` still overrides it.
+- **Event streams.** An open stream holds share for its life, about what
+  it retains, usually under a KiB and under `enforce` at most 1 MiB: an
+  opening past that, or with `state` past 64 KiB of text, is refused. Open
+  streams count toward admission, so count them when sizing: at the largest
+  that is one stream per MiB of a service's share, and
+  `SSE_MAX_STREAMS_PER_PRINCIPAL` limits them per principal only.
 - **Redis.** Under `enforce` a guest's Redis reads measure, then reserve,
   then read, in two `MULTI` blocks of `STRLEN`, `EXISTS` and `GETRANGE`.
   Give the Redis user those commands with `MULTI` and `EXEC`, and run

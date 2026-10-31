@@ -161,6 +161,12 @@ impl Hold {
         }
     }
 
+    pub(crate) fn enforcing(&self) -> bool {
+        self.account
+            .as_ref()
+            .is_some_and(|account| account.ledger().enforces())
+    }
+
     pub(crate) fn delivered(&mut self) {
         self.delivery = None;
     }

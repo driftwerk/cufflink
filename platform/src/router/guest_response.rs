@@ -301,6 +301,7 @@ fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Resp
         .filter(|delivery| !delivery.is_null())
         .map(|delivery| {
             serde_json::from_value(delivery)
+                .map(bounded_terminal)
                 .map(Box::new)
                 .map_err(|_| invalid(DELIVERY_KEY))
         })
@@ -314,6 +315,17 @@ fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Resp
         dropped,
         delivery,
     })
+}
+
+fn bounded_terminal(control: DeliveryControl) -> DeliveryControl {
+    match control {
+        DeliveryControl::Terminal { terminal } if terminal.len() > MAX_DELIVERY_BLOCK => {
+            DeliveryControl::Terminal {
+                terminal: terminal[..terminal.floor_char_boundary(MAX_DELIVERY_BLOCK)].to_string(),
+            }
+        }
+        control => control,
+    }
 }
 
 fn header_value(value: &str) -> Option<HeaderValue> {
@@ -357,9 +369,13 @@ fn body(envelope: &mut Map<String, Value>, hold: &mut Hold) -> Result<V2Body, De
     ) {
         (Some(json), None, None, None) => Ok(V2Body::Json(json)),
         (None, None, Some(stream), None) => Ok(s3_spec(&stream).map(V2Body::S3)?),
-        (None, None, None, Some(sse)) => Ok(SseSpec::parse(&sse)
-            .map(|spec| V2Body::Sse(Box::new(spec)))
-            .map_err(invalid)?),
+        (None, None, None, Some(sse)) => {
+            let spec = SseSpec::parse(&sse).map_err(invalid)?;
+            if hold.enforcing() && !spec.fits_a_stream() {
+                return Err(invalid("__sse: more than a stream may hold").into());
+            }
+            Ok(V2Body::Sse(Box::new(spec)))
+        }
         (None, None, None, None) => Ok(V2Body::Empty),
         (None, Some(encoded), None, None) => {
             let encoded = encoded.as_str().ok_or_else(|| invalid("__body_b64"))?;
@@ -464,7 +480,7 @@ async fn render_v2(
     v2: V2Response,
     service: &str,
     bodies: &mut impl Bodies,
-    hold: Hold,
+    mut hold: Hold,
 ) -> Result<PlatformResult<Response>, Refused> {
     metrics::counter!("cufflink_guest_response_v2_total", "body" => v2.body.label()).increment(1);
     v2.dropped
@@ -485,10 +501,15 @@ async fn render_v2(
             Ok(object) => stream_object(&spec, object),
             Err(error) => return Ok(Err(error)),
         },
-        V2Body::Sse(spec) => match bodies.sse(*spec) {
-            Ok(response) => response.map(|body| ChargedBody::wrap(body, hold)),
-            Err(error) => return Ok(Err(error)),
-        },
+        V2Body::Sse(spec) => {
+            let retained = spec.retained();
+            hold.force(retained.saturating_sub(hold.bytes()));
+            hold.shrink_to(retained);
+            match bodies.sse(*spec) {
+                Ok(response) => response.map(|body| ChargedBody::wrap(body, hold)),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
     };
     *response.status_mut() = v2.status;
     response.headers_mut().extend(v2.headers);
@@ -542,12 +563,7 @@ fn stream_object(spec: &S3Spec, object: ObjectReader) -> Response {
     let content_type = spec
         .content_type
         .clone()
-        .or_else(|| {
-            object
-                .content_type
-                .as_deref()
-                .and_then(|ct| HeaderValue::from_str(ct).ok())
-        })
+        .or_else(|| object.content_type.as_deref().and_then(header_value))
         .unwrap_or(HeaderValue::from_static("application/octet-stream"));
     let stream = object.stream.inspect(|chunk| {
         if let Ok(chunk) = chunk {
@@ -1112,18 +1128,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_event_stream_stays_charged_until_its_body_ends() {
+    async fn an_event_stream_holds_what_it_retains_until_its_body_ends() {
+        let stream = |data: usize| {
+            json!({"__v": 2, "__status": 200, "__sse": {
+                "initial": [{"data": "x".repeat(data)}],
+                "keep_alive_secs": 15,
+                "timeout_secs": 60,
+            }})
+            .to_string()
+        };
+        for (data, least, most) in [(16, 32, 1024), (256 * 1024, 512 * 1024, 513 * 1024)] {
+            let (ledger, response) = charged(&stream(data), 64 * MIB).await;
+            let response = response.expect("rendered");
+            let held = ledger.in_use();
+            assert!((least..=most).contains(&held), "{data}: {held}");
+            drop(response);
+            assert_eq!(ledger.in_use(), 0, "{data}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opening_past_what_a_stream_may_hold_is_refused_only_under_enforce() {
         let raw = json!({"__v": 2, "__status": 200, "__sse": {
             "initial": [{"data": "x".repeat(MIB)}],
             "keep_alive_secs": 15,
             "timeout_secs": 60,
         }})
         .to_string();
-        let (ledger, response) = charged(&raw, 64 * MIB).await;
-        let response = response.expect("rendered");
-        assert!(ledger.in_use() >= MIB, "the stream keeps what it was given");
-        drop(response);
-        assert_eq!(ledger.in_use(), 0);
+        let (_, response) = charged(&raw, 64 * MIB).await;
+        assert!(response.expect_err("refused").contains("__sse"));
+        assert!(decode(output(&raw)).is_ok(), "off and warn open it");
+    }
+
+    #[test]
+    fn a_stored_content_type_past_a_header_value_is_not_served() {
+        let spec = S3Spec {
+            bucket: "b".into(),
+            key: "k".into(),
+            content_type: None,
+        };
+        let object = ObjectReader {
+            size: None,
+            content_type: Some("x".repeat(MAX_HEADER_VALUE + 1)),
+            stream: futures_util::stream::empty().boxed(),
+        };
+        let response = stream_object(&spec, object);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn a_terminal_reason_is_cut_to_the_size_of_a_delivery_block() {
+        let terminal = "\u{e9}".repeat(MAX_DELIVERY_BLOCK);
+        let response = v2(&json!({
+            "__v": 2, "__status": 200, "__delivery": {"terminal": terminal},
+        }))
+        .expect("v2");
+        match response.delivery.as_deref() {
+            Some(DeliveryControl::Terminal { terminal }) => {
+                assert_eq!(terminal.len(), MAX_DELIVERY_BLOCK);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

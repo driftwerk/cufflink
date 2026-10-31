@@ -1892,10 +1892,22 @@ Recorded as the change was built, each with its reason.
   worst cost and two steps; a test holds it above the real peak on every
   shape, and it costs one scan of the text.
   This is what a review asked for as "one over-budget decode at a time",
-  with small decodes allowed to share the band. It cannot stall, and it
-  needs no deadline: guests and the text of queued answers stop at the
-  budget, a room is at most the overrun, so a room fits once the rooms
-  ahead of it are done, whatever guests hold. A delivery never waits on a
+  with small decodes allowed to share the band. Guests and the text of
+  queued answers stop at the budget and a room is at most the overrun, so
+  a room fits once the rooms ahead of it are done, whatever guests hold.
+  The one holder that outlasts its guest is an open event stream, for up
+  to `timeout_secs`, at most an hour, and its charge is not stopped at the
+  budget. Under `enforce` a stream holds at most 1 MiB, and it opens only
+  after its guest was admitted, so streams stop at the admission line, plus
+  at most 1 MiB for each guest in flight when they reach it: at most
+  `WASM_MAX_CONCURRENT` MiB, 256 by default. That leaves every room space
+  while the budget's headroom above the admission line is larger, which
+  with the defaults is a budget past 2.5 GiB. Below that, with streams
+  holding nearly the whole budget, which takes about one open stream per
+  MiB of it at the largest, a large room can find no space until streams
+  close. It then waits, and the deliveries queued behind it with it, for
+  at most its hard deadline less `KILL_MARGIN`, and ends as
+  `ExecutionError::Undelivered`, below. A delivery never waits on a
   guest, so a callee's answer cannot deadlock a caller waiting in a host
   call, and no holder of a room waits for another. A rendered body a slow
   client has not read holds its text and no room. The platform sets no
@@ -1963,19 +1975,35 @@ Recorded as the change was built, each with its reason.
   and puts long numbers in scratch. A `__delivery` block past 64 KiB is
   invalid, since `DeliveryControl` is untagged and would buffer it; one
   within it costs a few mebibytes at worst.
-- **What a response leaves uncharged.** One buffer: its head, once its hold
-  ends, which is at most 64 headers of an 8 KiB value and `http`'s 64 KiB
-  name, about 4.6 MiB. A content type takes the same 8 KiB limit as any
-  header value. Nothing else the guest sizes outlives its hold: an error
-  naming a header quotes at most 64 characters of the name, an object's
-  bucket and key stop at the 1 KiB S3 and GCS allow, so a failed open logs
-  no more than that, a dropped header is counted and logged by the entry
-  that denied it, never by the guest's name, and an event stream keeps its
-  hold until its body ends, since `initial` and `state` live as long as it
-  does. One other copy goes uncharged, for less time: while a host call
-  runs, an error it logs or returns can quote what the guest gave it, such
-  as a storage key or a URL, up to `max_guest_len`. A method or a part name
-  in such an error stops at 64 characters.
+- **An open event stream** holds what it retains until its body ends: the
+  tree of `state`, `ping`, and `initial` twice, in the spec and rendered in
+  the channel. It is measured, not the 1 MiB step its tree was charged in,
+  or a few KiB of stream would hold 1 MiB of share for up to an hour. Under
+  `enforce` an opening that would retain more than 1 MiB, or whose `state`
+  passes the 64 KiB of text a reduction may reach, is an invalid answer;
+  `off` and `warn` open it. 1 MiB is that step: far above a progress
+  stream's opening, and it keeps what streams can hold beyond admission
+  small enough to state, above. The retained size is measured, so a dense
+  `state` can pass 1 MiB within its 64 KiB of text. A reduction's events
+  stay charged until they leave the 32-slot channel, and only those.
+- **What a response leaves uncharged.** Its head, once its hold ends: at
+  most 64 headers of an 8 KiB value and `http`'s 64 KiB name, 4.5 MiB. A
+  stream's `state` once a reducer replaces it, at most 64 KiB of text, since
+  the charge is the opening's. A message forwarded with no reducer, in the
+  channel, at most the NATS payload limit. A before-hook's returned body,
+  used by the write that follows. A rendered event runs longer than its
+  text when its data has many lines, each gaining a `data: ` prefix.
+  While a host call runs, an error it logs or returns can quote what the
+  guest gave it, such as a storage key or a URL: up to `max_guest_len`
+  bytes of input, and several times that where a `Debug` form escapes it.
+  The rest of what a guest sizes is bounded or charged: a content type or a
+  store's stored one takes the 8 KiB of a header value, an error naming a
+  header, a method or a part quotes at most 64 characters of it, a
+  reducer's bad status is not quoted, an object's bucket and key stop at the
+  1 KiB S3 and GCS allow, so a failed open logs no more than that, a dropped
+  header is counted and logged by the entry that denied it, never by the
+  guest's name, and a `__delivery` terminal reason, which is logged and
+  kept on a job after its hold ends, is cut to 64 KiB.
 - **A finished job is not run again for its output.** A job that answered
   success and whose output cannot be read fails as `Terminal`, with an
   error saying it finished and its result could not be read. Nothing would

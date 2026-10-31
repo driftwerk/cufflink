@@ -274,6 +274,25 @@ pub struct ChargedJson;
 
 impl ChargedJson {
     #[doc(hidden)]
+    pub fn tree_bytes(value: &Value) -> usize {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(text) => text.capacity(),
+            Value::Array(items) => {
+                let held: usize = items.iter().map(Self::tree_bytes).sum();
+                items.capacity() * VALUE + held
+            }
+            Value::Object(entries) => {
+                let held: usize = entries
+                    .iter()
+                    .map(|(key, value)| key.capacity() + Self::tree_bytes(value))
+                    .sum();
+                map_cost(entries.len()) + held
+            }
+        }
+    }
+
+    #[doc(hidden)]
     pub fn parse<M: Meter + ?Sized>(
         input: &[u8],
         meter: &mut M,

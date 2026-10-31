@@ -5,6 +5,8 @@ use cufflink_test_guests::Profile;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+const SOON: Duration = Duration::from_secs(10);
+
 fn route(path: &str, handler: &str, subject: &str, reducer: Option<&str>) -> Value {
     json!({
         "method": "GET",
@@ -33,6 +35,62 @@ fn events(stream: &str) -> Vec<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter_map(|data| serde_json::from_str(data).ok())
         .collect()
+}
+
+#[tokio::test]
+async fn an_open_stream_stays_charged_under_enforce_until_it_closes() {
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let Some(nats_url) = infra.require_nats() else {
+        return;
+    };
+    let Some(wasm) = common::sdk::sdk_guest("sse", Profile::Debug) else {
+        return;
+    };
+    let mut db = infra.create_database().await;
+    let settings = [
+        ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+        ("WASM_MEMORY_BUDGET_MB", "64"),
+        ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "8"),
+        ("WASM_THREAD_STACK_KB", "1024"),
+    ];
+    let platform = PlatformProcess::start(&db.url, Some(nats_url), &settings).await;
+    platform.wait_ready().await;
+    let tenant = db.mint_tenant().await;
+    let mut manifest = common::wasm_manifest("receipts", &[]);
+    manifest["routing"] = json!("strict");
+    manifest["custom_routes"] =
+        json!([route("/feed", "receipt_progress", "dw.{tenant}.feed", None)]);
+    let (status, body) = platform.deploy_module(&tenant, &manifest, &wasm).await;
+    assert_eq!(status, 200, "deploy failed: {body}");
+
+    let in_use = || async {
+        platform
+            .metric(
+                "cufflink_wasm_memory_in_use_bytes",
+                &[("class", "interactive")],
+            )
+            .await
+            .unwrap_or_default()
+    };
+    let url = format!("{}/svc/{}/receipts/feed", platform.base_url, tenant.slug);
+    let mut stream = platform.http.get(url).send().await.expect("stream");
+    assert_eq!(stream.status().as_u16(), 200);
+    let opening = stream.chunk().await.expect("chunk").expect("an event");
+    assert!(String::from_utf8_lossy(&opening).contains("snapshot"));
+    common::until("the stream holds what it retains", SOON, async || {
+        (1.0..64.0 * 1024.0).contains(&in_use().await)
+    })
+    .await
+    .expect("in time");
+    drop(stream);
+    common::until("a closed stream gives it back", SOON, async || {
+        in_use().await == 0.0
+    })
+    .await
+    .expect("in time");
 }
 
 #[tokio::test]

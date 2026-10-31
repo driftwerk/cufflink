@@ -198,7 +198,7 @@ fn target(request: CallRequest) -> Result<Target, CallFailure> {
             HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
                 .ok()
                 .zip(HeaderValue::from_str(value).ok())
-                .ok_or_else(|| CallFailure::Denied(format!("header {name:?} is not valid")))
+                .ok_or_else(|| CallFailure::Denied(format!("header {name:.64} is not valid")))
         })
         .collect::<Result<HeaderMap, _>>()?;
     let body = request

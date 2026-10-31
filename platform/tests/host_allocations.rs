@@ -128,6 +128,12 @@ fn charged_json_is_charged_within_a_tenth_of_what_it_allocates() {
             parsed.peak + text.len(),
         );
         within_tenth(name, "parse tree", parsed.value.held, parsed.kept);
+        within_tenth(
+            name,
+            "tree_bytes",
+            ChargedJson::tree_bytes(&parsed.value.value),
+            parsed.kept,
+        );
         assert_eq!(
             meter.0, parsed.value.held,
             "{name}: the charge left is the tree's"
