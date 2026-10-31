@@ -365,12 +365,23 @@ impl HostState {
         path: &'static str,
         text: String,
     ) -> Result<(), Refused> {
+        let hold = self.hold();
+        self.set_held_response(path, text, hold)
+    }
+
+    fn set_held_response(
+        &mut self,
+        path: &'static str,
+        text: String,
+        mut hold: Hold,
+    ) -> Result<(), Refused> {
         self.host_response = None;
         self.caps()
             .response(path, text.len())
             .map_err(Refused::Cap)?;
-        let mut hold = self.hold();
-        hold.grow(text.capacity()).map_err(Refused::Budget)?;
+        hold.grow(text.capacity().saturating_sub(hold.bytes()))
+            .map_err(Refused::Budget)?;
+        hold.shrink_to(text.capacity());
         self.set_charged_response(text, hold);
         Ok(())
     }
@@ -382,9 +393,15 @@ impl HostState {
         }
     }
 
-    pub(crate) fn respond_with(&mut self, path: &'static str, text: Option<String>) -> i32 {
-        match text {
-            Some(text) => self.respond(path, text),
+    pub(crate) fn respond_held(
+        &mut self,
+        path: &'static str,
+        text: Option<String>,
+        hold: Hold,
+    ) -> i32 {
+        match text.map(|text| self.set_held_response(path, text, hold)) {
+            Some(Ok(())) => 0,
+            Some(Err(refused)) => self.refused(refused),
             None => {
                 self.clear_host_response();
                 0

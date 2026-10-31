@@ -1,6 +1,7 @@
 use super::{block_on, read_guest_string, wrap, HostState};
 use crate::policy::{self, PolicyKey, Violation};
-use crate::wasm_runtime::redis_scope::{self, Reading};
+use crate::wasm_runtime::budget::Refused;
+use crate::wasm_runtime::redis_scope::{self, ReadError, Reading};
 use std::collections::HashSet;
 use wasmtime::{Caller, Linker};
 
@@ -25,15 +26,21 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            match block_on(redis_scope::get(
+            let mut held = caller.data().hold();
+            let read = block_on(redis_scope::get(
                 &app_state.redis,
                 &plan,
-                Reading::of(caller.data().caps()),
-            )) {
+                Reading::of(caller.data().caps(), "redis_get"),
+                &mut held,
+            ));
+            match read {
                 Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
-                    caller.data_mut().respond_with("redis_get", read.value)
+                    caller
+                        .data_mut()
+                        .respond_held("redis_get", read.value, held)
                 }
+                Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
                     tracing::error!("[wasm] redis_get error: {}", e);
                     -1
@@ -126,23 +133,27 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            match block_on(redis_scope::get(
+            let mut held = caller.data().hold();
+            let read = block_on(redis_scope::get(
                 &app_state.redis,
                 &plan,
-                Reading::of(caller.data().caps()),
-            )) {
+                Reading::of(caller.data().caps(), "redis_get_status"),
+                &mut held,
+            ));
+            match read {
                 Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
                     let found = read.value.is_some();
                     match caller
                         .data_mut()
-                        .respond_with("redis_get_status", read.value)
+                        .respond_held("redis_get_status", read.value, held)
                     {
                         0 if found => 0,
                         0 => 1,
                         refused => refused,
                     }
                 }
+                Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
                     let msg = e.to_string();
                     tracing::error!("[wasm] redis_get_status error: {}", msg);
@@ -179,6 +190,9 @@ pub(super) fn register(
             if keys.is_empty() {
                 return caller.data_mut().respond("redis_mget", "[]".to_string());
             }
+            if let Err(cap) = caller.data().caps().fanout("redis_mget", keys.len()) {
+                return caller.data_mut().refused(Refused::Cap(cap));
+            }
             let Some(plans) = keys
                 .iter()
                 .map(|key| caller.data().redis_plan(key))
@@ -190,18 +204,19 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            let result = block_on(redis_scope::mget(
+            let mut held = caller.data().hold();
+            let read = block_on(redis_scope::mget(
                 &app_state.redis,
                 &plans,
-                Reading::of(caller.data().caps()),
-            ))
-            .map_err(eyre::Report::from)
-            .and_then(|read| {
-                caller.data().record_redis_fallback(read.from_fallback);
-                serde_json::to_string(&read.value).map_err(Into::into)
-            });
-            match result {
-                Ok(json) => caller.data_mut().respond("redis_mget", json),
+                Reading::of(caller.data().caps(), "redis_mget"),
+                &mut held,
+            ));
+            match read {
+                Ok(read) => {
+                    caller.data().record_redis_fallback(read.from_fallback);
+                    caller.data_mut().respond_json("redis_mget", &read.value)
+                }
+                Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
                     let msg = e.to_string();
                     tracing::error!("[wasm] redis_mget error: {}", msg);

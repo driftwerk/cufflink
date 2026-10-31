@@ -141,13 +141,19 @@ impl IntoResponse for PlatformError {
         if let PlatformError::RetryLater { after, .. } = &self {
             response
                 .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from(after.as_secs().max(1)));
+                .insert(RETRY_AFTER, HeaderValue::from(retry_after_secs(*after)));
         }
         response
             .extensions_mut()
             .insert(PlatformErrorBody { status, message });
         response
     }
+}
+
+fn retry_after_secs(after: Duration) -> u64 {
+    u64::try_from(after.as_millis().div_ceil(1000))
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 pub fn db_error_response(error: &DbError, op: CrudOp) -> (StatusCode, String) {
@@ -247,6 +253,8 @@ mod tests {
         for (after, seconds) in [
             (Duration::from_secs(30), "30"),
             (Duration::from_millis(200), "1"),
+            (Duration::from_millis(1500), "2"),
+            (Duration::ZERO, "1"),
         ] {
             let response = later(after).into_response();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

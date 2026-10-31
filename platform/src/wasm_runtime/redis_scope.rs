@@ -1,6 +1,6 @@
 use crate::policy::PolicyMode;
 use crate::redis_conn::{RedisCallError, RedisHandle};
-use crate::wasm_runtime::budget::HostCaps;
+use crate::wasm_runtime::budget::{Hold, HostCaps, Refused};
 use redis::{FromRedisValue, RedisResult};
 use uuid::Uuid;
 
@@ -28,6 +28,13 @@ impl FromRedisValue for Stored {
         match value {
             redis::Value::BulkString(bytes) if bytes == TOMBSTONE => Ok(Stored::Deleted),
             other => String::from_redis_value(other).map(Stored::Value),
+        }
+    }
+
+    fn from_owned_redis_value(value: redis::Value) -> RedisResult<Self> {
+        match value {
+            redis::Value::BulkString(bytes) if bytes == TOMBSTONE => Ok(Stored::Deleted),
+            other => String::from_owned_redis_value(other).map(Stored::Value),
         }
     }
 }
@@ -91,15 +98,16 @@ pub struct Read<T> {
 pub async fn get(
     redis: &RedisHandle,
     plan: &KeyPlan,
-    reading: Reading,
-) -> Result<Read<Option<String>>, RedisCallError> {
+    reading: Reading<'_>,
+    hold: &mut Hold,
+) -> Result<Read<Option<String>>, ReadError> {
+    let mut reader = Reader::new(reading, hold);
     let primary = vec![plan.primary().to_string()];
-    let stored: Option<Stored> = decoded(one(read_values(redis, primary, reading, true).await?))?;
+    let stored: Option<Stored> = decoded(one(reader.values(redis, primary, true).await?))?;
     match (stored, plan.fallback()) {
         (None, Some(fallback)) => {
             let fallback = vec![fallback.to_string()];
-            let value: Option<String> =
-                decoded(one(read_values(redis, fallback, reading, true).await?))?;
+            let value: Option<String> = decoded(one(reader.values(redis, fallback, true).await?))?;
             Ok(Read {
                 from_fallback: value.is_some(),
                 value,
@@ -158,10 +166,13 @@ pub async fn del(redis: &RedisHandle, plan: &KeyPlan) -> Result<(), RedisCallErr
 pub async fn mget(
     redis: &RedisHandle,
     plans: &[KeyPlan],
-    reading: Reading,
-) -> Result<Read<Vec<Option<String>>>, RedisCallError> {
+    reading: Reading<'_>,
+    hold: &mut Hold,
+) -> Result<Read<Vec<Option<String>>>, ReadError> {
+    let mut reader = Reader::new(reading, hold);
     let primaries: Vec<String> = plans.iter().map(|p| p.primary().to_string()).collect();
-    let stored: Vec<Option<Stored>> = read_values(redis, primaries, reading, false)
+    let stored: Vec<Option<Stored>> = reader
+        .values(redis, primaries, false)
         .await?
         .into_iter()
         .map(decoded)
@@ -188,7 +199,8 @@ pub async fn mget(
         });
     }
     let fallback_keys: Vec<String> = missing.iter().map(|(_, key)| key.clone()).collect();
-    let fallbacks: Vec<Option<String>> = read_values(redis, fallback_keys, reading, false)
+    let fallbacks: Vec<Option<String>> = reader
+        .values(redis, fallback_keys, false)
         .await?
         .into_iter()
         .map(decoded)
@@ -204,27 +216,106 @@ pub async fn mget(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reading {
+#[derive(Debug, Clone, Copy)]
+pub enum Reading<'a> {
     Plain,
-    Whole,
-    Upto(usize),
+    Bounded {
+        caps: &'a HostCaps,
+        path: &'static str,
+    },
 }
 
-impl Reading {
-    pub fn of(caps: &HostCaps) -> Self {
-        match caps.mode {
-            PolicyMode::Off => Self::Plain,
-            PolicyMode::Warn => Self::Whole,
-            PolicyMode::Enforce => Self::Upto(caps.response),
+impl<'a> Reading<'a> {
+    pub fn of(caps: &'a HostCaps, path: &'static str) -> Self {
+        match caps.enforces() {
+            true => Self::Bounded { caps, path },
+            false => Self::Plain,
+        }
+    }
+}
+
+struct Reader<'a> {
+    reading: Reading<'a>,
+    hold: &'a mut Hold,
+    read: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(reading: Reading<'a>, hold: &'a mut Hold) -> Self {
+        Self {
+            reading,
+            hold,
+            read: 0,
         }
     }
 
-    fn last_byte(self) -> i64 {
-        match self {
-            Self::Upto(cap) => i64::try_from(cap).unwrap_or(i64::MAX),
-            Self::Plain | Self::Whole => -1,
+    async fn values(
+        &mut self,
+        redis: &RedisHandle,
+        keys: Vec<String>,
+        single: bool,
+    ) -> Result<Vec<redis::Value>, ReadError> {
+        use redis::AsyncCommands;
+        let Reading::Bounded { caps, path } = self.reading else {
+            return Ok(redis
+                .call(|mut conn| async move {
+                    match (single, keys.as_slice()) {
+                        (true, [key]) => conn.get(key).await.map(|value| vec![value]),
+                        _ => conn.mget(&keys).await,
+                    }
+                })
+                .await?);
+        };
+        let sizes = measured(redis, &keys, single).await?;
+        let reserved = self.reserve(caps, path, &sizes)?;
+        let values = ranges(redis, &keys, &sizes, single).await?;
+        let read: usize = values.iter().map(value_len).sum();
+        self.hold.shrink_to(
+            self.hold
+                .bytes()
+                .saturating_sub(reserved.saturating_sub(read)),
+        );
+        match values
+            .iter()
+            .zip(&sizes)
+            .any(|(value, size)| value_len(value) > *size)
+        {
+            true => Err(ReadError::Changed),
+            false => Ok(values),
         }
+    }
+
+    fn reserve(
+        &mut self,
+        caps: &HostCaps,
+        path: &'static str,
+        sizes: &[usize],
+    ) -> Result<usize, ReadError> {
+        let bytes: usize = sizes.iter().sum();
+        self.read = self.read.saturating_add(bytes);
+        caps.response(path, self.read)
+            .map_err(|cap| ReadError::Refused(Refused::Cap(cap)))?;
+        let reserved = bytes.saturating_mul(2).saturating_add(sizes.len());
+        self.hold
+            .grow(reserved)
+            .map_err(|capacity| ReadError::Refused(Refused::Budget(capacity)))?;
+        Ok(reserved)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    #[error(transparent)]
+    Redis(#[from] RedisCallError),
+    #[error("{0}")]
+    Refused(Refused),
+    #[error("a Redis value changed while it was read; read it again")]
+    Changed,
+}
+
+impl From<redis::RedisError> for ReadError {
+    fn from(error: redis::RedisError) -> Self {
+        Self::Redis(RedisCallError::Redis(error))
     }
 }
 
@@ -232,75 +323,104 @@ fn one(values: Vec<redis::Value>) -> redis::Value {
     values.into_iter().next().unwrap_or(redis::Value::Nil)
 }
 
-fn decoded<T: FromRedisValue>(value: redis::Value) -> Result<Option<T>, RedisCallError> {
+fn value_len(value: &redis::Value) -> usize {
+    match value {
+        redis::Value::BulkString(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
+fn decoded<T: FromRedisValue>(value: redis::Value) -> Result<Option<T>, ReadError> {
     value
         .extract_error()
-        .and_then(|value| Option::<T>::from_redis_value(&value))
-        .map_err(RedisCallError::Redis)
+        .and_then(Option::<T>::from_owned_redis_value)
+        .map_err(ReadError::from)
 }
 
-async fn read_values(
+async fn transaction(
     redis: &RedisHandle,
-    keys: Vec<String>,
-    reading: Reading,
-    single: bool,
-) -> Result<Vec<redis::Value>, RedisCallError> {
+    block: redis::Pipeline,
+    commands: usize,
+) -> Result<Vec<redis::Value>, ReadError> {
     use redis::aio::ConnectionLike;
-    use redis::AsyncCommands;
-    redis
+    let exec = redis
         .call(|mut conn| async move {
-            if reading == Reading::Plain {
-                return match (single, keys.as_slice()) {
-                    (true, [key]) => conn.get(key).await.map(|value| vec![value]),
-                    _ => conn.mget(&keys).await,
-                };
-            }
-            let block = bounded_read(&keys, reading.last_byte());
-            let replies = conn
-                .req_packed_commands(&block, 1 + 2 * keys.len(), 1)
-                .await?;
-            ranged(one(replies), single)
+            conn.req_packed_commands(&block, commands + 1, 1)
+                .await
+                .map(one)
         })
-        .await
+        .await?;
+    match exec {
+        redis::Value::Array(replies) if replies.len() == commands => Ok(replies),
+        redis::Value::Array(_) => Err(protocol(
+            "the bounded read's transaction answered an unexpected number of replies",
+        )),
+        redis::Value::ServerError(error) => Err(redis::RedisError::from(error).into()),
+        _ => Err(protocol("the bounded read's transaction was aborted")),
+    }
 }
 
-fn bounded_read(keys: &[String], last_byte: i64) -> redis::Pipeline {
+fn protocol(what: &'static str) -> ReadError {
+    redis::RedisError::from((redis::ErrorKind::ResponseError, what)).into()
+}
+
+fn block<T>(
+    items: impl IntoIterator<Item = T>,
+    queue: impl Fn(&mut redis::Pipeline, T),
+) -> redis::Pipeline {
     let mut block = redis::pipe();
     block.cmd("MULTI");
-    for key in keys {
-        block.cmd("EXISTS").arg(key);
-        block.cmd("GETRANGE").arg(key).arg(0).arg(last_byte);
+    for item in items {
+        queue(&mut block, item);
     }
     block.cmd("EXEC");
     block
 }
 
-fn ranged(exec: redis::Value, single: bool) -> RedisResult<Vec<redis::Value>> {
-    let replies = match exec {
-        redis::Value::Array(replies) => replies,
-        redis::Value::ServerError(error) => return Err(error.into()),
-        _ => {
-            return Err(redis::RedisError::from((
-                redis::ErrorKind::ResponseError,
-                "the bounded read's transaction was aborted",
-            )))
-        }
-    };
-    replies
-        .chunks(2)
+async fn measured(
+    redis: &RedisHandle,
+    keys: &[String],
+    single: bool,
+) -> Result<Vec<usize>, ReadError> {
+    let block = block(keys, |block, key| {
+        block.cmd("STRLEN").arg(key);
+    });
+    transaction(redis, block, keys.len())
+        .await?
+        .into_iter()
         .map(|reply| match reply {
-            [redis::Value::Int(0), _] => Ok(redis::Value::Nil),
-            [_, value] => match value.clone().extract_error() {
+            redis::Value::Int(len) => Ok(usize::try_from(len).unwrap_or_default()),
+            redis::Value::ServerError(wrong_type) if single => {
+                Err(redis::RedisError::from(wrong_type).into())
+            }
+            redis::Value::ServerError(_) => Ok(0),
+            _ => Err(protocol("STRLEN answered something other than a length")),
+        })
+        .collect()
+}
+
+async fn ranges(
+    redis: &RedisHandle,
+    keys: &[String],
+    sizes: &[usize],
+    single: bool,
+) -> Result<Vec<redis::Value>, ReadError> {
+    let block = block(keys.iter().zip(sizes), |block, (key, size)| {
+        block.cmd("EXISTS").arg(key);
+        block.cmd("GETRANGE").arg(key).arg(0).arg(*size);
+    });
+    let mut replies = transaction(redis, block, 2 * keys.len()).await?.into_iter();
+    std::iter::from_fn(|| replies.next().zip(replies.next()))
+        .map(|reply| match reply {
+            (redis::Value::Int(0), _) => Ok(redis::Value::Nil),
+            (_, value) => match value.extract_error() {
                 Ok(value) => Ok(value),
                 Err(wrong_type) if single => Err(wrong_type),
                 Err(_) => Ok(redis::Value::Nil),
             },
-            _ => Err(redis::RedisError::from((
-                redis::ErrorKind::ResponseError,
-                "the bounded read answered an odd number of replies",
-            ))),
         })
-        .collect()
+        .collect::<RedisResult<_>>()
+        .map_err(ReadError::from)
 }
 
 #[cfg(test)]

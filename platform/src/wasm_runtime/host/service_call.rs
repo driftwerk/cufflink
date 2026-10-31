@@ -489,7 +489,7 @@ async fn call(
     };
     let uri = svc_uri(caller.tenant_slug, &target);
     let prefix = svc_prefix(caller.tenant_slug, &target.service);
-    let max_bytes = app.egress.effective_max_bytes(None);
+    let max_bytes = response_limit(state);
     match (local, app.config.platform_internal_url.as_deref()) {
         (Some(service), _) => {
             let sent = uri
@@ -589,6 +589,13 @@ fn envelope(outcome: &Result<CallResponse, CallFailure>) -> Envelope<'_> {
     }
 }
 
+fn response_limit(state: &HostState) -> u64 {
+    let egress = state.app_state.egress.effective_max_bytes(None);
+    state.caps().response_limit().map_or(egress, |cap| {
+        egress.min(u64::try_from(cap).unwrap_or(u64::MAX))
+    })
+}
+
 fn result_label(outcome: &Result<CallResponse, CallFailure>) -> &'static str {
     match outcome {
         Ok(response) if response.status >= 500 => "http_5xx",
@@ -610,7 +617,7 @@ pub(super) fn register(
             let bytes = host_try!(read_guest_bytes(&mut caller, "service_call", ptr, len));
             let started = Instant::now();
             let mut body = caller.data().hold();
-            let reserved = caller.data().app_state.egress.effective_max_bytes(None);
+            let reserved = response_limit(caller.data());
             if let Err(capacity) = body.grow(usize::try_from(reserved).unwrap_or(usize::MAX)) {
                 return caller.data_mut().refused(Refused::Budget(capacity));
             }
