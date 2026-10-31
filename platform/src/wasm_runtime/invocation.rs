@@ -1,10 +1,17 @@
 use super::CompiledModule;
 use crate::registry::ServiceIdentity;
-use crate::router::guest_response::Answer;
+use axum::http::StatusCode;
 use cufflink_telemetry::{Kind, Scope};
+use cufflink_types::delivery::DeliveryControl;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug)]
+pub struct Answer {
+    pub status: StatusCode,
+    pub delivery: Option<DeliveryControl>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InvocationKind {
@@ -101,7 +108,10 @@ pub enum ExecutionError {
     #[error("WASM guest returned an invalid response: {0}")]
     Response(String),
     #[error("{reason}")]
-    Undelivered { reason: String, answer: Answer },
+    Undelivered {
+        reason: String,
+        answer: Option<Answer>,
+    },
     #[error("Handler '{0}' not found in WASM module")]
     HandlerNotFound(String),
     #[error("WASM trap: {0}")]

@@ -161,9 +161,10 @@ pub async fn execute_on_worker(
     .map_err(|e| PlatformError::Internal(format!("NATS request failed: {}", e)))?;
 
     let mut hold = hold.delivering();
-    hold.make_room(ChargedJson::delivery_bound(&reply.payload) + reply.payload.len())
+    hold.force(reply.payload.len());
+    hold.make_room(|| ChargedJson::delivery_bound(&reply.payload) + reply.payload.len())
         .await;
-    hold.grow(reply.payload.len().saturating_mul(2))
+    hold.grow(reply.payload.len())
         .map_err(|capacity| match engine {
             Some(engine) => crate::router::map_execution_error(
                 "WASM",

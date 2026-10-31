@@ -120,6 +120,8 @@ The job's row, not its message, is the job.
 
 A failed job runs again with `POST /svc/{tenant}/_jobs/{id}/retry` or `cufflink jobs retry <id>` (a job that has not failed is a 409). Ended jobs are kept for a day, then deleted by the reclaimer.
 
+A failed job may have done its work. Under `enforce`, a job that answered success but whose result is too large to read fails terminally with its effects standing, so retrying it, or resubmitting it on `failed`, does the work again.
+
 ### Backups
 
 Backup exports requested through the platform API are published to `cufflink.backup.>` on the `CUFFLINK_BACKUP` stream and processed by the worker's `backup-worker` consumer.

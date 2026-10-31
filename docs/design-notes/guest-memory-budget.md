@@ -1880,7 +1880,14 @@ Recorded as the change was built, each with its reason.
   takes a room of `ChargedJson::delivery_bound(text)`, at most the delivery
   limit and less what it already holds, while `in_use + room` fits the
   ceiling, and otherwise queues for it in arrival order, holding no slot,
-  store or linear memory. The bound is three times the text, for the input,
+  store or linear memory. Rooms up to the overrun stay out of what guests
+  are measured against: `fits`, `breach` and `fitting` compare `in_use`
+  less the smaller of the rooms held and the overrun, so a running guest's
+  growth, a host buffer and a new request see the budget they would see
+  with no delivery running. Guests and rooms still stop at the ceiling:
+  `X + max(0, R - O) <= B` implies `X + R <= B + O`. At a budget that is
+  really full a request's body hold is refused at once, unrun, and does not
+  take the admission wait. The bound is three times the text, for the input,
   the strings and the render, plus each `{`, `[` and `,` at the tree's
   worst cost and two steps; a test holds it above the real peak on every
   shape, and it costs one scan of the text.
@@ -1890,9 +1897,11 @@ Recorded as the change was built, each with its reason.
   budget, a room is at most the overrun, so a room fits once the rooms
   ahead of it are done, whatever guests hold. A delivery never waits on a
   guest, so a callee's answer cannot deadlock a caller waiting in a host
-  call, and no holder of a room waits for another. What can hold the band
-  is a rendered body a slow client has not read, which transport timeouts
-  end. A wait that is still queued at the hard deadline, less
+  call, and no holder of a room waits for another. A rendered body a slow
+  client has not read holds its text and no room. The platform sets no
+  write timeout, since `axum::serve` has none and the `deadline` layer ends
+  at the response head, so a deployment needs a proxy with send timeouts
+  (`deployment.md`). A wait that is still queued at the hard deadline, less
   `KILL_MARGIN`, ends there as `ExecutionError::Undelivered`, not
   `NotStarted`: the guest ran, so a nack would run finished work again. It
   settles as an answer past the response cap does, below, with no tree, so
@@ -1900,8 +1909,9 @@ Recorded as the change was built, each with its reason.
   500 saying the guest finished. The room is unattributed, so it causes no share denial, and is held
   beside the tree's own charges rather than drawn from, which overstates
   `in_use` for the length of a decode and never understates it. It ends
-  when the hold drops or when the body is rendered. A worker's reply takes
-  a room the same way, since it builds a tree with its guest gone. The
+  when the hold drops or when the body is rendered. A worker's reply is
+  forced like a guest's text and takes a room the same way, since it builds
+  a tree with its guest gone. The
   audit parse of a request body takes none: it draws on what the request
   reserved before the guest ran. HTTP fan-out items are charged refusably
   past their reservation, so a base64 body larger than the reservation
@@ -1912,12 +1922,17 @@ Recorded as the change was built, each with its reason.
   which waits only on a copy and a drop, never on memory. So at most one
   copy is over the ceiling at once, and dropping the store then frees at
   least what the copy charged.
-- **The bound.** Under `enforce`, what the ledger counts never passes
-  `budget + overrun + max_response_bytes`. On a 2 GiB container with the
-  defaults that is limit 2048 MiB, reserve 614.4, budget 1433.6, overrun
-  307.2, one response 64: 1804.8 MiB, which leaves 243.2 MiB of the limit
-  for the platform's own heap (baseline, compiled modules, core stacks,
-  fragmentation). Budget plus overrun is also the pressure gate's line, the
+- **The bound.** Under `enforce`, the real memory of guests and of what
+  the host holds for them stays within
+  `budget + overrun + max_response_bytes`. What the ledger counts can read
+  above that, because a room is counted beside the tree it makes room for:
+  about budget plus twice the overrun at a full budget. On a 2 GiB
+  container with the defaults that is limit 2048 MiB, reserve 614.4, budget
+  1433.6, overrun 307.2, one response 64: 1804.8 MiB, which leaves
+  243.2 MiB of the limit for the platform's own heap (baseline, compiled
+  modules, core stacks, fragmentation), and 166.4 MiB on 1.5 GiB. That
+  heap baseline has not been measured, so an operator must measure it
+  before setting `enforce`. Budget plus overrun is also the pressure gate's line, the
   limit less half the reserve. Startup warns when the three sizes reach the
   limit. `on_migrate`'s request is the one text charged outside this, a
   small envelope of one deploy.
@@ -1928,17 +1943,27 @@ Recorded as the change was built, each with its reason.
   retried, `__delivery` is obeyed and an invalid envelope is an invalid
   answer. Other envelope fields are not checked in that reading, so an
   invalid `__headers` in such an answer goes unseen, and of a key repeated
-  in it nothing is read, so it reads as a legacy 200.
+  in it nothing is read, so it reads as a legacy 200. The reading allocates
+  nothing the guest sizes: serde_json skips a value with one scratch byte
+  per level and no limit, so a scan refuses text past the 127 levels a tree
+  stops at, which reads as a legacy 200 as the tree's failure does, and a
+  `__delivery` block past 64 KiB is invalid, since `DeliveryControl` is
+  untagged and would buffer it.
 - **A finished job is not run again for its output.** A job that answered
   success and whose output cannot be read fails as `Terminal`, with an
   error saying it finished and its result could not be read. Nothing would
   cure it on a retry, and the job's effects have happened.
 - **An answer past `WASM_MAX_RESPONSE_MB`** is the same case with no copy
-  made: `read_response` reads the outline over linear memory and returns
-  `ExecutionError::Undelivered`, so a subscription or schedule settles by the
-  answer, a job as above, and a worker after-hook is acked. A route still
-  answers 500. Only an out-of-bounds, non-UTF-8 or invalid response stays
-  an ordinary failure, which is retried.
+  made, under `enforce`: `read_response` reads the outline over linear
+  memory and returns `ExecutionError::Undelivered`, so a subscription or
+  schedule settles by the answer, a job as above, and a worker after-hook
+  is acked. A route still answers 500. An invalid envelope there, or at the
+  shutdown above, is settled too: a subscription retries as it does for any
+  invalid answer, a job fails `Terminal` and a worker after-hook is acked.
+  Under `off` and `warn` such an answer stays `ExecutionError::Response`,
+  as before this release: a subscription retries and dead-letters and a job
+  fails as `HandlerError`. An out-of-bounds or non-UTF-8 response stays an
+  ordinary failure, which is retried.
 - **A hook's answer** is charged until the hook returns. A before-hook's
   returned body, used by the write that follows, is not charged after that.
 

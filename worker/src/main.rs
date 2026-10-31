@@ -766,10 +766,10 @@ mod tests {
             after_hook_outcome(
                 Err(JobError::Execution(ExecutionError::Undelivered {
                     reason: "past the cap".into(),
-                    answer: cufflink_platform::router::guest_response::Answer {
+                    answer: Some(cufflink_platform::wasm_runtime::Answer {
                         status: axum::http::StatusCode::OK,
                         delivery: None,
-                    },
+                    }),
                 })),
                 at_hard_deadline
             ),

@@ -89,6 +89,10 @@ impl State {
         }
     }
 
+    fn against_budget(&self, overrun: usize) -> usize {
+        self.in_use.saturating_sub(self.delivering.min(overrun))
+    }
+
     fn open_delivery(&mut self, bytes: usize) {
         self.in_use += bytes;
         self.delivering += bytes;
@@ -311,11 +315,6 @@ impl Ledger {
     }
 
     #[cfg(test)]
-    pub(crate) fn kept_total(&self) -> usize {
-        self.lock().kept_total
-    }
-
-    #[cfg(test)]
     pub(crate) fn delivering(&self) -> usize {
         self.lock().delivering
     }
@@ -399,7 +398,7 @@ impl Ledger {
         };
         Breach {
             pressure: class.gated_by_pressure() && self.pressure.load(Ordering::SeqCst),
-            ceiling: state.in_use + bytes > ceiling,
+            ceiling: state.against_budget(limits.overrun) + bytes > ceiling,
             service: state.against_share(class, service) + bytes > limits.service,
             background: class == Class::Background
                 && state.by_class[Class::Background.index()] + bytes > limits.background,
@@ -420,7 +419,7 @@ impl Ledger {
 
     fn fits(&self, state: &State, held: usize, bytes: usize) -> Result<(), Reason> {
         let limits = self.settings.limits;
-        if state.in_use + bytes > limits.budget {
+        if state.against_budget(limits.overrun) + bytes > limits.budget {
             Err(Reason::Memory)
         } else if held + bytes > limits.service {
             Err(Reason::ServiceShare)
@@ -620,11 +619,8 @@ impl Ledger {
         self.settled(|state, _| self.take(state, class, service, bytes));
     }
 
-    pub(super) fn force_kept(&self, class: Class, service: &ServiceKey, bytes: usize) {
-        self.settled(|state, _| {
-            self.take(state, class, service, bytes);
-            state.keep(service, bytes);
-        });
+    pub(super) fn enforces(&self) -> bool {
+        self.settings.enforce
     }
 
     pub(super) fn past_the_ceiling(&self) -> bool {
@@ -840,7 +836,7 @@ impl Ledger {
             Class::Background => room(limits.background, state.by_class[Class::Background.index()]),
             _ => usize::MAX,
         };
-        room(limits.admit, state.in_use)
+        room(limits.admit, state.against_budget(limits.overrun))
             .min(room(limits.service, state.service(service)))
             .min(background)
     }
@@ -1458,9 +1454,57 @@ mod tests {
             small.as_mut().now_or_never().is_none(),
             "it would fit, and waits its turn"
         );
+        ledger.release(Class::Interactive, &catalog, 5 * MIB);
+        assert_eq!(
+            ledger.delivering(),
+            40 * MIB,
+            "room for the small one alone leaves it behind the large one"
+        );
         drop(first);
         assert!(large.await.is_some());
         assert!(small.await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rooms_stay_out_of_the_budget_up_to_the_overrun() {
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        let (loans, books) = (service("loan-service"), service("book-service"));
+        let first = ledger.delivery(30 * MIB, 0).await;
+        let second = ledger.delivery(20 * MIB, 0).await;
+        assert_eq!(ledger.delivering(), 50 * MIB);
+        for (service, bytes) in [(&catalog, 50 * MIB), (&loans, 40 * MIB), (&books, 10 * MIB)] {
+            assert_eq!(
+                ledger.grow(Class::Interactive, service, bytes),
+                Verdict::Allowed
+            );
+        }
+        assert_eq!(ledger.in_use(), 150 * MIB, "the ceiling, and no further");
+        assert_eq!(
+            ledger.grow(Class::Interactive, &books, 1),
+            Verdict::Denied(Reason::Memory)
+        );
+        assert_eq!(ledger.fitting(Class::Interactive, &books, MIB), 0);
+        drop((first, second));
+        assert_eq!(ledger.in_use(), 100 * MIB);
+    }
+
+    #[tokio::test]
+    async fn rooms_past_the_overrun_count_against_the_budget() {
+        let ledger = ledger(true);
+        let catalog = service("catalog-service");
+        let first = ledger.delivery(40 * MIB, 0).await;
+        let second = ledger.delivery(40 * MIB, 0).await;
+        assert_eq!(
+            ledger.grow(Class::Interactive, &catalog, 50 * MIB),
+            Verdict::Allowed,
+            "budget 100 less the 30 past the overrun leaves 70"
+        );
+        assert_eq!(
+            ledger.grow(Class::Interactive, &service("loan-service"), 20 * MIB + 1),
+            Verdict::Denied(Reason::Memory)
+        );
+        drop((first, second));
     }
 
     #[tokio::test]

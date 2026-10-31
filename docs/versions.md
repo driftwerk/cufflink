@@ -187,7 +187,16 @@ been. A later release makes `enforce` the default. Under `enforce`:
   larger answers. A subscription, schedule or
   job is still settled by the `__status` and `__delivery` of such an
   answer, and a job that succeeded fails terminally with its result
-  unread, rather than running again;
+  unread, rather than running again. So a `failed` job can have done its
+  work, and a client that resubmits on `failed` repeats it
+  ([jobs](wasm-workers.md));
+- the same holds for an answer past `WASM_MAX_RESPONSE_MB`, where under
+  `off` and `warn` the call still fails as before: a subscription retries
+  and dead-letters, and a job fails as a handler error;
+- a request arriving with the budget full is answered `503` at once when
+  its body cannot be held, without the `WASM_ADMISSION_WAIT_MS` wait. Rooms
+  up to the overrun do not count towards that, so answers being delivered
+  do not refuse it;
 - the most memory guests can reach is the budget, the overrun and one
   response ([sizing](deployment.md#guest-memory-budget));
 

@@ -209,9 +209,9 @@ fn unanswered(
 ) -> Attempt {
     match error {
         ExecutionError::Cancelled => Attempt::LeaseLost,
-        ExecutionError::Undelivered { reason, answer } => {
-            failed_by(answer, job).unwrap_or_else(|| finished_unread(reason))
-        }
+        ExecutionError::Undelivered { reason, answer } => answer
+            .and_then(|answer| failed_by(answer, job))
+            .unwrap_or_else(|| finished_unread(reason)),
         e if e.interrupted_by_shutdown(at_hard_deadline) => Attempt::Interrupted(e.to_string()),
         ExecutionError::Overloaded { retry_after, .. }
             if u32::try_from(job.capacity_deferrals).unwrap_or(u32::MAX) < deferrals_allowed =>
@@ -624,10 +624,10 @@ pub(crate) mod tests {
         let oversized = |status: u16| {
             Err(ExecutionError::Undelivered {
                 reason: "past the cap".into(),
-                answer: Answer {
+                answer: Some(Answer {
                     status: axum::http::StatusCode::from_u16(status).expect("a status"),
                     delivery: None,
-                },
+                }),
             })
         };
         let job = retrying(&[RetryOn::Error]);
@@ -645,6 +645,24 @@ pub(crate) mod tests {
                 ..
             }
         ));
+        assert!(
+            matches!(
+                classified(
+                    Err(ExecutionError::Undelivered {
+                        reason: "shut down".into(),
+                        answer: None,
+                    }),
+                    &job,
+                    false,
+                    10
+                ),
+                Attempt::Failed {
+                    class: JobErrorClass::Terminal { .. },
+                    ..
+                }
+            ),
+            "an invalid envelope from a job that finished does not run it again"
+        );
     }
 
     #[test]

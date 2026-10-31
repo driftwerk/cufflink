@@ -3,6 +3,7 @@ use crate::errors::{GuestOriginated, PlatformResult};
 use crate::policy::record::LogThrottle;
 use crate::router::sse_bridge::SseSpec;
 use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Meter, Refused};
+pub(crate) use crate::wasm_runtime::Answer;
 use crate::wasm_runtime::GuestOutput;
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -19,6 +20,8 @@ use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_VALUE: usize = 8 * 1024;
+const MAX_TREE_DEPTH: usize = 127;
+const MAX_DELIVERY_BLOCK: usize = 64 * 1024;
 
 const DENIED_HEADERS: [&str; 4] = [
     "content-length",
@@ -166,12 +169,6 @@ pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError>
     })
 }
 
-#[derive(Debug)]
-pub struct Answer {
-    pub status: StatusCode,
-    pub delivery: Option<DeliveryControl>,
-}
-
 #[derive(Default, serde::Deserialize)]
 #[serde(default)]
 struct Outline<'a> {
@@ -187,10 +184,30 @@ fn status_number(raw: &RawValue) -> Option<u64> {
     serde_json::from_str(raw.get()).ok()
 }
 
+fn deeper_than_a_tree(text: &[u8]) -> bool {
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    text.iter().any(|&byte| {
+        match (quoted, escaped, byte) {
+            (true, true, _) => escaped = false,
+            (true, false, b'\\') => escaped = true,
+            (true, false, b'"') | (false, _, b'"') => quoted = !quoted,
+            (false, _, b'{' | b'[') => depth += 1,
+            (false, _, b'}' | b']') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        depth > MAX_TREE_DEPTH
+    })
+}
+
+fn delivery_control(block: &RawValue) -> Result<DeliveryControl, GuestResponseError> {
+    (block.get().len() <= MAX_DELIVERY_BLOCK)
+        .then(|| serde_json::from_str(block.get()).ok())
+        .flatten()
+        .ok_or_else(|| invalid(DELIVERY_KEY))
+}
+
 pub(crate) fn outline(text: &[u8]) -> Result<Answer, GuestResponseError> {
-    let envelope = text
-        .trim_ascii_start()
-        .starts_with(b"{")
+    let envelope = (text.trim_ascii_start().starts_with(b"{") && !deeper_than_a_tree(text))
         .then(|| serde_json::from_slice::<Outline>(text).ok())
         .flatten()
         .unwrap_or_default();
@@ -202,11 +219,7 @@ pub(crate) fn outline(text: &[u8]) -> Result<Answer, GuestResponseError> {
     }
     Ok(Answer {
         status: v2_status(envelope.status.and_then(status_number))?,
-        delivery: envelope
-            .delivery
-            .map(|delivery| serde_json::from_str(delivery.get()))
-            .transpose()
-            .map_err(|_| invalid(DELIVERY_KEY))?,
+        delivery: envelope.delivery.map(delivery_control).transpose()?,
     })
 }
 
@@ -920,6 +933,78 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn an_outline_stops_at_the_depth_a_tree_stops_at() {
+        let nested = |levels: usize| {
+            format!(
+                r#"{{"__status":500,"a":{}{}}}"#,
+                "[".repeat(levels - 1),
+                "]".repeat(levels - 1)
+            )
+        };
+        let status = |raw: &str| outline(raw.as_bytes()).expect("an outline").status;
+        for raw in [nested(MAX_TREE_DEPTH), nested(MAX_TREE_DEPTH + 1)] {
+            assert_eq!(
+                status(&raw),
+                answer(&output(&raw)).expect("an answer").status
+            );
+        }
+        assert_eq!(
+            status(&nested(MAX_TREE_DEPTH)),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(status(&nested(1 << 20)), StatusCode::OK);
+    }
+
+    #[test]
+    fn brackets_in_a_string_are_not_depth() {
+        let brackets = "[{".repeat(MAX_TREE_DEPTH);
+        for raw in [
+            format!(r#"{{"__status":500,"a":"{brackets}"}}"#),
+            format!(r#"{{"__status":500,"a":"\"{brackets}\\"}}"#),
+            format!(r#"{{"__status":500,"{brackets}":1}}"#),
+        ] {
+            assert_eq!(
+                outline(raw.as_bytes()).expect("an outline").status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{raw}"
+            );
+        }
+        let closed = format!(
+            r#"{{"__status":500,"a":"\\","b":{}{}}}"#,
+            "[".repeat(MAX_TREE_DEPTH),
+            "]".repeat(MAX_TREE_DEPTH)
+        );
+        assert_eq!(
+            outline(closed.as_bytes()).expect("an outline").status,
+            StatusCode::OK,
+            "an escaped backslash ends with its string"
+        );
+    }
+
+    #[test]
+    fn a_delivery_block_is_read_only_at_the_size_of_one() {
+        let block = |terminal: usize| {
+            format!(
+                r#"{{"__v":2,"__status":200,"__delivery":{{"terminal":"{}"}}}}"#,
+                "x".repeat(terminal)
+            )
+        };
+        let wrapping = r#"{"terminal":""}"#.len();
+        assert!(matches!(
+            outline(block(MAX_DELIVERY_BLOCK - wrapping).as_bytes())
+                .expect("an outline")
+                .delivery,
+            Some(DeliveryControl::Terminal { .. })
+        ));
+        assert!(outline(block(MAX_DELIVERY_BLOCK - wrapping + 1).as_bytes()).is_err());
+        let wide = format!(
+            r#"{{"__v":2,"__status":200,"__delivery":[{}0]}}"#,
+            "0,".repeat(MAX_DELIVERY_BLOCK)
+        );
+        assert!(outline(wide.as_bytes()).is_err());
     }
 
     #[tokio::test]

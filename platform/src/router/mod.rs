@@ -6,7 +6,7 @@ pub mod custom;
 pub(crate) mod error_profile;
 pub mod filtering;
 pub mod graphql;
-pub mod guest_response;
+pub(crate) mod guest_response;
 pub mod jobs;
 pub mod meta;
 pub(crate) mod postures;

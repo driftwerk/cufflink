@@ -25,7 +25,7 @@ use wasmtime::*;
 
 pub(crate) use budget::RouteKey;
 pub use budget::{Admission, Class};
-pub use invocation::{ExecutionError, Invocation, InvocationKind};
+pub use invocation::{Answer, ExecutionError, Invocation, InvocationKind};
 
 pub(crate) const FEATURES: &[&str] = &[
     "precompiled_modules",
@@ -920,7 +920,8 @@ impl WasmEngine {
         .record(started.elapsed().as_secs_f64());
         match result {
             Ok(mut output) => {
-                let room = budget::ChargedJson::delivery_bound(output.text.as_bytes());
+                let text = output.text.as_bytes();
+                let room = || budget::ChargedJson::delivery_bound(text);
                 let placed = tokio::select! {
                     biased;
                     () = output.hold.make_room(room) => true,
@@ -1165,6 +1166,7 @@ impl WasmEngine {
             memory.data(&*store),
             response_ptr,
             self.limits.max_response_bytes,
+            self.budget.enforces(),
             |len| {
                 hold.force(len);
                 if hold.past_the_ceiling() {
@@ -1222,9 +1224,9 @@ fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError 
 }
 
 fn undelivered(reason: String, text: &[u8]) -> ExecutionError {
-    match crate::router::guest_response::outline(text) {
-        Ok(answer) => ExecutionError::Undelivered { reason, answer },
-        Err(_) => ExecutionError::Response(reason),
+    ExecutionError::Undelivered {
+        reason,
+        answer: crate::router::guest_response::outline(text).ok(),
     }
 }
 
@@ -1232,6 +1234,7 @@ fn read_response(
     memory: &[u8],
     ptr: i32,
     max_bytes: usize,
+    enforced: bool,
     charge: impl FnOnce(usize),
 ) -> Result<String, ExecutionError> {
     let start = usize::try_from(ptr)
@@ -1249,7 +1252,8 @@ fn read_response(
         )
         .increment(1);
         let reason = format!("response of {len} bytes exceeds the {max_bytes} byte cap");
-        return Err(match memory.get(start + 4..start + 4 + len) {
+        let text = memory.get(start + 4..start + 4 + len).filter(|_| enforced);
+        return Err(match text {
             Some(text) if std::str::from_utf8(text).is_ok() => undelivered(
                 format!("WASM guest returned an invalid response: {reason}"),
                 text,
@@ -1698,15 +1702,19 @@ pub(crate) mod tests {
         let mut memory = vec![0u8; 64];
         memory[8..12].copy_from_slice(&5u32.to_le_bytes());
         memory[12..17].copy_from_slice(b"hello");
-        let read = |memory: &[u8], ptr, max| read_response(memory, ptr, max, |_| ());
+        let read = |memory: &[u8], ptr, max| read_response(memory, ptr, max, true, |_| ());
         assert!(matches!(read(&memory, 8, 64), Ok(text) if text == "hello"));
-        read_response(&memory, 8, 64, |len| {
+        read_response(&memory, 8, 64, true, |len| {
             assert_eq!(len, 5, "charged before the copy");
         })
         .expect("read");
         assert!(matches!(
             read(&memory, 8, 4),
             Err(ExecutionError::Undelivered { reason, .. }) if reason.contains("cap")
+        ));
+        assert!(matches!(
+            read_response(&memory, 8, 4, false, |_| ()),
+            Err(ExecutionError::Response(msg)) if msg.contains("cap")
         ));
         memory[12] = 0xff;
         assert!(matches!(
@@ -2193,7 +2201,7 @@ pub(crate) mod tests {
         );
         let cancel = tokio_util::sync::CancellationToken::new();
         inv.admission = Some(engine.admit(&inv, &cancel).await.expect("admitted"));
-        let mut band = engine.kept_hold(&inv.identity, "h", 0);
+        let mut band = engine.hold(&inv.identity, Class::Interactive, "h", inv.kind);
         band.force(14 * MIB);
         let waiting = tokio::spawn({
             let engine = engine.clone();
@@ -2213,7 +2221,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 &answered,
-                Err(ExecutionError::Undelivered { reason, answer })
+                Err(ExecutionError::Undelivered { reason, answer: Some(answer) })
                     if reason.contains("shut down") && answer.status == 200
             ),
             "the guest finished, so it is never answered as not run: {answered:?}"
@@ -3185,7 +3193,30 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ExecutionError::Undelivered { .. }), "{err}");
+        assert!(matches!(err, ExecutionError::Response(_)), "{err}");
+
+        let enforcing = engine_with(WasmLimits {
+            max_response_bytes: 4,
+            ..budgeted_limits("enforce", "64")
+        });
+        let (_, answering) = install(&enforcing, &guest("h", "(call $respond_ok)"));
+        let err = enforcing
+            .run_text(
+                AppState::minimal(enforcing.clone()).await,
+                invocation(answering, "h", InvocationKind::Hook, Duration::from_secs(5)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecutionError::Undelivered {
+                    answer: Some(_),
+                    ..
+                }
+            ),
+            "{err}"
+        );
 
         let err = engine
             .run_text(

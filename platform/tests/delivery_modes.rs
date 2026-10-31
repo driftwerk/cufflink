@@ -691,6 +691,50 @@ async fn an_ack_always_message_that_ran_is_acked_with_its_service_at_its_share()
         .await;
 }
 
+async fn an_answer_past_the_response_cap(env: &[(&'static str, &'static str)]) -> Option<Deployed> {
+    let env: Vec<_> = env
+        .iter()
+        .chain(&[("WASM_MAX_RESPONSE_MB", "1")])
+        .copied()
+        .collect();
+    let deployed = deployed_module(
+        &[(
+            "answer_big_gated",
+            on_success(json!({"max_deliver": 2, "backoff_secs": [1]})),
+        )],
+        &env,
+        common::guest::module_bytes(),
+    )
+    .await?;
+    deployed.publish("answer_big_gated", "{}").await;
+    deployed.until_settled("answer_big_gated").await;
+    Some(deployed)
+}
+
+#[tokio::test]
+async fn under_enforce_an_answer_past_the_response_cap_is_settled_by_what_it_says() {
+    let env = budgeted(&[
+        ("WASM_MEMORY_BUDGET_MB", "64"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+    ]);
+    let Some(deployed) = an_answer_past_the_response_cap(&env).await else {
+        return;
+    };
+    assert_eq!(deployed.deliveries("answer_big_gated").await, 1);
+    assert!(deployed.dead_letters("answer_big_gated").await.is_empty());
+}
+
+#[tokio::test]
+async fn under_warn_an_answer_past_the_response_cap_is_a_failure() {
+    let Some(deployed) =
+        an_answer_past_the_response_cap(&[("WASM_MEMORY_BUDGET_MODE", "warn")]).await
+    else {
+        return;
+    };
+    assert_eq!(deployed.deliveries("answer_big_gated").await, 2);
+    assert_eq!(deployed.dead_letters("answer_big_gated").await.len(), 1);
+}
+
 #[tokio::test]
 async fn an_idle_durable_holds_nothing_in_the_ledger() {
     let env = budgeted(&[("WASM_MEMORY_BUDGET_MB", "64")]);

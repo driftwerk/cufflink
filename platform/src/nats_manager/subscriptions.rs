@@ -833,10 +833,14 @@ pub(crate) async fn run_handler(
         .map_err(|e| {
             let e = match e {
                 ExecutionError::Undelivered { reason, answer } => {
+                    let invalid = || Outcome::Retry {
+                        after: None,
+                        reason: reason.clone(),
+                    };
                     return HandlerFailure::Settled {
-                        outcome: settled_by(answer),
+                        outcome: answer.map_or_else(invalid, settled_by),
                         reason: eyre::eyre!("WASM execution error: {reason}"),
-                    }
+                    };
                 }
                 e => e,
             };

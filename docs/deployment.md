@@ -28,12 +28,26 @@ platform or worker past its container's limit.
   ones included. For many light concurrent guests, raise the container's
   memory, lower `WASM_THREAD_STACK_KB` (at least 1024; it sets every runtime
   thread's stack), or lower `WASM_MAX_CONCURRENT`.
-- **The most it can reach.** Under `enforce`, guests and what the host
-  holds for them never pass the budget, `WASM_MEMORY_DELIVERY_OVERRUN_MB`
-  (half the reserve) and one response (`WASM_MAX_RESPONSE_MB`). On a 2 GiB
-  container with the defaults: budget 1433.6 MiB, overrun 307.2 MiB,
-  response 64 MiB, 1804.8 MiB in all, which leaves 243.2 MiB for the
-  platform's own heap. Startup warns when the three reach the limit.
+- **The most it can reach.** Under `enforce`, the memory guests use, and
+  the host uses for them, stays within the budget,
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB` (half the reserve) and one response
+  (`WASM_MAX_RESPONSE_MB`). On a 2 GiB container with the defaults: budget
+  1433.6 MiB, overrun 307.2 MiB, response 64 MiB, 1804.8 MiB in all, which
+  leaves 243.2 MiB for the platform's own heap. On 1.5 GiB it leaves
+  166.4 MiB. Startup warns when the three reach the limit.
+  `cufflink_wasm_memory_in_use_bytes` can read above that figure, about the
+  budget plus twice the overrun at a full budget, since the room of an
+  answer being decoded is counted beside the tree it makes room for.
+- **Measure the heap before `enforce`.** The platform's heap baseline has
+  not been measured, so the figures left for it above are arithmetic, not
+  a proven fit. Measure it under your own modules and load during the
+  `warn` soak, and raise `WASM_MEMORY_HOST_RESERVE_MB` if it does not fit
+  before setting `enforce`.
+- **Run behind a proxy with send timeouts.** The platform sets no timeout
+  on writing a response: `axum::serve` has none, and the `deadline` layer
+  ends at the response head. A client that stops reading keeps its rendered
+  body charged until its connection closes, so put a reverse proxy in front
+  that closes such connections.
 - **The largest answer.** An answer whose text, tree and render alone pass
   the smaller of the overrun and the service share is refused as too large
   at any load: its effects stand and a route answers `500`. On 2 GiB that

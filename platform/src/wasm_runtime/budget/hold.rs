@@ -142,9 +142,10 @@ impl Hold {
         Self::unrefused(self.account.clone())
     }
 
-    pub(crate) async fn make_room(&mut self, bytes: usize) {
-        if let Some(account) = &self.account {
-            self.delivery = account.ledger().delivery(bytes, self.bytes).await;
+    pub(crate) async fn make_room(&mut self, bound: impl FnOnce() -> usize) {
+        let enforcing = self.account.as_ref().map(Account::ledger);
+        if let Some(ledger) = enforcing.filter(|ledger| ledger.enforces()) {
+            self.delivery = ledger.delivery(bound(), self.bytes).await;
         }
     }
 
@@ -197,11 +198,9 @@ impl Hold {
 
     pub(crate) fn force(&mut self, extra: usize) {
         if let Some(account) = self.account.as_ref().filter(|_| extra > 0) {
-            let (ledger, class, service) = (account.ledger(), account.class(), account.service());
-            match self.terms {
-                Terms::Kept { .. } => ledger.force_kept(class, service, extra),
-                Terms::Refusable | Terms::Unrefused => ledger.force(class, service, extra),
-            }
+            account
+                .ledger()
+                .force(account.class(), account.service(), extra);
             self.bytes += extra;
         }
     }
@@ -437,13 +436,13 @@ mod tests {
 
         let (ledger, base) = testing::hold(64 * MIB);
         let mut hold = base.delivering();
-        hold.make_room(8 * MIB).await;
+        hold.make_room(|| 8 * MIB).await;
         assert_eq!(ledger.delivering(), 8 * MIB);
         drop(hold);
         assert_eq!(ledger.delivering(), 0);
 
         let mut hold = base.delivering();
-        hold.make_room(8 * MIB).await;
+        hold.make_room(|| 8 * MIB).await;
         hold.delivered();
         assert_eq!(ledger.delivering(), 0);
         assert_eq!(ledger.in_use(), 0);
@@ -464,18 +463,6 @@ mod tests {
         };
         assert_eq!(needed(refused(2 * MIB).needing(3 * MIB)), 3 * MIB);
         assert_eq!(needed(refused(4 * MIB).needing(3 * MIB)), 4 * MIB);
-    }
-
-    #[test]
-    fn a_forced_charge_on_a_kept_hold_is_credited_as_kept() {
-        let (ledger, account) = owned(true);
-        let mut kept = Hold::kept(Some(account), 4 * MIB);
-        kept.grow(MIB).expect("fits");
-        kept.force(MIB);
-        assert_eq!(ledger.kept_total(), 2 * MIB);
-        drop(kept);
-        assert_eq!(ledger.in_use(), 0);
-        assert_eq!(ledger.kept_total(), 0, "nothing is left marked as kept");
     }
 
     #[test]
