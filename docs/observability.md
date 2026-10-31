@@ -376,7 +376,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_strict_route_matches_total` | counter | `result` (`matched`, `passthrough`, `no_route`, `method_not_allowed`) | Strict-routing decisions |
 | `cufflink_request_body_rejected_total` | counter | `reason` (`too_large`, `multipart`) | Custom-route bodies refused: over the route's limit, or not the multipart form the route takes |
 | `cufflink_guest_response_v2_total` | counter | `body` (`empty`, `json`, `bytes`, `s3`, `sse`) | Response-v2 envelopes rendered |
-| `cufflink_guest_header_dropped_total` | counter | `name` | Response headers a guest set that the platform owns, dropped |
+| `cufflink_guest_header_dropped_total` | counter | `name` | Response headers a guest set that the platform owns, dropped. `name` is the header, or `proxy-` or `access-control-` for those prefixes, so a guest cannot mint labels |
 | `cufflink_s3_stream_bytes_total` | counter | — | Bytes of stored objects streamed to clients by `s3_object` responses |
 | `cufflink_sse_streams_active` | gauge | — | Event streams open, CRUD and bridged |
 | `cufflink_sse_rejected_total` | counter | `reason` (`cap`, `subject`) | Streams refused: the principal's cap reached, or a subject naming another service's events its manifest does not subscribe to |

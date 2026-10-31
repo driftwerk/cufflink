@@ -1945,8 +1945,9 @@ Recorded as the change was built, each with its reason.
   response's is, so the two stay inside a full room, and a tree that would
   pass it takes this reading instead. Other envelope fields are not checked
   in that reading, so an
-  invalid `__headers` in such an answer goes unseen, and of a key repeated
-  in it nothing is read, so it reads as a legacy 200.
+  invalid `__headers` in such an answer goes unseen. If `__status`, `__v`
+  or `__delivery` is repeated nothing is read, so it reads as a legacy 200,
+  while any other key may repeat.
   The reading's allocation is bounded and does not grow with the text, as
   `host_allocations` pins over strings, long numbers, escaped keys, unknown
   keys, `__delivery` and deep nesting. Each source of one is closed:
@@ -1961,7 +1962,17 @@ Recorded as the change was built, each with its reason.
   serde_json builds a type error holding a whole string, in `Debug` form,
   and puts long numbers in scratch. A `__delivery` block past 64 KiB is
   invalid, since `DeliveryControl` is untagged and would buffer it; one
-  within it costs about a mebibyte at worst.
+  within it costs a few mebibytes at worst.
+- **What a response leaves uncharged.** One buffer: its head, once its hold
+  ends, which is at most 64 headers of an 8 KiB value and `http`'s 64 KiB
+  name, about 4.6 MiB. A content type takes the same 8 KiB limit as any
+  header value. Nothing else the guest sizes outlives its hold: an error
+  naming a header quotes at most 64 characters of the name, an object's
+  bucket and key stop at the 1 KiB S3 and GCS allow, so a failed open logs
+  no more than that, a dropped header is counted and logged by the entry
+  that denied it, never by the guest's name, and an event stream keeps its
+  hold until its body ends, since `initial` and `state` live as long as it
+  does.
 - **A finished job is not run again for its output.** A job that answered
   success and whose output cannot be read fails as `Terminal`, with an
   error saying it finished and its result could not be read. Nothing would

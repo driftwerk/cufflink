@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_VALUE: usize = 8 * 1024;
+const MAX_OBJECT_NAME: usize = 1024;
 const MAX_TREE_DEPTH: usize = 127;
 const MAX_DELIVERY_BLOCK: usize = 64 * 1024;
 const MAX_ESCAPED_KEY: usize = 64 * 1024;
@@ -32,11 +33,14 @@ const DENIED_HEADERS: [&str; 4] = [
 ];
 const DENIED_PREFIXES: [&str; 2] = ["proxy-", "access-control-"];
 
-fn denied(name: &HeaderName) -> bool {
+fn denied(name: &HeaderName) -> Option<&'static str> {
     let name = name.as_str();
-    HOP_BY_HOP_HEADERS.contains(&name)
-        || DENIED_HEADERS.contains(&name)
-        || DENIED_PREFIXES.iter().any(|p| name.starts_with(p))
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .chain(&DENIED_HEADERS)
+        .find(|denied| **denied == name)
+        .or_else(|| DENIED_PREFIXES.iter().find(|p| name.starts_with(**p)))
+        .copied()
 }
 
 #[derive(Debug)]
@@ -50,7 +54,7 @@ pub(crate) struct V2Response {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: V2Body,
-    pub dropped: Vec<HeaderName>,
+    pub dropped: Vec<&'static str>,
     pub delivery: Option<Box<DeliveryControl>>,
 }
 
@@ -312,7 +316,13 @@ fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Resp
     })
 }
 
-fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<HeaderName>), GuestResponseError> {
+fn header_value(value: &str) -> Option<HeaderValue> {
+    (value.len() <= MAX_HEADER_VALUE)
+        .then(|| HeaderValue::from_str(value).ok())
+        .flatten()
+}
+
+fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<&'static str>), GuestResponseError> {
     let pairs = match value {
         None | Some(Value::Null) => return Ok((HeaderMap::new(), Vec::new())),
         Some(Value::Object(pairs)) if pairs.len() <= MAX_HEADERS => pairs,
@@ -322,16 +332,16 @@ fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<HeaderName>), GuestR
         (HeaderMap::new(), Vec::new()),
         |(mut allowed, mut dropped), (name, value)| {
             let name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| invalid(format!("header name '{name}'")))?;
+                .map_err(|_| invalid(format!("header name '{name:.64}'")))?;
             let value = value
                 .as_str()
-                .filter(|value| value.len() <= MAX_HEADER_VALUE)
-                .and_then(|value| HeaderValue::from_str(value).ok())
-                .ok_or_else(|| invalid(format!("header value of '{name}'")))?;
-            if denied(&name) {
-                dropped.push(name);
-            } else {
-                allowed.insert(name, value);
+                .and_then(header_value)
+                .ok_or_else(|| invalid(format!("header value of '{name:.64}'")))?;
+            match denied(&name) {
+                Some(denied) => dropped.push(denied),
+                None => {
+                    allowed.insert(name, value);
+                }
             }
             Ok((allowed, dropped))
         },
@@ -362,7 +372,7 @@ fn body(envelope: &mut Map<String, Value>, hold: &mut Hold) -> Result<V2Body, De
                 None => HeaderValue::from_static("application/octet-stream"),
                 Some(content_type) => content_type
                     .as_str()
-                    .and_then(|ct| HeaderValue::from_str(ct).ok())
+                    .and_then(header_value)
                     .ok_or_else(|| invalid("__content_type"))?,
             };
             Ok(V2Body::Bytes {
@@ -378,7 +388,7 @@ fn s3_spec(stream: &Value) -> Result<S3Spec, GuestResponseError> {
     let text = |key: &str| {
         stream[key]
             .as_str()
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value.len() <= MAX_OBJECT_NAME)
             .map(str::to_string)
             .ok_or_else(|| invalid(format!("__stream.{key}")))
     };
@@ -390,7 +400,7 @@ fn s3_spec(stream: &Value) -> Result<S3Spec, GuestResponseError> {
         value => Some(
             value
                 .as_str()
-                .and_then(|ct| HeaderValue::from_str(ct).ok())
+                .and_then(header_value)
                 .ok_or_else(|| invalid("__stream.content_type"))?,
         ),
     };
@@ -459,7 +469,7 @@ async fn render_v2(
     metrics::counter!("cufflink_guest_response_v2_total", "body" => v2.body.label()).increment(1);
     v2.dropped
         .iter()
-        .for_each(|name| dropped_header(service, name));
+        .for_each(|denied| dropped_header(service, denied));
     let mut response = match v2.body {
         V2Body::Empty => Body::empty().into_response(),
         V2Body::Json(value) => json_response(StatusCode::OK, value, hold)?,
@@ -476,7 +486,7 @@ async fn render_v2(
             Err(error) => return Ok(Err(error)),
         },
         V2Body::Sse(spec) => match bodies.sse(*spec) {
-            Ok(response) => response,
+            Ok(response) => response.map(|body| ChargedBody::wrap(body, hold)),
             Err(error) => return Ok(Err(error)),
         },
     };
@@ -556,14 +566,17 @@ fn stream_object(spec: &S3Spec, object: ObjectReader) -> Response {
     response
 }
 
-static DROPPED_HEADERS: LazyLock<LogThrottle<(String, HeaderName)>> =
+static DROPPED_HEADERS: LazyLock<LogThrottle<(String, &'static str)>> =
     LazyLock::new(|| LogThrottle::new(Duration::from_secs(60)));
 
-fn dropped_header(service: &str, name: &HeaderName) {
-    metrics::counter!("cufflink_guest_header_dropped_total", "name" => name.as_str().to_string())
-        .increment(1);
-    if DROPPED_HEADERS.should_log((service.to_string(), name.clone()), Instant::now()) {
-        tracing::warn!(service, header = %name, "Dropped a response header the platform owns");
+fn dropped_header(service: &str, denied: &'static str) {
+    metrics::counter!("cufflink_guest_header_dropped_total", "name" => denied).increment(1);
+    if DROPPED_HEADERS.should_log((service.to_string(), denied), Instant::now()) {
+        tracing::warn!(
+            service,
+            header = denied,
+            "Dropped a response header the platform owns"
+        );
     }
 }
 
@@ -819,9 +832,7 @@ mod tests {
 
     impl Bodies for Objects {
         fn sse(&mut self, _spec: SseSpec) -> PlatformResult<Response> {
-            Err(crate::errors::PlatformError::Internal(
-                "no event stream".into(),
-            ))
+            Ok(Body::empty().into_response())
         }
 
         async fn open(&self, spec: &S3Spec) -> PlatformResult<ObjectReader> {
@@ -1045,6 +1056,74 @@ mod tests {
         let answer = answer(&output).expect("an outline does not read the headers");
         assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(ledger.in_use(), output.text.len());
+    }
+
+    #[test]
+    fn an_invalid_header_is_named_within_a_bounded_message() {
+        let invalid_name = "\u{e9}".repeat(MIB);
+        let valid_name = "x".repeat(60 * 1024);
+        for (name, value) in [(invalid_name, json!("v")), (valid_name, json!(1))] {
+            let error = v2(&json!({"__v": 2, "__status": 200, "__headers": {name: value}}))
+                .expect_err("invalid");
+            assert!(error.0.len() <= 256, "{} bytes", error.0.len());
+        }
+    }
+
+    #[test]
+    fn a_dropped_header_is_reported_by_what_denied_it() {
+        let name = format!("proxy-{}", "x".repeat(1024));
+        let response = v2(&json!({"__v": 2, "__status": 200, "__headers": {
+            name: "x", "set-cookie": "s=1",
+        }}))
+        .expect("v2");
+        assert_eq!(response.dropped, ["proxy-", "set-cookie"]);
+    }
+
+    #[test]
+    fn an_object_is_named_within_what_a_store_allows() {
+        let stream = |bucket: &str, key: &str| {
+            json!({"__v": 2, "__status": 200, "__stream": {
+                "kind": "s3", "bucket": bucket, "key": key,
+            }})
+        };
+        let at_limit = "x".repeat(MAX_OBJECT_NAME);
+        let past_limit = "x".repeat(MAX_OBJECT_NAME + 1);
+        assert!(v2(&stream(&at_limit, &at_limit)).is_ok());
+        assert!(v2(&stream(&past_limit, "k")).is_err());
+        assert!(v2(&stream("b", &past_limit)).is_err());
+    }
+
+    #[test]
+    fn a_content_type_is_limited_as_a_header_value_is() {
+        let at_limit = "x".repeat(MAX_HEADER_VALUE);
+        let past_limit = "x".repeat(MAX_HEADER_VALUE + 1);
+        let bytes = |content_type: &str| json!({"__v": 2, "__status": 200, "__body_b64": "", "__content_type": content_type});
+        let object = |content_type: &str| {
+            json!({"__v": 2, "__status": 200, "__stream": {
+                "kind": "s3", "bucket": "b", "key": "k", "content_type": content_type,
+            }})
+        };
+        for envelope in [bytes(&at_limit), object(&at_limit)] {
+            assert!(v2(&envelope).is_ok());
+        }
+        for envelope in [bytes(&past_limit), object(&past_limit)] {
+            assert!(v2(&envelope).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_stays_charged_until_its_body_ends() {
+        let raw = json!({"__v": 2, "__status": 200, "__sse": {
+            "initial": [{"data": "x".repeat(MIB)}],
+            "keep_alive_secs": 15,
+            "timeout_secs": 60,
+        }})
+        .to_string();
+        let (ledger, response) = charged(&raw, 64 * MIB).await;
+        let response = response.expect("rendered");
+        assert!(ledger.in_use() >= MIB, "the stream keeps what it was given");
+        drop(response);
+        assert_eq!(ledger.in_use(), 0);
     }
 
     #[test]
