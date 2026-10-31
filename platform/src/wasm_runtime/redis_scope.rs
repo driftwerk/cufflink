@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub const RESERVED_PREFIXES: [&str; 3] = ["auth:", "cufflink:", "t:"];
 
 const TOMBSTONE: &[u8] = b"\xffcufflink:deleted";
+const READ_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Stored {
@@ -266,23 +267,38 @@ impl<'a> Reader<'a> {
                 })
                 .await?);
         };
-        let sizes = measured(redis, &keys, single).await?;
+        rereading(async || self.bounded(redis, &keys, single, caps, path).await).await
+    }
+
+    async fn bounded(
+        &mut self,
+        redis: &RedisHandle,
+        keys: &[String],
+        single: bool,
+        caps: &HostCaps,
+        path: &'static str,
+    ) -> Result<Vec<redis::Value>, ReadError> {
+        let sizes = measured(redis, keys, single).await?;
         let reserved = self.reserve(caps, path, &sizes)?;
-        let values = ranges(redis, &keys, &sizes, single).await?;
-        let read: usize = values.iter().map(value_len).sum();
+        let values = ranges(redis, keys, &sizes, single).await?;
+        let grew = values
+            .iter()
+            .zip(&sizes)
+            .any(|(value, size)| value_len(value) > *size);
+        let read = match grew {
+            true => 0,
+            false => values.iter().map(value_len).sum(),
+        };
         self.hold.shrink_to(
             self.hold
                 .bytes()
                 .saturating_sub(reserved.saturating_sub(read)),
         );
-        match values
-            .iter()
-            .zip(&sizes)
-            .any(|(value, size)| value_len(value) > *size)
-        {
-            true => Err(ReadError::Changed),
-            false => Ok(values),
+        if grew {
+            self.read = self.read.saturating_sub(sizes.iter().sum());
+            return Err(ReadError::Changed);
         }
+        Ok(values)
     }
 
     fn reserve(
@@ -317,6 +333,16 @@ impl From<redis::RedisError> for ReadError {
     fn from(error: redis::RedisError) -> Self {
         Self::Redis(RedisCallError::Redis(error))
     }
+}
+
+async fn rereading<T>(mut read: impl AsyncFnMut() -> Result<T, ReadError>) -> Result<T, ReadError> {
+    for _ in 1..READ_ATTEMPTS {
+        match read().await {
+            Err(ReadError::Changed) => {}
+            settled => return settled,
+        }
+    }
+    read().await
 }
 
 fn one(values: Vec<redis::Value>) -> redis::Value {
@@ -487,6 +513,38 @@ mod tests {
             Option::<Stored>::from_redis_value(&redis::Value::Nil).expect("absent"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_value_that_changed_is_read_again_and_only_the_last_change_is_answered() {
+        let mut attempts = 0;
+        let settled = rereading(async || {
+            attempts += 1;
+            match attempts {
+                1 | 2 => Err(ReadError::Changed),
+                _ => Ok(attempts),
+            }
+        })
+        .await;
+        assert_eq!(settled.expect("the third read"), READ_ATTEMPTS);
+
+        let mut attempts = 0;
+        let changing: Result<(), ReadError> = rereading(async || {
+            attempts += 1;
+            Err(ReadError::Changed)
+        })
+        .await;
+        assert!(matches!(changing, Err(ReadError::Changed)));
+        assert_eq!(attempts, READ_ATTEMPTS);
+
+        let mut attempts = 0;
+        let refused: Result<(), ReadError> = rereading(async || {
+            attempts += 1;
+            Err(protocol("not a race"))
+        })
+        .await;
+        assert!(matches!(refused, Err(ReadError::Redis(_))));
+        assert_eq!(attempts, 1, "only a change is read again");
     }
 
     #[test]

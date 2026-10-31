@@ -27,6 +27,7 @@ use uuid::Uuid;
 use wasmtime::Linker;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const ENVELOPE_ALLOWANCE: u64 = 64 * 1024;
 
 const DECODE_ROUNDS: usize = 3;
 
@@ -590,9 +591,16 @@ fn envelope(outcome: &Result<CallResponse, CallFailure>) -> Envelope<'_> {
 }
 
 fn response_limit(state: &HostState) -> u64 {
-    let egress = state.app_state.egress.effective_max_bytes(None);
-    state.caps().response_limit().map_or(egress, |cap| {
-        egress.min(u64::try_from(cap).unwrap_or(u64::MAX))
+    body_limit(
+        state.app_state.egress.effective_max_bytes(None),
+        state.caps().response_limit(),
+    )
+}
+
+fn body_limit(egress: u64, cap: Option<usize>) -> u64 {
+    cap.map_or(egress, |cap| {
+        let encoded = u64::try_from(cap).unwrap_or(u64::MAX) / 4 * 3;
+        egress.min(encoded.saturating_sub(ENVELOPE_ALLOWANCE))
     })
 }
 
@@ -1052,6 +1060,25 @@ mod tests {
             );
         }
         assert_eq!(hits.load(Ordering::SeqCst), 2, "nothing escaping was sent");
+    }
+
+    #[test]
+    fn a_body_at_its_limit_fits_the_response_cap_once_encoded() {
+        const CAP: usize = 1024 * 1024;
+        let limit = body_limit(u64::MAX, Some(CAP));
+        let body = vec![0u8; usize::try_from(limit).expect("small")];
+        let headers = BTreeMap::from([("content-type".to_string(), "x".repeat(8 * 1024))]);
+        let outcome = Ok(CallResponse {
+            status: 200,
+            headers,
+            body,
+        });
+        let encoded = serde_json::to_string(&envelope(&outcome)).expect("envelope");
+        assert!(encoded.len() <= CAP, "{} above {CAP}", encoded.len());
+
+        assert_eq!(body_limit(2048, Some(CAP)), 2048, "the egress limit first");
+        assert_eq!(body_limit(5, None), 5, "no cap outside enforce");
+        assert_eq!(body_limit(u64::MAX, Some(1024)), 0);
     }
 
     #[test]

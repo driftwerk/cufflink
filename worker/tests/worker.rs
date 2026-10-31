@@ -836,6 +836,9 @@ async fn an_after_hook_fetched_with_no_room_waits_for_it_and_runs_once() {
     let mut db = infra.create_migrated_database().await;
     let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
     let _turn = exclusive_jetstream(&js).await;
+    events::setup_long_jobs_stream(&js)
+        .await
+        .expect("long-jobs stream");
 
     let hooks = HookService::deploy(infra, &mut db).await;
     let env: Vec<(&str, &str)> = budgeted("64")
@@ -893,6 +896,9 @@ async fn an_after_hook_denied_on_every_delivery_is_dead_lettered_for_capacity() 
     let mut db = infra.create_migrated_database().await;
     let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
     let _turn = exclusive_jetstream(&js).await;
+    events::setup_long_jobs_stream(&js)
+        .await
+        .expect("long-jobs stream");
 
     let hooks = HookService::deploy(infra, &mut db).await;
     let env: Vec<(&str, &str)> = budgeted("72")

@@ -42,7 +42,7 @@ pub(super) fn register(
                 }
                 Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
-                    tracing::error!("[wasm] redis_get error: {}", e);
+                    read_failed("redis_get", &e);
                     -1
                 }
             }
@@ -155,9 +155,8 @@ pub(super) fn register(
                 }
                 Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
-                    let msg = e.to_string();
-                    tracing::error!("[wasm] redis_get_status error: {}", msg);
-                    caller.data_mut().respond("redis_get_status", msg);
+                    read_failed("redis_get_status", &e);
+                    caller.data_mut().respond("redis_get_status", e.to_string());
                     -1
                 }
             }
@@ -218,9 +217,8 @@ pub(super) fn register(
                 }
                 Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
-                    let msg = e.to_string();
-                    tracing::error!("[wasm] redis_mget error: {}", msg);
-                    caller.data_mut().respond("redis_mget", msg);
+                    read_failed("redis_mget", &e);
+                    caller.data_mut().respond("redis_mget", e.to_string());
                     -1
                 }
             }
@@ -228,6 +226,13 @@ pub(super) fn register(
     )?;
 
     Ok(())
+}
+
+fn read_failed(call: &str, error: &ReadError) {
+    match error {
+        ReadError::Changed => tracing::debug!("[wasm] {call}: {error}"),
+        _ => tracing::error!("[wasm] {call} error: {error}"),
+    }
 }
 
 impl HostState {
