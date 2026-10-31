@@ -459,6 +459,19 @@ async fn an_after_hook_of_a_service_at_its_share_is_kept_and_runs_once_room_free
         "the kept text took the service past its share, so its answer was refused: {}",
         holder.body
     );
+    assert_eq!(
+        gauge(
+            &platform,
+            "cufflink_wasm_memory_denied_total",
+            &[
+                ("tenant", catalog.slug.as_str()),
+                ("reason", "service_share"),
+                ("what", "host")
+            ]
+        )
+        .await,
+        1.0
+    );
     eventually("the hook ran", async || {
         hooked(&rows, "catalog_service").await == 1
     })
