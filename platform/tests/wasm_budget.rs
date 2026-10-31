@@ -452,7 +452,13 @@ async fn an_after_hook_of_a_service_at_its_share_is_kept_and_runs_once_room_free
     .await;
     assert_eq!(hooked(&rows, "catalog_service").await, 0);
 
-    holding.release().await;
+    holding.gate.open().await;
+    let holder = holding.call.await.expect("the holder");
+    assert_eq!(
+        holder.status, 503,
+        "the kept text took the service past its share, so its answer was refused: {}",
+        holder.body
+    );
     eventually("the hook ran", async || {
         hooked(&rows, "catalog_service").await == 1
     })

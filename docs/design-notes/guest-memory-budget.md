@@ -1752,7 +1752,9 @@ Recorded as the change was built, each with its reason.
 - **Committed request text is never refused.** The request text of an
   after-hook, in process or published to the worker, and of `on_migrate`
   is charged past the share when it must be. The hook is then kept and
-  waits for its run, rather than being dropped before it is queued.
+  waits for its run, rather than being dropped before it is queued. Until
+  the service is back within its share, its other growth and host buffers
+  are refused, as they would be at the share.
 - **Shutdown while waiting.** Committed or background work still waiting
   for memory at the hard deadline ends `NotStarted`, never as a capacity
   refusal. A message is naked at once under both ack modes, without
