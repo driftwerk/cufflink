@@ -1,6 +1,7 @@
 # Guest memory budget and admission control
 
-Design only. Nothing here is implemented yet.
+Implemented in v0.35.0. Section 14 records where the implementation
+differs from this design, and why.
 
 - The maintainer answered section 11's questions on 2026-10-30, accepting
   every proposed default. On the same day the maintainer re-decided
@@ -1739,6 +1740,29 @@ Recorded as the change was built, each with its reason.
   its delay, and the redelivery answers, as an interrupted `on_success`
   message does today. A requester whose timeout is shorter than the delay
   sees a timeout.
+- **Holding lower tiers back.** A committed or aged background waiter that
+  does not fit holds back only the work that competes for the limit it
+  passes, judged by the narrowest one: its own service's lower tiers for
+  the service share, other background work for the background share, and
+  everything for the ceiling. A waiter blocked by nothing but the pressure
+  gate holds nothing back: the gate refuses interactive and background
+  work itself, and nested work is not gated (section 3.8), so holding it
+  would free nothing for the waiter. An arrival still joins the queue when
+  a waiter of its tier or above waits; `grant` then decides.
+- **Committed request text is never refused.** The request text of an
+  after-hook, in process or published to the worker, and of `on_migrate`
+  is charged past the share when it must be. The hook is then kept and
+  waits for its run, rather than being dropped before it is queued.
+- **Shutdown while waiting.** Committed or background work still waiting
+  for memory at the hard deadline ends `NotStarted`, never as a capacity
+  refusal. A message is naked at once under both ack modes, without
+  counting toward the capacity bound or being dead-lettered, and a job is
+  released.
+- **Fairness is per service, not per tenant.** A tenant whose services are
+  busy at once can hold the whole budget. A tenant share was not added:
+  below 100 % it would cut a single-tenant platform's budget, the common
+  deployment, and at 100 % it does nothing. An operator lowers
+  `WASM_MEMORY_SERVICE_SHARE_PERCENT` instead.
 - **`warn` counts.** Under `warn` a denial is counted where `enforce` would
   have refused. A host buffer forced past the budget raises the ledger, so
   later checks in the same window see it, and the count is an upper bound
@@ -1788,11 +1812,26 @@ Recorded as the change was built, each with its reason.
 - **A `db_v2` decode error** keeps reading rows to the end, as the
   collected render did, so the error and the statement's end are the same
   as before. Only a refusal stops early.
-- **`redis_mget`** reads each key up to the response cap. The total is
-  checked once, at the response.
-- **`service_call`** reserves the callee's whole response limit before the
-  call and shrinks the charge to the body it got, since the body is read by
-  the HTTP client in one piece.
+- **Redis reads under `enforce` take two transactions**, not the one of
+  section 2.4: a queued command's answer cannot size a later command in
+  the same `MULTI`. The first measures each value (`STRLEN`). The total is
+  checked against the cap, and twice it is reserved, since redis-rs holds
+  the reply frame and the decoded value together. The second reads each
+  value up to its measured length and one byte more. A value that grew in
+  between fails the call with `-1`. `redis_mget` takes at most
+  `HOST_FANOUT_MAX_ITEMS` keys. The connection's read buffer keeps the
+  capacity of the largest reply it parsed, which the host reserve holds.
+- **Under `warn`, Redis reads are plain `GET` and `MGET`**, as under `off`,
+  and their result is measured when it is answered.
+- **`service_call`** reserves the callee's response limit, at most the host
+  response cap under `enforce`, and reads no more than that, since the
+  HTTP client reads the body in one piece. The charge then shrinks to the
+  body. A larger response fails the call with a transport error rather
+  than a cap refusal.
+- **Image work's threads.** Decoding and encoding run on blocking-pool
+  threads whose stacks are not charged when they have never run a guest.
+  One runs per image call in flight, so they are bounded by the guests in
+  flight.
 
 **Configuration and tests.**
 
@@ -1800,12 +1839,23 @@ Recorded as the change was built, each with its reason.
   milliseconds and is used instead of `WASM_ADMISSION_RETRY_AFTER_SECS`
   when set. A deferred message or job waits it before it is delivered
   again, so tests can defer and redeliver within a fraction of a second. A
-  `Retry-After` header stays a whole number of seconds, at least 1.
+  `Retry-After` header is the delay rounded up to whole seconds, at least
+  1.
 - **The launcher passes the platform's environment as arguments.** The
   runner's `sudo` refuses `-E`, so `testkit` runs `<launcher> env -i
   NAME=value… <platform binary>` and the job's prefix is `sudo systemd-run
   … --`. The platform therefore sees exactly the variables `testkit` sets,
-  as it does when launched directly.
+  as it does when launched directly. Those variables are on the command
+  line, where other processes can read them, so only test values go
+  through it. `RuntimeMaxSec` stops a scope a crashed run left behind.
+- **The memory-limit tests** assert that the scope never reached
+  `memory.max`, that the part of a burst holding memory at a gate ran and
+  the rest was refused, and that large Redis values are reserved before
+  they are read. HTTP and object-store cases are not in this change.
+- **A gate's key** is matched by both of its halves in `pg_locks`
+  (`classid` and `objid`), so any `bigint` key works.
+- **`testkit`'s NATS** binds a random loopback port (`-a 127.0.0.1 -p -1`),
+  so it never collides with a server already on 4222.
 - **The image codecs build optimised in the dev profile**
   (`[profile.dev.package.*]` in the workspace manifest), and the resize goes
   through `DynamicImage::resize_exact`, so its Lanczos code is built in the

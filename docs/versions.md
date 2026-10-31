@@ -182,7 +182,23 @@ answered as before. Under `enforce`:
   `db_v2` call answers the new `DbErrorKind::TooLarge` (`too_large`). The
   statement is stopped, and a transaction it ran in is rolled back
   (`cufflink_db_tx_abandoned_total{reason="unread"}`);
-- a Redis value is read only up to the cap.
+- `redis_get` and `redis_mget` measure the values first (`STRLEN` in one
+  `MULTI`), refuse a read whose values together pass the cap, reserve
+  them, and then read them (`EXISTS` and `GETRANGE` in a second `MULTI`).
+  A value that grew between the two answers the call `-1`, as an error the
+  guest may retry. `redis_mget` takes at most `HOST_FANOUT_MAX_ITEMS`
+  (128) keys. The Redis user needs `MULTI`, `EXEC`, `STRLEN`, `EXISTS` and
+  `GETRANGE`; an ACL that allows only `GET` and `MGET` refuses these
+  reads. Redis 7 or later is required for them to answer exactly as `GET`
+  does when a key expires during the read; on Redis 6 the platform logs a
+  warning at startup and such a key may read as `""` rather than nil.
+  Under `warn` and `off`, the reads stay plain `GET` and `MGET`;
+- `service_call` reads a callee's response only up to the cap, so a
+  larger one fails the call with a transport error.
+
+The budget is shared fairly between services, not tenants: each service
+may hold at most `WASM_MEMORY_SERVICE_SHARE_PERCENT` (50) of it, so a
+tenant with two busy services can hold all of it.
 
 In every mode, `image_transform_multi` encodes and uploads its targets one
 at a time, so a failure part way leaves the earlier targets uploaded.

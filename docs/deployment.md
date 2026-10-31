@@ -34,6 +34,14 @@ platform or worker past its container's limit.
   `M_MMAP_THRESHOLD` to 1 MiB unless the mode is `off`, so freed buffers of
   a mebibyte or more go back to the kernel; `MALLOC_MMAP_THRESHOLD_` or
   `GLIBC_TUNABLES` still overrides it.
+- **Redis.** Under `enforce` a guest's Redis reads measure, then reserve,
+  then read, in two `MULTI` blocks of `STRLEN`, `EXISTS` and `GETRANGE`.
+  Give the Redis user those commands with `MULTI` and `EXEC`, and run
+  Redis 7 or later ([v0.35.0](versions.md#features-added-in-v0350)).
+- **Fairness** is per service: a tenant whose services are busy at once
+  can hold up to the whole budget. Lower
+  `WASM_MEMORY_SERVICE_SHARE_PERCENT` where one tenant runs several heavy
+  services beside others.
 - **Soak** in `warn`, the default, and read
   `cufflink_wasm_admission_refused_total{mode="warn"}` and
   `cufflink_wasm_memory_denied_total{mode="warn"}` before setting `enforce`.

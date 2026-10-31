@@ -62,7 +62,7 @@ Cufflink is a platform for deploying CRUD microservices in seconds. You define y
 | **NATS** | Event streaming, worker dispatch, webhooks | NATS 2.10 with JetStream |
 | **Keycloak** | Identity provider; one realm per tenant plus a platform realm | Keycloak 26 |
 | **Object storage** | WASM modules, web artifacts, backups, file uploads | Any S3-compatible store (RustFS locally) or GCS |
-| **Redis** | Shared rate-limit counters and permission cache | Redis 6 |
+| **Redis** | Shared rate-limit counters, permission cache and the guests' `redis::*` calls | Redis 7 (Redis 6 with one edge case, see [v0.35.0](versions.md#features-added-in-v0350)) |
 
 ---
 
@@ -308,7 +308,7 @@ A setting that carries a secret can be given as a file instead: `<name>_FILE` na
 | `KEYCLOAK_JWKS_MAX_STALE_SECS` | `86400` | How long a realm's cached JWKS keeps validating tokens after refreshes start failing (a Keycloak outage does not log everyone out); served stale sets are counted in `cufflink_jwks_stale_served_total{realm}`. An unknown `kid` still forces a fresh fetch |
 | `KEYCLOAK_REALM` | `cufflink` | Platform realm (platform admins) |
 | `KEYCLOAK_ISSUER` | *(unset)* | Browser-facing Keycloak base URL when it differs from `KEYCLOAK_URL` (e.g. `http://localhost:8180` in compose). Tokens must carry `{issuer}/realms/{realm}` (a tenant's own `keycloak_issuer` wins; unset, the issuer is discovered from Keycloak). Returned by `/api/auth/config` |
-| `REDIS_URL` | *(unset)* | Redis for shared rate-limit counters and the permission cache; in-memory fallback when unset |
+| `REDIS_URL` | *(unset)* | Redis for shared rate-limit counters and the permission cache; in-memory fallback when unset. Under `WASM_MEMORY_BUDGET_MODE=enforce` a guest's `redis_get` and `redis_mget` run as `MULTI` blocks of `STRLEN`, `EXISTS` and `GETRANGE`, which the Redis user's ACL must allow |
 | `LOKI_URL` | *(unset)* | Loki base URL backing `GET /api/services/{id}/logs` and `cufflink logs` |
 | `LOKI_LABEL_MODEL` | `legacy` | How that Loki labels the lines: `legacy` (JSON bodies from the collector's deprecated `loki` exporter) or `scoped` (OTLP ingestion labelled by tenant and service) ([observability](observability.md#loki_label_model)) |
 | `DEFAULT_TENANT_SLUG` | `default` | Tenant auto-assigned to realm users that have no roles yet |
