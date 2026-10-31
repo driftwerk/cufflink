@@ -67,6 +67,10 @@ pub trait Work<M: Delivery = jetstream::Message>: Send + Sync + 'static {
 
     fn decide(&self, outcome: &Outcome, meta: &MessageMeta) -> Decision;
 
+    fn headroom(&self) -> BoxFuture<'_, usize> {
+        std::future::ready(usize::MAX).boxed()
+    }
+
     fn dead_letter<'a>(
         &'a self,
         msg: &'a M,
@@ -367,7 +371,15 @@ pub async fn run<S: Source>(
                 Err(_) => return PumpExit::Stopped,
             },
         };
-        let wanted = fetch_size(config.batch, slots.available_permits());
+        let waiting = Instant::now();
+        let room = tokio::select! {
+            biased;
+            exit = halted(&stop, &shutdown) => return exit,
+            room = pump.work.headroom() => room,
+        };
+        metrics::histogram!("cufflink_pump_admission_wait_seconds", "kind" => pump.label.kind)
+            .record(waiting.elapsed().as_secs_f64());
+        let wanted = fetch_size(config.batch, slots.available_permits()).min(room.max(1));
         let fetched = tokio::select! {
             biased;
             exit = halted(&stop, &shutdown) => return exit,

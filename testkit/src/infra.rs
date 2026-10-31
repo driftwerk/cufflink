@@ -286,7 +286,7 @@ async fn spawn_nats_server() -> Option<String> {
 
 async fn start_nats_server(bin: &str, dir: &Path) -> Option<(Child, String)> {
     let mut child = Command::new(bin)
-        .args(["-js", "-p", "0", "--store_dir"])
+        .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--store_dir"])
         .arg(dir)
         .arg("--ports_file_dir")
         .arg(dir)
@@ -723,8 +723,120 @@ pub fn free_port() -> u16 {
     .expect("an unissued port")
 }
 
+pub const PLATFORM_LAUNCHER: &str = "CUFFLINK_TEST_PLATFORM_LAUNCHER";
+
+const SCOPE_STOP_WAIT: Duration = Duration::from_secs(5);
+
+static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Launch {
+    Direct,
+    Launcher,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub unit: String,
+    user: bool,
+}
+
+impl Scope {
+    fn systemctl(&self) -> Command {
+        let (program, first) = if self.user {
+            ("systemctl", "--user")
+        } else {
+            ("sudo", "systemctl")
+        };
+        let mut command = Command::new(program);
+        command.arg(first);
+        command
+    }
+
+    fn name(&self) -> String {
+        format!("{}.scope", self.unit)
+    }
+
+    pub fn cgroup(&self) -> Option<PathBuf> {
+        let shown = self
+            .systemctl()
+            .args(["show", "-p", "ControlGroup", "--value", &self.name()])
+            .output()
+            .ok()?;
+        let group = String::from_utf8(shown.stdout).ok()?;
+        let group = group.trim().trim_start_matches('/');
+        (!group.is_empty()).then(|| Path::new("/sys/fs/cgroup").join(group))
+    }
+
+    pub fn active(&self) -> bool {
+        self.systemctl()
+            .args(["is-active", "--quiet", &self.name()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn stop(&self) {
+        let _ = self
+            .systemctl()
+            .args(["stop", &self.name()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn launched(binary: &Path, variables: &[(String, String)]) -> (Command, Option<Scope>) {
+    let prefix = std::env::var(PLATFORM_LAUNCHER).unwrap_or_default();
+    let mut words = prefix.split_whitespace();
+    let Some(program) = words.next() else {
+        return (direct(binary, variables), None);
+    };
+    let unit = format!(
+        "cufflink-budget-{}-{}",
+        std::process::id(),
+        LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .args(words.map(|word| word.replace("{unit}", &unit)))
+        .args(["env", "-i"])
+        .args(
+            variables
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        )
+        .arg(binary);
+    let user = prefix.split_whitespace().any(|word| word == "--user");
+    (command, Some(Scope { unit, user }))
+}
+
+fn variables(env: &[(&str, &str)], port_var: &str, port: u16) -> Vec<(String, String)> {
+    let mut variables = BTreeMap::from([
+        (
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        ),
+        ("WASM_MEMORY_BUDGET_MODE".to_string(), "off".to_string()),
+    ]);
+    variables.extend(
+        env.iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    variables.insert(port_var.to_string(), port.to_string());
+    variables.into_iter().collect()
+}
+
+fn direct(binary: &Path, variables: &[(String, String)]) -> Command {
+    let mut command = Command::new(binary);
+    command.env_clear().envs(variables.iter().cloned());
+    command
+}
+
 pub struct ChildProcess {
     child: Mutex<Child>,
+    scope: Option<Scope>,
     database_url: Option<String>,
     output: Option<NamedTempFile>,
     pub base_url: String,
@@ -734,13 +846,22 @@ pub struct ChildProcess {
 
 impl ChildProcess {
     pub async fn spawn(binary: &Path, port_var: &str, env: &[(&str, &str)]) -> Self {
+        Self::spawn_as(Launch::Direct, binary, port_var, env).await
+    }
+
+    pub(crate) async fn spawn_as(
+        launch: Launch,
+        binary: &Path,
+        port_var: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
         let _starting = STARTING
             .acquire()
             .await
             .expect("the start gate is never closed");
         let mut exits = Vec::with_capacity(SPAWN_ATTEMPTS);
         for _ in 0..SPAWN_ATTEMPTS {
-            let process = Self::launch(binary, free_port(), port_var, env);
+            let process = Self::launch(launch, binary, free_port(), port_var, env);
             match process.wait_for_health(binary).await {
                 Ok(()) => return process,
                 Err(status) => exits.push((status, process.output_tail())),
@@ -753,16 +874,34 @@ impl ChildProcess {
     }
 
     pub fn launch_unchecked(binary: &Path, port_var: &str, env: &[(&str, &str)]) -> Self {
-        Self::launch(binary, free_port(), port_var, env)
+        Self::launch(Launch::Direct, binary, free_port(), port_var, env)
     }
 
-    fn launch(binary: &Path, port: u16, port_var: &str, env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(binary);
-        command
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .envs(env.iter().copied())
-            .env(port_var, port.to_string());
+    pub(crate) fn launch_unchecked_as(
+        launch: Launch,
+        binary: &Path,
+        port_var: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
+        Self::launch(launch, binary, free_port(), port_var, env)
+    }
+
+    pub fn scope(&self) -> Option<&Scope> {
+        self.scope.as_ref()
+    }
+
+    fn launch(
+        launch: Launch,
+        binary: &Path,
+        port: u16,
+        port_var: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
+        let variables = variables(env, port_var, port);
+        let (mut command, scope) = match launch {
+            Launch::Direct => (direct(binary, &variables), None),
+            Launch::Launcher => launched(binary, &variables),
+        };
         let output = std::env::var("CUFFLINK_TEST_LOG")
             .is_err()
             .then(|| NamedTempFile::new().expect("a file for the child's output"));
@@ -775,6 +914,7 @@ impl ChildProcess {
             .unwrap_or_else(|e| panic!("spawn {}: {e}", binary.display()));
         Self {
             child: Mutex::new(child),
+            scope,
             database_url: env
                 .iter()
                 .find(|(name, _)| *name == "DATABASE_URL")
@@ -979,6 +1119,16 @@ impl ChildProcess {
 
     pub fn kill(&mut self) {
         let mut child = self.child();
+        if let Some(scope) = &self.scope {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let deadline = Instant::now() + SCOPE_STOP_WAIT;
+            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            scope.stop();
+        }
         let _ = child.kill();
         let _ = child.wait();
     }

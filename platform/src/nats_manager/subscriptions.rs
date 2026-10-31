@@ -11,11 +11,11 @@ use crate::nats_manager::pump::{
 use crate::nats_manager::reconciler::{DesiredLoop, RunningLoop, Served, WorkSpec};
 use crate::nats_manager::subjects::{is_valid_publish_subject, PLATFORM_INBOX_PREFIX};
 use crate::registry::ServiceIdentity;
-use crate::router::guest_response::{self, GuestResponse};
+use crate::router::guest_response;
 use crate::schedules::work::ScheduleWork;
 use crate::shutdown::DrainOutcome;
 use crate::tenant_sessions::{Purpose, Statements};
-use crate::wasm_runtime::{ExecutionError, Invocation, InvocationKind};
+use crate::wasm_runtime::{Class, ExecutionError, GuestOutput, Invocation, InvocationKind};
 use crate::AppState;
 use async_nats::jetstream;
 use async_nats::HeaderMap;
@@ -454,6 +454,15 @@ impl Work for SubscriptionWork {
         )
     }
 
+    fn headroom(&self) -> BoxFuture<'_, usize> {
+        match (&self.ctx.handler_type, &self.ctx.state.wasm_engine) {
+            (HandlerType::Wasm, Some(engine)) => engine
+                .headroom(&self.ctx.identity, Some(&self.ctx.handler_name))
+                .boxed(),
+            _ => std::future::ready(usize::MAX).boxed(),
+        }
+    }
+
     fn dead_letter<'a>(
         &'a self,
         msg: &'a jetstream::Message,
@@ -477,13 +486,25 @@ impl Work for SubscriptionWork {
 
 pub(crate) enum HandlerFailure {
     Interrupted(eyre::Report),
+    NotStarted(eyre::Report),
     Failed(eyre::Report),
+    Deferred {
+        after: Duration,
+        reason: eyre::Report,
+    },
+    Settled {
+        outcome: Outcome,
+        reason: eyre::Report,
+    },
 }
 
 impl HandlerFailure {
     pub(crate) fn outcome(&self) -> Outcome {
         match self {
             HandlerFailure::Interrupted(_) => Outcome::Interrupted,
+            HandlerFailure::NotStarted(_) => Outcome::NotStarted,
+            HandlerFailure::Deferred { after, .. } => Outcome::Deferred { after: *after },
+            HandlerFailure::Settled { outcome, .. } => outcome.clone(),
             HandlerFailure::Failed(e) => Outcome::Retry {
                 after: None,
                 reason: e.to_string(),
@@ -499,7 +520,7 @@ impl From<eyre::Report> for HandlerFailure {
 }
 
 enum HandlerOutcome {
-    Rpc(Result<String, HandlerFailure>),
+    Rpc(Result<GuestOutput, HandlerFailure>),
     SideEffect(eyre::Result<()>),
 }
 
@@ -512,7 +533,11 @@ impl HandlerOutcome {
         match self {
             HandlerOutcome::Rpc(Ok(_)) | HandlerOutcome::SideEffect(Ok(())) => None,
             HandlerOutcome::Rpc(Err(
-                HandlerFailure::Interrupted(e) | HandlerFailure::Failed(e),
+                HandlerFailure::Interrupted(e)
+                | HandlerFailure::NotStarted(e)
+                | HandlerFailure::Failed(e)
+                | HandlerFailure::Deferred { reason: e, .. }
+                | HandlerFailure::Settled { reason: e, .. },
             ))
             | HandlerOutcome::SideEffect(Err(e)) => Some(e.to_string()),
         }
@@ -531,18 +556,19 @@ impl HandlerOutcome {
     }
 }
 
-pub(crate) fn answered(response: &str) -> Outcome {
-    let (status, delivery) = match guest_response::decode(response.to_string()) {
-        Ok(GuestResponse::Legacy { status, .. }) => (status, None),
-        Ok(GuestResponse::V2(v2)) => (v2.status, v2.delivery),
-        Err(e) => {
-            return Outcome::Retry {
-                after: None,
-                reason: format!("handler answered an {e}"),
-            }
-        }
-    };
-    match delivery.map(|delivery| *delivery) {
+pub(crate) fn answered(response: &GuestOutput) -> Outcome {
+    match guest_response::answer(response) {
+        Ok(answer) => settled_by(answer),
+        Err(e) => Outcome::Retry {
+            after: None,
+            reason: format!("handler answered an {e}"),
+        },
+    }
+}
+
+fn settled_by(answer: guest_response::Answer) -> Outcome {
+    let guest_response::Answer { status, delivery } = answer;
+    match delivery {
         Some(DeliveryControl::RetryAfter { retry_after_ms }) => Outcome::Retry {
             after: Some(Duration::from_millis(retry_after_ms).min(RETRY_AFTER_MAX)),
             reason: format!("handler asked to be retried ({status})"),
@@ -620,9 +646,14 @@ async fn handle_message(
 
     match (reply_inbox.as_deref(), handled) {
         (Some(inbox), HandlerOutcome::Rpc(Ok(response))) => {
-            publish_reply(&ctx.state.nats, inbox, response).await;
+            publish_reply(&ctx.state.nats, inbox, response.text).await;
         }
-        (Some(inbox), HandlerOutcome::Rpc(Err(HandlerFailure::Failed(e)))) => {
+        (
+            Some(inbox),
+            HandlerOutcome::Rpc(Err(
+                HandlerFailure::Failed(e) | HandlerFailure::Settled { reason: e, .. },
+            )),
+        ) => {
             publish_reply(&ctx.state.nats, inbox, error_envelope(&e.to_string())).await;
         }
         (Some(inbox), HandlerOutcome::Rpc(Err(HandlerFailure::Interrupted(e)))) => {
@@ -630,6 +661,12 @@ async fn handle_message(
                 publish_reply(&ctx.state.nats, inbox, error_envelope(&e.to_string())).await;
             }
         }
+        (
+            Some(_),
+            HandlerOutcome::Rpc(Err(
+                HandlerFailure::Deferred { .. } | HandlerFailure::NotStarted(_),
+            )),
+        ) => {}
         (Some(_), HandlerOutcome::SideEffect(_)) => {
             warn!(
                 "Subscription {} received `{}` for non-RPC handler `{:?}`; ignoring",
@@ -696,7 +733,7 @@ async fn handle_wasm(
     ctx: &SubscriptionContext,
     event: &Value,
     meta: &MessageMeta,
-) -> Result<String, HandlerFailure> {
+) -> Result<GuestOutput, HandlerFailure> {
     run_handler(
         &ctx.state,
         Run {
@@ -719,7 +756,7 @@ async fn handle_wasm(
 pub(crate) async fn run_handler(
     state: &Arc<AppState>,
     run: Run<'_>,
-) -> Result<String, HandlerFailure> {
+) -> Result<GuestOutput, HandlerFailure> {
     let (tenant_slug, service_name, handler_name, what) = (
         run.identity.tenant_slug.as_str(),
         run.identity.service_name.as_str(),
@@ -771,25 +808,44 @@ pub(crate) async fn run_handler(
         "Executing WASM {} handler '{}'", what, handler_name
     );
 
-    let response_str = wasm_engine
-        .run(
+    let identity = service.identity();
+    let response = wasm_engine
+        .run_retrying_capacity(
             state.clone(),
-            Invocation {
-                compiled,
+            InvocationKind::Subscription,
+            request_str,
+            |request_json| Invocation {
+                compiled: Arc::clone(&compiled),
                 handler: handler_name.to_string(),
-                request_json: request_str,
-                identity: service.identity(),
+                request_json,
+                identity: identity.clone(),
                 publishes: service.manifest.publishes.clone(),
                 extensions: service.manifest.extensions.clone(),
                 kind: InvocationKind::Subscription,
                 scope_kind: Some(run.kind),
                 budget: run.budget,
                 cancel: None,
+                class: Class::Background,
+                admission: None,
             },
         )
         .await
         .map_err(|e| {
+            let e = match e {
+                ExecutionError::Undelivered { reason, answer } => {
+                    return HandlerFailure::Settled {
+                        outcome: settled_by(answer),
+                        reason: eyre::eyre!("WASM execution error: {reason}"),
+                    }
+                }
+                e => e,
+            };
             let interrupted = e.interrupted_by_shutdown(state.shutdown.hard_deadline_reached());
+            let not_started = matches!(e, ExecutionError::NotStarted);
+            let deferred = match &e {
+                ExecutionError::Overloaded { retry_after, .. } => Some(*retry_after),
+                _ => None,
+            };
             let report = match e {
                 ExecutionError::DeadlineExceeded { budget } => eyre::eyre!(
                     "WASM {} handler timed out after {}s",
@@ -798,10 +854,14 @@ pub(crate) async fn run_handler(
                 ),
                 other => eyre::eyre!("WASM execution error: {}", other),
             };
-            if interrupted {
-                HandlerFailure::Interrupted(report)
-            } else {
-                HandlerFailure::Failed(report)
+            match (deferred, not_started, interrupted) {
+                (Some(after), _, _) => HandlerFailure::Deferred {
+                    after,
+                    reason: report,
+                },
+                (None, true, _) => HandlerFailure::NotStarted(report),
+                (None, false, true) => HandlerFailure::Interrupted(report),
+                (None, false, false) => HandlerFailure::Failed(report),
             }
         })?;
 
@@ -811,10 +871,10 @@ pub(crate) async fn run_handler(
         "WASM {} handler '{}' completed: {}",
         what,
         handler_name,
-        response_preview(&response_str)
+        response_preview(&response.text)
     );
 
-    Ok(response_str)
+    Ok(response)
 }
 
 fn response_preview(response: &str) -> String {
@@ -1357,6 +1417,92 @@ mod task_tracking_tests {
 #[cfg(test)]
 mod delivery_tests {
     use super::*;
+    use crate::wasm_runtime::budget::Hold;
+
+    fn output(text: &str) -> GuestOutput {
+        GuestOutput {
+            text: text.to_string(),
+            hold: Hold::none(),
+        }
+    }
+
+    #[test]
+    fn a_finished_handler_is_settled_however_full_its_service_is() {
+        use crate::wasm_runtime::budget::testing;
+
+        let (ledger, mut full) = testing::hold(4 * testing::MIB);
+        full.grow(4 * testing::MIB).expect("the budget");
+        let finished = |text: &str| {
+            HandlerOutcome::Rpc(Ok(GuestOutput {
+                text: text.to_string(),
+                hold: full.delivering(),
+            }))
+        };
+        for ack in [AckMode::Always, AckMode::OnSuccess] {
+            assert_eq!(finished(r#"{"ok":true}"#).outcome(ack), Outcome::Ok);
+        }
+        assert_eq!(
+            finished(&format!("\"{}\"", "x".repeat(5 * testing::MIB))).outcome(AckMode::OnSuccess),
+            Outcome::Ok,
+            "an answer too large to read and with nothing to say is settled"
+        );
+        assert_eq!(ledger.in_use(), 4 * testing::MIB);
+    }
+
+    #[test]
+    fn a_large_answer_says_the_same_with_a_budget_as_without_one() {
+        use crate::wasm_runtime::budget::testing;
+
+        let (_ledger, base) = testing::hold(4 * testing::MIB);
+        let pad = "x".repeat(5 * testing::MIB);
+        for raw in [
+            format!(r#"{{"__status":500,"__body":"{pad}"}}"#),
+            format!(r#"{{"__status":422,"__body":"{pad}"}}"#),
+            format!(
+                r#"{{"__v":2,"__status":200,"__delivery":{{"terminal":"poison"}},"__body":"{pad}"}}"#
+            ),
+            format!(
+                r#"{{"__v":2,"__status":200,"__delivery":{{"retry_after_ms":10}},"__body":"{pad}"}}"#
+            ),
+            format!(r#"{{"__v":2,"__status":99,"__body":"{pad}"}}"#),
+        ] {
+            let refused = GuestOutput {
+                text: raw.clone(),
+                hold: base.delivering(),
+            };
+            assert_eq!(answered(&refused), answered(&output(&raw)));
+        }
+    }
+
+    #[test]
+    fn an_answer_past_the_response_cap_settles_as_it_says() {
+        let failure = |status: u16, delivery| HandlerFailure::Settled {
+            outcome: settled_by(guest_response::Answer {
+                status: axum::http::StatusCode::from_u16(status).expect("a status"),
+                delivery,
+            }),
+            reason: eyre::eyre!("past the cap"),
+        };
+        assert_eq!(failure(200, None).outcome(), Outcome::Ok);
+        assert!(matches!(
+            failure(503, None).outcome(),
+            Outcome::Retry { .. }
+        ));
+        assert!(matches!(
+            failure(
+                200,
+                Some(DeliveryControl::Terminal {
+                    terminal: "poison".into()
+                })
+            )
+            .outcome(),
+            Outcome::Terminal { .. }
+        ));
+    }
+
+    fn answered_text(text: &str) -> Outcome {
+        answered(&output(text))
+    }
     use cufflink_types::ConsumerSpec;
 
     fn retried(outcome: Outcome) -> Option<Option<Duration>> {
@@ -1377,14 +1523,14 @@ mod delivery_tests {
             "plain text",
             "",
         ] {
-            assert_eq!(answered(ok), Outcome::Ok, "{ok}");
+            assert_eq!(answered_text(ok), Outcome::Ok, "{ok}");
         }
         for (failed, status) in [
             (r#"{"__status":500,"__body":{"error":"x"}}"#, 500),
             (r#"{"__v":2,"__status":503,"__body":{"error":"x"}}"#, 503),
         ] {
             assert_eq!(
-                answered(failed),
+                answered_text(failed),
                 Outcome::Retry {
                     after: None,
                     reason: format!("handler answered {status}"),
@@ -1396,7 +1542,7 @@ mod delivery_tests {
             (r#"{"__v":2,"__status":422,"__body":{"error":"x"}}"#, 422),
         ] {
             assert_eq!(
-                answered(rejected),
+                answered_text(rejected),
                 Outcome::Terminal {
                     reason: format!("handler rejected the message with {status}"),
                 }
@@ -1407,13 +1553,13 @@ mod delivery_tests {
     #[test]
     fn what_the_handler_asks_for_outweighs_its_status() {
         assert_eq!(
-            retried(answered(
+            retried(answered_text(
                 r#"{"__v":2,"__status":503,"__body":{},"__delivery":{"retry_after_ms":1500}}"#
             )),
             Some(Some(Duration::from_millis(1500)))
         );
         assert_eq!(
-            retried(answered(
+            retried(answered_text(
                 r#"{"__v":2,"__status":200,"__body":{},"__delivery":{"retry_after_ms":0}}"#
             )),
             Some(Some(Duration::ZERO))
@@ -1425,7 +1571,7 @@ mod delivery_tests {
             (3_599_999, Duration::from_millis(3_599_999)),
         ] {
             assert_eq!(
-                retried(answered(&format!(
+                retried(answered_text(&format!(
                     r#"{{"__v":2,"__status":503,"__body":{{}},"__delivery":{{"retry_after_ms":{asked_ms}}}}}"#
                 ))),
                 Some(Some(waits)),
@@ -1437,7 +1583,7 @@ mod delivery_tests {
             "a wait the server can count"
         );
         assert_eq!(
-            answered(
+            answered_text(
                 r#"{"__v":2,"__status":500,"__body":{},"__delivery":{"terminal":"unknown book"}}"#
             ),
             Outcome::Terminal {
@@ -1453,10 +1599,14 @@ mod delivery_tests {
             r#"{"__v":2,"__status":200,"__delivery":{"retry_after_ms":"soon"}}"#,
             r#"{"__v":2,"__status":200,"__delivery":{"terminal":"a","retry_after_ms":1}}"#,
         ] {
-            assert_eq!(retried(answered(unreadable)), Some(None), "{unreadable}");
+            assert_eq!(
+                retried(answered_text(unreadable)),
+                Some(None),
+                "{unreadable}"
+            );
         }
         assert_eq!(
-            answered(r#"{"__status":500,"__delivery":{"terminal":"x"}}"#),
+            answered_text(r#"{"__status":500,"__delivery":{"terminal":"x"}}"#),
             Outcome::Retry {
                 after: None,
                 reason: "handler answered 500".into()
@@ -1467,7 +1617,7 @@ mod delivery_tests {
 
     #[test]
     fn under_always_an_answer_is_a_success() {
-        let failed = || HandlerOutcome::Rpc(Ok(r#"{"__status":500}"#.to_string()));
+        let failed = || HandlerOutcome::Rpc(Ok(output(r#"{"__status":500}"#)));
         assert_eq!(failed().outcome(AckMode::Always), Outcome::Ok);
         assert!(retried(failed().outcome(AckMode::OnSuccess)).is_some());
         let built_in = || HandlerOutcome::SideEffect(Err(eyre::eyre!("no such table")));

@@ -2,8 +2,11 @@ use cufflink_platform::{app, config, shutdown::Shutdown};
 use tokio::net::TcpListener;
 use tracing::info;
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
+    cufflink_platform::wasm_runtime::budget::runtime()?.block_on(run())
+}
+
+async fn run() -> eyre::Result<()> {
     cufflink_telemetry::init(cufflink_telemetry::Component::Platform, &[])?;
 
     let vars = cufflink_settings::from_env()?;

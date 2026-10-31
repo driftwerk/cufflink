@@ -1,9 +1,11 @@
 use crate::errors::{PlatformError, PlatformResult};
 use crate::nats_manager::subjects::{resolve_subject, subject_covers};
 use crate::registry::{RegisteredService, ServiceIdentity};
+use crate::router::charged_guest_text;
 use crate::router::custom::{execute, Execution};
 use crate::router::sse::SseSlot;
-use crate::wasm_runtime::{CompiledModule, InvocationKind};
+use crate::wasm_runtime::budget::{ChargedJson, Hold};
+use crate::wasm_runtime::{Class, CompiledModule, GuestOutput, InvocationKind};
 use crate::AppState;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -252,8 +254,16 @@ struct Reduction {
 }
 
 impl Reduction {
-    fn parse(raw: &str) -> Result<Self, String> {
-        let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    fn read(output: GuestOutput) -> Result<Self, String> {
+        let GuestOutput { text, mut hold } = output;
+        let value = ChargedJson::parse(text.as_bytes(), &mut hold)
+            .map_err(|e| e.to_string())?
+            .value;
+        drop(text);
+        Self::of(value)
+    }
+
+    fn of(value: Value) -> Result<Self, String> {
         if value.get("__status").is_some() {
             return Err(format!("the reducer answered {}", value["__status"]));
         }
@@ -271,27 +281,43 @@ impl Reducer {
         state: &Value,
         message: &async_nats::Message,
     ) -> Result<Reduction, String> {
-        let request = crate::router::guest_json(&self.context.request(
-            &self.service.identity(),
-            &self.handler,
-            state,
-            message_json(message),
-        ))
+        let identity = self.service.identity();
+        let mut held = self
+            .state
+            .wasm_engine
+            .as_ref()
+            .map_or_else(Hold::none, |engine| {
+                engine.hold(
+                    &identity,
+                    Class::Interactive,
+                    &self.handler,
+                    InvocationKind::SseReducer,
+                )
+            });
+        let request = charged_guest_text(
+            &self
+                .context
+                .request(&identity, &self.handler, state, message_json(message)),
+            &mut held,
+        )
         .map_err(|e| e.to_string())?;
-        let raw = execute(
+        let output = execute(
             &self.state,
             Execution {
                 service: &self.service,
                 handler: &self.handler,
                 compiled: self.compiled.clone(),
-                request: &request,
+                request,
                 kind: InvocationKind::SseReducer,
                 budget: REDUCER_BUDGET,
+                class: Class::Interactive,
+                admission: None,
             },
         )
         .await
         .map_err(|e| e.to_string())?;
-        Reduction::parse(&raw)
+        drop(held);
+        Reduction::read(output)
     }
 }
 
@@ -510,6 +536,13 @@ impl Delivery {
 mod tests {
     use super::*;
 
+    fn parsed(raw: &str) -> Result<Reduction, String> {
+        Reduction::read(GuestOutput {
+            text: raw.to_string(),
+            hold: Hold::none(),
+        })
+    }
+
     #[test]
     fn a_reduction_carries_the_principal_of_its_route() {
         let service = ServiceIdentity {
@@ -616,7 +649,7 @@ mod tests {
     #[test]
     fn reductions_come_from_the_reducers_json() {
         assert_eq!(
-            Reduction::parse(
+            parsed(
                 r#"{"events":[{"data":{"type":"all_completed"}}],"state":{"n":2},"close":true}"#
             ),
             Ok(Reduction {
@@ -626,12 +659,12 @@ mod tests {
             })
         );
         assert_eq!(
-            Reduction::parse(r#"{"events":[],"state":null}"#).map(|r| r.close),
+            parsed(r#"{"events":[],"state":null}"#).map(|r| r.close),
             Ok(false)
         );
-        assert!(Reduction::parse(r#"{"__status":400,"__body":{"error":"x"}}"#).is_err());
-        assert!(Reduction::parse("not json").is_err());
-        assert!(Reduction::parse(r#"{"events":[{"event":"a\rb","data":1}]}"#).is_err());
+        assert!(parsed(r#"{"__status":400,"__body":{"error":"x"}}"#).is_err());
+        assert!(parsed("not json").is_err());
+        assert!(parsed(r#"{"events":[{"event":"a\rb","data":1}]}"#).is_err());
     }
 
     #[test]

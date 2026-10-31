@@ -2,14 +2,16 @@ use super::HOP_BY_HOP_HEADERS;
 use crate::errors::{GuestOriginated, PlatformResult};
 use crate::policy::record::LogThrottle;
 use crate::router::sse_bridge::SseSpec;
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Meter, Refused};
+use crate::wasm_runtime::GuestOutput;
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use base64::{engine::general_purpose, Engine};
 use cufflink_storage::ObjectReader;
 use cufflink_types::delivery::{DeliveryControl, DELIVERY_KEY};
 use futures_util::StreamExt;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::future::Future;
 use std::sync::LazyLock;
@@ -87,6 +89,15 @@ pub(crate) trait Bodies {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct GuestResponseError(String);
 
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => error.fmt(f),
+            Self::Refused(refused) => write!(f, "response that could not be held: {refused}"),
+        }
+    }
+}
+
 impl std::fmt::Display for GuestResponseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "invalid response {}", self.0)
@@ -97,41 +108,145 @@ fn invalid(what: impl Into<String>) -> GuestResponseError {
     GuestResponseError(what.into())
 }
 
-pub(crate) fn decode(raw: String) -> Result<GuestResponse, GuestResponseError> {
-    let value: Value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
+#[derive(Debug)]
+pub(crate) enum DecodeError {
+    Invalid(GuestResponseError),
+    Refused(Refused),
+}
+
+impl From<GuestResponseError> for DecodeError {
+    fn from(error: GuestResponseError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+pub(crate) fn parse_output(output: GuestOutput) -> Result<(Value, Hold), Refused> {
+    let GuestOutput { text, mut hold } = output;
+    let charged = text.len();
+    match ChargedJson::parse(text.as_bytes(), &mut hold) {
+        Ok(parsed) => {
+            drop(text);
+            hold.credit(charged);
+            Ok((parsed.value, hold))
+        }
+        Err(ChargedJsonError::Syntax(_)) => Ok((Value::String(text), hold)),
+        Err(ChargedJsonError::Capacity(refused)) => Err(refused),
+    }
+}
+
+pub(crate) fn decode(output: GuestOutput) -> Result<(GuestResponse, Hold), DecodeError> {
+    let (value, mut hold) = parse_output(output).map_err(DecodeError::Refused)?;
+    decode_value(value, &mut hold).map(|response| (response, hold))
+}
+
+pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError> {
+    let text = output.text.as_bytes();
+    let mut hold = output.hold.sibling();
+    let response = match ChargedJson::parse(text, &mut hold) {
+        Ok(parsed) => match decode_value(parsed.value, &mut hold) {
+            Ok(response) => response,
+            Err(DecodeError::Invalid(error)) => return Err(error),
+            Err(DecodeError::Refused(_)) => return outline(text),
+        },
+        Err(ChargedJsonError::Capacity(_)) => return outline(text),
+        Err(ChargedJsonError::Syntax(_)) => GuestResponse::Legacy {
+            status: StatusCode::OK,
+            body: Value::Null,
+        },
+    };
+    Ok(match response {
+        GuestResponse::Legacy { status, .. } => Answer {
+            status,
+            delivery: None,
+        },
+        GuestResponse::V2(v2) => Answer {
+            status: v2.status,
+            delivery: v2.delivery.map(|delivery| *delivery),
+        },
+    })
+}
+
+#[derive(Debug)]
+pub struct Answer {
+    pub status: StatusCode,
+    pub delivery: Option<DeliveryControl>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct Outline<'a> {
+    #[serde(rename = "__v", borrow)]
+    version: Option<&'a RawValue>,
+    #[serde(rename = "__status", borrow)]
+    status: Option<&'a RawValue>,
+    #[serde(rename = "__delivery", borrow)]
+    delivery: Option<&'a RawValue>,
+}
+
+fn status_number(raw: &RawValue) -> Option<u64> {
+    serde_json::from_str(raw.get()).ok()
+}
+
+pub(crate) fn outline(text: &[u8]) -> Result<Answer, GuestResponseError> {
+    let envelope = text
+        .trim_ascii_start()
+        .starts_with(b"{")
+        .then(|| serde_json::from_slice::<Outline>(text).ok())
+        .flatten()
+        .unwrap_or_default();
+    if envelope.version.is_none_or(|version| version.get() != "2") {
+        return Ok(Answer {
+            status: legacy_status(envelope.status.and_then(status_number)),
+            delivery: None,
+        });
+    }
+    Ok(Answer {
+        status: v2_status(envelope.status.and_then(status_number))?,
+        delivery: envelope
+            .delivery
+            .map(|delivery| serde_json::from_str(delivery.get()))
+            .transpose()
+            .map_err(|_| invalid(DELIVERY_KEY))?,
+    })
+}
+
+fn legacy_status(status: Option<u64>) -> StatusCode {
+    StatusCode::from_u16(status.unwrap_or(200) as u16).unwrap_or(StatusCode::OK)
+}
+
+fn v2_status(status: Option<u64>) -> Result<StatusCode, GuestResponseError> {
+    status
+        .and_then(|status| u16::try_from(status).ok())
+        .filter(|status| (200..=599).contains(status))
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .ok_or_else(|| invalid("status"))
+}
+
+fn decode_value(value: Value, hold: &mut Hold) -> Result<GuestResponse, DecodeError> {
     match value {
         Value::Object(envelope) if envelope.get("__v") == Some(&Value::from(2)) => {
-            decode_v2(envelope).map(GuestResponse::V2)
+            decode_v2(envelope, hold).map(GuestResponse::V2)
         }
         legacy => Ok(decode_legacy(legacy)),
     }
 }
 
 fn decode_legacy(value: Value) -> GuestResponse {
-    let (status, body) = match value.get("__status") {
-        Some(status) => (
-            status.as_u64().unwrap_or(200) as u16,
-            value
-                .get("__body")
-                .cloned()
-                .unwrap_or_else(|| value.clone()),
-        ),
-        None => (200, value),
+    let (status, body) = match value {
+        Value::Object(mut envelope) if envelope.contains_key("__status") => {
+            let status = legacy_status(envelope["__status"].as_u64());
+            match envelope.remove("__body") {
+                Some(body) => (status, body),
+                None => (status, Value::Object(envelope)),
+            }
+        }
+        value => (StatusCode::OK, value),
     };
-    GuestResponse::Legacy {
-        status: StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-        body,
-    }
+    GuestResponse::Legacy { status, body }
 }
 
-fn decode_v2(mut envelope: Map<String, Value>) -> Result<V2Response, GuestResponseError> {
-    let status = envelope
-        .get("__status")
-        .and_then(Value::as_u64)
-        .and_then(|status| u16::try_from(status).ok())
-        .filter(|status| (200..=599).contains(status))
-        .and_then(|status| StatusCode::from_u16(status).ok())
-        .ok_or_else(|| invalid("status"))?;
+fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Response, DecodeError> {
+    let status = v2_status(envelope.get("__status").and_then(Value::as_u64))?;
     let (headers, dropped) = headers(envelope.get("__headers"))?;
     let delivery = envelope
         .remove(DELIVERY_KEY)
@@ -142,7 +257,7 @@ fn decode_v2(mut envelope: Map<String, Value>) -> Result<V2Response, GuestRespon
                 .map_err(|_| invalid(DELIVERY_KEY))
         })
         .transpose()?;
-    let body = body(&mut envelope)?;
+    let body = body(&mut envelope, hold)?;
     let bodiless = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
     Ok(V2Response {
         status,
@@ -179,7 +294,7 @@ fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<HeaderName>), GuestR
     )
 }
 
-fn body(envelope: &mut Map<String, Value>) -> Result<V2Body, GuestResponseError> {
+fn body(envelope: &mut Map<String, Value>, hold: &mut Hold) -> Result<V2Body, DecodeError> {
     match (
         envelope.remove("__body"),
         envelope.remove("__body_b64"),
@@ -187,16 +302,18 @@ fn body(envelope: &mut Map<String, Value>) -> Result<V2Body, GuestResponseError>
         envelope.remove("__sse"),
     ) {
         (Some(json), None, None, None) => Ok(V2Body::Json(json)),
-        (None, None, Some(stream), None) => s3_spec(&stream).map(V2Body::S3),
-        (None, None, None, Some(sse)) => SseSpec::parse(&sse)
+        (None, None, Some(stream), None) => Ok(s3_spec(&stream).map(V2Body::S3)?),
+        (None, None, None, Some(sse)) => Ok(SseSpec::parse(&sse)
             .map(|spec| V2Body::Sse(Box::new(spec)))
-            .map_err(invalid),
+            .map_err(invalid)?),
         (None, None, None, None) => Ok(V2Body::Empty),
         (None, Some(encoded), None, None) => {
-            let bytes = encoded
-                .as_str()
-                .and_then(|encoded| general_purpose::STANDARD.decode(encoded).ok())
-                .ok_or_else(|| invalid("__body_b64"))?;
+            let encoded = encoded.as_str().ok_or_else(|| invalid("__body_b64"))?;
+            hold.charge(base64::decoded_len_estimate(encoded.len()))
+                .map_err(DecodeError::Refused)?;
+            let bytes = general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| invalid("__body_b64"))?;
             let content_type = match envelope.get("__content_type") {
                 None => HeaderValue::from_static("application/octet-stream"),
                 Some(content_type) => content_type
@@ -209,9 +326,7 @@ fn body(envelope: &mut Map<String, Value>) -> Result<V2Body, GuestResponseError>
                 bytes: Bytes::from(bytes),
             })
         }
-        _ => Err(invalid(
-            "body: more than one of __body, __body_b64, __stream, __sse",
-        )),
+        _ => Err(invalid("body: more than one of __body, __body_b64, __stream, __sse").into()),
     }
 }
 
@@ -243,43 +358,130 @@ fn s3_spec(stream: &Value) -> Result<S3Spec, GuestResponseError> {
 }
 
 impl GuestResponse {
-    pub(crate) async fn render(self, service: &str, bodies: &mut impl Bodies) -> Response {
+    pub(crate) async fn render(
+        self,
+        service: &str,
+        bodies: &mut impl Bodies,
+        hold: Hold,
+    ) -> Result<Response, Refused> {
         let rendered = match self {
-            GuestResponse::Legacy { status, body } => Ok((status, Json(body)).into_response()),
-            GuestResponse::V2(v2) => render_v2(v2, service, bodies).await,
+            GuestResponse::Legacy { status, body } => Ok(json_response(status, body, hold)?),
+            GuestResponse::V2(v2) => render_v2(v2, service, bodies, hold).await?,
         };
-        match rendered {
+        Ok(match rendered {
             Ok(mut response) => {
                 response.extensions_mut().insert(GuestOriginated);
                 response
             }
             Err(error) => error.into_response(),
-        }
+        })
     }
+}
+
+fn json_response(status: StatusCode, body: Value, tree: Hold) -> Result<Response, Refused> {
+    let mut text = tree.sibling();
+    let written = ChargedJson::write(&body, &mut text);
+    drop(body);
+    drop(tree);
+    Ok(match written {
+        Ok(written) => (
+            status,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            ChargedBody::wrap(Body::from(written), text),
+        )
+            .into_response(),
+        Err(ChargedJsonError::Capacity(refused)) => return Err(refused),
+        Err(ChargedJsonError::Syntax(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            error.to_string(),
+        )
+            .into_response(),
+    })
 }
 
 async fn render_v2(
     v2: V2Response,
     service: &str,
     bodies: &mut impl Bodies,
-) -> PlatformResult<Response> {
+    hold: Hold,
+) -> Result<PlatformResult<Response>, Refused> {
     metrics::counter!("cufflink_guest_response_v2_total", "body" => v2.body.label()).increment(1);
     v2.dropped
         .iter()
         .for_each(|name| dropped_header(service, name));
     let mut response = match v2.body {
         V2Body::Empty => Body::empty().into_response(),
-        V2Body::Json(value) => Json(value).into_response(),
+        V2Body::Json(value) => json_response(StatusCode::OK, value, hold)?,
         V2Body::Bytes {
             content_type,
             bytes,
-        } => ([(header::CONTENT_TYPE, content_type)], bytes).into_response(),
-        V2Body::S3(spec) => stream_object(&spec, bodies.open(&spec).await?),
-        V2Body::Sse(spec) => bodies.sse(*spec)?,
+        } => (
+            [(header::CONTENT_TYPE, content_type)],
+            ChargedBody::wrap(Body::from(bytes), hold),
+        )
+            .into_response(),
+        V2Body::S3(spec) => match bodies.open(&spec).await {
+            Ok(object) => stream_object(&spec, object),
+            Err(error) => return Ok(Err(error)),
+        },
+        V2Body::Sse(spec) => match bodies.sse(*spec) {
+            Ok(response) => response,
+            Err(error) => return Ok(Err(error)),
+        },
     };
     *response.status_mut() = v2.status;
     response.headers_mut().extend(v2.headers);
-    Ok(response)
+    Ok(Ok(response))
+}
+
+pub(crate) struct ChargedBody {
+    inner: Body,
+    hold: Option<Hold>,
+}
+
+impl ChargedBody {
+    pub(crate) fn wrap(inner: Body, mut hold: Hold) -> Body {
+        hold.delivered();
+        match hold.bytes() {
+            0 => inner,
+            _ => Body::new(Self {
+                inner,
+                hold: Some(hold),
+            }),
+        }
+    }
+}
+
+impl http_body::Body for ChargedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            this.hold.take();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn stream_object(spec: &S3Spec, object: ObjectReader) -> Response {
@@ -324,18 +526,22 @@ fn dropped_header(service: &str, name: &HeaderName) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm_runtime::budget::testing::{self, MIB};
+    use crate::wasm_runtime::budget::Ledger;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn legacy(raw: &str) -> (u16, Value) {
-        match decode(raw.to_string()) {
-            Ok(GuestResponse::Legacy { status, body }) => (status.as_u16(), body),
+        match decode(output(raw)) {
+            Ok((GuestResponse::Legacy { status, body }, _)) => (status.as_u16(), body),
             other => panic!("{raw}: {other:?}"),
         }
     }
 
     fn v2(envelope: &Value) -> Result<V2Response, GuestResponseError> {
-        match decode(envelope.to_string())? {
-            GuestResponse::V2(v2) => Ok(v2),
+        match decode(output(&envelope.to_string())) {
+            Ok((GuestResponse::V2(v2), _)) => Ok(v2),
+            Err(DecodeError::Invalid(error)) => Err(error),
             other => panic!("{envelope}: {other:?}"),
         }
     }
@@ -586,11 +792,221 @@ mod tests {
         }
     }
 
+    fn output(raw: &str) -> GuestOutput {
+        GuestOutput {
+            text: raw.to_string(),
+            hold: Hold::none(),
+        }
+    }
+
     async fn rendered(raw: &str) -> Response {
-        decode(raw.to_string())
-            .expect("decodes")
-            .render("svc", &mut Objects)
+        let (response, hold) = decode(output(raw)).expect("decodes");
+        response
+            .render("svc", &mut Objects, hold)
             .await
+            .expect("rendered")
+    }
+
+    async fn charged(raw: &str, budget: usize) -> (Arc<Ledger>, Result<Response, String>) {
+        let (ledger, mut hold) = testing::hold(budget);
+        hold.grow(raw.len()).expect("the response text fits");
+        let text = raw.to_string();
+        let response = match decode(GuestOutput { text, hold }) {
+            Ok((response, hold)) => response
+                .render("svc", &mut Objects, hold)
+                .await
+                .map_err(|refused| refused.to_string()),
+            Err(error) => Err(format!("{error:?}")),
+        };
+        (ledger, response)
+    }
+
+    #[tokio::test]
+    async fn finished_guests_trees_take_turns_under_the_ceiling() {
+        let budget = 100 * MIB;
+        let ceiling = 2 * budget;
+        let (ledger, base) = testing::hold(budget);
+        let mut running = base.sibling();
+        running.grow(budget).expect("other guests fill the budget");
+        let text = format!("[{}]", vec![r#"{"":0}"#; 100_000].join(","));
+        let delivery = || async {
+            let mut hold = base.delivering();
+            hold.force(text.len());
+            hold.make_room(ChargedJson::delivery_bound(text.as_bytes()))
+                .await;
+            let tree = parse_output(GuestOutput {
+                text: text.clone(),
+                hold,
+            })
+            .expect("never refused for what else is running");
+            tokio::task::yield_now().await;
+            let held = ledger.in_use() - ledger.delivering();
+            drop(tree);
+            held
+        };
+        let held = futures_util::future::join_all((0..8).map(|_| delivery())).await;
+        for held in held {
+            assert!(held > budget, "built beside a full budget");
+            assert!(held <= ceiling, "{} MiB", held / MIB);
+        }
+        assert_eq!(ledger.delivering(), 0);
+        drop(running);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_body_waiting_on_its_client_holds_its_text_and_no_room() {
+        let (ledger, base) = testing::hold(64 * MIB);
+        let mut hold = base.delivering();
+        hold.force(MIB);
+        hold.make_room(8 * MIB).await;
+        let body = ChargedBody::wrap(Body::empty(), hold);
+        assert_eq!(ledger.delivering(), 0);
+        assert_eq!(ledger.in_use(), MIB);
+        drop(body);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rendered_body_ends_the_room_its_tree_was_built_in() {
+        let (ledger, base) = testing::hold(64 * MIB);
+        let mut hold = base.delivering();
+        hold.make_room(8 * MIB).await;
+        assert_eq!(ledger.delivering(), 8 * MIB);
+        let (response, hold) = decode(GuestOutput {
+            text: r#"{"ok":true}"#.to_string(),
+            hold,
+        })
+        .expect("decodes");
+        let response = response
+            .render("catalog-service", &mut Objects, hold)
+            .await
+            .expect("not refused");
+        assert_eq!(ledger.delivering(), 0);
+        drop(response);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn an_outline_reads_what_the_tree_reads() {
+        let terminal = r#"{"__v":2,"__status":200,"__delivery":{"terminal":"poison"}}"#;
+        let retried = r#"{"__v":2,"__status":200,"__delivery":{"retry_after_ms":100}}"#;
+        let read = |answer: Result<Answer, GuestResponseError>| {
+            answer.map(|answer| (answer.status.as_u16(), format!("{:?}", answer.delivery)))
+        };
+        for raw in [
+            r#"{"__status":500,"__body":{"error":"down"}}"#,
+            r#"{"__status":99999}"#,
+            r#"{"__status":"500"}"#,
+            r#"{"__status":null}"#,
+            r#"{"ok":true}"#,
+            r#"  {"__status":404}"#,
+            r#"[2,500]"#,
+            r#""text""#,
+            "null",
+            "not json",
+            terminal,
+            retried,
+            r#"{"__v":2,"__status":503,"__delivery":null,"__body":[1,2,3]}"#,
+            r#"{"__v":2,"__status":99}"#,
+            r#"{"__v":2,"__status":"200"}"#,
+            r#"{"__v":2}"#,
+            r#"{"__v":3,"__status":500}"#,
+            r#"{"__v":2,"__status":200,"__delivery":{"unknown":1}}"#,
+        ] {
+            assert_eq!(
+                read(outline(raw.as_bytes())),
+                read(answer(&output(raw))),
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rendered_json_body_is_byte_for_byte_what_axum_writes() {
+        for raw in [
+            r#"{"b":[1.5,1e300,-0.0],"a":"\u00e9\n","c":{"z":null,"y":true}}"#,
+            r#"{"__status":201,"__body":[{"x":1},{"x":2}]}"#,
+            r#"{"__status":202,"kept":"whole"}"#,
+            r#""text""#,
+            "not json at all",
+            r#"{"__v":2,"__status":200,"__body":{"k":[1,2,3]}}"#,
+        ] {
+            let ours = rendered(raw).await;
+            let (status, body) = match decode(output(raw)) {
+                Ok((GuestResponse::Legacy { status, body }, _)) => (status, body),
+                Ok((
+                    GuestResponse::V2(V2Response {
+                        status,
+                        body: V2Body::Json(body),
+                        ..
+                    }),
+                    _,
+                )) => (status, body),
+                other => panic!("{raw}: {other:?}"),
+            };
+            let theirs = (status, axum::Json(body)).into_response();
+            assert_eq!(ours.status(), theirs.status(), "{raw}");
+            assert_eq!(
+                ours.headers()[header::CONTENT_TYPE],
+                theirs.headers()[header::CONTENT_TYPE],
+                "{raw}"
+            );
+            assert_eq!(
+                axum::body::to_bytes(ours.into_body(), 1 << 16)
+                    .await
+                    .expect("ours"),
+                axum::body::to_bytes(theirs.into_body(), 1 << 16)
+                    .await
+                    .expect("theirs"),
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_response_stays_charged_until_its_body_is_sent_or_dropped() {
+        let raw = json!({"rows": vec!["x".repeat(1024); 4096]}).to_string();
+        let (ledger, response) = charged(&raw, 64 * MIB).await;
+        let response = response.expect("rendered");
+        assert!(ledger.in_use() >= raw.len(), "the written text is charged");
+        let body = axum::body::to_bytes(response.into_body(), 64 * MIB)
+            .await
+            .expect("body");
+        assert_eq!(body.len(), raw.len());
+        assert_eq!(ledger.in_use(), 0);
+
+        let (ledger, response) = charged(&raw, 64 * MIB).await;
+        let mut body = response.expect("rendered").into_body().into_data_stream();
+        assert!(ledger.in_use() > 0);
+        drop(body.next());
+        drop(body);
+        assert_eq!(ledger.in_use(), 0, "a client that went away releases it");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_cannot_be_charged_is_refused_and_nothing_stays_held() {
+        let raw = format!("[{}]", vec!["[0]"; 200_000].join(","));
+        let (ledger, response) = charged(&raw, 4 * MIB).await;
+        let error = response.expect_err("refused");
+        assert!(
+            error.contains("Budget") || error.contains("budget"),
+            "{error}"
+        );
+        assert_eq!(ledger.in_use(), 0);
+
+        let bytes = general_purpose::STANDARD.encode(vec![7u8; 3 * MIB]);
+        let envelope = json!({"__v": 2, "__status": 200, "__body_b64": bytes});
+        let Value::Object(envelope) = envelope else {
+            panic!("an object")
+        };
+        let (ledger, mut hold) = testing::hold(2 * MIB);
+        assert!(
+            matches!(decode_v2(envelope, &mut hold), Err(DecodeError::Refused(_))),
+            "the decoded bytes are charged before decoding"
+        );
+        drop(hold);
+        assert_eq!(ledger.in_use(), 0);
     }
 
     #[tokio::test]

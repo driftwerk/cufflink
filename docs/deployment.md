@@ -7,6 +7,58 @@ existed, except where a section says otherwise.
 An install that hosts more than one tenant sets everything
 [tenant isolation](tenant-isolation.md) lists.
 
+## Guest memory budget
+
+`WASM_MEMORY_BUDGET_MODE` ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs))
+bounds what guests in flight together hold, so a burst cannot grow a
+platform or worker past its container's limit.
+
+- **The budget** is the container's limit less the host reserve,
+  `max(256 MiB, 30 %)`. The limit is read from the process's cgroup: the
+  smallest `memory.max` or `memory.high` of its cgroup v2 and every
+  ancestor, or cgroup v1's `hierarchical_memory_limit`. Startup logs the
+  limit, the file it came from, the reserve and the budget. Without a limit
+  the budget is off.
+- **What it counts:** each guest's linear memory and tables, and the stack
+  of every blocking thread that has run a guest, until that thread retires
+  2 s after its last task.
+- **Stacks.** The 2 MiB stack charge (`WASM_THREAD_STACK_KB`) is an upper
+  bound, often about ten times what a thread touches. In a 768 MiB
+  container the 512 MiB budget holds the stacks of 256 invocations, light
+  ones included. For many light concurrent guests, raise the container's
+  memory, lower `WASM_THREAD_STACK_KB` (at least 1024; it sets every runtime
+  thread's stack), or lower `WASM_MAX_CONCURRENT`.
+- **The most it can reach.** Under `enforce`, guests and what the host
+  holds for them never pass the budget, `WASM_MEMORY_DELIVERY_OVERRUN_MB`
+  (half the reserve) and one response (`WASM_MAX_RESPONSE_MB`). On a 2 GiB
+  container with the defaults: budget 1433.6 MiB, overrun 307.2 MiB,
+  response 64 MiB, 1804.8 MiB in all, which leaves 243.2 MiB for the
+  platform's own heap. Startup warns when the three reach the limit.
+- **The largest answer.** An answer whose text, tree and render alone pass
+  the smaller of the overrun and the service share is refused as too large
+  at any load: its effects stand and a route answers `500`. On 2 GiB that
+  is 307 MiB, about 32 MiB of text of small records, or strings up to
+  `WASM_MAX_RESPONSE_MB`. At the 128 MiB floor, for containers up to
+  853 MiB, it is about 13 MiB of records or 42 MiB of strings. Raise
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB`, below the reserve, to deliver more.
+- **What the reserve holds:** the process's baseline, compiled modules, the
+  core threads' stacks and fragmentation. The host buffers of host calls,
+  requests and responses are charged to the budget. On glibc startup sets
+  `M_MMAP_THRESHOLD` to 1 MiB unless the mode is `off`, so freed buffers of
+  a mebibyte or more go back to the kernel; `MALLOC_MMAP_THRESHOLD_` or
+  `GLIBC_TUNABLES` still overrides it.
+- **Redis.** Under `enforce` a guest's Redis reads measure, then reserve,
+  then read, in two `MULTI` blocks of `STRLEN`, `EXISTS` and `GETRANGE`.
+  Give the Redis user those commands with `MULTI` and `EXEC`, and run
+  Redis 7 or later ([v0.35.0](versions.md#features-added-in-v0350)).
+- **Fairness** is per service: a tenant whose services are busy at once
+  can hold up to the whole budget. Lower
+  `WASM_MEMORY_SERVICE_SHARE_PERCENT` where one tenant runs several heavy
+  services beside others.
+- **Soak** in `warn`, the default, and read
+  `cufflink_wasm_admission_refused_total{mode="warn"}` and
+  `cufflink_wasm_memory_denied_total{mode="warn"}` before setting `enforce`.
+
 ## HTTP request layers
 
 `CUFFLINK_HTTP_PROFILE` picks the defaults; each value can be overridden on

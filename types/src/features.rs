@@ -15,6 +15,7 @@ pub const RESPONSE_V2: &str = "response_v2";
 pub const SSE_BRIDGE: &str = "sse_bridge";
 pub const ROUTE_MATCHING: &str = "route_matching";
 pub const ROUTE_LIMITS: &str = "route_limits";
+pub const ROUTE_CONCURRENCY: &str = "route_concurrency";
 pub const ERROR_PROFILE: &str = "error_profile";
 pub const INTERNAL_POSTURE: &str = "internal_posture";
 pub const API_KEY_POSTURE: &str = "api_key_posture";
@@ -49,6 +50,7 @@ pub const PRIVATE_TABLES: &str = "private_tables";
 pub const INACTIVE_DEPLOY: &str = "inactive_deploy";
 pub const CONFIG_APPLY: &str = "config_apply";
 pub const COLUMN_PERMISSIONS: &str = "column_permissions";
+pub const GUEST_MEMORY_BUDGET: &str = "guest_memory_budget";
 
 impl ServiceManifest {
     /// Features this manifest's declared shape requires, sorted and
@@ -393,6 +395,11 @@ mod tests {
                 "/custom_routes/0/audit_redact",
                 |r| r.audit_redact.push("card.number".into()),
                 vec![AUDIT_REDACTION],
+            ),
+            route(
+                "/custom_routes/0/max_concurrent",
+                |r| r.max_concurrent = Some(4),
+                vec![ROUTE_CONCURRENCY],
             ),
             table(
                 "/tables/0/pagination",

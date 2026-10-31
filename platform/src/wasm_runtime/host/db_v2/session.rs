@@ -12,6 +12,7 @@ pub enum AbandonReason {
     Deadline,
     Shutdown,
     Leaked,
+    Unread,
 }
 
 impl AbandonReason {
@@ -21,10 +22,11 @@ impl AbandonReason {
             AbandonReason::Deadline => "deadline",
             AbandonReason::Shutdown => "shutdown",
             AbandonReason::Leaked => "leaked",
+            AbandonReason::Unread => "unread",
         }
     }
 
-    pub(crate) fn of(result: &Result<String, ExecutionError>) -> Self {
+    pub(crate) fn of<T>(result: &Result<T, ExecutionError>) -> Self {
         match result {
             Ok(_) => AbandonReason::Leaked,
             Err(ExecutionError::DeadlineExceeded { .. }) => AbandonReason::Deadline,
@@ -196,21 +198,21 @@ mod tests {
         use std::time::Duration;
         assert_eq!(AbandonReason::of(&Ok(String::new())), AbandonReason::Leaked);
         assert_eq!(
-            AbandonReason::of(&Err(ExecutionError::DeadlineExceeded {
+            AbandonReason::of::<()>(&Err(ExecutionError::DeadlineExceeded {
                 budget: Duration::from_secs(1)
             })),
             AbandonReason::Deadline
         );
         assert_eq!(
-            AbandonReason::of(&Err(ExecutionError::ShuttingDown)),
+            AbandonReason::of::<()>(&Err(ExecutionError::ShuttingDown)),
             AbandonReason::Shutdown
         );
         assert_eq!(
-            AbandonReason::of(&Err(ExecutionError::Trap("unreachable".into()))),
+            AbandonReason::of::<()>(&Err(ExecutionError::Trap("unreachable".into()))),
             AbandonReason::Trap
         );
         assert_eq!(
-            AbandonReason::of(&Err(ExecutionError::Cancelled)),
+            AbandonReason::of::<()>(&Err(ExecutionError::Cancelled)),
             AbandonReason::Trap,
             "a cancelled guest was stopped where it stood, as a trapped one is"
         );

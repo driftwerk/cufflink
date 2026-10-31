@@ -49,6 +49,13 @@ Each replica maintains its own in-memory caches that stay in sync automatically:
 - On cache miss, the module is fetched from object storage and compiled
 - No inter-replica coordination needed since modules are immutable per version
 
+### Guest Memory Budget
+
+- Each replica holds its own budget, derived from its own container's limit
+  ([sizing](deployment.md#guest-memory-budget))
+- Budgets do not add up across replicas for a burst routed to one replica:
+  that replica waits or answers `503` for what it cannot hold
+
 ### Tenant Database Pools
 
 - Each replica maintains its own pool cache (`MAX_TENANT_POOLS`, default 64 tenants; `MAX_CONNS_PER_TENANT`, default 4 connections each)

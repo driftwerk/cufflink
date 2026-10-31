@@ -1,9 +1,10 @@
 use super::body::Part;
-use crate::errors::PlatformResult;
 use crate::policy::{Correction, PolicyKey, Violation};
 use crate::router::postures::{NamedPrincipal, ServiceCaller};
 use crate::tenant_catalog::TenantEntry;
-use axum::body::Bytes;
+use crate::wasm_runtime::budget::{
+    base64_len, stepped, ChargedJson, ChargedJsonError, Hold, Meter, Parsed, Refused,
+};
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose, Engine};
 use cufflink_types::host::request::{GuestRequest, MultipartField};
@@ -89,13 +90,35 @@ fn guest_header_map(
         .collect()
 }
 
-pub(super) fn parse_body(body: &Bytes) -> Value {
+pub(super) fn parse_body<M: Meter + ?Sized>(body: &[u8], meter: &mut M) -> Result<Parsed, Refused> {
     if body.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(body)
-            .unwrap_or(Value::String(String::from_utf8_lossy(body).into_owned()))
+        return Ok(Parsed {
+            value: Value::Null,
+            cost: 0,
+            held: 0,
+        });
     }
+    match ChargedJson::parse(body, meter) {
+        Ok(parsed) => Ok(parsed),
+        Err(ChargedJsonError::Capacity(refused)) => Err(refused),
+        Err(ChargedJsonError::Syntax(_)) => lossy(body, meter),
+    }
+}
+
+fn lossy<M: Meter + ?Sized>(body: &[u8], meter: &mut M) -> Result<Parsed, Refused> {
+    let bound = stepped(match std::str::from_utf8(body) {
+        Ok(_) => body.len(),
+        Err(_) => body.len().saturating_mul(3),
+    });
+    meter.charge(bound)?;
+    let text = String::from_utf8_lossy(body).into_owned();
+    let held = stepped(text.capacity()).min(bound);
+    meter.credit(bound - held);
+    Ok(Parsed {
+        value: Value::String(text),
+        cost: bound,
+        held,
+    })
 }
 
 fn with_params(body: Value, query: &HashMap<String, String>) -> Value {
@@ -188,7 +211,16 @@ pub(super) struct RouteRequest<'a> {
 }
 
 impl RouteRequest<'_> {
-    pub(super) fn into_json(self) -> PlatformResult<Value> {
+    pub(super) fn into_json(self, hold: &Hold) -> Result<(Value, Hold), ChargedJsonError> {
+        let copies: usize = self
+            .v2
+            .as_ref()
+            .and_then(|v2| v2.multipart)
+            .map_or(0, |parts| parts.iter().map(|part| part.data.len()).sum());
+        let mut built = hold.sibling();
+        built
+            .charge(stepped(base64_len(self.raw_body.len())) + stepped(copies))
+            .map_err(ChargedJsonError::Capacity)?;
         let legacy = GuestRequest {
             method: self.method.to_string(),
             handler: self.handler.to_string(),
@@ -202,16 +234,22 @@ impl RouteRequest<'_> {
             caller: self.caller.map(ServiceCaller::to_json),
             ..GuestRequest::default()
         };
-        crate::router::guest_json(&match self.v2 {
+        let request = match self.v2 {
             Some(v2) => v2.onto(legacy),
             None => legacy,
-        })
+        };
+        let mut value = hold.sibling();
+        let parsed = ChargedJson::to_value(&request, &mut value)?;
+        drop(request);
+        drop(built);
+        Ok((parsed.value, value))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
 
     fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -242,13 +280,22 @@ mod tests {
 
     #[test]
     fn body_parses_as_json_or_falls_back_to_text() {
-        assert_eq!(parse_body(&Bytes::new()), Value::Null);
         assert_eq!(
-            parse_body(&Bytes::from_static(b"{\"a\":1}")),
+            parse_body(&Bytes::new(), &mut Hold::none())
+                .expect("parsed")
+                .value,
+            Value::Null
+        );
+        assert_eq!(
+            parse_body(&Bytes::from_static(b"{\"a\":1}"), &mut Hold::none())
+                .expect("parsed")
+                .value,
             json!({"a": 1})
         );
         assert_eq!(
-            parse_body(&Bytes::from_static(b"a=1&b=2")),
+            parse_body(&Bytes::from_static(b"a=1&b=2"), &mut Hold::none())
+                .expect("parsed")
+                .value,
             json!("a=1&b=2")
         );
     }
@@ -314,7 +361,9 @@ mod tests {
             method: "POST",
             handler: "stripe_webhook",
             headers: signed_headers(),
-            body: parse_body(&Bytes::copy_from_slice(body)),
+            body: parse_body(&Bytes::copy_from_slice(body), &mut Hold::none())
+                .expect("parsed")
+                .value,
             raw_body: body,
             query: &query(&[("source", "stripe")]),
             tenant: "acme",
@@ -324,7 +373,8 @@ mod tests {
             caller: None,
             v2: None,
         }
-        .into_json()
+        .into_json(&Hold::none())
+        .map(|(value, _)| value)
         .expect("request")
     }
 
@@ -432,7 +482,8 @@ mod tests {
             caller: None,
             v2: Some(v2),
         }
-        .into_json()
+        .into_json(&Hold::none())
+        .map(|(value, _)| value)
         .expect("request")
     }
 
@@ -572,7 +623,8 @@ mod tests {
             caller: Some(&caller),
             v2: None,
         }
-        .into_json()
+        .into_json(&Hold::none())
+        .map(|(value, _)| value)
         .expect("request");
         assert_eq!(
             request["caller"],

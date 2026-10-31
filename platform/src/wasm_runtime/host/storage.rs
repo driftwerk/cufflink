@@ -1,10 +1,15 @@
 use super::util::{ended, exchange};
 use super::{
-    block_on_bounded, fanout_concurrency, read_guest_string, wrap, BatchResult, HostState,
+    block_on_bounded, fanout_concurrency, read_guest_string, wrap, write_in_order, BatchResult,
+    HostIoError, HostState, ResponseText,
 };
 use crate::policy::Denied;
 use crate::storage::S3Storage;
+use crate::wasm_runtime::budget::{
+    base64_len, s3_host_bytes, ChargedJsonError, Hold, HostCaps, Refused,
+};
 use crate::wasm_runtime::storage_scope;
+use base64::{engine::general_purpose, Engine};
 use cufflink_storage::UploadOptions;
 use cufflink_types::host::storage::{
     HeadRequest, HeadResponse, StorageErrorEnvelope, StorageErrorKind, UploadRequest,
@@ -12,6 +17,7 @@ use cufflink_types::host::storage::{
 };
 use reqwest::header::HeaderValue;
 use std::collections::HashSet;
+use std::sync::Arc;
 use wasmtime::{Caller, Linker};
 
 pub(super) fn register(
@@ -46,25 +52,36 @@ pub(super) fn register(
                 return -1;
             }
 
+            caller.data_mut().clear_host_response();
             let app_state = caller.data().app_state.clone();
+            let limits = Arc::clone(&caller.data().limits);
+            let mut hold = caller.data().hold();
 
             let result = block_on_bounded(&caller.data().bounds(), async {
                 let storage = app_state
                     .storage
                     .as_ref()
-                    .ok_or_else(|| eyre::eyre!("S3 storage not configured"))?;
-
-                let data = storage.download_from_bucket(&bucket, &key).await?;
-
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                Ok::<String, eyre::Report>(b64)
+                    .ok_or_else(|| Fetch::Failed(eyre::eyre!("S3 storage not configured")))?;
+                let bytes = fetch_object(
+                    storage,
+                    &bucket,
+                    &key,
+                    &mut hold,
+                    &limits.budget.caps,
+                    "s3_download",
+                )
+                .await?;
+                Ok::<String, Fetch>(general_purpose::STANDARD.encode(bytes))
             });
 
             match result {
                 Ok(b64) => {
-                    caller.data_mut().host_response = Some(b64);
+                    hold.shrink_to(b64.capacity());
+                    caller.data_mut().set_charged_response(b64, hold);
                     0
+                }
+                Err(HostIoError::Failed(Fetch::Refused(refused))) => {
+                    caller.data_mut().refused(refused)
                 }
                 Err(e) => {
                     tracing::error!("[wasm] s3_download error: {}", e);
@@ -79,12 +96,12 @@ pub(super) fn register(
         names,
         "s3_download_many",
         |mut caller: Caller<'_, HostState>, items_ptr: i32, items_len: i32| -> i32 {
-            let items_json = host_try!(read_guest_string(
-                &mut caller,
-                "s3_download_many",
-                items_ptr,
-                items_len
-            ));
+            const PATH: &str = "s3_download_many";
+            let items_json = host_try!(read_guest_string(&mut caller, PATH, items_ptr, items_len));
+            let mut parsed = caller.data().hold();
+            if let Err(capacity) = parsed.grow(items_json.len()) {
+                return caller.data_mut().refused(Refused::Budget(capacity));
+            }
             let items: Vec<S3Item> = match serde_json::from_str(&items_json) {
                 Ok(v) => v,
                 Err(e) => {
@@ -92,54 +109,62 @@ pub(super) fn register(
                     return -1;
                 }
             };
-            let items: Vec<(S3Item, bool)> = items
+            drop(items_json);
+            let limits = Arc::clone(&caller.data().limits);
+            let caps = &limits.budget.caps;
+            if let Err(cap) = caps.fanout(PATH, items.len()) {
+                return caller.data_mut().refused(Refused::Cap(cap));
+            }
+            let items: Vec<(S3Item, bool, Hold)> = items
                 .into_iter()
                 .map(|item| {
                     let permitted = caller.data().authorize_storage(&item.bucket, &[&item.key]);
-                    (item, permitted)
+                    (item, permitted, parsed.sibling())
                 })
                 .collect();
+            caller.data_mut().clear_host_response();
             let app_state = caller.data().app_state.clone();
+            let mut hold = caller.data().hold();
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state.storage.as_ref().cloned();
-                let permits = fanout_concurrency();
-                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
-                let futs = items.into_iter().map(|(item, permitted)| {
-                    let sem = sem.clone();
-                    let storage = storage.clone();
-                    async move {
-                        if !permitted {
-                            return BatchResult::err("storage access denied");
-                        }
-                        let _p = sem.acquire_owned().await.ok();
-                        let storage = match storage.as_ref() {
-                            Some(s) => s,
-                            None => {
-                                return BatchResult::err("S3 storage not configured");
-                            }
-                        };
-                        match storage.download_from_bucket(&item.bucket, &item.key).await {
-                            Ok(bytes) => {
-                                use base64::Engine;
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                BatchResult::ok(serde_json::json!({ "data_b64": b64 }))
-                            }
-                            Err(e) => BatchResult::err(&e.to_string()),
-                        }
-                    }
-                });
-                let results: Vec<BatchResult> = futures_util::future::join_all(futs)
-                    .await
+                let storage = app_state.storage.as_ref();
+                let fetches = items
                     .into_iter()
-                    .collect();
-                Ok::<String, eyre::Report>(serde_json::to_string(&results)?)
+                    .map(|(item, permitted, mut held)| async move {
+                        if !permitted {
+                            return Ok((BatchResult::err("storage access denied"), held));
+                        }
+                        let Some(storage) = storage else {
+                            return Ok((BatchResult::err("S3 storage not configured"), held));
+                        };
+                        match fetch_object(storage, &item.bucket, &item.key, &mut held, caps, PATH)
+                            .await
+                        {
+                            Ok(bytes) => {
+                                let b64 = general_purpose::STANDARD.encode(bytes);
+                                Ok((
+                                    BatchResult::ok(serde_json::json!({ "data_b64": b64 })),
+                                    held,
+                                ))
+                            }
+                            Err(Fetch::Failed(e)) => Ok((BatchResult::err(&e.to_string()), held)),
+                            Err(Fetch::Refused(refused)) => Err(refused),
+                        }
+                    });
+                let mut text = ResponseText::new(&mut hold, caps, PATH);
+                write_in_order(fetches, fanout_concurrency(), &mut text)
+                    .await
+                    .map(|()| text.into_text())
             });
+            drop(parsed);
 
             match result {
-                Ok(json) => {
-                    caller.data_mut().host_response = Some(json);
+                Ok(text) => {
+                    caller.data_mut().set_charged_response(text, hold);
                     0
+                }
+                Err(HostIoError::Failed(ChargedJsonError::Capacity(refused))) => {
+                    caller.data_mut().refused(refused)
                 }
                 Err(e) => {
                     tracing::error!("[wasm] s3_download_many error: {}", e);
@@ -200,10 +225,7 @@ pub(super) fn register(
             });
 
             match result {
-                Ok(url) => {
-                    caller.data_mut().host_response = Some(url);
-                    0
-                }
+                Ok(url) => caller.data_mut().respond("s3_presign_upload", url),
                 Err(e) => {
                     tracing::error!("[wasm] s3_presign_upload error: {}", e);
                     -1
@@ -255,10 +277,7 @@ pub(super) fn register(
             });
 
             match result {
-                Ok(url) => {
-                    caller.data_mut().host_response = Some(url);
-                    0
-                }
+                Ok(url) => caller.data_mut().respond("s3_presign_download", url),
                 Err(e) => {
                     tracing::error!("[wasm] s3_presign_download error: {}", e);
                     -1
@@ -317,6 +336,84 @@ pub(super) fn register(
     )?;
 
     Ok(())
+}
+
+pub(crate) enum Fetch {
+    Refused(Refused),
+    Failed(eyre::Report),
+}
+
+impl std::fmt::Display for Fetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refused) => refused.fmt(f),
+            Self::Failed(e) => e.fmt(f),
+        }
+    }
+}
+
+pub(super) async fn fetch_object(
+    storage: &S3Storage,
+    bucket: &str,
+    key: &str,
+    hold: &mut Hold,
+    caps: &HostCaps,
+    path: &'static str,
+) -> Result<Vec<u8>, Fetch> {
+    read_object(storage, bucket, key, |size| {
+        caps.response(
+            path,
+            base64_len(usize::try_from(size).unwrap_or(usize::MAX)),
+        )
+        .map_err(Refused::Cap)?;
+        hold.grow(s3_host_bytes(size)).map_err(Refused::Budget)
+    })
+    .await
+}
+
+pub(crate) async fn read_object(
+    storage: &S3Storage,
+    bucket: &str,
+    key: &str,
+    reserve: impl FnOnce(u64) -> Result<(), Refused>,
+) -> Result<Vec<u8>, Fetch> {
+    let failed = || {
+        eyre::eyre!(
+            "{} download failed for {bucket}/{key}",
+            storage.backend_kind()
+        )
+    };
+    let size = match storage.head_in_bucket(bucket, key).await {
+        Ok(Some(meta)) => meta.size,
+        Ok(None) => return Err(Fetch::Failed(failed())),
+        Err(e) => return Err(Fetch::Failed(e.wrap_err(failed()))),
+    };
+    reserve(size).map_err(Fetch::Refused)?;
+    let reader = match storage.open_read(bucket, key).await {
+        Ok(Some(reader)) => reader,
+        Ok(None) => return Err(Fetch::Failed(failed())),
+        Err(e) => return Err(Fetch::Failed(e.wrap_err(failed()))),
+    };
+    read_within(reader.stream, size)
+        .await
+        .map_err(|e| Fetch::Failed(e.wrap_err(failed())))
+}
+
+async fn read_within(
+    mut stream: futures_util::stream::BoxStream<'static, eyre::Result<bytes::Bytes>>,
+    size: u64,
+) -> eyre::Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let size = usize::try_from(size)?;
+    let mut bytes = Vec::with_capacity(size);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if chunk.len() > size - bytes.len() {
+            eyre::bail!("the object grew past the {size} bytes it was read for");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[derive(serde::Deserialize)]
@@ -657,5 +754,205 @@ mod v2_tests {
                 "{request:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::policy::PolicyMode;
+    use crate::wasm_runtime::budget::testing::{self, MIB};
+    use std::time::Duration;
+
+    async fn stored(objects: &[(&str, Vec<u8>)]) -> S3Storage {
+        let storage = S3Storage::from_inner(cufflink_storage::in_memory("media"));
+        for (key, bytes) in objects {
+            storage
+                .upload_to_bucket("media", key, bytes.clone(), "application/octet-stream")
+                .await
+                .expect("stored");
+        }
+        storage
+    }
+
+    fn enforced() -> HostCaps {
+        HostCaps {
+            mode: PolicyMode::Enforce,
+            ..HostCaps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_object_is_read_under_its_reservation_and_a_missing_one_fails_as_before() {
+        let storage = stored(&[("a.bin", vec![7; 3 * MIB])]).await;
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        let bytes = fetch_object(
+            &storage,
+            "media",
+            "a.bin",
+            &mut hold,
+            &enforced(),
+            "s3_download",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(bytes, vec![7; 3 * MIB]);
+        assert_eq!(ledger.in_use(), 7 * MIB, "the bytes and their base64");
+        drop(hold);
+        assert_eq!(ledger.in_use(), 0);
+
+        let before = storage
+            .download_from_bucket("media", "gone")
+            .await
+            .expect_err("missing")
+            .to_string();
+        let (_, mut hold) = testing::hold(64 * MIB);
+        match fetch_object(
+            &storage,
+            "media",
+            "gone",
+            &mut hold,
+            &enforced(),
+            "s3_download",
+        )
+        .await
+        {
+            Err(Fetch::Failed(e)) => assert_eq!(e.to_string(), before),
+            other => panic!(
+                "{}",
+                other.map_or_else(|e| e.to_string(), |_| "read".into())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_object_past_the_response_cap_or_the_budget_is_refused_before_it_is_read() {
+        let storage = stored(&[("a.bin", vec![1; 4 * MIB])]).await;
+        let capped = HostCaps {
+            response: 4 * MIB,
+            ..enforced()
+        };
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        assert!(matches!(
+            fetch_object(
+                &storage,
+                "media",
+                "a.bin",
+                &mut hold,
+                &capped,
+                "s3_download"
+            )
+            .await,
+            Err(Fetch::Refused(Refused::Cap(_)))
+        ));
+        assert_eq!(ledger.in_use(), 0);
+        let warned = HostCaps {
+            mode: PolicyMode::Warn,
+            ..capped
+        };
+        assert!(
+            fetch_object(
+                &storage,
+                "media",
+                "a.bin",
+                &mut hold,
+                &warned,
+                "s3_download"
+            )
+            .await
+            .is_ok(),
+            "warn counts and reads"
+        );
+        drop(hold);
+
+        let (ledger, mut hold) = testing::hold(8 * MIB);
+        assert!(matches!(
+            fetch_object(
+                &storage,
+                "media",
+                "a.bin",
+                &mut hold,
+                &enforced(),
+                "s3_download"
+            )
+            .await,
+            Err(Fetch::Refused(Refused::Budget(_)))
+        ));
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_read_stops_at_the_size_it_was_reserved_for() {
+        let chunks = futures_util::stream::iter([
+            Ok(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::from_static(b"def")),
+        ]);
+        assert_eq!(
+            read_within(Box::pin(chunks), 6).await.expect("fits"),
+            b"abcdef"
+        );
+        let chunks = futures_util::stream::iter([
+            Ok(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::from_static(b"def")),
+        ]);
+        assert!(read_within(Box::pin(chunks), 5).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fan_out_results_keep_their_order_and_the_envelope_is_unchanged() {
+        let results = || {
+            vec![
+                BatchResult::ok(serde_json::json!({"data_b64": "AQI="})),
+                BatchResult::err("storage access denied"),
+                BatchResult::ok(serde_json::json!({"data_b64": ""})),
+            ]
+        };
+        let expected = serde_json::to_string(&results()).expect("json");
+        let delays = [30u64, 0, 10];
+        let fetches = results()
+            .into_iter()
+            .zip(delays)
+            .map(|(result, delay)| async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                Ok((result, Hold::none()))
+            });
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        let caps = enforced();
+        let mut text = ResponseText::new(&mut hold, &caps, "s3_download_many");
+        write_in_order(fetches, 3, &mut text)
+            .await
+            .expect("written");
+        assert_eq!(text.into_text(), expected);
+        assert_eq!(hold.bytes(), ledger.in_use());
+
+        let refused = Refused::Budget(crate::wasm_runtime::budget::Capacity {
+            reason: crate::wasm_runtime::budget::Reason::Memory,
+            requested: 1,
+            holding: 1,
+        });
+        let fetches = [Ok((BatchResult::err("x"), Hold::none())), Err(refused)]
+            .into_iter()
+            .map(std::future::ready);
+        let mut hold = Hold::none();
+        let mut text = ResponseText::new(&mut hold, &caps, "s3_download_many");
+        assert!(matches!(
+            write_in_order(fetches, 2, &mut text).await,
+            Err(ChargedJsonError::Capacity(_))
+        ));
+    }
+
+    #[test]
+    fn response_text_is_held_to_a_cap_smaller_than_its_charge_step() {
+        let caps = HostCaps {
+            response: 64 * 1024,
+            ..enforced()
+        };
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        let mut text = ResponseText::new(&mut hold, &caps, "s3_download_many");
+        text.push(&"x".repeat(64 * 1024)).expect("at the cap");
+        assert!(matches!(text.push("x"), Err(Refused::Cap(_))));
+        drop(text);
+        assert_eq!(hold.bytes(), 64 * 1024);
+        assert_eq!(ledger.in_use(), 64 * 1024);
     }
 }

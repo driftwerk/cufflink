@@ -1,7 +1,7 @@
 use super::*;
 use crate::repo::wasm_jobs::{JobStatus, WasmJob};
 use crate::router::jobs::state::tests::job;
-use crate::router::jobs::state::{classify, decide_job, Attempt, JobDecision, JobErrorClass};
+use crate::router::jobs::state::{classified, decide_job, Attempt, JobDecision, JobErrorClass};
 use crate::wasm_runtime::ExecutionError;
 use chrono::{DateTime, Utc};
 use cufflink_types::{features, JobConfig};
@@ -79,7 +79,7 @@ fn a_handlers_error_or_timeout_is_never_attempted_again() {
                 "handle_run_report_job".into(),
             )),
         ] {
-            let Attempt::Failed { class, error } = classify(run, &first, false) else {
+            let Attempt::Failed { class, error } = classified(run, &first, false, 10) else {
                 panic!("a failed attempt");
             };
             assert_eq!(after(&first, &class), JobDecision::Fail, "{error}");
@@ -91,7 +91,8 @@ fn a_handlers_error_or_timeout_is_never_attempted_again() {
 fn a_crash_is_attempted_again_while_attempts_remain() {
     for config in sample_jobs() {
         let crash = || Err(ExecutionError::Runtime("the worker's task ended".into()));
-        let Attempt::Failed { class, .. } = classify(crash(), &enqueued(&config, 1), false) else {
+        let Attempt::Failed { class, .. } = classified(crash(), &enqueued(&config, 1), false, 10)
+        else {
             panic!("a failed attempt");
         };
         assert_eq!(class, JobErrorClass::Crash);
@@ -113,7 +114,7 @@ fn what_the_handler_answered_is_the_jobs_result_whatever_it_says() {
         json!({"error": "budget exhausted"}),
     ] {
         assert_eq!(
-            classify(Ok(answer.to_string()), &enqueued(&long, 1), false),
+            classified(Ok(answer.to_string()), &enqueued(&long, 1), false, 10),
             Attempt::Completed(answer)
         );
     }

@@ -22,6 +22,7 @@ pub(crate) use request::{strip_credential_headers, StrictTarget};
 pub(crate) const FEATURES: &[&str] = &[
     cufflink_types::features::ROUTE_MATCHING,
     cufflink_types::features::ROUTE_LIMITS,
+    cufflink_types::features::ROUTE_CONCURRENCY,
     cufflink_types::features::RESPONSE_V2,
     cufflink_types::features::ERROR_PROFILE,
     cufflink_types::features::SSE_BRIDGE,

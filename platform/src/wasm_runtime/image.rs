@@ -1,3 +1,5 @@
+use super::budget::{Hold, HostCaps, Refused, IMAGE_BYTES_PER_PIXEL, IMAGE_MAX_SIDE};
+use super::host::{read_object, Fetch};
 use crate::storage::S3Storage;
 use eyre::{Result, WrapErr};
 use image::{
@@ -5,9 +7,11 @@ use image::{
     RgbImage,
 };
 use std::io::Cursor;
+use std::sync::Arc;
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Format {
+pub enum Format {
     Jpeg,
     Webp,
     Avif,
@@ -31,7 +35,7 @@ impl Format {
         }
     }
 
-    fn encode(self, img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    pub fn encode(self, img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
         match self {
             Format::Jpeg => encode_jpeg(img, quality),
             Format::Webp => encode_webp(img, quality),
@@ -40,90 +44,201 @@ impl Format {
     }
 }
 
+pub(crate) struct ImageBudget<'a> {
+    pub caps: &'a HostCaps,
+    pub share: Option<usize>,
+    pub path: &'static str,
+}
+
+impl ImageBudget<'_> {
+    pub(crate) fn source(&self, size: u64, hold: &mut Hold) -> Result<(), Refused> {
+        self.caps
+            .check(self.path, "image_input", size, self.caps.image_input as u64)
+            .map_err(Refused::Cap)?;
+        hold.grow(usize::try_from(size).unwrap_or(usize::MAX))
+            .map_err(Refused::Budget)
+    }
+
+    pub(crate) fn targets(&self, count: usize) -> Result<(), Refused> {
+        self.caps
+            .check(
+                self.path,
+                "image_targets",
+                count as u64,
+                self.caps.image_targets as u64,
+            )
+            .map_err(Refused::Cap)
+    }
+
+    fn decode(&self, source: &[u8], held: &Hold) -> Result<(Hold, image::Limits), Fetch> {
+        let (width, height) = ImageReader::new(Cursor::new(source))
+            .with_guessed_format()
+            .wrap_err("failed to guess image format")
+            .and_then(|reader| {
+                reader
+                    .into_dimensions()
+                    .wrap_err("failed to read image dimensions")
+            })
+            .map_err(Fetch::Failed)?;
+        let pixels = u64::from(width) * u64::from(height);
+        self.caps
+            .check(
+                self.path,
+                "image_pixels",
+                pixels,
+                self.caps.image_pixels(self.share),
+            )
+            .map_err(|cap| Fetch::Refused(Refused::Cap(cap)))?;
+        let bytes =
+            usize::try_from(pixels.saturating_mul(IMAGE_BYTES_PER_PIXEL)).unwrap_or(usize::MAX);
+        let mut decode = held.sibling();
+        decode
+            .grow(bytes)
+            .map_err(|capacity| Fetch::Refused(Refused::Budget(capacity)))?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(IMAGE_MAX_SIDE);
+        limits.max_image_height = Some(IMAGE_MAX_SIDE);
+        limits.max_alloc = Some(pixels.saturating_mul(IMAGE_BYTES_PER_PIXEL));
+        Ok((decode, limits))
+    }
+}
+
+pub(crate) struct Source {
+    bytes: Vec<u8>,
+    hold: Hold,
+}
+
+impl Source {
+    pub(crate) async fn read(
+        storage: &S3Storage,
+        budget: &ImageBudget<'_>,
+        bucket: &str,
+        key: &str,
+        mut hold: Hold,
+    ) -> Result<Self, Fetch> {
+        let bytes =
+            read_object(storage, bucket, key, |size| budget.source(size, &mut hold)).await?;
+        Ok(Self { bytes, hold })
+    }
+}
+
+struct Decoded {
+    image: DynamicImage,
+    _hold: Hold,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transform(
     storage: &S3Storage,
+    budget: &ImageBudget<'_>,
     bucket: &str,
-    in_key: &str,
+    source: Source,
     out_key: &str,
     max_dim: u32,
     quality: u8,
     format: Format,
-) -> Result<u32> {
-    let original = storage.download_from_bucket(bucket, in_key).await?;
-
-    let encoded = tokio::task::spawn_blocking(move || {
-        let img = decode_and_resize(&original, max_dim)?;
-        format.encode(&img, quality)
+) -> Result<u32, Fetch> {
+    let (hold, limits) = budget.decode(&source.bytes, &source.hold)?;
+    let (encoded, _encoded_hold) = tokio::task::spawn_blocking(move || {
+        let Source {
+            bytes,
+            hold: source_hold,
+        } = source;
+        let img = decode_oriented(&bytes, limits)?;
+        drop((bytes, source_hold));
+        format
+            .encode(&resize_to(&img, max_dim), quality)
+            .map(|encoded| (encoded, hold))
     })
     .await
-    .wrap_err("image transform task panicked")??;
+    .wrap_err("image transform task panicked")
+    .and_then(|encoded| encoded)
+    .map_err(Fetch::Failed)?;
 
     let bytes_written = encoded.len() as u32;
     storage
         .upload_to_bucket(bucket, out_key, encoded, format.content_type())
-        .await?;
+        .await
+        .map_err(Fetch::Failed)?;
     Ok(bytes_written)
 }
 
 pub(crate) async fn transform_multi(
     storage: &S3Storage,
+    budget: &ImageBudget<'_>,
     bucket: &str,
-    in_key: &str,
+    source: Source,
     targets: Vec<(String, u32, u8, Format)>,
-) -> Result<Vec<u32>> {
-    let original = storage.download_from_bucket(bucket, in_key).await?;
-    let specs: Vec<(u32, u8, Format)> = targets
-        .iter()
-        .map(|(_, dim, q, f)| (*dim, *q, *f))
-        .collect();
-
-    let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
-        let img = decode_oriented(&original)?;
-        specs
-            .iter()
-            .map(|(max_dim, quality, format)| format.encode(&resize_to(&img, *max_dim), *quality))
-            .collect()
+) -> Result<Vec<u32>, Fetch> {
+    let (hold, limits) = budget.decode(&source.bytes, &source.hold)?;
+    let decoded = tokio::task::spawn_blocking(move || {
+        let Source {
+            bytes,
+            hold: _source,
+        } = source;
+        decode_oriented(&bytes, limits).map(|image| Arc::new(Decoded { image, _hold: hold }))
     })
     .await
-    .wrap_err("image transform task panicked")??;
+    .wrap_err("image transform task panicked")
+    .and_then(|decoded| decoded)
+    .map_err(Fetch::Failed)?;
 
-    let mut sizes = Vec::with_capacity(encoded.len());
-    for ((out_key, _, _, format), bytes) in targets.iter().zip(encoded) {
-        sizes.push(bytes.len() as u32);
+    let mut sizes = Vec::with_capacity(targets.len());
+    for (out_key, max_dim, quality, format) in targets {
+        let decoded = Arc::clone(&decoded);
+        let encoded = tokio::task::spawn_blocking(move || {
+            format.encode(&resize_to(&decoded.image, max_dim), quality)
+        })
+        .await
+        .wrap_err("image transform task panicked")
+        .and_then(|encoded| encoded)
+        .map_err(Fetch::Failed)?;
+        sizes.push(encoded.len() as u32);
         storage
-            .upload_to_bucket(bucket, out_key, bytes, format.content_type())
-            .await?;
+            .upload_to_bucket(bucket, &out_key, encoded, format.content_type())
+            .await
+            .map_err(Fetch::Failed)?;
     }
     Ok(sizes)
 }
 
-fn decode_oriented(input: &[u8]) -> Result<RgbImage> {
+#[doc(hidden)]
+pub fn decode_oriented(input: &[u8], limits: image::Limits) -> Result<DynamicImage> {
     let mut decoder = ImageReader::new(Cursor::new(input))
         .with_guessed_format()
         .wrap_err("failed to guess image format")?
         .into_decoder()
         .wrap_err("failed to build image decoder")?;
+    decoder
+        .set_limits(limits)
+        .wrap_err("the image is larger than its reservation")?;
     let orientation = decoder
         .orientation()
         .wrap_err("failed to read image orientation")?;
     let mut decoded =
         DynamicImage::from_decoder(decoder).wrap_err("failed to decode source image")?;
     decoded.apply_orientation(orientation);
-    Ok(decoded.to_rgb8())
+    Ok(DynamicImage::ImageRgb8(decoded.to_rgb8()))
 }
 
-fn resize_to(img: &RgbImage, max_dim: u32) -> RgbImage {
-    let (w, h) = img.dimensions();
+#[doc(hidden)]
+pub fn resize_to(img: &DynamicImage, max_dim: u32) -> RgbImage {
+    let (w, h) = (img.width(), img.height());
     if max_dim > 0 && w.max(h) > max_dim {
         let (new_w, new_h) = scaled_dims(w, h, max_dim);
-        image::imageops::resize(img, new_w, new_h, FilterType::Lanczos3)
+        img.resize_exact(new_w, new_h, FilterType::Lanczos3)
+            .into_rgb8()
     } else {
-        img.clone()
+        img.to_rgb8()
     }
 }
 
+#[cfg(test)]
 fn decode_and_resize(input: &[u8], max_dim: u32) -> Result<RgbImage> {
-    Ok(resize_to(&decode_oriented(input)?, max_dim))
+    Ok(resize_to(
+        &decode_oriented(input, image::Limits::default())?,
+        max_dim,
+    ))
 }
 
 fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
@@ -299,7 +414,8 @@ mod tests {
 
     #[test]
     fn resize_to_caps_or_clones() {
-        let img = decode_oriented(&synthetic_jpeg(4000, 3000)).expect("decode");
+        let img =
+            decode_oriented(&synthetic_jpeg(4000, 3000), image::Limits::default()).expect("decode");
         assert_eq!(resize_to(&img, 2048).dimensions(), (2048, 1536));
         assert_eq!(resize_to(&img, 0).dimensions(), (4000, 3000));
         assert_eq!(resize_to(&img, 5000).dimensions(), (4000, 3000));
@@ -316,11 +432,164 @@ mod tests {
 
     #[test]
     fn one_decode_yields_independent_sizes() {
-        let img = decode_oriented(&synthetic_jpeg(2000, 1000)).expect("decode");
+        let img =
+            decode_oriented(&synthetic_jpeg(2000, 1000), image::Limits::default()).expect("decode");
         let sizes: Vec<_> = [256u32, 1024, 2048]
             .iter()
             .map(|d| resize_to(&img, *d).dimensions())
             .collect();
         assert_eq!(sizes, vec![(256, 128), (1024, 512), (2000, 1000)]);
+    }
+
+    mod budgeted {
+        use super::*;
+        use crate::policy::PolicyMode;
+        use crate::wasm_runtime::budget::testing::{self, MIB};
+
+        fn enforced() -> HostCaps {
+            HostCaps {
+                mode: PolicyMode::Enforce,
+                ..HostCaps::default()
+            }
+        }
+
+        fn image_budget(caps: &HostCaps, share: Option<usize>) -> ImageBudget<'_> {
+            ImageBudget {
+                caps,
+                share,
+                path: "image_transform_multi",
+            }
+        }
+
+        async fn stored(bytes: Vec<u8>) -> S3Storage {
+            let storage = S3Storage::from_inner(cufflink_storage::in_memory("media"));
+            storage
+                .upload_to_bucket("media", "in.jpg", bytes, "image/jpeg")
+                .await
+                .expect("stored");
+            storage
+        }
+
+        fn refused(result: Result<impl Sized, Fetch>) -> Option<Refused> {
+            match result {
+                Err(Fetch::Refused(refused)) => Some(refused),
+                _ => None,
+            }
+        }
+
+        #[tokio::test]
+        async fn targets_are_encoded_and_uploaded_and_every_charge_is_returned() {
+            let storage = stored(synthetic_jpeg(800, 600)).await;
+            let caps = enforced();
+            let (ledger, hold) = testing::hold(256 * MIB);
+            let budget = image_budget(&caps, hold.share());
+            let source = Source::read(&storage, &budget, "media", "in.jpg", hold)
+                .await
+                .unwrap_or_else(|_| panic!("read"));
+            assert!(ledger.in_use() > 0, "the source is charged while held");
+            let targets = vec![
+                ("small.jpg".to_string(), 200, 80, Format::Jpeg),
+                ("big.webp".to_string(), 0, 80, Format::Webp),
+            ];
+            let sizes = transform_multi(&storage, &budget, "media", source, targets)
+                .await
+                .unwrap_or_else(|_| panic!("transformed"));
+            assert_eq!(sizes.len(), 2);
+            for key in ["small.jpg", "big.webp"] {
+                let bytes = storage
+                    .download_from_bucket("media", key)
+                    .await
+                    .expect("uploaded");
+                assert!(image::load_from_memory(&bytes).is_ok(), "{key}");
+            }
+            assert_eq!(ledger.in_use(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_source_past_the_input_cap_is_refused_before_it_is_read() {
+            let storage = stored(synthetic_jpeg(64, 64)).await;
+            let caps = HostCaps {
+                image_input: 16,
+                ..enforced()
+            };
+            let (ledger, hold) = testing::hold(64 * MIB);
+            let budget = image_budget(&caps, None);
+            let read = Source::read(&storage, &budget, "media", "in.jpg", hold).await;
+            assert!(matches!(refused(read), Some(Refused::Cap(cap)) if cap.cap == "image_input"));
+            assert_eq!(ledger.in_use(), 0);
+        }
+
+        #[tokio::test]
+        async fn the_pixel_cap_and_the_decode_charge_are_read_from_the_header() {
+            let storage = stored(synthetic_jpeg(1000, 1000)).await;
+            let caps = HostCaps {
+                image_pixels: 999_999,
+                ..enforced()
+            };
+            let (_, hold) = testing::hold(64 * MIB);
+            let budget = image_budget(&caps, None);
+            let source = Source::read(&storage, &budget, "media", "in.jpg", hold)
+                .await
+                .unwrap_or_else(|_| panic!("read"));
+            let result = transform(
+                &storage,
+                &budget,
+                "media",
+                source,
+                "out.jpg",
+                0,
+                80,
+                Format::Jpeg,
+            )
+            .await;
+            assert!(
+                matches!(refused(result), Some(Refused::Cap(cap)) if cap.cap == "image_pixels")
+            );
+
+            let caps = enforced();
+            let (ledger, hold) = testing::hold(8 * MIB);
+            let budget = image_budget(&caps, None);
+            let source = Source::read(&storage, &budget, "media", "in.jpg", hold)
+                .await
+                .unwrap_or_else(|_| panic!("read"));
+            let result = transform(
+                &storage,
+                &budget,
+                "media",
+                source,
+                "out.jpg",
+                0,
+                80,
+                Format::Jpeg,
+            )
+            .await;
+            assert!(
+                matches!(refused(result), Some(Refused::Budget(_))),
+                "a million pixels need 20 MiB to decode"
+            );
+            assert_eq!(ledger.in_use(), 0);
+            assert!(storage
+                .download_from_bucket("media", "out.jpg")
+                .await
+                .is_err());
+        }
+
+        #[test]
+        fn the_target_count_is_capped_and_the_share_lowers_the_pixel_cap() {
+            let caps = enforced();
+            assert!(image_budget(&caps, None).targets(16).is_ok());
+            assert!(matches!(
+                image_budget(&caps, None).targets(17),
+                Err(Refused::Cap(cap)) if cap.cap == "image_targets"
+            ));
+            assert_eq!(caps.image_pixels(Some(20 * MIB)), MIB as u64);
+        }
+
+        #[test]
+        fn a_decoder_refuses_dimensions_past_its_limits() {
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(100);
+            assert!(decode_oriented(&synthetic_jpeg(200, 50), limits).is_err());
+        }
     }
 }

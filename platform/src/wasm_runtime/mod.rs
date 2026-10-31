@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod host;
 pub mod image;
 mod invocation;
@@ -15,16 +16,21 @@ use eyre::Result;
 use host::{GuestLimits, HostState, HostStateInit, NatsPublishPolicy};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::info;
 use uuid::Uuid;
 use wasmtime::*;
 
+pub(crate) use budget::RouteKey;
+pub use budget::{Admission, Class};
 pub use invocation::{ExecutionError, Invocation, InvocationKind};
 
-pub(crate) const FEATURES: &[&str] = &["precompiled_modules"];
+pub(crate) const FEATURES: &[&str] = &[
+    "precompiled_modules",
+    cufflink_types::features::GUEST_MEMORY_BUDGET,
+];
 
 pub(super) fn wt(err: wasmtime::Error) -> eyre::Report {
     eyre::eyre!("{}", err)
@@ -48,6 +54,9 @@ pub struct WasmLimits {
     pub max_concurrent: usize,
     pub epoch_tick: Duration,
     pub module_cache_max: usize,
+    pub admission_wait: Duration,
+    pub retry_after: Duration,
+    pub budget: budget::BudgetConfig,
 }
 
 impl Default for WasmLimits {
@@ -62,6 +71,9 @@ impl Default for WasmLimits {
             max_concurrent: 256,
             epoch_tick: Duration::from_millis(100),
             module_cache_max: 128,
+            admission_wait: Duration::from_millis(1000),
+            retry_after: Duration::from_secs(2),
+            budget: budget::BudgetConfig::default(),
         }
     }
 }
@@ -87,20 +99,42 @@ impl WasmLimits {
             );
         }
         let defaults = Self::default();
+        let max_concurrent = env_var("WASM_MAX_CONCURRENT", defaults.max_concurrent)?;
+        let budget = budget::BudgetConfig::from_vars(
+            cufflink_settings::process_var,
+            budget::detect_cgroup(std::path::Path::new("/")),
+            max_concurrent,
+        )?;
+        let max_memory_bytes =
+            env_var("WASM_MAX_MEMORY_MB", defaults.max_memory_bytes / MIB)? * MIB;
+        let max_response_bytes =
+            env_var("WASM_MAX_RESPONSE_MB", defaults.max_response_bytes / MIB)? * MIB;
+        budget.log_startup(max_memory_bytes, max_response_bytes);
         let limits = Self {
-            max_memory_bytes: env_var("WASM_MAX_MEMORY_MB", defaults.max_memory_bytes / MIB)? * MIB,
+            max_memory_bytes: budget.clamped_memory_cap(max_memory_bytes),
             max_tables: env_var("WASM_MAX_TABLES", defaults.max_tables)?,
             max_table_elements: env_var("WASM_MAX_TABLE_ELEMENTS", defaults.max_table_elements)?,
             max_instances: env_var("WASM_MAX_INSTANCES", defaults.max_instances)?,
             max_guest_len: env_var("WASM_MAX_GUEST_LEN_MB", defaults.max_guest_len / MIB)? * MIB,
-            max_response_bytes: env_var("WASM_MAX_RESPONSE_MB", defaults.max_response_bytes / MIB)?
-                * MIB,
-            max_concurrent: env_var("WASM_MAX_CONCURRENT", defaults.max_concurrent)?,
+            max_response_bytes,
+            max_concurrent,
             epoch_tick: Duration::from_millis(env_var(
                 "WASM_EPOCH_TICK_MS",
                 defaults.epoch_tick.as_millis() as u64,
             )?),
             module_cache_max: env_var("WASM_MODULE_CACHE_MAX", defaults.module_cache_max)?,
+            admission_wait: Duration::from_millis(env_var(
+                "WASM_ADMISSION_WAIT_MS",
+                defaults.admission_wait.as_millis() as u64,
+            )?),
+            retry_after: match cufflink_settings::process_var("WASM_ADMISSION_RETRY_AFTER_MS") {
+                Some(_) => Duration::from_millis(env_var("WASM_ADMISSION_RETRY_AFTER_MS", 0)?),
+                None => Duration::from_secs(env_var(
+                    "WASM_ADMISSION_RETRY_AFTER_SECS",
+                    defaults.retry_after.as_secs(),
+                )?),
+            },
+            budget,
         };
         limits.validate()?;
         Ok(limits)
@@ -117,6 +151,14 @@ impl WasmLimits {
             ("WASM_MAX_CONCURRENT", self.max_concurrent as u64),
             ("WASM_MODULE_CACHE_MAX", self.module_cache_max as u64),
             ("WASM_EPOCH_TICK_MS", self.epoch_tick.as_millis() as u64),
+            (
+                "WASM_ADMISSION_WAIT_MS",
+                self.admission_wait.as_millis() as u64,
+            ),
+            (
+                "WASM_ADMISSION_RETRY_AFTER_SECS (or _MS)",
+                self.retry_after.as_millis() as u64,
+            ),
         ]
         .iter()
         .find(|(_, value)| *value == 0)
@@ -171,6 +213,38 @@ pub struct CompiledModule {
     pub instance_pre: InstancePre<HostState>,
     pub service_id: Uuid,
     pub version: i32,
+    pub initial_memory: usize,
+}
+
+pub(crate) struct RouteAdmission<'a> {
+    pub handler: &'a str,
+    pub route: budget::RouteKey,
+    pub class: Class,
+    pub max_concurrent: Option<u32>,
+    pub budget: Duration,
+}
+
+impl RouteAdmission<'_> {
+    fn limit(&self) -> Option<(budget::RouteKey, u32)> {
+        self.max_concurrent.map(|max| (self.route, max))
+    }
+}
+
+const WASM_PAGE: u64 = 64 * 1024;
+
+fn initial_memory(module: &Module) -> usize {
+    let required = module.resources_required();
+    let memory = required
+        .max_initial_memory_size
+        .unwrap_or_default()
+        .saturating_mul(WASM_PAGE)
+        .saturating_mul(u64::from(required.num_memories));
+    let tables = required
+        .max_initial_table_size
+        .unwrap_or_default()
+        .saturating_mul(budget::TABLE_ELEMENT_BYTES as u64)
+        .saturating_mul(u64::from(required.num_tables));
+    usize::try_from(memory.saturating_add(tables)).unwrap_or(usize::MAX)
 }
 
 struct CacheEntry {
@@ -273,6 +347,8 @@ pub struct WasmEngine {
     host_fn_names: Arc<HashSet<&'static str>>,
     limits: Arc<WasmLimits>,
     permits: Arc<Semaphore>,
+    copies: Arc<Mutex<()>>,
+    budget: Arc<budget::Budget>,
     modules: Arc<ModuleCache>,
     storage: Arc<RwLock<Option<S3Storage>>>,
     artifact_index: Arc<std::sync::OnceLock<deadpool_postgres::Pool>>,
@@ -289,6 +365,14 @@ impl WasmEngine {
         let mut linker = Linker::new(&engine);
         let host_fn_names = host::register_host_functions(&mut linker)?;
         start_epoch_ticker(&engine, limits.epoch_tick)?;
+        let memory_budget = budget::Budget::new(
+            limits.budget.clone(),
+            limits.max_concurrent,
+            limits.max_memory_bytes,
+            limits.admission_wait,
+            limits.retry_after,
+        );
+        memory_budget.start_pressure_gate()?;
 
         Ok(Self {
             fingerprint: precompiled::fingerprint(&engine).into(),
@@ -296,6 +380,8 @@ impl WasmEngine {
             linker: Arc::new(linker),
             host_fn_names: Arc::new(host_fn_names),
             permits: Arc::new(Semaphore::new(limits.max_concurrent)),
+            copies: Arc::default(),
+            budget: Arc::new(memory_budget),
             modules: Arc::new(ModuleCache::new(limits.module_cache_max)),
             limits: Arc::new(limits),
             storage: Arc::new(RwLock::new(None)),
@@ -382,6 +468,7 @@ impl WasmEngine {
             .instantiate_pre(&module)
             .map_err(|e| LoadError::Compile(e.to_string()))?;
         Ok(Arc::new(CompiledModule {
+            initial_memory: initial_memory(&module),
             module,
             instance_pre,
             service_id,
@@ -672,48 +759,158 @@ impl WasmEngine {
         self.modules.len()
     }
 
-    pub async fn run(
+    pub(crate) fn admits_before_running(&self) -> bool {
+        self.budget.enforces()
+    }
+
+    pub(crate) async fn admit_route(
+        &self,
+        compiled: &CompiledModule,
+        identity: &crate::registry::ServiceIdentity,
+        route: RouteAdmission<'_>,
+    ) -> Result<Admission, ExecutionError> {
+        let started = tokio::time::Instant::now();
+        self.budget
+            .admit(
+                budget::Ticket {
+                    class: route.class,
+                    kind: InvocationKind::Route,
+                    identity,
+                    handler: route.handler,
+                    route: route.limit(),
+                    initial_memory: compiled.initial_memory,
+                    budget: route.budget,
+                },
+                &self.permits,
+            )
+            .await
+            .map(|admission| admission.counting_from(started))
+    }
+
+    pub(crate) async fn route_slot(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        route: RouteAdmission<'_>,
+    ) -> Result<Option<OwnedSemaphorePermit>, ExecutionError> {
+        let ticket = budget::Ticket {
+            class: route.class,
+            kind: InvocationKind::Route,
+            identity,
+            handler: route.handler,
+            route: route.limit(),
+            initial_memory: 0,
+            budget: route.budget,
+        };
+        let until = self.budget.admission_deadline(&ticket);
+        self.budget.route_slot(&ticket, until).await
+    }
+
+    pub async fn headroom(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        handler: Option<&str>,
+    ) -> usize {
+        self.budget.room(Some(identity), handler).await
+    }
+
+    pub async fn headroom_for_any_handler(&self) -> usize {
+        self.budget.room(None, None).await
+    }
+
+    pub fn publish_gauges(&self) {
+        self.budget.publish();
+    }
+
+    pub(crate) fn hold(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        class: Class,
+        handler: &str,
+        kind: InvocationKind,
+    ) -> budget::Hold {
+        let account = self.budget.account(identity, class, handler, kind);
+        match class {
+            Class::Committed => budget::Hold::unrefused(account),
+            Class::Interactive | Class::Nested | Class::Background => budget::Hold::on(account),
+        }
+    }
+
+    pub(crate) fn kept_hold(
+        &self,
+        identity: &crate::registry::ServiceIdentity,
+        handler: &str,
+        initial_memory: usize,
+    ) -> budget::Hold {
+        self.budget.kept(identity, handler, initial_memory)
+    }
+
+    pub fn refusal(&self, refused: budget::Refused, ran: bool) -> ExecutionError {
+        match refused {
+            budget::Refused::Budget(capacity) => {
+                self.budget.refusal(capacity.reason, capacity.holding, ran)
+            }
+            budget::Refused::Cap(cap) => ExecutionError::Response(cap.to_string()),
+        }
+    }
+
+    pub fn capacity_deferrals_allowed(&self) -> u32 {
+        self.budget.capacity_retries_job()
+    }
+
+    async fn hard_deadline(&self) {
+        self.shutdown.cancelled().await;
+        tokio::time::sleep(
+            self.shutdown
+                .remaining()
+                .saturating_sub(crate::shutdown::KILL_MARGIN),
+        )
+        .await;
+    }
+
+    async fn admit(
+        &self,
+        inv: &Invocation,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Admission, ExecutionError> {
+        let admitted = self.budget.admit(
+            budget::Ticket {
+                class: inv.class,
+                kind: inv.kind,
+                identity: &inv.identity,
+                handler: &inv.handler,
+                route: None,
+                initial_memory: inv.compiled.initial_memory,
+                budget: inv.budget,
+            },
+            &self.permits,
+        );
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ExecutionError::Cancelled),
+            _ = self.hard_deadline(), if self.budget.waits_outside_budget(inv.class, inv.kind) => {
+                Err(ExecutionError::NotStarted)
+            }
+            admitted = admitted => admitted,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_text(
         &self,
         state: Arc<AppState>,
         inv: Invocation,
     ) -> Result<String, ExecutionError> {
+        self.run(state, inv).await.map(|output| output.text)
+    }
+
+    pub async fn run(
+        &self,
+        state: Arc<AppState>,
+        inv: Invocation,
+    ) -> Result<GuestOutput, ExecutionError> {
         let kind = inv.kind.label();
-        let budget = inv.budget;
         let started = Instant::now();
-        let deadline = started + budget;
-        let in_flight =
-            GaugeGuard::enter(metrics::gauge!("cufflink_wasm_inflight", "kind" => kind));
-
-        let cancel = inv.cancel.clone().unwrap_or_default();
-        let outcome = tokio::time::timeout(budget, async {
-            let policies = state
-                .tenants
-                .policies_or_load(inv.identity.tenant_id)
-                .await
-                .map_err(|e| {
-                    ExecutionError::Runtime(format!("tenant policies unavailable: {e}"))
-                })?;
-            let permit = cancel
-                .run_until_cancelled(Arc::clone(&self.permits).acquire_owned())
-                .await
-                .ok_or(ExecutionError::Cancelled)?
-                .map_err(|e| ExecutionError::Runtime(format!("executor closed: {e}")))?;
-            metrics::histogram!("cufflink_wasm_queue_wait_seconds", "kind" => kind)
-                .record(started.elapsed().as_secs_f64());
-            let span = tracing::Span::current();
-            let engine = self.clone();
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let _in_flight = in_flight;
-                let _guard = span.enter();
-                engine.execute(state, &inv, policies, deadline, cancel)
-            })
-            .await
-            .map_err(|e| ExecutionError::Runtime(format!("WASM task join error: {e}")))?
-        })
-        .await;
-
-        let result = outcome.unwrap_or(Err(ExecutionError::DeadlineExceeded { budget }));
+        let result = self.run_admitted(state, inv).await;
         let label = result.as_ref().map_or_else(ExecutionError::label, |_| "ok");
         metrics::histogram!(
             "cufflink_wasm_handler_duration_seconds",
@@ -721,17 +918,112 @@ impl WasmEngine {
             "result" => label,
         )
         .record(started.elapsed().as_secs_f64());
-        result
+        match result {
+            Ok(mut output) => {
+                let room = budget::ChargedJson::delivery_bound(output.text.as_bytes());
+                let placed = tokio::select! {
+                    biased;
+                    () = output.hold.make_room(room) => true,
+                    () = self.hard_deadline() => false,
+                };
+                match placed {
+                    true => Ok(output),
+                    false => Err(undelivered(
+                        "the guest finished, but the platform shut down before its answer could \
+                         be delivered"
+                            .to_string(),
+                        output.text.as_bytes(),
+                    )),
+                }
+            }
+            failed => failed,
+        }
+    }
+
+    pub async fn run_retrying_capacity(
+        &self,
+        state: Arc<AppState>,
+        kind: InvocationKind,
+        request: String,
+        invocation: impl Fn(String) -> Invocation,
+    ) -> Result<GuestOutput, ExecutionError> {
+        for _ in 0..self.budget.capacity_retries() {
+            let run = self
+                .run(Arc::clone(&state), invocation(request.clone()))
+                .await;
+            match run {
+                Err(ExecutionError::Overloaded { .. }) => {
+                    metrics::counter!(
+                        "cufflink_wasm_capacity_retries_total",
+                        "kind" => kind.label(),
+                    )
+                    .increment(1);
+                }
+                ended => return ended,
+            }
+        }
+        self.run(state, invocation(request)).await
+    }
+
+    async fn run_admitted(
+        &self,
+        state: Arc<AppState>,
+        mut inv: Invocation,
+    ) -> Result<GuestOutput, ExecutionError> {
+        let cancel = inv.cancel.clone().unwrap_or_default();
+        let early = match inv.admission.take() {
+            Some(admission) => Some(admission),
+            None if self.budget.waits_outside_budget(inv.class, inv.kind) => {
+                Some(self.admit(&inv, &cancel).await?)
+            }
+            None => None,
+        };
+        let budget = inv.budget;
+        let from = early
+            .as_ref()
+            .and_then(Admission::budget_from)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let deadline = from.into_std() + budget;
+        tokio::time::timeout_at(from + budget, async {
+            let policies = state
+                .tenants
+                .policies_or_load(inv.identity.tenant_id)
+                .await
+                .map_err(|e| {
+                    ExecutionError::Runtime(format!("tenant policies unavailable: {e}"))
+                })?;
+            let admission = match early {
+                Some(admission) => admission,
+                None => self.admit(&inv, &cancel).await?,
+            };
+            let in_flight = GaugeGuard::enter(
+                metrics::gauge!("cufflink_wasm_inflight", "kind" => inv.kind.label()),
+            );
+            let span = tracing::Span::current();
+            let engine = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let _in_flight = in_flight;
+                let _guard = span.enter();
+                engine.execute(state, &inv, admission, policies, deadline, cancel)
+            })
+            .await
+            .map_err(|e| ExecutionError::Runtime(format!("WASM task join error: {e}")))?
+        })
+        .await
+        .unwrap_or(Err(ExecutionError::DeadlineExceeded { budget }))
     }
 
     fn execute(
         &self,
         state: Arc<AppState>,
         inv: &Invocation,
+        admission: Admission,
         policies: Arc<PolicySet>,
         deadline: Instant,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<String, ExecutionError> {
+    ) -> Result<GuestOutput, ExecutionError> {
+        let (_slots, charge) = admission.into_parts();
+        let mut copying = None;
         let _span = scoped_span!(
             "wasm_handler",
             inv.scope(),
@@ -741,11 +1033,10 @@ impl WasmEngine {
         .entered();
         let kind = inv.kind.label();
 
-        let request = serde_json::from_str::<serde_json::Value>(&inv.request_json).ok();
-        let auth = request
-            .as_ref()
-            .and_then(crate::router::jobs::AuthSnapshot::from_request_auth);
-        let call_depth = request.as_ref().map_or(0, host::inbound_depth);
+        let RequestContext { auth, caller } =
+            serde_json::from_str(&inv.request_json).unwrap_or_default();
+        let call_depth = host::caller_depth(&caller);
+        let auth = crate::router::jobs::AuthSnapshot::from_auth(auth);
         let guest_limits = GuestLimits::new(
             Arc::clone(&self.limits),
             Arc::clone(&policies),
@@ -753,7 +1044,9 @@ impl WasmEngine {
                 tenant: inv.identity.tenant_slug.clone(),
                 service: inv.identity.service_name.clone(),
                 handler: inv.handler.clone(),
+                kind: inv.kind,
             },
+            charge,
         );
         let nats_publish_scope = state
             .tenants
@@ -794,31 +1087,45 @@ impl WasmEngine {
             }
         });
 
-        let result = self.call_handler(&mut store, inv);
+        let on_thread = store
+            .data_mut()
+            .guest_limits
+            .charge_mut()
+            .map(budget::enter_thread);
+        let result = self.call_handler(&mut store, inv, &mut copying);
         store
             .data_mut()
             .db
             .abandon_all(host::AbandonReason::of(&result));
+        if let Some(sample) = store.data().guest_limits.sample() {
+            self.budget
+                .record_sample(inv.identity.service_id, &inv.handler, sample);
+        }
+        drop(on_thread);
 
         metrics::histogram!("cufflink_wasm_memory_peak_bytes", "kind" => kind)
             .record(store.data().guest_limits.peak_memory() as f64);
         if let Ok(response) = &result {
             metrics::histogram!("cufflink_wasm_response_bytes", "kind" => kind)
-                .record(response.len() as f64);
+                .record(response.text.len() as f64);
         }
         result
     }
 
-    fn call_handler(
-        &self,
+    fn call_handler<'engine>(
+        &'engine self,
         store: &mut Store<HostState>,
         inv: &Invocation,
-    ) -> Result<String, ExecutionError> {
-        let instance = inv
-            .compiled
-            .instance_pre
-            .instantiate(&mut *store)
-            .map_err(|e| classify(store, e, inv.budget))?;
+        copying: &mut Option<MutexGuard<'engine, ()>>,
+    ) -> Result<GuestOutput, ExecutionError> {
+        let instance =
+            inv.compiled
+                .instance_pre
+                .instantiate(&mut *store)
+                .map_err(|e| match store.data().guest_limits.budget_denial() {
+                    Some(denial) => unrun(denial, &self.budget),
+                    None => classify(store, e, inv.budget, &self.budget),
+                })?;
 
         let memory = instance
             .get_memory(&mut *store, "memory")
@@ -835,7 +1142,7 @@ impl WasmEngine {
         })?;
         let request_ptr = alloc
             .call(&mut *store, request_len)
-            .map_err(|e| classify(store, e, inv.budget))?;
+            .map_err(|e| classify(store, e, inv.budget, &self.budget))?;
         let request_ptr = usize::try_from(request_ptr).map_err(|_| {
             ExecutionError::Runtime("guest allocator returned a negative pointer".into())
         })?;
@@ -851,33 +1158,82 @@ impl WasmEngine {
 
         let response_ptr = handle_fn
             .call(&mut *store, (request_ptr as i32, request_len))
-            .map_err(|e| classify(store, e, inv.budget))?;
+            .map_err(|e| classify(store, e, inv.budget, &self.budget))?;
 
-        read_response(
+        let mut hold = store.data().hold().delivering();
+        let text = read_response(
             memory.data(&*store),
             response_ptr,
             self.limits.max_response_bytes,
-        )
+            |len| {
+                hold.force(len);
+                if hold.past_the_ceiling() {
+                    *copying = Some(self.copies.lock().unwrap_or_else(PoisonError::into_inner));
+                }
+            },
+        )?;
+        Ok(GuestOutput { text, hold })
     }
 }
 
-fn classify(store: &Store<HostState>, err: wasmtime::Error, budget: Duration) -> ExecutionError {
+#[derive(Default, serde::Deserialize)]
+struct RequestContext {
+    #[serde(default)]
+    auth: serde_json::Value,
+    #[serde(default)]
+    caller: serde_json::Value,
+}
+
+pub struct GuestOutput {
+    pub text: String,
+    pub hold: budget::Hold,
+}
+
+fn classify(
+    store: &Store<HostState>,
+    err: wasmtime::Error,
+    budget: Duration,
+    memory: &budget::Budget,
+) -> ExecutionError {
+    let limits = &store.data().guest_limits;
+    let trapped = err.downcast_ref::<Trap>().is_some();
     match err.downcast_ref::<Interrupt>() {
         Some(Interrupt::Deadline) => ExecutionError::DeadlineExceeded { budget },
         Some(Interrupt::Shutdown) => ExecutionError::ShuttingDown,
         Some(Interrupt::Cancelled) => ExecutionError::Cancelled,
-        None => match store.data().guest_limits.denied() {
-            Some(denied) => ExecutionError::MemoryLimit {
+        None => match (limits.denied(), limits.budget_denial()) {
+            (Some(denied), _) => ExecutionError::MemoryLimit {
                 requested: denied.requested,
                 limit: denied.limit,
             },
-            None if err.downcast_ref::<Trap>().is_some() => ExecutionError::Trap(err.to_string()),
-            None => ExecutionError::Runtime(err.to_string()),
+            (None, Some(denial)) if trapped => denied(denial, memory, true),
+            _ if trapped => ExecutionError::Trap(err.to_string()),
+            _ => ExecutionError::Runtime(err.to_string()),
         },
     }
 }
 
-fn read_response(memory: &[u8], ptr: i32, max_bytes: usize) -> Result<String, ExecutionError> {
+fn denied(denial: host::BudgetDenial, memory: &budget::Budget, ran: bool) -> ExecutionError {
+    memory.refusal(denial.reason, denial.holding, ran)
+}
+
+fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError {
+    denied(denial, memory, false)
+}
+
+fn undelivered(reason: String, text: &[u8]) -> ExecutionError {
+    match crate::router::guest_response::outline(text) {
+        Ok(answer) => ExecutionError::Undelivered { reason, answer },
+        Err(_) => ExecutionError::Response(reason),
+    }
+}
+
+fn read_response(
+    memory: &[u8],
+    ptr: i32,
+    max_bytes: usize,
+    charge: impl FnOnce(usize),
+) -> Result<String, ExecutionError> {
     let start = usize::try_from(ptr)
         .map_err(|_| ExecutionError::Response("negative response pointer".into()))?;
     let len_bytes: [u8; 4] = memory
@@ -892,13 +1248,19 @@ fn read_response(memory: &[u8], ptr: i32, max_bytes: usize) -> Result<String, Ex
             "mode" => "enforce",
         )
         .increment(1);
-        return Err(ExecutionError::Response(format!(
-            "response of {len} bytes exceeds the {max_bytes} byte cap"
-        )));
+        let reason = format!("response of {len} bytes exceeds the {max_bytes} byte cap");
+        return Err(match memory.get(start + 4..start + 4 + len) {
+            Some(text) if std::str::from_utf8(text).is_ok() => undelivered(
+                format!("WASM guest returned an invalid response: {reason}"),
+                text,
+            ),
+            _ => ExecutionError::Response(reason),
+        });
     }
     let body = memory
         .get(start + 4..start + 4 + len)
         .ok_or_else(|| ExecutionError::Response("response body out of bounds".into()))?;
+    charge(len);
     String::from_utf8(body.to_vec())
         .map_err(|e| ExecutionError::Response(format!("response is not UTF-8: {e}")))
 }
@@ -1000,6 +1362,12 @@ pub(crate) mod tests {
             scope_kind: None,
             budget,
             cancel: None,
+            class: match kind {
+                InvocationKind::Job | InvocationKind::Subscription => Class::Background,
+                InvocationKind::OnMigrate => Class::Committed,
+                _ => Class::Interactive,
+            },
+            admission: None,
         }
     }
 
@@ -1026,6 +1394,20 @@ pub(crate) mod tests {
         };
         let err = zero.validate().unwrap_err().to_string();
         assert!(err.contains("WASM_MAX_CONCURRENT"), "{err}");
+        assert_eq!(defaults.admission_wait, Duration::from_millis(1000));
+        assert_eq!(defaults.retry_after, Duration::from_secs(2));
+        let no_wait = WasmLimits {
+            admission_wait: Duration::ZERO,
+            ..WasmLimits::default()
+        };
+        let err = no_wait.validate().unwrap_err().to_string();
+        assert!(err.contains("WASM_ADMISSION_WAIT_MS"), "{err}");
+        let no_delay = WasmLimits {
+            retry_after: Duration::ZERO,
+            ..WasmLimits::default()
+        };
+        let err = no_delay.validate().unwrap_err().to_string();
+        assert!(err.contains("WASM_ADMISSION_RETRY_AFTER"), "{err}");
     }
 
     #[test]
@@ -1316,18 +1698,32 @@ pub(crate) mod tests {
         let mut memory = vec![0u8; 64];
         memory[8..12].copy_from_slice(&5u32.to_le_bytes());
         memory[12..17].copy_from_slice(b"hello");
-        assert_eq!(read_response(&memory, 8, 64).unwrap(), "hello");
+        let read = |memory: &[u8], ptr, max| read_response(memory, ptr, max, |_| ());
+        assert!(matches!(read(&memory, 8, 64), Ok(text) if text == "hello"));
+        read_response(&memory, 8, 64, |len| {
+            assert_eq!(len, 5, "charged before the copy");
+        })
+        .expect("read");
         assert!(matches!(
-            read_response(&memory, 8, 4),
+            read(&memory, 8, 4),
+            Err(ExecutionError::Undelivered { reason, .. }) if reason.contains("cap")
+        ));
+        memory[12] = 0xff;
+        assert!(matches!(
+            read(&memory, 8, 4),
             Err(ExecutionError::Response(msg)) if msg.contains("cap")
         ));
         memory[8..12].copy_from_slice(&1000u32.to_le_bytes());
         assert!(matches!(
-            read_response(&memory, 8, 4096),
+            read(&memory, 8, 4096),
             Err(ExecutionError::Response(msg)) if msg.contains("out of bounds")
         ));
-        assert!(read_response(&memory, -1, 64).is_err());
-        assert!(read_response(&memory, 62, 64).is_err());
+        assert!(matches!(
+            read(&memory, 8, 4),
+            Err(ExecutionError::Response(msg)) if msg.contains("cap")
+        ));
+        assert!(read(&memory, -1, 64).is_err());
+        assert!(read(&memory, 62, 64).is_err());
     }
 
     const PROBES: &str = r#"
@@ -1372,7 +1768,7 @@ pub(crate) mod tests {
         let state = AppState::minimal(engine.clone()).await;
         for handler in ["oob", "not_utf8", "valid", "neg_len"] {
             let response = engine
-                .run(
+                .run_text(
                     Arc::clone(&state),
                     invocation(
                         Arc::clone(&compiled),
@@ -1420,7 +1816,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&engine, READBACK);
         let state = AppState::minimal(engine.clone()).await;
         let response = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1446,7 +1842,7 @@ pub(crate) mod tests {
         );
         let state = AppState::minimal_with_policies(engine.clone(), &enforce_wasm_limits()).await;
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1470,7 +1866,7 @@ pub(crate) mod tests {
         let state = AppState::minimal(engine.clone()).await;
         let started = Instant::now();
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,
@@ -1503,7 +1899,7 @@ pub(crate) mod tests {
             let (engine, cancel) = (engine.clone(), cancel.clone());
             async move {
                 engine
-                    .run(
+                    .run_text(
                         state,
                         Invocation {
                             cancel: Some(cancel),
@@ -1533,6 +1929,42 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_keeps_the_wait_for_a_slot_inside_the_budget() {
+        let engine = engine_with(WasmLimits {
+            max_concurrent: 1,
+            budget: budget::BudgetConfig {
+                mode: crate::policy::PolicyMode::Off,
+                ..budget::BudgetConfig::default()
+            },
+            ..WasmLimits::default()
+        });
+        let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
+        let state = AppState::minimal(engine.clone()).await;
+        let _held = Arc::clone(&engine.permits)
+            .acquire_owned()
+            .await
+            .expect("the only permit");
+        let started = Instant::now();
+        let err = engine
+            .run_text(
+                state,
+                invocation(
+                    compiled,
+                    "h",
+                    InvocationKind::Route,
+                    Duration::from_millis(150),
+                ),
+            )
+            .await
+            .expect_err("no slot frees");
+        assert!(
+            matches!(err, ExecutionError::DeadlineExceeded { .. }),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_invocation_stops_waiting_for_its_turn() {
         let engine = engine_with(WasmLimits {
             max_concurrent: 1,
@@ -1556,13 +1988,680 @@ pub(crate) mod tests {
             )
         };
         let err = engine
-            .run(Arc::clone(&state), queued(Some(cancel)))
+            .run_text(Arc::clone(&state), queued(Some(cancel)))
             .await
             .unwrap_err();
         assert!(matches!(err, ExecutionError::Cancelled), "{err}");
         drop(held);
-        let response = engine.run(state, queued(None)).await.expect("response");
+        let response = engine
+            .run_text(state, queued(None))
+            .await
+            .expect("response");
         assert!(!response.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_route_at_its_limit_waits_for_a_slot_then_is_refused_unrun() {
+        let handle = global_metrics();
+        let engine = engine_with(WasmLimits {
+            admission_wait: Duration::from_millis(150),
+            ..WasmLimits::default()
+        });
+        let identity = crate::registry::ServiceIdentity {
+            tenant_id: Uuid::new_v4(),
+            tenant_slug: "globex".to_string(),
+            service_id: Uuid::new_v4(),
+            schema: "loan_service".to_string(),
+            service_name: "loan-service".to_string(),
+        };
+        let refusals = || {
+            counter(
+                &handle.render(),
+                "cufflink_wasm_admission_refused_total",
+                &["tenant=\"globex\"", "reason=\"route_concurrency\""],
+            )
+        };
+        let before = refusals();
+        let limited = |handler| RouteAdmission {
+            handler,
+            route: budget::RouteKey {
+                service_id: identity.service_id,
+                version: 1,
+                index: usize::from(handler == "import"),
+            },
+            class: Class::Interactive,
+            max_concurrent: Some(2),
+            budget: Duration::from_secs(30),
+        };
+        let slot = || engine.route_slot(&identity, limited("export"));
+        let first = slot().await.expect("first slot");
+        let _second = slot().await.expect("second slot");
+
+        let started = Instant::now();
+        let err = slot().await.expect_err("a third waits, then is refused");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            matches!(
+                err,
+                ExecutionError::Overloaded {
+                    reason: budget::Reason::RouteConcurrency,
+                    retry_after,
+                    ran: false,
+                } if retry_after == Duration::from_secs(2)
+            ),
+            "{err}"
+        );
+        assert_eq!(err.label(), "overloaded");
+        assert_eq!(refusals(), before + 1.0);
+        assert!(
+            engine
+                .route_slot(&identity, limited("import"))
+                .await
+                .is_ok(),
+            "another route of the service has its own slots"
+        );
+
+        let waiting = tokio::spawn({
+            let (engine, identity) = (engine.clone(), identity.clone());
+            async move {
+                engine
+                    .route_slot(
+                        &identity,
+                        RouteAdmission {
+                            handler: "export",
+                            route: budget::RouteKey {
+                                service_id: identity.service_id,
+                                version: 1,
+                                index: 0,
+                            },
+                            class: Class::Interactive,
+                            max_concurrent: Some(2),
+                            budget: Duration::from_secs(30),
+                        },
+                    )
+                    .await
+                    .map(drop)
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(first);
+        waiting
+            .await
+            .expect("join")
+            .expect("a waiter takes the slot freed within the wait");
+    }
+
+    fn budgeted(mode: &str, mib: &str) -> WasmEngine {
+        engine_with(budgeted_limits(mode, mib))
+    }
+
+    fn budgeted_limits(mode: &str, mib: &str) -> WasmLimits {
+        WasmLimits {
+            budget: budget::BudgetConfig::from_vars(
+                cufflink_settings::fixed(&[
+                    ("WASM_MEMORY_BUDGET_MODE", mode),
+                    ("WASM_MEMORY_BUDGET_MB", mib),
+                    ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+                    ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+                    ("WASM_THREAD_STACK_KB", "1024"),
+                ]),
+                None,
+                256,
+            )
+            .expect("budget"),
+            ..WasmLimits::default()
+        }
+    }
+
+    fn narrow(mib: &str, overrun: &str) -> WasmLimits {
+        WasmLimits {
+            budget: budget::BudgetConfig::from_vars(
+                cufflink_settings::fixed(&[
+                    ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+                    ("WASM_MEMORY_BUDGET_MB", mib),
+                    ("WASM_MEMORY_DELIVERY_OVERRUN_MB", overrun),
+                    ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+                    ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+                    ("WASM_MEMORY_COLD_ESTIMATE_MB", "1"),
+                    ("WASM_THREAD_STACK_KB", "1024"),
+                ]),
+                None,
+                256,
+            )
+            .expect("budget"),
+            ..WasmLimits::default()
+        }
+    }
+
+    const ANSWER_8_MIB: &str = "(drop (memory.grow (i32.const 130))) (i32.store (i32.const 512) (i32.const 8388608)) (i32.const 512)";
+
+    #[tokio::test]
+    async fn a_response_copied_past_the_ceiling_waits_for_the_copy_before_it() {
+        let engine = engine_with(narrow("12", "1"));
+        let (_, small) = install(&engine, &guest("h", "(call $respond_ok)"));
+        let (_, large) = install(&engine, &guest("h", ANSWER_8_MIB));
+        let state = AppState::minimal(engine.clone()).await;
+        let (held, turn_taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let copies = Arc::clone(&engine.copies);
+        let holder = std::thread::spawn(move || {
+            let _turn = copies.lock().expect("unheld");
+            held.send(()).expect("the test waits");
+            released.recv().ok();
+        });
+        turn_taken.recv().expect("the turn is taken");
+        let run = |compiled: Arc<CompiledModule>| {
+            let (engine, state) = (engine.clone(), Arc::clone(&state));
+            tokio::spawn(async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "h",
+                            InvocationKind::Route,
+                            Duration::from_secs(10),
+                        ),
+                    )
+                    .await
+            })
+        };
+        run(small)
+            .await
+            .expect("join")
+            .expect("under the ceiling a copy takes no turn");
+        let blocked = run(large);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!blocked.is_finished(), "past the ceiling it waits its turn");
+        release.send(()).expect("the holder waits");
+        holder.join().expect("join");
+        let text = blocked.await.expect("join").expect("delivered");
+        assert_eq!(text.len(), 8 * MIB);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_with_no_room_at_the_hard_deadline_is_undelivered_and_settled() {
+        let shutdown = Shutdown::new(crate::shutdown::KILL_MARGIN + Duration::from_millis(300));
+        let engine = WasmEngine::new(narrow("13", "1"), shutdown.clone()).expect("engine");
+        let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
+        let state = AppState::minimal(engine.clone()).await;
+        let mut inv = invocation(
+            compiled,
+            "h",
+            InvocationKind::Subscription,
+            Duration::from_secs(30),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        inv.admission = Some(engine.admit(&inv, &cancel).await.expect("admitted"));
+        let mut band = engine.kept_hold(&inv.identity, "h", 0);
+        band.force(14 * MIB);
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.run_text(state, inv).await }
+        });
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        while ledger.delivery_waiters() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        shutdown.trigger();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the drain does not end the wait");
+        let answered = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the hard deadline ends the wait")
+            .expect("join");
+        assert!(
+            matches!(
+                &answered,
+                Err(ExecutionError::Undelivered { reason, answer })
+                    if reason.contains("shut down") && answer.status == 200
+            ),
+            "the guest finished, so it is never answered as not run: {answered:?}"
+        );
+        assert_eq!(ledger.delivery_waiters(), 0);
+    }
+
+    #[test]
+    fn a_kept_text_leaves_room_for_the_modules_initial_memory() {
+        let engine = budgeted("enforce", "64");
+        let identity = crate::registry::ServiceIdentity {
+            tenant_id: Uuid::nil(),
+            tenant_slug: "acme".to_string(),
+            service_id: Uuid::new_v4(),
+            schema: "test_service".to_string(),
+            service_name: "test-service".to_string(),
+        };
+        let kept = |initial_memory| {
+            let mut hold = engine.kept_hold(&identity, "h", initial_memory);
+            hold.grow(20 * MIB)
+        };
+        assert!(kept(0).is_ok());
+        assert!(
+            kept(48 * MIB).is_err(),
+            "what admission will reserve for the hook does not fit beside it"
+        );
+    }
+
+    fn holding_guest(pages: u32, ms: u32) -> String {
+        format!(
+            r#"(module
+              (import "env" "util_sleep_ms" (func $sleep (param i32) (result i32)))
+              (memory (export "memory") 2)
+              (data (i32.const 0) "{{\"ok\":true}}")
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "hold") (param i32 i32) (result i32)
+                (if (i32.eq (memory.grow (i32.const {pages})) (i32.const -1)) (then (unreachable)))
+                (drop (call $sleep (i32.const {ms})))
+                (i32.store (i32.const 512) (i32.const 11))
+                (memory.copy (i32.const 516) (i32.const 0) (i32.const 11))
+                (i32.const 512))
+              (func (export "probe") (param i32 i32) (result i32)
+                (drop (memory.grow (i32.const {pages})))
+                (i32.store (i32.const 512) (i32.const 11))
+                (memory.copy (i32.const 516) (i32.const 0) (i32.const 11))
+                (i32.const 512)))"#
+        )
+    }
+
+    const PAGES_24_MIB: u32 = 384;
+
+    async fn burst(engine: &WasmEngine) -> (Vec<Result<String, ExecutionError>>, usize) {
+        let (_, compiled) = install(engine, &holding_guest(PAGES_24_MIB, 300));
+        let state = AppState::minimal(engine.clone()).await;
+        let run = |compiled: Arc<CompiledModule>| {
+            let (engine, state) = (engine.clone(), Arc::clone(&state));
+            async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "hold",
+                            InvocationKind::Route,
+                            Duration::from_secs(10),
+                        ),
+                    )
+                    .await
+            }
+        };
+        run(Arc::clone(&compiled))
+            .await
+            .expect("a first run measures the handler");
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sampler = tokio::spawn({
+            let (ledger, sampling) = (Arc::clone(&ledger), Arc::clone(&sampling));
+            async move {
+                let mut peak = 0;
+                while sampling.load(Ordering::Relaxed) {
+                    peak = peak.max(ledger.in_use() - ledger.residue());
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                peak
+            }
+        });
+        let results =
+            futures_util::future::join_all((0..8).map(|_| run(Arc::clone(&compiled)))).await;
+        sampling.store(false, Ordering::Relaxed);
+        let peak = sampler.await.expect("sampler");
+        assert_eq!(
+            ledger.in_use(),
+            ledger.residue(),
+            "only idle threads' stacks remain"
+        );
+        (results, peak)
+    }
+
+    #[test]
+    fn execute_reads_only_the_auth_and_the_caller_from_the_request() {
+        let request = r#"{"body":{"rows":[[1],[2]]},"auth":{"sub":"u-1","roles":["a"]},"caller":{"depth":2},"method":"POST"}"#;
+        let RequestContext { auth, caller } = serde_json::from_str(request).expect("context");
+        let full: serde_json::Value = serde_json::from_str(request).expect("request");
+        assert_eq!(host::caller_depth(&caller), 2);
+        let snapshot = crate::router::jobs::AuthSnapshot::from_auth(auth).expect("auth");
+        let expected = crate::router::jobs::AuthSnapshot::from_request_auth(&full).expect("auth");
+        assert_eq!(
+            (snapshot.subject, snapshot.claims),
+            (expected.subject, expected.claims)
+        );
+        for other in [r#""text""#, "null", r#"{"auth":null}"#, "{"] {
+            let RequestContext { auth, caller } = serde_json::from_str(other).unwrap_or_default();
+            assert!(
+                crate::router::jobs::AuthSnapshot::from_auth(auth).is_none(),
+                "{other}"
+            );
+            assert_eq!(host::caller_depth(&caller), 0, "{other}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_waiting_for_memory_at_shutdown_is_answered_unrun_at_the_hard_deadline() {
+        let limits = budgeted_limits("enforce", "64");
+        let shutdown = Shutdown::new(crate::shutdown::KILL_MARGIN + Duration::from_millis(300));
+        let engine = WasmEngine::new(limits, shutdown.clone()).expect("engine");
+        let (_, compiled) = install(&engine, &holding_guest(1, 0));
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let full = ledger
+            .try_reserve(
+                Class::Interactive,
+                &budget::ServiceKey {
+                    tenant: "globex".into(),
+                    service: "loan-service".into(),
+                },
+                60 * MIB,
+            )
+            .expect("fills the budget");
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "hold",
+                            InvocationKind::Subscription,
+                            Duration::from_secs(30),
+                        ),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.trigger();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the drain does not end the wait");
+        let answered = waiting.await.expect("join");
+        assert!(
+            matches!(answered, Err(ExecutionError::NotStarted)),
+            "a not-started answer, never one of capacity: {answered:?}"
+        );
+        drop(full);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn under_enforce_a_burst_waits_for_the_budget_and_never_passes_it() {
+        let engine = budgeted("enforce", "64");
+        let (results, peak) = burst(&engine).await;
+        assert!(
+            peak <= 64 * MIB,
+            "at most two 24 MiB guests hold memory at once, within the budget: {peak}"
+        );
+        let ran = results.iter().filter(|r| r.is_ok()).count();
+        assert!(ran >= 2, "{results:?}");
+        assert!(
+            results.iter().all(|result| matches!(
+                result,
+                Ok(_) | Err(ExecutionError::Overloaded { ran: false, .. })
+            )),
+            "the rest wait and run, or are refused unrun: {results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn under_warn_a_burst_runs_and_counts_what_would_have_waited() {
+        let handle = global_metrics();
+        let refused = || {
+            counter(
+                &handle.render(),
+                "cufflink_wasm_admission_refused_total",
+                &["mode=\"warn\"", "reason=\"memory\""],
+            )
+        };
+        let before = refused();
+        let engine = budgeted("warn", "64");
+        let (results, _) = burst(&engine).await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert!(refused() > before, "would-be refusals are counted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grow_past_the_budget_is_denied_at_once_and_attributed_only_to_a_trap() {
+        let engine = budgeted("enforce", "64");
+        let (_, compiled) = install(&engine, &holding_guest(1100, 0));
+        let state = AppState::minimal(engine.clone()).await;
+        let run = |handler: &str| {
+            engine.run_text(
+                Arc::clone(&state),
+                invocation(
+                    Arc::clone(&compiled),
+                    handler,
+                    InvocationKind::Route,
+                    Duration::from_secs(5),
+                ),
+            )
+        };
+        let started = Instant::now();
+        assert_eq!(
+            run("probe").await.expect("the guest handled -1"),
+            r#"{"ok":true}"#
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "never blocks");
+        assert!(
+            matches!(
+                run("hold").await,
+                Err(ExecutionError::TooLarge { requested, share }) if requested > share
+            ),
+            "a guest growing past the whole service share can never fit"
+        );
+
+        let engine = budgeted("enforce", "64");
+        let (_, small) = install(&engine, &holding_guest(PAGES_24_MIB, 0));
+        let state = AppState::minimal(engine.clone()).await;
+        engine.budget.record_sample(Uuid::nil(), "hold", MIB);
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let other = super::budget::ServiceKey {
+            tenant: "globex".into(),
+            service: "loan-service".into(),
+        };
+        let held = ledger
+            .try_reserve(Class::Interactive, &other, 40 * MIB)
+            .expect("fits");
+        let err = engine
+            .run_text(
+                state,
+                invocation(small, "hold", InvocationKind::Route, Duration::from_secs(5)),
+            )
+            .await
+            .expect_err("denied mid-run");
+        assert!(
+            matches!(err, ExecutionError::Overloaded { ran: true, .. }),
+            "{err:?}"
+        );
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_creeping_past_its_share_in_small_steps_is_too_large_not_overloaded() {
+        let engine = budgeted("enforce", "64");
+        let creep = r#"(module
+          (memory (export "memory") 2)
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "creep") (param i32 i32) (result i32)
+            (if (i32.eq (memory.grow (i32.const 640)) (i32.const -1)) (then (unreachable)))
+            (if (i32.eq (memory.grow (i32.const 640)) (i32.const -1)) (then (unreachable)))
+            (i32.const 0)))"#;
+        let (_, compiled) = install(&engine, creep);
+        let state = AppState::minimal(engine.clone()).await;
+        let err = engine
+            .run_text(
+                state,
+                invocation(
+                    compiled,
+                    "creep",
+                    InvocationKind::Subscription,
+                    Duration::from_secs(5),
+                ),
+            )
+            .await
+            .expect_err("80 MiB can never fit a 64 MiB share");
+        assert!(
+            matches!(
+                err,
+                ExecutionError::TooLarge { requested, share }
+                    if requested > share
+            ),
+            "a denied 40 MiB step of an 80 MiB guest is its own size, not capacity: {err:?}"
+        );
+    }
+
+    fn charged_classes(ledger: &budget::Ledger) -> usize {
+        Class::ALL
+            .iter()
+            .map(|class| ledger.in_use_by(*class))
+            .sum()
+    }
+
+    async fn settled(ledger: &budget::Ledger) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while charged_classes(ledger) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        charged_classes(ledger)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_that_traps_or_overruns_its_deadline_leaves_nothing_charged() {
+        let engine = budgeted("enforce", "64");
+        let ending = format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "trap") (param i32 i32) (result i32)
+                (drop (memory.grow (i32.const {PAGES_24_MIB})))
+                (unreachable))
+              (func (export "spin") (param i32 i32) (result i32)
+                (drop (memory.grow (i32.const {PAGES_24_MIB})))
+                {SPIN}))"#
+        );
+        let (_, compiled) = install(&engine, &ending);
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        for (handler, budget) in [
+            ("trap", Duration::from_secs(5)),
+            ("spin", Duration::from_millis(300)),
+        ] {
+            let err = engine
+                .run_text(
+                    Arc::clone(&state),
+                    invocation(
+                        Arc::clone(&compiled),
+                        handler,
+                        InvocationKind::Route,
+                        budget,
+                    ),
+                )
+                .await
+                .expect_err(handler);
+            assert!(
+                matches!(
+                    (handler, &err),
+                    ("trap", ExecutionError::Trap(_))
+                        | ("spin", ExecutionError::DeadlineExceeded { .. })
+                ),
+                "{handler}: {err:?}"
+            );
+            assert_eq!(settled(&ledger).await, 0, "{handler}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_its_caller_stopped_waiting_for_stays_charged_until_it_ends() {
+        let engine = budgeted("enforce", "64");
+        let (_, compiled) = install(&engine, &holding_guest(PAGES_24_MIB, 800));
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let caller = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "hold",
+                            InvocationKind::Route,
+                            Duration::from_secs(5),
+                        ),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        caller.abort();
+        assert!(caller.await.is_err_and(|e| e.is_cancelled()));
+        assert!(
+            ledger.in_use_by(Class::Interactive) >= 24 * MIB,
+            "the guest still holds its memory"
+        );
+        assert_eq!(settled(&ledger).await, 0, "credited once the guest ended");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nested_call_is_refused_at_once_rather_than_waiting() {
+        let engine = budgeted("enforce", "64");
+        let (_, compiled) = install(&engine, &holding_guest(1, 0));
+        let state = AppState::minimal(engine.clone()).await;
+        let ledger = Arc::clone(engine.budget.ledger().expect("a ledger"));
+        let full = ledger
+            .try_reserve(
+                Class::Interactive,
+                &budget::ServiceKey {
+                    tenant: "globex".into(),
+                    service: "loan-service".into(),
+                },
+                60 * MIB,
+            )
+            .expect("fills the budget");
+        let started = Instant::now();
+        let answered = engine
+            .run_text(
+                state,
+                Invocation {
+                    class: Class::Nested,
+                    ..invocation(
+                        compiled,
+                        "hold",
+                        InvocationKind::Route,
+                        Duration::from_secs(30),
+                    )
+                },
+            )
+            .await;
+        assert!(
+            matches!(answered, Err(ExecutionError::Overloaded { ran: false, .. })),
+            "{answered:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a nested call never waits: its caller holds memory it would wait on"
+        );
+        drop(full);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn after_a_burst_only_the_live_threads_stacks_stay_claimed() {
+        let engine = budgeted("enforce", "64");
+        let (results, _) = burst(&engine).await;
+        assert!(results.iter().any(Result::is_ok), "{results:?}");
+        let ledger = engine.budget.ledger().expect("a ledger");
+        assert_eq!(settled(ledger).await, 0, "no guest holds anything");
+        let residue = ledger.residue();
+        assert_eq!(residue % MIB, 0, "whole 1 MiB stacks: {residue}");
+        assert!(
+            residue <= results.len() * MIB,
+            "at most one stack per thread that ran a guest: {residue}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_memory_does_not_compile() {
+        let engine = engine();
+        assert!(
+            Module::new(&engine.engine, "(module (memory 1 2 shared))").is_err(),
+            "threads are off, so no guest memory escapes the ledger by being shared"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1575,7 +2674,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&enforce, &hog);
         let state = AppState::minimal_with_policies(enforce.clone(), &enforce_wasm_limits()).await;
         let err = enforce
-            .run(
+            .run_text(
                 state,
                 invocation(compiled, "hog", InvocationKind::Job, Duration::from_secs(5)),
             )
@@ -1591,7 +2690,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&warn, &hog);
         let state = AppState::minimal(warn.clone()).await;
         let response = warn
-            .run(
+            .run_text(
                 state,
                 invocation(compiled, "hog", InvocationKind::Job, Duration::from_secs(5)),
             )
@@ -1642,7 +2741,7 @@ pub(crate) mod tests {
         let engine = engine();
         let (_, compiled) = install(&engine, &grow_65_mib);
         let run = |state: Arc<AppState>| {
-            engine.run(
+            engine.run_text(
                 state,
                 invocation(
                     Arc::clone(&compiled),
@@ -1678,7 +2777,7 @@ pub(crate) mod tests {
         let (_, hog) = install(&engine, &hog);
         let state = AppState::minimal_with_policies(engine.clone(), &[above_ceiling]).await;
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(hog, "hog", InvocationKind::Job, Duration::from_secs(5)),
             )
@@ -1792,7 +2891,7 @@ pub(crate) mod tests {
         let engine = engine();
         let (_, compiled) = install(&engine, &presigning_guest());
         let call = |state: Arc<AppState>, handler: &str| {
-            engine.run(
+            engine.run_text(
                 state,
                 invocation(
                     Arc::clone(&compiled),
@@ -1883,7 +2982,7 @@ pub(crate) mod tests {
             .await
             .expect("seed image");
         let call = |handler: &str| {
-            engine.run(
+            engine.run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -1966,7 +3065,7 @@ pub(crate) mod tests {
         let engine = engine();
         let (_, compiled) = install(&engine, &fetching_guest());
         let call = |state: Arc<AppState>, handler: &str| {
-            engine.run(
+            engine.run_text(
                 state,
                 invocation(
                     Arc::clone(&compiled),
@@ -2049,7 +3148,7 @@ pub(crate) mod tests {
         let before = reserved();
         let state = AppState::minimal(engine.clone()).await;
         engine
-            .run(
+            .run_text(
                 state,
                 Invocation {
                     publishes: None,
@@ -2075,7 +3174,7 @@ pub(crate) mod tests {
         let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
         let state = AppState::minimal(engine.clone()).await;
         let err = engine
-            .run(
+            .run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -2086,10 +3185,10 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ExecutionError::Response(_)), "{err}");
+        assert!(matches!(err, ExecutionError::Undelivered { .. }), "{err}");
 
         let err = engine
-            .run(
+            .run_text(
                 Arc::clone(&state),
                 invocation(
                     Arc::clone(&compiled),
@@ -2114,7 +3213,7 @@ pub(crate) mod tests {
         let state = AppState::minimal(engine.clone()).await;
         engine.shutdown.trigger();
         let err = engine
-            .run(
+            .run_text(
                 state,
                 invocation(
                     compiled,

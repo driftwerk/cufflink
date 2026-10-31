@@ -72,15 +72,27 @@ struct Deployed {
     js: jetstream::Context,
     rows: deadpool_postgres::Object,
     wasm: Vec<u8>,
-    _db: TestDb,
+    db: TestDb,
 }
 
 async fn deployed(handlers: &[(&str, Value)]) -> Option<Deployed> {
+    deployed_with(handlers, &[]).await
+}
+
+async fn deployed_with(handlers: &[(&str, Value)], env: &[(&str, &str)]) -> Option<Deployed> {
+    let wasm = common::sdk::sdk_guest("eventing", Profile::Debug)?;
+    deployed_module(handlers, env, wasm).await
+}
+
+async fn deployed_module(
+    handlers: &[(&str, Value)],
+    env: &[(&str, &str)],
+    wasm: Vec<u8>,
+) -> Option<Deployed> {
     let infra = common::infra().await?;
     let nats_url = infra.require_nats()?;
-    let wasm = common::sdk::sdk_guest("eventing", Profile::Debug)?;
     let mut db = infra.create_database().await;
-    let platform = PlatformProcess::start(&db.url, Some(nats_url), &[]).await;
+    let platform = PlatformProcess::start(&db.url, Some(nats_url), env).await;
     platform.wait_ready().await;
     let tenant = db.mint_tenant().await;
     let (status, body) = platform
@@ -104,7 +116,7 @@ async fn deployed(handlers: &[(&str, Value)]) -> Option<Deployed> {
         tenant,
         rows,
         wasm,
-        _db: db,
+        db,
     })
 }
 
@@ -156,18 +168,24 @@ impl Deployed {
             .unwrap_or_default()
     }
 
-    async fn until_settled(&self, handler: &str) {
-        let stream = self
-            .js
+    async fn consumer(&self, handler: &str) -> jetstream::consumer::Info {
+        self.js
             .get_stream(tenant_stream(&self.tenant))
             .await
-            .expect("stream");
+            .expect("stream")
+            .consumer_info(durable(handler))
+            .await
+            .expect("durable")
+    }
+
+    async fn metric(&self, name: &str) -> f64 {
+        self.platform.metric(name, &[]).await.unwrap_or_default()
+    }
+
+    async fn until_settled(&self, handler: &str) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let info = stream
-                .consumer_info(durable(handler))
-                .await
-                .expect("durable");
+            let info = self.consumer(handler).await;
             if info.num_pending == 0
                 && info.num_ack_pending == 0
                 && info.delivered.stream_sequence > 0
@@ -475,6 +493,223 @@ async fn a_handler_is_told_of_its_delivery() {
         ),
         ("succeed", 1, durable("succeed"), &None),
         "under `ack: always` too"
+    );
+}
+
+const BUDGETED: &[(&str, &str)] = &[
+    ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+    ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+    ("WASM_MEMORY_BACKGROUND_SHARE_PERCENT", "100"),
+    ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+    ("WASM_THREAD_STACK_KB", "1024"),
+    ("WASM_CAPACITY_RETRIES", "1"),
+];
+
+fn budgeted(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    BUDGETED.iter().chain(extra).copied().collect()
+}
+
+async fn until(what: &str, reached: impl AsyncFnMut() -> bool) {
+    common::until(what, Duration::from_secs(10), reached)
+        .await
+        .expect("in time");
+}
+
+#[tokio::test]
+async fn messages_run_only_as_room_allows_and_each_is_delivered_once() {
+    let env = budgeted(&[
+        ("WASM_MEMORY_BUDGET_MB", "64"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "24"),
+    ]);
+    let Some(deployed) =
+        deployed_with(&[("grow", on_success(json!({"concurrency": 8})))], &env).await
+    else {
+        return;
+    };
+    let gate = common::Gate::closed(&deployed.db.tenant_url(&deployed.tenant.slug)).await;
+    for _ in 0..4 {
+        deployed.publish("grow", r#"{"mib":1,"gate":4242}"#).await;
+    }
+    until("two messages run", async || gate.waiting().await == 2).await;
+    for _ in 0..5 {
+        assert_eq!(
+            gate.waiting().await,
+            2,
+            "a 64 MiB budget fits two 24 MiB estimates, not three"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    gate.open().await;
+    deployed.until_settled("grow").await;
+    assert_eq!(deployed.deliveries("grow").await, 4);
+    assert_eq!(
+        deployed.consumer("grow").await.delivered.consumer_sequence,
+        4,
+        "four deliveries for four messages"
+    );
+    assert_eq!(
+        deployed
+            .metric("cufflink_wasm_capacity_retries_total")
+            .await,
+        0.0
+    );
+    assert!(deployed.dead_letters("grow").await.is_empty());
+}
+
+#[tokio::test]
+async fn an_ack_always_message_denied_mid_run_is_run_again_in_place_then_deferred_and_not_lost() {
+    let env = budgeted(&[
+        ("WASM_MEMORY_BUDGET_MB", "64"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+        ("WASM_ADMISSION_RETRY_AFTER_MS", "200"),
+    ]);
+    let always = || json!({"ack": "always"});
+    let Some(deployed) = deployed_with(
+        &[
+            ("hold", always()),
+            ("hold_more", always()),
+            ("grow", always()),
+        ],
+        &env,
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant_db = deployed.db.tenant_url(&deployed.tenant.slug);
+    let first = common::Gate::closed_at(&tenant_db, 1).await;
+    let second = common::Gate::closed_at(&tenant_db, 2).await;
+    deployed.publish("hold", r#"{"mib":20,"gate":1}"#).await;
+    deployed
+        .publish("hold_more", r#"{"mib":20,"gate":2}"#)
+        .await;
+    until("both holders wait at their gates", async || {
+        first.waiting().await == 1 && second.waiting().await == 1
+    })
+    .await;
+
+    deployed.publish("grow", r#"{"mib":[24,50]}"#).await;
+    until(
+        "the first run is denied and waits to run again",
+        async || {
+            deployed
+                .metric("cufflink_wasm_capacity_retries_total")
+                .await
+                == 1.0
+        },
+    )
+    .await;
+    second.open().await;
+    until(
+        "the second run is denied too and the message deferred",
+        async || deployed.counted("grow", "deferred").await == 1.0,
+    )
+    .await;
+    assert_eq!(deployed.deliveries("grow").await, 0);
+
+    first.open().await;
+    deployed.until_settled("grow").await;
+    assert_eq!(deployed.deliveries("grow").await, 1, "run once room freed");
+    let info = deployed.consumer("grow").await;
+    assert_eq!(
+        info.delivered.consumer_sequence, 2,
+        "the one deferral is the one redelivery"
+    );
+    assert_eq!(deployed.counted("grow", "dead_letter").await, 0.0);
+    assert!(deployed.dead_letters("grow").await.is_empty());
+}
+
+async fn a_finished_handler_is_settled_once_with_its_service_at_its_share(delivery: Value) {
+    let env = [
+        ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+        ("WASM_MEMORY_BUDGET_MB", "64"),
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "40"),
+        ("WASM_MEMORY_BACKGROUND_SHARE_PERCENT", "100"),
+        ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+        ("WASM_THREAD_STACK_KB", "1024"),
+        ("WASM_CAPACITY_RETRIES", "1"),
+        ("WASM_ADMISSION_RETRY_AFTER_MS", "50"),
+    ];
+    let Some(deployed) = deployed_module(
+        &[
+            ("answer_big_gated", delivery),
+            ("fill_gated", json!({"ack": "always"})),
+        ],
+        &env,
+        common::guest::module_bytes(),
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant_db = deployed.db.tenant_url(&deployed.tenant.slug);
+    let answering = common::Gate::closed_at(&tenant_db, 2).await;
+    let filling = common::Gate::closed(&tenant_db).await;
+    deployed.publish("answer_big_gated", "{}").await;
+    until("the handler waits at its gate", async || {
+        answering.waiting().await == 1
+    })
+    .await;
+    deployed.publish("fill_gated", "{}").await;
+    until("the service is at its share", async || {
+        filling.waiting().await == 1
+    })
+    .await;
+
+    answering.open().await;
+    deployed.until_settled("answer_big_gated").await;
+    assert_eq!(deployed.deliveries("answer_big_gated").await, 1);
+    assert_eq!(
+        deployed
+            .consumer("answer_big_gated")
+            .await
+            .delivered
+            .consumer_sequence,
+        1,
+        "its 3 MiB answer is past what is left of the share, and it is read all the same"
+    );
+    assert_eq!(deployed.counted("answer_big_gated", "deferred").await, 0.0);
+    assert_eq!(
+        deployed
+            .metric("cufflink_wasm_capacity_retries_total")
+            .await,
+        0.0
+    );
+    filling.open().await;
+}
+
+#[tokio::test]
+async fn an_on_success_message_that_ran_is_acked_with_its_service_at_its_share() {
+    a_finished_handler_is_settled_once_with_its_service_at_its_share(on_success(json!({}))).await;
+}
+
+#[tokio::test]
+async fn an_ack_always_message_that_ran_is_acked_with_its_service_at_its_share() {
+    a_finished_handler_is_settled_once_with_its_service_at_its_share(json!({"ack": "always"}))
+        .await;
+}
+
+#[tokio::test]
+async fn an_idle_durable_holds_nothing_in_the_ledger() {
+    let env = budgeted(&[("WASM_MEMORY_BUDGET_MB", "64")]);
+    let Some(deployed) = deployed_with(&[("grow", on_success(json!({})))], &env).await else {
+        return;
+    };
+    until("the pump is pulling", async || {
+        deployed.consumer("grow").await.num_waiting >= 1
+    })
+    .await;
+    assert_eq!(
+        deployed
+            .platform
+            .metric(
+                "cufflink_wasm_memory_in_use_bytes",
+                &[("class", "background")]
+            )
+            .await,
+        Some(0.0)
     );
 }
 

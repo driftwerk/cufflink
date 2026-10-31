@@ -12,6 +12,7 @@ use crate::policy::{PolicyKey, PolicyMode};
 use crate::registry::RegisteredService;
 use crate::tenant_catalog::TenantEntry;
 use crate::tenant_sessions::{Purpose, Statements};
+use crate::wasm_runtime::budget::{Hold, Meter};
 use crate::AppState;
 use async_nats::HeaderMap;
 use chrono::{DateTime, Utc};
@@ -349,14 +350,19 @@ impl<'a> Sink<'a> {
     }
 
     pub fn record(&self, record: &AuditRecord) {
+        self.record_drawing(record, &mut Hold::none());
+    }
+
+    pub(crate) fn record_drawing<M: Meter + ?Sized>(&self, record: &AuditRecord, meter: &mut M) {
         self.count(&record.action);
+        let (legacy, durable) = record.payloads(meter);
         let legacy = Message {
             subject: legacy_audit_subject(self.tenant_slug),
-            payload: record.legacy_payload().to_string().into_bytes(),
+            payload: legacy,
         };
         let durable = Message {
             subject: audit_subject(self.tenant_slug, &self.service.name),
-            payload: record.durable_payload().to_string().into_bytes(),
+            payload: durable,
         };
         if !self.enforced {
             spawn_publish(

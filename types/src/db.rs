@@ -460,6 +460,7 @@ error_kinds! {
     NotSupported => "not_supported",
     Protocol => "protocol",
     Unavailable => "unavailable",
+    TooLarge => "too_large",
 }
 
 impl DbErrorKind {
@@ -856,6 +857,7 @@ mod tests {
             DbErrorKind::PoolTimeout,
             DbErrorKind::TransactionLimit,
             DbErrorKind::Unavailable,
+            DbErrorKind::TooLarge,
             DbErrorKind::Other,
         ] {
             assert_eq!(

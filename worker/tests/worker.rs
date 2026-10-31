@@ -162,6 +162,7 @@ impl HookService {
             service_schema: self.service.schema(),
             service_name: Some("hook-svc".into()),
             publishes: None,
+            nested: false,
         }
     }
 
@@ -756,6 +757,207 @@ impl JobService {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+const SOON: Duration = Duration::from_secs(10);
+
+fn budgeted(megabytes: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+        ("WASM_MEMORY_BUDGET_MB", megabytes),
+        ("WASM_MEMORY_SERVICE_SHARE_PERCENT", "100"),
+        ("WASM_MEMORY_BACKGROUND_SHARE_PERCENT", "100"),
+        ("WASM_MEMORY_ADMIT_PERCENT", "100"),
+        ("WASM_MEMORY_COLD_ESTIMATE_MB", "8"),
+        ("WASM_MEMORY_JOB_FLOOR_MB", "4"),
+        ("WASM_THREAD_STACK_KB", "1024"),
+        ("WASM_ADMISSION_WAIT_MS", "100"),
+        ("WASM_ADMISSION_RETRY_AFTER_MS", "200"),
+        ("WASM_CAPACITY_RETRIES_JOB", "100"),
+    ]
+}
+
+#[tokio::test]
+async fn a_job_denied_mid_run_is_deferred_without_spending_an_attempt() {
+    let Some(jobs) = JobService::start(&budgeted("80")).await else {
+        return;
+    };
+    let gate = cufflink_testkit::Gate::closed(&jobs.db.tenant_url(&jobs.slug)).await;
+    let holder = jobs.enqueue(&job("hold_gated_56", 60, 1)).await;
+    cufflink_testkit::until("the holder waits at the gate", SOON, async || {
+        gate.waiting().await == 1
+    })
+    .await
+    .expect("in time");
+
+    let grower = jobs.enqueue(&job("grow_24", 60, 1)).await;
+    let deferred = jobs
+        .until(grower, "was deferred", |row| row.capacity_deferrals >= 1)
+        .await;
+    assert!(
+        deferred
+            .published_at
+            .is_some_and(|deferred_at| deferred.next_attempt_at > deferred_at),
+        "the next attempt is after the delay: {deferred:?}"
+    );
+
+    gate.open().await;
+    for job_id in [holder, grower] {
+        let done = jobs
+            .until(job_id, "completed", |row| {
+                row.status == JobStatus::Completed
+            })
+            .await;
+        assert_eq!(
+            done.attempts, 1,
+            "the one attempt allowed was not spent by the deferral: {done:?}"
+        );
+    }
+    assert_eq!(
+        jobs.metric(
+            "cufflink_wasm_job_deferrals_total",
+            &[("result", "deferred")]
+        )
+        .await,
+        Some(1.0),
+        "once deferred, the job waited for room rather than coming back each delay"
+    );
+    jobs.settled("both jobs ended").await;
+}
+
+#[tokio::test]
+async fn an_after_hook_fetched_with_no_room_waits_for_it_and_runs_once() {
+    let Some(infra) = infra::infra().await else {
+        return;
+    };
+    let Some(nats_url) = infra.require_nats() else {
+        return;
+    };
+    let mut db = infra.create_migrated_database().await;
+    let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
+    let _turn = exclusive_jetstream(&js).await;
+    events::setup_long_jobs_stream(&js)
+        .await
+        .expect("long-jobs stream");
+
+    let hooks = HookService::deploy(infra, &mut db).await;
+    let env: Vec<(&str, &str)> = budgeted("64")
+        .into_iter()
+        .chain([("WORKER_AFTER_HOOK_CONCURRENCY", "2")])
+        .collect();
+    let worker = Worker::start_in(hooks.storage_dir.clone(), &db, nats_url, &env).await;
+    worker.process.wait_ready().await;
+    let gate = cufflink_testkit::Gate::closed(&db.tenant_url(&hooks.tenant.slug)).await;
+    hooks.publish(&js, hooks.job("hold_gated_56", "{}")).await;
+    cufflink_testkit::until("the holder waits at the gate", SOON, async || {
+        gate.waiting().await == 1
+    })
+    .await
+    .expect("in time");
+
+    hooks.publish(&js, hooks.job("insert_hooked", "{}")).await;
+    cufflink_testkit::until("the hook waits for room", SOON, async || {
+        worker
+            .process
+            .metric(
+                "cufflink_wasm_admission_waiters",
+                &[("class", "background")],
+            )
+            .await
+            == Some(1.0)
+    })
+    .await
+    .expect("in time");
+    assert!(hooks.titles().await.is_empty());
+
+    gate.open().await;
+    assert_eq!(hooks.until_titles(1).await, ["hooked"]);
+    assert_eq!(
+        worker
+            .process
+            .metric("cufflink_wasm_capacity_retries_total", &[])
+            .await
+            .unwrap_or_default(),
+        0.0,
+        "it waited before it ran, so nothing was denied"
+    );
+}
+
+#[tokio::test]
+async fn an_after_hook_denied_on_every_delivery_is_dead_lettered_for_capacity() {
+    use cufflink_platform::nats_manager::dlq::{DELIVERIES_HEADER, REASON_HEADER};
+
+    let Some(infra) = infra::infra().await else {
+        return;
+    };
+    let Some(nats_url) = infra.require_nats() else {
+        return;
+    };
+    let mut db = infra.create_migrated_database().await;
+    let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
+    let _turn = exclusive_jetstream(&js).await;
+    events::setup_long_jobs_stream(&js)
+        .await
+        .expect("long-jobs stream");
+
+    let hooks = HookService::deploy(infra, &mut db).await;
+    let env: Vec<(&str, &str)> = budgeted("72")
+        .into_iter()
+        .chain([
+            ("WORKER_AFTER_HOOK_CONCURRENCY", "2"),
+            ("WASM_CAPACITY_RETRIES", "1"),
+            ("WASM_ADMISSION_RETRY_AFTER_MS", "50"),
+        ])
+        .collect();
+    let worker = Worker::start_in(hooks.storage_dir.clone(), &db, nats_url, &env).await;
+    worker.process.wait_ready().await;
+    let gate = cufflink_testkit::Gate::closed(&db.tenant_url(&hooks.tenant.slug)).await;
+    hooks.publish(&js, hooks.job("hold_gated_56", "{}")).await;
+    cufflink_testkit::until("the holder waits at the gate", SOON, async || {
+        gate.waiting().await == 1
+    })
+    .await
+    .expect("in time");
+
+    hooks
+        .publish(&js, hooks.job("big_query_or_trap", "{}"))
+        .await;
+    let letter = dead_letter(
+        &js,
+        format!("cufflink.dlq.{}.>", hooks.tenant.slug),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("dead-lettered once its deliveries run out");
+    let headers = letter.headers.as_ref().expect("headers");
+    assert_eq!(
+        letter.subject.as_str(),
+        format!(
+            "cufflink.dlq.{}.hook-svc.hook.big_query_or_trap",
+            hooks.tenant.slug
+        )
+    );
+    assert_eq!(
+        headers.get(REASON_HEADER).map(|v| v.as_str()),
+        Some("capacity")
+    );
+    assert_eq!(
+        headers.get(DELIVERIES_HEADER).map(|v| v.as_str()),
+        Some("3")
+    );
+    assert_eq!(
+        worker
+            .process
+            .metric(
+                "cufflink_wasm_capacity_retries_total",
+                &[("kind", "worker_route")]
+            )
+            .await,
+        Some(3.0),
+        "each delivery ran once more before it was deferred"
+    );
+
+    gate.open().await;
 }
 
 #[cfg(unix)]
@@ -2028,119 +2230,170 @@ async fn a_running_backup_job_is_claimed_again_by_a_redelivery_alone() {
     );
 }
 
+struct Routed {
+    platform: ChildProcess,
+    worker: Worker,
+    tenant: infra::Tenant,
+    db: infra::TestDb,
+    _turn: MutexGuard<'static, ()>,
+}
+
+impl Routed {
+    async fn start(
+        worker_routes: &str,
+        wasm: &[u8],
+        services: &[(&str, serde_json::Value)],
+        worker_env: &[(&str, &str)],
+    ) -> Option<Self> {
+        const KEYS: &str = "k1:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let platform_binary = infra::require_binary("cufflink-platform")?;
+        let infra = infra::infra().await?;
+        let nats_url = infra.require_nats()?;
+        let mut db = infra.create_database().await;
+        let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
+        let turn = exclusive_jetstream(&js).await;
+
+        let storage_dir = std::env::temp_dir().join(format!("cufflink-worker-{}", Uuid::new_v4()));
+        let dir = storage_dir.to_string_lossy().into_owned();
+        let platform = ChildProcess::spawn(
+            &platform_binary,
+            "PLATFORM_PORT",
+            &[
+                ("DATABASE_URL", db.url.as_str()),
+                ("NATS_URL", nats_url),
+                ("PLATFORM_HOST", "127.0.0.1"),
+                ("KEYCLOAK_URL", ""),
+                ("STORAGE_BACKEND", "local"),
+                ("STORAGE_LOCAL_DIR", dir.as_str()),
+                ("CUFFLINK_SERVICE_IDENTITY_KEYS", KEYS),
+                ("WORKER_ROUTES", worker_routes),
+                ("RUST_LOG", "info"),
+            ],
+        )
+        .await;
+        platform.wait_ready().await;
+        let tenant = db.mint_tenant().await;
+
+        for (name, routes) in services {
+            use base64::Engine;
+            let response = platform
+                .http
+                .post(format!("{}/api/services/deploy", platform.base_url))
+                .header("authorization", format!("ApiKey {}", tenant.api_key))
+                .json(&json!({
+                    "manifest": {
+                        "name": name,
+                        "version": "0.1.0",
+                        "mode": "wasm",
+                        "routing": "strict",
+                        "tables": [{
+                            "name": "items",
+                            "columns": [{"name": "id", "column_type": "uuid", "primary_key": true,
+                                         "nullable": false, "auto_generate": true}]
+                        }],
+                        "custom_routes": routes,
+                        "publishes": [],
+                    },
+                    "wasm_base64": base64::engine::general_purpose::STANDARD.encode(wasm),
+                    "api_version": 1,
+                }))
+                .send()
+                .await
+                .expect("deploy");
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            assert_eq!(status, 200, "deploy of {name}: {body}");
+        }
+
+        let env: Vec<(&str, &str)> = [
+            ("CUFFLINK_SERVICE_IDENTITY_KEYS", KEYS),
+            ("PLATFORM_INTERNAL_URL", platform.base_url.as_str()),
+        ]
+        .into_iter()
+        .chain(worker_env.iter().copied())
+        .collect();
+        let worker = Worker::start_in(storage_dir, &db, nats_url, &env).await;
+        worker.process.wait_ready().await;
+        Some(Self {
+            platform,
+            worker,
+            tenant,
+            db,
+            _turn: turn,
+        })
+    }
+
+    fn post(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> impl std::future::Future<Output = Answered> + use<> {
+        let request = self
+            .platform
+            .http
+            .post(format!(
+                "{}/svc/{}{path}",
+                self.platform.base_url, self.tenant.slug
+            ))
+            .json(&body);
+        async move {
+            let response = request.send().await.expect("call");
+            Answered {
+                status: response.status().as_u16(),
+                retry_after: response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                body: response.json().await.unwrap_or(serde_json::Value::Null),
+            }
+        }
+    }
+}
+
+struct Answered {
+    status: u16,
+    retry_after: Option<String>,
+    body: serde_json::Value,
+}
+
+fn public(handler: &str) -> serde_json::Value {
+    json!({"method": "POST", "path": format!("/{handler}"), "handler": handler,
+           "posture": {"kind": "public", "reason": "integration test"}})
+}
+
 #[tokio::test]
 async fn a_worker_guest_calls_an_internal_route_through_the_platform() {
-    const KEYS: &str = "k1:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    let Some(platform_binary) = infra::require_binary("cufflink-platform") else {
-        return;
-    };
     if let Some(reason) = cufflink_test_guests::UNAVAILABLE {
         infra::skip(reason);
         return;
     }
     let wasm = cufflink_test_guests::wasm("internal", cufflink_test_guests::Profile::Debug)
         .expect("built guest");
-    let Some(infra) = infra::infra().await else {
-        return;
-    };
-    let Some(nats_url) = infra.require_nats() else {
-        return;
-    };
-    let mut db = infra.create_database().await;
-    let js = async_nats::jetstream::new(async_nats::connect(nats_url).await.expect("nats"));
-    let _turn = exclusive_jetstream(&js).await;
-
-    let storage_dir = std::env::temp_dir().join(format!("cufflink-worker-{}", Uuid::new_v4()));
-    let dir = storage_dir.to_string_lossy().into_owned();
-    let platform = ChildProcess::spawn(
-        &platform_binary,
-        "PLATFORM_PORT",
+    let Some(routed) = Routed::start(
+        r#"{"front": ["hop"]}"#,
+        &wasm,
         &[
-            ("DATABASE_URL", db.url.as_str()),
-            ("NATS_URL", nats_url),
-            ("PLATFORM_HOST", "127.0.0.1"),
-            ("KEYCLOAK_URL", ""),
-            ("STORAGE_BACKEND", "local"),
-            ("STORAGE_LOCAL_DIR", dir.as_str()),
-            ("CUFFLINK_SERVICE_IDENTITY_KEYS", KEYS),
-            ("WORKER_ROUTES", r#"{"front": ["hop"]}"#),
-            ("RUST_LOG", "info"),
+            ("front", json!([public("hop")])),
+            (
+                "back",
+                json!([{"method": "POST", "path": "/files/{id}", "handler": "whoami",
+                        "posture": {"kind": "internal", "callers": ["front"]}}]),
+            ),
         ],
+        &[],
     )
-    .await;
-    platform.wait_ready().await;
-    let tenant = db.mint_tenant().await;
-
-    let manifest = |name: &str, routes: serde_json::Value| {
-        json!({
-            "name": name,
-            "version": "0.1.0",
-            "mode": "wasm",
-            "routing": "strict",
-            "tables": [{
-                "name": "items",
-                "columns": [{"name": "id", "column_type": "uuid", "primary_key": true,
-                             "nullable": false, "auto_generate": true}]
-            }],
-            "custom_routes": routes,
-            "publishes": [],
-        })
-    };
-    for (name, routes) in [
-        (
-            "front",
-            json!([{"method": "POST", "path": "/hop", "handler": "hop",
-                    "posture": {"kind": "public", "reason": "integration test"}}]),
-        ),
-        (
-            "back",
-            json!([{"method": "POST", "path": "/files/{id}", "handler": "whoami",
-                    "posture": {"kind": "internal", "callers": ["front"]}}]),
-        ),
-    ] {
-        use base64::Engine;
-        let response = platform
-            .http
-            .post(format!("{}/api/services/deploy", platform.base_url))
-            .header("authorization", format!("ApiKey {}", tenant.api_key))
-            .json(&json!({
-                "manifest": manifest(name, routes),
-                "wasm_base64": base64::engine::general_purpose::STANDARD.encode(&wasm),
-                "api_version": 1,
-            }))
-            .send()
-            .await
-            .expect("deploy");
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        assert_eq!(status, 200, "deploy of {name}: {body}");
-    }
-
-    let worker = Worker::start_in(
-        storage_dir,
-        &db,
-        nats_url,
-        &[
-            ("CUFFLINK_SERVICE_IDENTITY_KEYS", KEYS),
-            ("PLATFORM_INTERNAL_URL", platform.base_url.as_str()),
-        ],
-    )
-    .await;
-    worker.process.wait_ready().await;
-    let hop = |path: &str| {
-        platform
-            .http
-            .post(format!(
-                "{}/svc/{}/front/hop",
-                platform.base_url, tenant.slug
-            ))
-            .json(&json!({"service": "back", "path": path, "body": {}}))
-            .send()
+    .await
+    else {
+        return;
     };
     for path in ["/files/7", "/files/{draft}"] {
-        let response = hop(path).await.expect("hop");
-        let status = response.status().as_u16();
-        let body: serde_json::Value = response.json().await.expect("json");
+        let Answered { status, body, .. } = routed
+            .post(
+                "/front/hop",
+                json!({"service": "back", "path": path, "body": {}}),
+            )
+            .await;
         assert_eq!(status, 200, "{path}: {body}");
         assert_eq!(
             body,
@@ -2152,6 +2405,51 @@ async fn a_worker_guest_calls_an_internal_route_through_the_platform() {
             "{path}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_worker_routed_call_with_no_room_is_answered_503_with_retry_after() {
+    let env = budgeted("64");
+    let Some(routed) = Routed::start(
+        r#"{"front": ["hold_gated_56"]}"#,
+        &guest::module_bytes(),
+        &[("front", json!([public("hold_gated_56")]))],
+        &env,
+    )
+    .await
+    else {
+        return;
+    };
+    let gate = cufflink_testkit::Gate::closed(&routed.db.tenant_url(&routed.tenant.slug)).await;
+    let holding = tokio::spawn(routed.post("/front/hold_gated_56", json!({})));
+    cufflink_testkit::until("the holder waits at the gate", SOON, async || {
+        gate.waiting().await == 1
+    })
+    .await
+    .expect("in time");
+
+    let refused = routed.post("/front/hold_gated_56", json!({})).await;
+    assert_eq!(refused.status, 503, "{}", refused.body);
+    assert_eq!(
+        refused.retry_after.as_deref(),
+        Some("1"),
+        "200 ms rounds up to a whole second"
+    );
+    assert_eq!(
+        routed
+            .worker
+            .process
+            .metric(
+                "cufflink_wasm_admission_refused_total",
+                &[("reason", "memory")]
+            )
+            .await,
+        Some(1.0)
+    );
+
+    gate.open().await;
+    let held = holding.await.expect("join");
+    assert_eq!(held.status, 200, "{}", held.body);
 }
 
 #[tokio::test]

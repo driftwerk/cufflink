@@ -21,7 +21,10 @@ use cufflink_platform::repo::deployments::{execution_context, ExecutionContext};
 use cufflink_platform::shutdown::{self, Shutdown, DEPENDENCY_FLUSH_CAP};
 use cufflink_platform::storage::S3Storage;
 use cufflink_platform::tenant_db::TenantPoolManager;
-use cufflink_platform::wasm_runtime::{ExecutionError, Invocation, InvocationKind, WasmEngine};
+use cufflink_platform::wasm_runtime::budget::Hold;
+use cufflink_platform::wasm_runtime::{
+    Class, ExecutionError, GuestOutput, Invocation, InvocationKind, WasmEngine,
+};
 use cufflink_platform::worker_dispatch::{requested_budget, WasmJob, WasmJobResult};
 use cufflink_platform::{AppState, Assembly};
 use cufflink_telemetry::Kind;
@@ -87,8 +90,11 @@ fn subscribe_pattern(configured: Option<String>) -> eyre::Result<String> {
     Ok(pattern)
 }
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
+    cufflink_platform::wasm_runtime::budget::runtime()?.block_on(run())
+}
+
+async fn run() -> eyre::Result<()> {
     cufflink_telemetry::init(cufflink_telemetry::Component::Worker, &[])?;
     info!(
         version = platform_version(),
@@ -373,27 +379,23 @@ async fn reply_to_sync_job(
         &msg.payload,
         budget,
         Kind::WorkerRoute,
+        Class::Interactive,
     )
     .instrument(jobs::span("sync", msg.headers.as_ref()))
     .await;
     jobs::record("sync", if outcome.is_ok() { "ok" } else { "error" });
 
-    let result = match outcome {
-        Ok(response) => WasmJobResult {
-            ok: true,
-            response: Some(response),
-            error: None,
-        },
-        Err(e) => WasmJobResult::failed(e.to_string()),
+    let (result, mut hold) = match outcome {
+        Ok(response) => (WasmJobResult::answered(response.text), response.hold),
+        Err(e) => (
+            match &e {
+                JobError::Execution(error) => WasmJobResult::of_error(error, e.to_string()),
+                _ => WasmJobResult::failed(e.to_string()),
+            },
+            Hold::none(),
+        ),
     };
-    let reply_payload = serde_json::to_vec(&result).unwrap_or_else(|e| {
-        serde_json::json!({
-            "ok": false,
-            "error": format!("Failed to serialize result: {e}"),
-        })
-        .to_string()
-        .into_bytes()
-    });
+    let reply_payload = result.into_payload(&mut hold, wasm_engine);
     if let Some(reply) = msg.reply {
         if let Err(e) = nats_conn::publish_bounded(
             &app_state.nats,
@@ -465,13 +467,21 @@ async fn resolve_job(
     }
 }
 
+fn class_of(class: Class, nested: bool) -> Class {
+    match (class, nested) {
+        (Class::Interactive, true) => Class::Nested,
+        (class, _) => class,
+    }
+}
+
 async fn process_job(
     app_state: &Arc<AppState>,
     wasm_engine: &WasmEngine,
     payload: &[u8],
     budget: Duration,
     kind: Kind,
-) -> Result<String, JobError> {
+    class: Class,
+) -> Result<GuestOutput, JobError> {
     let (job, context) = resolve_job(app_state, payload).await.inspect_err(|e| {
         if let JobError::IdentityMismatch {
             claimed_tenant,
@@ -508,24 +518,40 @@ async fn process_job(
             version: job.version,
         })?;
 
-    wasm_engine
-        .run(
-            app_state.clone(),
-            Invocation {
-                compiled,
-                handler: job.handler,
-                request_json: job.request_json,
-                identity: context.identity(),
-                publishes: context.publishes,
-                extensions: context.extensions,
-                kind: InvocationKind::WorkerRoute,
-                scope_kind: Some(kind),
-                budget,
-                cancel: None,
-            },
-        )
-        .await
-        .map_err(JobError::Execution)
+    let class = class_of(class, job.nested);
+    let identity = context.identity();
+    let invocation = |request_json| Invocation {
+        compiled: Arc::clone(&compiled),
+        handler: job.handler.clone(),
+        request_json,
+        identity: identity.clone(),
+        publishes: context.publishes.clone(),
+        extensions: context.extensions.clone(),
+        kind: InvocationKind::WorkerRoute,
+        scope_kind: Some(kind),
+        budget,
+        cancel: None,
+        class,
+        admission: None,
+    };
+    let run = match class {
+        Class::Background => {
+            wasm_engine
+                .run_retrying_capacity(
+                    app_state.clone(),
+                    InvocationKind::WorkerRoute,
+                    job.request_json.clone(),
+                    invocation,
+                )
+                .await
+        }
+        _ => {
+            wasm_engine
+                .run(app_state.clone(), invocation(job.request_json.clone()))
+                .await
+        }
+    };
+    run.map_err(JobError::Execution)
 }
 
 const ASYNC_JOB_SUBJECT_PREFIX: &str = "cufflink.wasm.async.";
@@ -580,11 +606,15 @@ struct AfterHookWork {
     retries: RetryDelays,
 }
 
-fn after_hook_outcome(result: Result<String, JobError>, at_hard_deadline: bool) -> Outcome {
+fn after_hook_outcome(result: Result<GuestOutput, JobError>, at_hard_deadline: bool) -> Outcome {
     match result {
-        Ok(_) => Outcome::Ok,
+        Ok(_) | Err(JobError::Execution(ExecutionError::Undelivered { .. })) => Outcome::Ok,
+        Err(JobError::Execution(ExecutionError::NotStarted)) => Outcome::NotStarted,
         Err(JobError::Execution(e)) if e.interrupted_by_shutdown(at_hard_deadline) => {
             Outcome::Interrupted
+        }
+        Err(JobError::Execution(ExecutionError::Overloaded { retry_after, .. })) => {
+            Outcome::Deferred { after: retry_after }
         }
         Err(e @ JobError::InvalidPayload(_)) => Outcome::Invalid {
             reason: e.to_string(),
@@ -645,6 +675,7 @@ impl Work for AfterHookWork {
                 &msg.payload,
                 WORKER_ROUTE_BUDGET,
                 Kind::Hook,
+                Class::Background,
             )
             .instrument(jobs::span("async", msg.headers.as_ref()))
             .await;
@@ -667,6 +698,10 @@ impl Work for AfterHookWork {
             after_hook_outcome(result, app_state.shutdown.hard_deadline_reached())
         }
         .boxed()
+    }
+
+    fn headroom(&self) -> BoxFuture<'_, usize> {
+        self.wasm_engine.headroom_for_any_handler().boxed()
     }
 
     fn decide(&self, outcome: &Outcome, meta: &MessageMeta) -> Decision {
@@ -703,14 +738,43 @@ impl Work for AfterHookWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cufflink_platform::wasm_runtime::budget::Reason;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_routed_call_with_a_caller_is_nested_and_a_hook_stays_background() {
+        assert_eq!(class_of(Class::Interactive, false), Class::Interactive);
+        assert_eq!(class_of(Class::Interactive, true), Class::Nested);
+        assert_eq!(class_of(Class::Background, true), Class::Background);
+        assert_eq!(class_of(Class::Background, false), Class::Background);
+    }
 
     #[test]
     fn an_after_hook_is_retried_only_when_a_retry_can_help() {
         let at_hard_deadline = false;
         assert_eq!(
-            after_hook_outcome(Ok("{}".into()), at_hard_deadline),
+            after_hook_outcome(
+                Ok(GuestOutput {
+                    text: "{}".into(),
+                    hold: Hold::none(),
+                }),
+                at_hard_deadline
+            ),
             Outcome::Ok
+        );
+        assert_eq!(
+            after_hook_outcome(
+                Err(JobError::Execution(ExecutionError::Undelivered {
+                    reason: "past the cap".into(),
+                    answer: cufflink_platform::router::guest_response::Answer {
+                        status: axum::http::StatusCode::OK,
+                        delivery: None,
+                    },
+                })),
+                at_hard_deadline
+            ),
+            Outcome::Ok,
+            "a hook that finished is not run again for its answer's size"
         );
         assert_eq!(
             after_hook_outcome(
@@ -719,6 +783,28 @@ mod tests {
             ),
             Outcome::Interrupted
         );
+        assert_eq!(
+            after_hook_outcome(
+                Err(JobError::Execution(ExecutionError::NotStarted)),
+                at_hard_deadline
+            ),
+            Outcome::NotStarted
+        );
+        for ran in [false, true] {
+            assert_eq!(
+                after_hook_outcome(
+                    Err(JobError::Execution(ExecutionError::Overloaded {
+                        reason: Reason::Memory,
+                        retry_after: Duration::from_millis(50),
+                        ran,
+                    })),
+                    at_hard_deadline
+                ),
+                Outcome::Deferred {
+                    after: Duration::from_millis(50)
+                }
+            );
+        }
         let deadline = || {
             Err(JobError::Execution(ExecutionError::DeadlineExceeded {
                 budget: Duration::from_secs(30),
@@ -772,6 +858,7 @@ mod tests {
                 service_schema: "victim_schema".into(),
                 service_name: Some("victim-service".into()),
                 publishes: None,
+                nested: false,
             },
             ExecutionContext {
                 tenant_id: Uuid::nil(),

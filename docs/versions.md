@@ -144,6 +144,100 @@ declares.
 |---------|-------------|----------|
 | `column_permissions` | any column declares `#[restricted(...)]` | columns read and written through the data routes only with a grant ([column permissions](column-permissions.md)) |
 
+## Features added in v0.35.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `route_concurrency` | any route sets `max_concurrent` | invocations of a route in flight at once, per replica ([route limits](routing.md#route-limits)) |
+| `guest_memory_budget` | never demanded | a process-wide budget for guest memory and the host memory made for guests, with admission that waits or answers 503 and `Retry-After` rather than exceeding it ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)) |
+
+This release adds the guest memory budget: a process-wide ledger of the
+linear memory, tables and thread stacks of the guests in flight, and of the
+memory the host makes for them, with
+admission that waits, or answers `503` and `Retry-After`, rather than
+exceed it ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)).
+`WASM_MEMORY_BUDGET_MODE` is `warn` by default: nothing waits or is refused
+for the budget yet, and
+`cufflink_wasm_admission_refused_total{mode="warn"}` shows what would have
+been. A later release makes `enforce` the default. Under `enforce`:
+
+- a service is limited to 32 invocations in flight per replica
+  (`WASM_MAX_CONCURRENT_PER_SERVICE`). Background work may hold half of
+  them, so with the default a subscription runs at most 16 messages at once
+  per process, whatever its `consumer.concurrency`; raise the limit on a
+  worker-only process to suit it;
+- a message of an `ack: always` subscription denied memory mid-run is run
+  again rather than acked, so it may run twice;
+- a route denied memory mid-run is answered `503`, saying the request may
+  have been partly applied;
+- a write with an after-hook runs in a transaction, and is answered `503`
+  with nothing committed when the hook's request text cannot be held, or
+  `413` when the text alone passes the service share. A `503` after a
+  before-hook ran says so, since a retry runs that hook again;
+- in-process after-hooks are at-most-once: one that cannot start within
+  `WASM_COMMITTED_WAIT_SECS` (300), or is denied memory mid-run, is logged
+  and dropped, and not retried. Route work that must happen to a worker;
+- a request or message whose guest has returned is delivered: it takes
+  room up to `WASM_MEMORY_DELIVERY_OVERRUN_MB` past the budget, in turn, and
+  is never refused for what else is running. Only an answer whose text,
+  tree and render alone pass the smaller of the overrun and the service
+  share is refused, as too large: its effects stand and a route answers
+  `500`. By default that is 128 MiB up to an 853 MiB container and 15 % of
+  the limit above it; raise `WASM_MEMORY_DELIVERY_OVERRUN_MB` to deliver
+  larger answers. A subscription, schedule or
+  job is still settled by the `__status` and `__delivery` of such an
+  answer, and a job that succeeded fails terminally with its result
+  unread, rather than running again;
+- the most memory guests can reach is the budget, the overrun and one
+  response ([sizing](deployment.md#guest-memory-budget));
+
+Memory the host makes for guests is charged before it is made: request
+and response bodies, and the results of host calls (database rows,
+objects, HTTP responses, Redis values, images). Under `enforce`, each
+host-call result is capped at `WASM_MAX_HOST_RESPONSE_MB` (64); under
+`warn`, a result past it is counted in `cufflink_wasm_host_cap_total` and
+answered as before. Under `enforce`:
+
+- a `db_query` result past the cap fails the call with `-1`, and a
+  `db_v2` call answers the new `DbErrorKind::TooLarge` (`too_large`). The
+  statement is stopped, and a transaction it ran in is rolled back
+  (`cufflink_db_tx_abandoned_total{reason="unread"}`);
+- `redis_get` and `redis_mget` measure the values first (`STRLEN` in one
+  `MULTI`), refuse a read whose values together pass the cap, reserve
+  them, and then read them (`EXISTS` and `GETRANGE` in a second `MULTI`).
+  A value that keeps growing between the two, over three reads, answers
+  the call `-1`, as an error the guest may retry. `redis_mget` takes at most `HOST_FANOUT_MAX_ITEMS`
+  (128) keys. The Redis user needs `MULTI`, `EXEC`, `STRLEN`, `EXISTS` and
+  `GETRANGE`; an ACL that allows only `GET` and `MGET` refuses these
+  reads. Redis 7 or later is required for them to answer exactly as `GET`
+  does when a key expires during the read; on Redis 6 the platform logs a
+  warning at startup and such a key may read as `""` rather than nil.
+  Under `warn` and `off`, the reads stay plain `GET` and `MGET`;
+- `service_call` reads a callee's response only up to what its envelope
+  can carry under the cap, about three quarters of it, so a larger one
+  fails the call with a transport error.
+
+The budget is shared fairly between services, not tenants: each service
+may hold at most `WASM_MEMORY_SERVICE_SHARE_PERCENT` (50) of it, so a
+tenant with two busy services can hold all of it.
+
+In every mode, `image_transform_multi` encodes and uploads its targets one
+at a time, so a failure part way leaves the earlier targets uploaded.
+
+These process changes apply in every mode, `off` included:
+
+- the runtime's idle blocking threads exit after 2 s, and at most
+  `WASM_MAX_CONCURRENT × 5 + 64` exist at once;
+- on glibc, allocations of 1 MiB or more are returned to the kernel when
+  freed (`mallopt(M_MMAP_THRESHOLD)`), unless the mode is `off` or
+  `MALLOC_MMAP_THRESHOLD_` or `GLIBC_TUNABLES` sets it;
+- a malformed budget variable (any of those
+  [setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs) lists
+  for the budget, `WASM_THREAD_STACK_KB` included) stops the process at
+  startup rather than falling back to a default.
+
+Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
+
 `cufflink services list --features` prints what each deployed service
 requires.
 
@@ -246,6 +340,14 @@ Rolling a platform back from v0.31.0 to v0.30:
 | Services that declare column permissions (`cufflink services list --features` names them, as `column_permissions`) | **Roll each back first, to a version without them.** The v0.30 platform drops the key it does not know and serves the service without it: every restricted column is answered to, and written by, every caller that reaches the row. Such a service cannot be deployed there (422, naming the feature) |
 | The database | Nothing: v0.31.0 has no migration |
 
+Rolling a platform back from v0.35.0 to an earlier release:
+
+| What v0.35.0 added | Before rolling the platform back |
+|--------------------|----------------------------------|
+| Services that declare `max_concurrent` on a route (`cufflink services list --features` names them, as `route_concurrency`) | Nothing must be done first. The older platform drops the key it does not know and runs the route without its limit. Such a service cannot be deployed there (422, naming the feature) |
+| The guest memory budget | Nothing: the older platform ignores the `WASM_MEMORY_*` variables and admits as before |
+| The database | Nothing: `V7__capacity_deferrals` only adds a column the older binary ignores. A job put off for capacity keeps its later `next_attempt_at` and runs then |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -268,7 +370,8 @@ only the plaintext column, which `encrypted` storage empties
 Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
-`V5__extensions` and `V6__runner_keys` on v0.28.0): expected and harmless, as migrations are
+`V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
+v0.35.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist

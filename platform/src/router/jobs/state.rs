@@ -1,6 +1,8 @@
 use crate::repo::wasm_jobs::{JobStatus, WasmJob};
-use crate::router::guest_response::{decode, GuestResponse};
+use crate::router::guest_response::{answer, parse_output, Answer};
+use crate::wasm_runtime::budget::Hold;
 use crate::wasm_runtime::ExecutionError;
+use crate::wasm_runtime::GuestOutput;
 use chrono::{DateTime, Utc};
 use cufflink_types::backoff::Backoff;
 use cufflink_types::delivery::DeliveryControl;
@@ -11,6 +13,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobErrorClass {
     Crash,
+    Capacity,
     Timeout,
     HandlerError,
     Explicit { retry_after: Duration },
@@ -21,6 +24,7 @@ impl JobErrorClass {
     pub fn as_str(&self) -> &'static str {
         match self {
             JobErrorClass::Crash => "crash",
+            JobErrorClass::Capacity => "capacity",
             JobErrorClass::Timeout => "timeout",
             JobErrorClass::HandlerError => "handler_error",
             JobErrorClass::Explicit { .. } => "explicit",
@@ -30,7 +34,7 @@ impl JobErrorClass {
 
     fn is_retried(&self, retry_on: &[RetryOn]) -> bool {
         match self {
-            JobErrorClass::Crash | JobErrorClass::Explicit { .. } => true,
+            JobErrorClass::Crash | JobErrorClass::Capacity | JobErrorClass::Explicit { .. } => true,
             JobErrorClass::Timeout => retry_on.contains(&RetryOn::Timeout),
             JobErrorClass::HandlerError => retry_on.contains(&RetryOn::Error),
             JobErrorClass::Terminal { .. } => false,
@@ -109,6 +113,7 @@ pub enum Attempt {
     Completed(Value),
     Failed { class: JobErrorClass, error: String },
     Interrupted(String),
+    Deferred(Duration),
     LeaseLost,
 }
 
@@ -121,59 +126,111 @@ impl Attempt {
     }
 }
 
-fn answer_of(response: &str) -> Option<(u16, Option<DeliveryControl>)> {
-    decode(response.to_string())
-        .ok()
-        .map(|response| match response {
-            GuestResponse::Legacy { status, .. } => (status.as_u16(), None),
-            GuestResponse::V2(response) => (
-                response.status.as_u16(),
-                response.delivery.map(|delivery| *delivery),
-            ),
-        })
-}
-
-fn answered(response: String, job: &WasmJob) -> Attempt {
-    match answer_of(&response) {
-        Some((status, Some(DeliveryControl::RetryAfter { retry_after_ms }))) => Attempt::failed(
+fn failed_by(answer: Answer, job: &WasmJob) -> Option<Attempt> {
+    let status = answer.status.as_u16();
+    match answer.delivery {
+        Some(DeliveryControl::RetryAfter { retry_after_ms }) => Some(Attempt::failed(
             JobErrorClass::Explicit {
                 retry_after: Duration::from_millis(retry_after_ms),
             },
             format!("Handler asked for another attempt ({status})"),
-        ),
-        Some((_, Some(DeliveryControl::Terminal { terminal }))) => Attempt::failed(
+        )),
+        Some(DeliveryControl::Terminal { terminal }) => Some(Attempt::failed(
             JobErrorClass::Terminal {
                 reason: terminal.clone(),
             },
             terminal,
-        ),
-        Some((status, None)) if status >= 500 && job.retry_on.contains(&RetryOn::Error) => {
-            Attempt::failed(
-                JobErrorClass::HandlerError,
-                format!("Handler answered {status}"),
-            )
-        }
-        _ => Attempt::Completed(serde_json::from_str(&response).unwrap_or(Value::String(response))),
+        )),
+        None if status >= 500 && job.retry_on.contains(&RetryOn::Error) => Some(Attempt::failed(
+            JobErrorClass::HandlerError,
+            format!("Handler answered {status}"),
+        )),
+        None => None,
+    }
+}
+
+fn finished_unread(reason: impl std::fmt::Display) -> Attempt {
+    let reason = format!("the job finished, but its result could not be read: {reason}");
+    Attempt::failed(
+        JobErrorClass::Terminal {
+            reason: reason.clone(),
+        },
+        reason,
+    )
+}
+
+fn answered(response: GuestOutput, job: &WasmJob) -> (Attempt, Hold) {
+    match answer(&response)
+        .ok()
+        .and_then(|answer| failed_by(answer, job))
+    {
+        Some(failed) => (failed, Hold::none()),
+        None => match parse_output(response) {
+            Ok((value, hold)) => (Attempt::Completed(value), hold),
+            Err(refused) => (finished_unread(refused), Hold::none()),
+        },
     }
 }
 
 pub fn classify(
+    run: Result<GuestOutput, ExecutionError>,
+    job: &WasmJob,
+    at_hard_deadline: bool,
+    deferrals_allowed: u32,
+) -> (Attempt, Hold) {
+    match run {
+        Ok(response) => answered(response, job),
+        Err(error) => (
+            unanswered(error, job, at_hard_deadline, deferrals_allowed),
+            Hold::none(),
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn classified(
     run: Result<String, ExecutionError>,
     job: &WasmJob,
     at_hard_deadline: bool,
+    deferrals_allowed: u32,
 ) -> Attempt {
-    match run {
-        Ok(response) => answered(response, job),
-        Err(ExecutionError::Cancelled) => Attempt::LeaseLost,
-        Err(e) if e.interrupted_by_shutdown(at_hard_deadline) => {
-            Attempt::Interrupted(e.to_string())
+    let run = run.map(|text| GuestOutput {
+        text,
+        hold: Hold::none(),
+    });
+    classify(run, job, at_hard_deadline, deferrals_allowed).0
+}
+
+fn unanswered(
+    error: ExecutionError,
+    job: &WasmJob,
+    at_hard_deadline: bool,
+    deferrals_allowed: u32,
+) -> Attempt {
+    match error {
+        ExecutionError::Cancelled => Attempt::LeaseLost,
+        ExecutionError::Undelivered { reason, answer } => {
+            failed_by(answer, job).unwrap_or_else(|| finished_unread(reason))
         }
-        Err(ExecutionError::DeadlineExceeded { .. }) => Attempt::failed(
+        e if e.interrupted_by_shutdown(at_hard_deadline) => Attempt::Interrupted(e.to_string()),
+        ExecutionError::Overloaded { retry_after, .. }
+            if u32::try_from(job.capacity_deferrals).unwrap_or(u32::MAX) < deferrals_allowed =>
+        {
+            metrics::counter!("cufflink_wasm_job_deferrals_total", "result" => "deferred")
+                .increment(1);
+            Attempt::Deferred(retry_after)
+        }
+        e @ ExecutionError::Overloaded { .. } => {
+            metrics::counter!("cufflink_wasm_job_deferrals_total", "result" => "counted")
+                .increment(1);
+            Attempt::failed(JobErrorClass::Capacity, e.to_string())
+        }
+        ExecutionError::DeadlineExceeded { .. } => Attempt::failed(
             JobErrorClass::Timeout,
             format!("Handler exceeded timeout ({}s)", job.timeout_secs),
         ),
-        Err(e @ ExecutionError::Runtime(_)) => Attempt::failed(JobErrorClass::Crash, e.to_string()),
-        Err(e @ ExecutionError::HandlerNotFound(_)) => {
+        e @ ExecutionError::Runtime(_) => Attempt::failed(JobErrorClass::Crash, e.to_string()),
+        e @ ExecutionError::HandlerNotFound(_) => {
             let error = format!("Handler error: {e}");
             Attempt::failed(
                 JobErrorClass::Terminal {
@@ -182,7 +239,7 @@ pub fn classify(
                 error,
             )
         }
-        Err(e) => Attempt::failed(JobErrorClass::HandlerError, format!("Handler error: {e}")),
+        e => Attempt::failed(JobErrorClass::HandlerError, format!("Handler error: {e}")),
     }
 }
 
@@ -226,6 +283,7 @@ pub(crate) mod tests {
             trace_context: None,
             dead_lettered_at: None,
             idempotency_key: None,
+            capacity_deferrals: 0,
             schedule_name: None,
         }
     }
@@ -266,11 +324,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_capacity_denial_defers_until_the_bound_then_counts_as_a_failure_that_is_retried() {
+        let overloaded = || {
+            Err(ExecutionError::Overloaded {
+                reason: crate::wasm_runtime::budget::Reason::Memory,
+                retry_after: Duration::from_secs(2),
+                ran: true,
+            })
+        };
+        let mut waiting = job(JobStatus::Running, 1, 3);
+        waiting.capacity_deferrals = 9;
+        assert_eq!(
+            classified(overloaded(), &waiting, false, 10),
+            Attempt::Deferred(Duration::from_secs(2))
+        );
+        waiting.capacity_deferrals = 10;
+        let Attempt::Failed { class, error } = classified(overloaded(), &waiting, false, 10) else {
+            panic!("the eleventh deferral counts");
+        };
+        assert_eq!(class, JobErrorClass::Capacity);
+        assert!(error.contains("capacity"), "{error}");
+        assert_eq!(class.as_str(), "capacity");
+        assert!(
+            class.is_retried(&[]),
+            "as a crash is, whatever retry_on says"
+        );
+        assert_eq!(
+            classified(
+                Err(ExecutionError::TooLarge {
+                    requested: 2,
+                    share: 1
+                }),
+                &waiting,
+                false,
+                10
+            ),
+            Attempt::failed(
+                JobErrorClass::HandlerError,
+                "Handler error: WASM guest needs more memory than it may hold \
+                 (requested 2 bytes, limit 1 bytes)"
+            ),
+            "no retry cures what can never fit"
+        );
+    }
+
+    #[test]
     fn every_class_is_retried_by_who_declares_it_while_attempts_remain() {
         for class in classes() {
             for retry_on in retry_sets() {
                 let retried = match class {
-                    JobErrorClass::Crash | JobErrorClass::Explicit { .. } => true,
+                    JobErrorClass::Crash
+                    | JobErrorClass::Capacity
+                    | JobErrorClass::Explicit { .. } => true,
                     JobErrorClass::Timeout => retry_on.contains(&RetryOn::Timeout),
                     JobErrorClass::HandlerError => retry_on.contains(&RetryOn::Error),
                     JobErrorClass::Terminal { .. } => false,
@@ -476,6 +581,72 @@ pub(crate) mod tests {
         }
     }
 
+    fn too_large(text: &str) -> (Attempt, Hold) {
+        use crate::wasm_runtime::budget::testing;
+        let (_ledger, base) = testing::hold(4 * testing::MIB);
+        let output = GuestOutput {
+            text: text.to_string(),
+            hold: base.delivering(),
+        };
+        classify(Ok(output), &retrying(&[RetryOn::Error]), false, 10)
+    }
+
+    #[test]
+    fn a_finished_job_too_large_to_read_ends_and_is_not_run_again() {
+        let text = format!("\"{}\"", "x".repeat(5 * 1024 * 1024));
+        let (attempt, _) = too_large(&text);
+        let Attempt::Failed { class, error } = attempt else {
+            panic!("expected a failure, got {attempt:?}");
+        };
+        assert!(matches!(class, JobErrorClass::Terminal { .. }));
+        assert!(error.contains("finished"), "{error}");
+        assert!(matches!(
+            decide(&class, 1, &[RetryOn::Error]),
+            JobDecision::Fail
+        ));
+    }
+
+    #[test]
+    fn a_failed_job_too_large_to_read_is_still_its_handlers_failure() {
+        let pad = "x".repeat(5 * 1024 * 1024);
+        let (attempt, _) = too_large(&format!(r#"{{"__status":500,"__body":"{pad}"}}"#));
+        assert!(matches!(
+            attempt,
+            Attempt::Failed {
+                class: JobErrorClass::HandlerError,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_job_answering_past_the_response_cap_ends_as_it_says() {
+        let oversized = |status: u16| {
+            Err(ExecutionError::Undelivered {
+                reason: "past the cap".into(),
+                answer: Answer {
+                    status: axum::http::StatusCode::from_u16(status).expect("a status"),
+                    delivery: None,
+                },
+            })
+        };
+        let job = retrying(&[RetryOn::Error]);
+        assert!(matches!(
+            classified(oversized(200), &job, false, 10),
+            Attempt::Failed {
+                class: JobErrorClass::Terminal { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            classified(oversized(500), &job, false, 10),
+            Attempt::Failed {
+                class: JobErrorClass::HandlerError,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_response_is_the_jobs_result_whatever_its_status() {
         for response in [
@@ -486,14 +657,14 @@ pub(crate) mod tests {
         ] {
             for retry_on in [vec![], vec![RetryOn::Timeout]] {
                 assert_eq!(
-                    classify(Ok(response.into()), &retrying(&retry_on), false),
+                    classified(Ok(response.into()), &retrying(&retry_on), false, 10),
                     Attempt::Completed(serde_json::from_str(response).expect("json")),
                     "{response}"
                 );
             }
         }
         assert_eq!(
-            classify(Ok("plain text".into()), &retrying(&[]), false),
+            classified(Ok("plain text".into()), &retrying(&[]), false, 10),
             Attempt::Completed(Value::String("plain text".into()))
         );
     }
@@ -509,7 +680,7 @@ pub(crate) mod tests {
             ),
         ] {
             assert_eq!(
-                classify(Ok(response.into()), &job, false),
+                classified(Ok(response.into()), &job, false, 10),
                 Attempt::failed(
                     JobErrorClass::HandlerError,
                     format!("Handler answered {status}")
@@ -525,7 +696,7 @@ pub(crate) mod tests {
         ] {
             assert!(
                 matches!(
-                    classify(Ok(response.into()), &job, false),
+                    classified(Ok(response.into()), &job, false, 10),
                     Attempt::Completed(_)
                 ),
                 "{response}"
@@ -538,10 +709,11 @@ pub(crate) mod tests {
         for retry_on in retry_sets() {
             let job = retrying(&retry_on);
             assert_eq!(
-                classify(
+                classified(
                     Ok(r#"{"__v":2,"__status":503,"__body":{"error":"busy"},"__delivery":{"retry_after_ms":1500}}"#.into()),
                     &job,
-                    false
+                    false,
+                    10
                 ),
                 Attempt::failed(
                     JobErrorClass::Explicit {
@@ -551,10 +723,11 @@ pub(crate) mod tests {
                 )
             );
             assert_eq!(
-                classify(
+                classified(
                     Ok(r#"{"__v":2,"__status":422,"__body":{"error":"unknown book"},"__delivery":{"terminal":"unknown book"}}"#.into()),
                     &job,
-                    false
+                    false,
+                    10
                 ),
                 Attempt::failed(
                     JobErrorClass::Terminal {
@@ -576,7 +749,7 @@ pub(crate) mod tests {
             r#"{"__v":2,"__status":503,"__body":{},"__delivery":{"retry_after_ms":"soon"}}"#,
         ] {
             assert_eq!(
-                classify(Ok(response.into()), &job, false),
+                classified(Ok(response.into()), &job, false, 10),
                 Attempt::Completed(serde_json::from_str(response).expect("json")),
                 "{response}"
             );
@@ -592,40 +765,53 @@ pub(crate) mod tests {
             })
         };
         assert_eq!(
-            classify(deadline(), &job, false),
+            classified(deadline(), &job, false, 10),
             Attempt::failed(JobErrorClass::Timeout, "Handler exceeded timeout (900s)")
         );
         assert!(matches!(
-            classify(deadline(), &job, true),
+            classified(deadline(), &job, true, 10),
             Attempt::Interrupted(_)
         ));
         assert!(matches!(
-            classify(Err(ExecutionError::ShuttingDown), &job, false),
+            classified(Err(ExecutionError::ShuttingDown), &job, false, 10),
             Attempt::Interrupted(_)
         ));
+        assert!(
+            matches!(
+                classified(Err(ExecutionError::NotStarted), &job, false, 0),
+                Attempt::Interrupted(_)
+            ),
+            "released, whatever deferrals are left"
+        );
         assert_eq!(
-            classify(Err(ExecutionError::Cancelled), &job, false),
+            classified(Err(ExecutionError::Cancelled), &job, false, 10),
             Attempt::LeaseLost
         );
         assert_eq!(
-            classify(Err(ExecutionError::Runtime("join".into())), &job, false),
+            classified(Err(ExecutionError::Runtime("join".into())), &job, false, 10),
             Attempt::failed(JobErrorClass::Crash, "WASM runtime error: join")
         );
         assert_eq!(
-            classify(Err(ExecutionError::Trap("unreachable".into())), &job, false),
+            classified(
+                Err(ExecutionError::Trap("unreachable".into())),
+                &job,
+                false,
+                10
+            ),
             Attempt::failed(
                 JobErrorClass::HandlerError,
                 "Handler error: WASM trap: unreachable"
             )
         );
         assert!(matches!(
-            classify(
+            classified(
                 Err(ExecutionError::MemoryLimit {
                     requested: 2,
                     limit: 1
                 }),
                 &job,
-                false
+                false,
+                10
             ),
             Attempt::Failed {
                 class: JobErrorClass::HandlerError,
@@ -633,7 +819,7 @@ pub(crate) mod tests {
             }
         ));
         assert!(matches!(
-            classify(Err(ExecutionError::HandlerNotFound("h".into())), &job, false),
+            classified(Err(ExecutionError::HandlerNotFound("h".into())), &job, false, 10),
             Attempt::Failed {
                 class: JobErrorClass::Terminal { .. },
                 error,

@@ -470,6 +470,7 @@ async fn run_phases(
         progress.phase("on_migrate", json!({})).await;
         crate::router::crud::execute_hook_as(
             crate::wasm_runtime::InvocationKind::OnMigrate,
+            crate::wasm_runtime::Class::Committed,
             state,
             &hook.service,
             hook.name,
@@ -527,6 +528,7 @@ mod tests {
             &service,
             None,
             None,
+            &mut crate::wasm_runtime::budget::Hold::none(),
         )
         .expect("text")
     }

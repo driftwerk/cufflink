@@ -5,6 +5,7 @@ use crate::egress::{EgressError, EgressGuard, EgressTarget, OutboundRequest};
 use crate::policy::{Denied, PolicyKey};
 use crate::router::HOP_BY_HOP_HEADERS;
 use crate::telemetry::{record_response, request_span, resolving};
+use crate::wasm_runtime::budget::Refused;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
@@ -12,7 +13,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -26,6 +27,7 @@ use uuid::Uuid;
 use wasmtime::Linker;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const ENVELOPE_ALLOWANCE: u64 = 64 * 1024;
 
 const DECODE_ROUNDS: usize = 3;
 
@@ -221,8 +223,8 @@ fn next_depth(current: u8) -> Result<u8, CallFailure> {
         .ok_or(CallFailure::DepthExceeded)
 }
 
-pub(crate) fn inbound_depth(request: &Value) -> u8 {
-    request["caller"]["depth"]
+pub(crate) fn caller_depth(caller: &Value) -> u8 {
+    caller["depth"]
         .as_u64()
         .map_or(0, |depth| u8::try_from(depth).unwrap_or(u8::MAX))
 }
@@ -386,7 +388,7 @@ async fn send_local(
     Ok(CallResponse {
         status,
         headers,
-        body: body.to_vec(),
+        body: body.into(),
     })
 }
 
@@ -488,7 +490,7 @@ async fn call(
     };
     let uri = svc_uri(caller.tenant_slug, &target);
     let prefix = svc_prefix(caller.tenant_slug, &target.service);
-    let max_bytes = app.egress.effective_max_bytes(None);
+    let max_bytes = response_limit(state);
     match (local, app.config.platform_internal_url.as_deref()) {
         (Some(service), _) => {
             let sent = uri
@@ -541,19 +543,65 @@ async fn runs_in_tenant(
     }
 }
 
-fn envelope(outcome: &Result<CallResponse, CallFailure>) -> Value {
-    match outcome {
-        Ok(response) => json!({
-            "ok": true,
-            "status": response.status,
-            "headers": response.headers,
-            "body_b64": STANDARD.encode(&response.body),
-        }),
-        Err(failure) => json!({
-            "ok": false,
-            "error": { "kind": failure.kind(), "message": failure.message() },
-        }),
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Envelope<'a> {
+    Answered {
+        body_b64: Base64<'a>,
+        headers: &'a BTreeMap<String, String>,
+        ok: bool,
+        status: u16,
+    },
+    Failed {
+        error: FailureBody,
+        ok: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct FailureBody {
+    kind: &'static str,
+    message: String,
+}
+
+struct Base64<'a>(&'a [u8]);
+
+impl serde::Serialize for Base64<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&base64::display::Base64Display::new(self.0, &STANDARD))
     }
+}
+
+fn envelope(outcome: &Result<CallResponse, CallFailure>) -> Envelope<'_> {
+    match outcome {
+        Ok(response) => Envelope::Answered {
+            body_b64: Base64(&response.body),
+            headers: &response.headers,
+            ok: true,
+            status: response.status,
+        },
+        Err(failure) => Envelope::Failed {
+            error: FailureBody {
+                kind: failure.kind(),
+                message: failure.message(),
+            },
+            ok: false,
+        },
+    }
+}
+
+fn response_limit(state: &HostState) -> u64 {
+    body_limit(
+        state.app_state.egress.effective_max_bytes(None),
+        state.caps().response_limit(),
+    )
+}
+
+fn body_limit(egress: u64, cap: Option<usize>) -> u64 {
+    cap.map_or(egress, |cap| {
+        let encoded = u64::try_from(cap).unwrap_or(u64::MAX) / 4 * 3;
+        egress.min(encoded.saturating_sub(ENVELOPE_ALLOWANCE))
+    })
 }
 
 fn result_label(outcome: &Result<CallResponse, CallFailure>) -> &'static str {
@@ -576,6 +624,11 @@ pub(super) fn register(
         |mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
             let bytes = host_try!(read_guest_bytes(&mut caller, "service_call", ptr, len));
             let started = Instant::now();
+            let mut body = caller.data().hold();
+            let reserved = response_limit(caller.data());
+            if let Err(capacity) = body.grow(usize::try_from(reserved).unwrap_or(usize::MAX)) {
+                return caller.data_mut().refused(Refused::Budget(capacity));
+            }
             let state = caller.data();
             let resolved = OnceCell::new();
             let outcome = match serde_json::from_slice::<CallRequest>(&bytes) {
@@ -611,8 +664,14 @@ pub(super) fn register(
             .increment(1);
             metrics::histogram!("cufflink_service_call_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
-            caller.data_mut().host_response = Some(envelope(&outcome).to_string());
-            0
+            body.shrink_to(
+                outcome
+                    .as_ref()
+                    .map_or(0, |response| response.body.capacity()),
+            );
+            caller
+                .data_mut()
+                .respond_json("service_call", &envelope(&outcome))
         },
     )
 }
@@ -620,6 +679,7 @@ pub(super) fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -815,9 +875,9 @@ mod tests {
         assert_eq!(next_depth(MAX_CALL_DEPTH - 1), Ok(MAX_CALL_DEPTH));
         assert_eq!(next_depth(MAX_CALL_DEPTH), Err(CallFailure::DepthExceeded));
         assert_eq!(next_depth(u8::MAX), Err(CallFailure::DepthExceeded));
-        assert_eq!(inbound_depth(&json!({"caller": {"depth": 3}})), 3);
-        assert_eq!(inbound_depth(&json!({"caller": {"depth": 900}})), u8::MAX);
-        assert_eq!(inbound_depth(&json!({"auth": null})), 0);
+        assert_eq!(caller_depth(&json!({"depth": 3})), 3);
+        assert_eq!(caller_depth(&json!({"depth": 900})), u8::MAX);
+        assert_eq!(caller_depth(&Value::Null), 0);
     }
 
     #[test]
@@ -1003,19 +1063,48 @@ mod tests {
     }
 
     #[test]
+    fn a_body_at_its_limit_fits_the_response_cap_once_encoded() {
+        const CAP: usize = 1024 * 1024;
+        let limit = body_limit(u64::MAX, Some(CAP));
+        let body = vec![0u8; usize::try_from(limit).expect("small")];
+        let headers = BTreeMap::from([("content-type".to_string(), "x".repeat(8 * 1024))]);
+        let outcome = Ok(CallResponse {
+            status: 200,
+            headers,
+            body,
+        });
+        let encoded = serde_json::to_string(&envelope(&outcome)).expect("envelope");
+        assert!(encoded.len() <= CAP, "{} above {CAP}", encoded.len());
+
+        assert_eq!(body_limit(2048, Some(CAP)), 2048, "the egress limit first");
+        assert_eq!(body_limit(5, None), 5, "no cap outside enforce");
+        assert_eq!(body_limit(u64::MAX, Some(1024)), 0);
+    }
+
+    #[test]
     fn envelopes_and_labels_follow_the_outcome() {
         let ok = Ok(CallResponse {
             status: 201,
             headers: BTreeMap::from([("x-a".to_string(), "1".to_string())]),
             body: b"hi".to_vec(),
         });
+        let before =
+            json!({"ok": true, "status": 201, "headers": {"x-a": "1"}, "body_b64": "aGk="});
         assert_eq!(
-            envelope(&ok),
-            json!({"ok": true, "status": 201, "headers": {"x-a": "1"}, "body_b64": "aGk="})
+            serde_json::to_string(&envelope(&ok)).expect("envelope"),
+            serde_json::to_string(&before).expect("before"),
+            "byte for byte as the Value it replaced"
         );
         assert_eq!(result_label(&ok), "ok");
         let failed = Err(CallFailure::DepthExceeded);
-        assert_eq!(envelope(&failed)["error"]["kind"], "depth_exceeded");
+        let before = json!({
+            "ok": false,
+            "error": { "kind": "depth_exceeded", "message": CallFailure::DepthExceeded.message() },
+        });
+        assert_eq!(
+            serde_json::to_string(&envelope(&failed)).expect("envelope"),
+            serde_json::to_string(&before).expect("before")
+        );
         assert_eq!(result_label(&failed), "depth");
         for (status, label) in [(404, "http_4xx"), (503, "http_5xx")] {
             assert_eq!(
