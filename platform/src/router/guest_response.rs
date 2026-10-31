@@ -22,6 +22,7 @@ const MAX_HEADERS: usize = 64;
 const MAX_HEADER_VALUE: usize = 8 * 1024;
 const MAX_TREE_DEPTH: usize = 127;
 const MAX_DELIVERY_BLOCK: usize = 64 * 1024;
+const MAX_ESCAPED_KEY: usize = 64 * 1024;
 
 const DENIED_HEADERS: [&str; 4] = [
     "content-length",
@@ -90,7 +91,7 @@ pub(crate) trait Bodies {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct GuestResponseError(String);
+pub struct GuestResponseError(String);
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -144,7 +145,7 @@ pub(crate) fn decode(output: GuestOutput) -> Result<(GuestResponse, Hold), Decod
 
 pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError> {
     let text = output.text.as_bytes();
-    let mut hold = output.hold.sibling();
+    let mut hold = output.hold.beside();
     let response = match ChargedJson::parse(text, &mut hold) {
         Ok(parsed) => match decode_value(parsed.value, &mut hold) {
             Ok(response) => response,
@@ -181,22 +182,51 @@ struct Outline<'a> {
 }
 
 fn status_number(raw: &RawValue) -> Option<u64> {
-    serde_json::from_str(raw.get()).ok()
+    raw.get().parse().ok()
 }
 
-fn deeper_than_a_tree(text: &[u8]) -> bool {
-    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
-    text.iter().any(|&byte| {
-        match (quoted, escaped, byte) {
-            (true, true, _) => escaped = false,
-            (true, false, b'\\') => escaped = true,
-            (true, false, b'"') | (false, _, b'"') => quoted = !quoted,
-            (false, _, b'{' | b'[') => depth += 1,
-            (false, _, b'}' | b']') => depth = depth.saturating_sub(1),
+#[derive(Default)]
+struct OutlineScan {
+    depth: usize,
+    quoted: bool,
+    escaped: bool,
+    at_key: bool,
+    key_bytes: usize,
+    key_escaped: bool,
+}
+
+impl OutlineScan {
+    fn gives_up_at(&mut self, byte: u8) -> bool {
+        self.key_bytes += usize::from(self.quoted && self.at_key);
+        match (self.quoted, self.escaped, byte) {
+            (true, true, _) => self.escaped = false,
+            (true, false, b'\\') => {
+                self.escaped = true;
+                self.key_escaped = self.at_key;
+            }
+            (true, false, b'"') => self.quoted = false,
+            (false, _, b'"') => {
+                self.quoted = true;
+                self.key_bytes = 0;
+                self.key_escaped = false;
+            }
+            (false, _, b'{' | b'[') => {
+                self.depth += 1;
+                self.at_key = self.depth == 1;
+            }
+            (false, _, b'}' | b']') => self.depth = self.depth.saturating_sub(1),
+            (false, _, b',') => self.at_key = self.depth == 1,
+            (false, _, b':') => self.at_key = false,
             _ => {}
         }
-        depth > MAX_TREE_DEPTH
-    })
+        self.depth > MAX_TREE_DEPTH
+            || (self.quoted && self.key_escaped && self.key_bytes > MAX_ESCAPED_KEY)
+    }
+}
+
+fn past_the_reach_of_an_outline(text: &[u8]) -> bool {
+    let mut scan = OutlineScan::default();
+    text.iter().any(|&byte| scan.gives_up_at(byte))
 }
 
 fn delivery_control(block: &RawValue) -> Result<DeliveryControl, GuestResponseError> {
@@ -206,11 +236,12 @@ fn delivery_control(block: &RawValue) -> Result<DeliveryControl, GuestResponseEr
         .ok_or_else(|| invalid(DELIVERY_KEY))
 }
 
-pub(crate) fn outline(text: &[u8]) -> Result<Answer, GuestResponseError> {
-    let envelope = (text.trim_ascii_start().starts_with(b"{") && !deeper_than_a_tree(text))
-        .then(|| serde_json::from_slice::<Outline>(text).ok())
-        .flatten()
-        .unwrap_or_default();
+pub fn outline(text: &[u8]) -> Result<Answer, GuestResponseError> {
+    let envelope = (text.trim_ascii_start().starts_with(b"{")
+        && !past_the_reach_of_an_outline(text))
+    .then(|| serde_json::from_slice::<Outline>(text).ok())
+    .flatten()
+    .unwrap_or_default();
     if envelope.version.is_none_or(|version| version.get() != "2") {
         return Ok(Answer {
             status: legacy_status(envelope.status.and_then(status_number)),
@@ -911,6 +942,20 @@ mod tests {
             r#"{"__status":500,"__body":{"error":"down"}}"#,
             r#"{"__status":99999}"#,
             r#"{"__status":"500"}"#,
+            r#"{"__status":-0}"#,
+            r#"{"__status":-1}"#,
+            r#"{"__status":500.0}"#,
+            r#"{"__status":5e2}"#,
+            r#"{"__status":18446744073709551616}"#,
+            r#"{"__status":true}"#,
+            r#"{"__status":[500]}"#,
+            r#"{"__status":  500  }"#,
+            r#"{"__v":2,"__status":-0}"#,
+            r#"{"__v":2,"__status":500.0}"#,
+            r#"{"__v":2,"__status":5e2}"#,
+            r#"{"__v":2,"__status":18446744073709551616}"#,
+            r#"{"__v":2.0,"__status":500}"#,
+            r#"{"__st\u0061tus":500}"#,
             r#"{"__status":null}"#,
             r#"{"ok":true}"#,
             r#"  {"__status":404}"#,
@@ -982,6 +1027,63 @@ mod tests {
             StatusCode::OK,
             "an escaped backslash ends with its string"
         );
+    }
+
+    #[test]
+    fn an_answers_tree_is_limited_with_its_text() {
+        let text = format!(
+            r#"{{"__v":2,"__status":500,"__headers":"a tree refuses this","a":"{}"}}"#,
+            "x".repeat(MIB)
+        );
+        let tree = ChargedJson::parse(text.as_bytes(), &mut Hold::none())
+            .expect("the text parses")
+            .cost;
+        let (ledger, base) = testing::hold(tree + text.len() / 2);
+        let mut hold = base.delivering();
+        hold.force(text.len());
+        let output = GuestOutput { text, hold };
+        let answer = answer(&output).expect("an outline does not read the headers");
+        assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(ledger.in_use(), output.text.len());
+    }
+
+    #[test]
+    fn a_long_escaped_key_is_past_the_reach_of_an_outline() {
+        let key = |escape: &str, bytes: usize| format!("{escape}{}", "x".repeat(bytes - 2));
+        let status = |key: &str| {
+            let raw = format!(r#"{{"{key}":1,"__status":500}}"#);
+            outline(raw.as_bytes()).expect("an outline").status
+        };
+        assert_eq!(
+            status(&key(r"\n", MAX_ESCAPED_KEY)),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(status(&key(r"\n", MAX_ESCAPED_KEY + 1)), StatusCode::OK);
+        assert_eq!(
+            status(&format!("{}\\n", "x".repeat(MAX_ESCAPED_KEY))),
+            StatusCode::OK,
+            "it costs the same with its escape at the end"
+        );
+        assert_eq!(
+            status(&key("xx", MAX_ESCAPED_KEY + 1)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a key with no escape is borrowed"
+        );
+        let escaped_value = format!(
+            r#"{{"a":"\n{}","__status":500}}"#,
+            "x".repeat(MAX_ESCAPED_KEY)
+        );
+        let nested_key = format!(
+            r#"{{"a":{{"\n{}":1}},"__status":500}}"#,
+            "x".repeat(MAX_ESCAPED_KEY)
+        );
+        for raw in [escaped_value, nested_key] {
+            assert_eq!(
+                outline(raw.as_bytes()).expect("an outline").status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "only a top-level key reaches scratch"
+            );
+        }
     }
 
     #[test]

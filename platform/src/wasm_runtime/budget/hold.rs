@@ -79,6 +79,7 @@ enum Terms {
 pub struct Hold {
     account: Option<Account>,
     bytes: usize,
+    beside: usize,
     terms: Terms,
     delivery: Option<Delivery>,
 }
@@ -97,6 +98,7 @@ impl Hold {
         Self {
             account: None,
             bytes: 0,
+            beside: 0,
             terms: Terms::Refusable,
             delivery: None,
         }
@@ -106,6 +108,7 @@ impl Hold {
         Self {
             account,
             bytes: 0,
+            beside: 0,
             terms: Terms::Refusable,
             delivery: None,
         }
@@ -115,6 +118,7 @@ impl Hold {
         Self {
             account,
             bytes: 0,
+            beside: 0,
             terms: Terms::Unrefused,
             delivery: None,
         }
@@ -124,6 +128,7 @@ impl Hold {
         Self {
             account,
             bytes: 0,
+            beside: 0,
             terms: Terms::Kept { room },
             delivery: None,
         }
@@ -133,9 +138,16 @@ impl Hold {
         Self {
             account: self.account.clone(),
             bytes: 0,
+            beside: 0,
             terms: self.terms,
             delivery: None,
         }
+    }
+
+    pub(crate) fn beside(&self) -> Self {
+        let mut hold = self.sibling();
+        hold.beside = self.bytes;
+        hold
     }
 
     pub(crate) fn delivering(&self) -> Self {
@@ -173,7 +185,7 @@ impl Hold {
         let Some(account) = self.account.as_ref().filter(|_| extra > 0) else {
             return Ok(());
         };
-        let holding = self.bytes.saturating_add(extra);
+        let holding = self.bytes.saturating_add(self.beside).saturating_add(extra);
         let (ledger, class, service) = (account.ledger(), account.class(), account.service());
         let verdict = match self.terms {
             Terms::Refusable => ledger.grow(class, service, extra),
@@ -446,6 +458,18 @@ mod tests {
         hold.delivered();
         assert_eq!(ledger.delivering(), 0);
         assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_tree_built_beside_its_text_is_limited_with_it() {
+        let (ledger, account) = owned(true);
+        let mut text = Hold::unrefused(Some(account));
+        text.force(40 * MIB);
+        let mut tree = text.beside();
+        tree.grow(10 * MIB).expect("text and tree reach the limit");
+        let refused = tree.grow(1).expect_err("past the limit together");
+        assert_eq!(refused.reason, Reason::DeliveryLimit);
+        assert_eq!(ledger.in_use(), 50 * MIB);
     }
 
     #[test]

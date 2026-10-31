@@ -23,6 +23,7 @@ use tracing::info;
 use uuid::Uuid;
 use wasmtime::*;
 
+pub use crate::router::guest_response::outline;
 pub(crate) use budget::RouteKey;
 pub use budget::{Admission, Class};
 pub use invocation::{Answer, ExecutionError, Invocation, InvocationKind};

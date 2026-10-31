@@ -1941,14 +1941,27 @@ Recorded as the change was built, each with its reason.
   `__status` and `__delivery` from the bytes with no tree, as
   `RequestContext` does, by the same status rules as the tree: a 500 is
   retried, `__delivery` is obeyed and an invalid envelope is an invalid
-  answer. Other envelope fields are not checked in that reading, so an
+  answer. The tree is limited together with the text it is read from, as a
+  response's is, so the two stay inside a full room, and a tree that would
+  pass it takes this reading instead. Other envelope fields are not checked
+  in that reading, so an
   invalid `__headers` in such an answer goes unseen, and of a key repeated
-  in it nothing is read, so it reads as a legacy 200. The reading allocates
-  nothing the guest sizes: serde_json skips a value with one scratch byte
-  per level and no limit, so a scan refuses text past the 127 levels a tree
-  stops at, which reads as a legacy 200 as the tree's failure does, and a
-  `__delivery` block past 64 KiB is invalid, since `DeliveryControl` is
-  untagged and would buffer it.
+  in it nothing is read, so it reads as a legacy 200.
+  The reading's allocation is bounded and does not grow with the text, as
+  `host_allocations` pins over strings, long numbers, escaped keys, unknown
+  keys, `__delivery` and deep nesting. Each source of one is closed:
+  serde_json skips a value with one scratch byte per level and no limit, so
+  a scan with no allocation gives up on text past the 127 levels a tree
+  stops at, which reads as a legacy 200 as the tree's failure does. It
+  copies a top-level key with an escape into scratch, whole, and no other
+  string, so the scan also gives up on such a key past 64 KiB, far longer
+  than any real key, which costs at most that one buffer since scratch is
+  reused, and this too reads as a legacy 200, unlike the tree, which would
+  read the `__status` beside it. `__status` is parsed as text, since
+  serde_json builds a type error holding a whole string, in `Debug` form,
+  and puts long numbers in scratch. A `__delivery` block past 64 KiB is
+  invalid, since `DeliveryControl` is untagged and would buffer it; one
+  within it costs about a mebibyte at worst.
 - **A finished job is not run again for its output.** A job that answered
   success and whose output cannot be read fails as `Terminal`, with an
   error saying it finished and its result could not be read. Nothing would

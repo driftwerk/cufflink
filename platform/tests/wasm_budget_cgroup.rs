@@ -177,6 +177,7 @@ async fn concurrent_large_answers_stay_inside_the_limit() {
         .trim()
         .parse()
         .expect("memory.peak is a number");
+    println!("memory.peak {} MiB of {} MiB", peak / MIB, CEILING / MIB);
     assert!(
         peak <= CEILING,
         "peak {peak} passed budget + overrun, {CEILING} bytes"
