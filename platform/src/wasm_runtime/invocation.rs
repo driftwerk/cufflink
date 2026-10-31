@@ -89,6 +89,8 @@ pub enum ExecutionError {
     DeadlineExceeded { budget: Duration },
     #[error("WASM execution aborted: platform is shutting down")]
     ShuttingDown,
+    #[error("WASM execution not started: platform is shutting down")]
+    NotStarted,
     #[error("WASM execution cancelled")]
     Cancelled,
     #[error(
@@ -119,7 +121,7 @@ pub enum ExecutionError {
 impl ExecutionError {
     pub fn interrupted_by_shutdown(&self, at_hard_deadline: bool) -> bool {
         match self {
-            ExecutionError::ShuttingDown => true,
+            ExecutionError::ShuttingDown | ExecutionError::NotStarted => true,
             ExecutionError::DeadlineExceeded { .. } => at_hard_deadline,
             _ => false,
         }
@@ -128,7 +130,7 @@ impl ExecutionError {
     pub(super) fn label(&self) -> &'static str {
         match self {
             ExecutionError::DeadlineExceeded { .. } => "timeout",
-            ExecutionError::ShuttingDown => "shutdown",
+            ExecutionError::ShuttingDown | ExecutionError::NotStarted => "shutdown",
             ExecutionError::Cancelled => "cancelled",
             ExecutionError::MemoryLimit { .. } => "memory_limit",
             ExecutionError::Trap(_) => "trap",
@@ -166,6 +168,7 @@ mod tests {
             budget: Duration::from_secs(30),
         };
         assert!(ExecutionError::ShuttingDown.interrupted_by_shutdown(false));
+        assert!(ExecutionError::NotStarted.interrupted_by_shutdown(false));
         assert!(deadline.interrupted_by_shutdown(true));
         assert!(!deadline.interrupted_by_shutdown(false));
         assert!(!ExecutionError::Runtime("join".into()).interrupted_by_shutdown(true));

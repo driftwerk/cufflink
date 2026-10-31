@@ -488,6 +488,7 @@ impl Work for SubscriptionWork {
 
 pub(crate) enum HandlerFailure {
     Interrupted(eyre::Report),
+    NotStarted(eyre::Report),
     Failed(eyre::Report),
     Deferred {
         after: Duration,
@@ -499,6 +500,7 @@ impl HandlerFailure {
     pub(crate) fn outcome(&self) -> Outcome {
         match self {
             HandlerFailure::Interrupted(_) => Outcome::Interrupted,
+            HandlerFailure::NotStarted(_) => Outcome::NotStarted,
             HandlerFailure::Deferred { after, .. } => Outcome::Deferred { after: *after },
             HandlerFailure::Failed(e) => Outcome::Retry {
                 after: None,
@@ -529,6 +531,7 @@ impl HandlerOutcome {
             HandlerOutcome::Rpc(Ok(_)) | HandlerOutcome::SideEffect(Ok(())) => None,
             HandlerOutcome::Rpc(Err(
                 HandlerFailure::Interrupted(e)
+                | HandlerFailure::NotStarted(e)
                 | HandlerFailure::Failed(e)
                 | HandlerFailure::Deferred { reason: e, .. },
             ))
@@ -660,7 +663,12 @@ async fn handle_message(
                 publish_reply(&ctx.state.nats, inbox, error_envelope(&e.to_string())).await;
             }
         }
-        (Some(_), HandlerOutcome::Rpc(Err(HandlerFailure::Deferred { .. }))) => {}
+        (
+            Some(_),
+            HandlerOutcome::Rpc(Err(
+                HandlerFailure::Deferred { .. } | HandlerFailure::NotStarted(_),
+            )),
+        ) => {}
         (Some(_), HandlerOutcome::SideEffect(_)) => {
             warn!(
                 "Subscription {} received `{}` for non-RPC handler `{:?}`; ignoring",
@@ -826,6 +834,7 @@ pub(crate) async fn run_handler(
         .await
         .map_err(|e| {
             let interrupted = e.interrupted_by_shutdown(state.shutdown.hard_deadline_reached());
+            let not_started = matches!(e, ExecutionError::NotStarted);
             let deferred = match &e {
                 ExecutionError::Overloaded { retry_after, .. } => Some(*retry_after),
                 _ => None,
@@ -838,13 +847,14 @@ pub(crate) async fn run_handler(
                 ),
                 other => eyre::eyre!("WASM execution error: {}", other),
             };
-            match (deferred, interrupted) {
-                (Some(after), _) => HandlerFailure::Deferred {
+            match (deferred, not_started, interrupted) {
+                (Some(after), _, _) => HandlerFailure::Deferred {
                     after,
                     reason: report,
                 },
-                (None, true) => HandlerFailure::Interrupted(report),
-                (None, false) => HandlerFailure::Failed(report),
+                (None, true, _) => HandlerFailure::NotStarted(report),
+                (None, false, true) => HandlerFailure::Interrupted(report),
+                (None, false, false) => HandlerFailure::Failed(report),
             }
         })?;
 

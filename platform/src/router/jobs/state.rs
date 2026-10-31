@@ -700,6 +700,13 @@ pub(crate) mod tests {
             classified(Err(ExecutionError::ShuttingDown), &job, false, 10),
             Attempt::Interrupted(_)
         ));
+        assert!(
+            matches!(
+                classified(Err(ExecutionError::NotStarted), &job, false, 0),
+                Attempt::Interrupted(_)
+            ),
+            "released, whatever deferrals are left"
+        );
         assert_eq!(
             classified(Err(ExecutionError::Cancelled), &job, false, 10),
             Attempt::LeaseLost

@@ -609,6 +609,7 @@ struct AfterHookWork {
 fn after_hook_outcome(result: Result<GuestOutput, JobError>, at_hard_deadline: bool) -> Outcome {
     match result {
         Ok(_) => Outcome::Ok,
+        Err(JobError::Execution(ExecutionError::NotStarted)) => Outcome::NotStarted,
         Err(JobError::Execution(e)) if e.interrupted_by_shutdown(at_hard_deadline) => {
             Outcome::Interrupted
         }
@@ -737,6 +738,7 @@ impl Work for AfterHookWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cufflink_platform::wasm_runtime::budget::Reason;
     use std::collections::HashMap;
 
     #[test]
@@ -767,6 +769,28 @@ mod tests {
             ),
             Outcome::Interrupted
         );
+        assert_eq!(
+            after_hook_outcome(
+                Err(JobError::Execution(ExecutionError::NotStarted)),
+                at_hard_deadline
+            ),
+            Outcome::NotStarted
+        );
+        for ran in [false, true] {
+            assert_eq!(
+                after_hook_outcome(
+                    Err(JobError::Execution(ExecutionError::Overloaded {
+                        reason: Reason::Memory,
+                        retry_after: Duration::from_millis(50),
+                        ran,
+                    })),
+                    at_hard_deadline
+                ),
+                Outcome::Deferred {
+                    after: Duration::from_millis(50)
+                }
+            );
+        }
         let deadline = || {
             Err(JobError::Execution(ExecutionError::DeadlineExceeded {
                 budget: Duration::from_secs(30),

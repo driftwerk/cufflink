@@ -165,7 +165,7 @@ impl Ran {
     fn of(outcome: &Outcome) -> Option<Self> {
         match outcome {
             Outcome::Ok => Some(Ran::Ok),
-            Outcome::Interrupted | Outcome::Deferred { .. } => None,
+            Outcome::Interrupted | Outcome::NotStarted | Outcome::Deferred { .. } => None,
             Outcome::Retry { .. } | Outcome::Terminal { .. } | Outcome::Invalid { .. } => {
                 Some(Ran::Error)
             }

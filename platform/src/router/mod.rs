@@ -87,6 +87,9 @@ pub(crate) fn map_execution_error(subject: &str, err: ExecutionError) -> Platfor
         ExecutionError::ShuttingDown => PlatformError::Internal(format!(
             "{subject} execution aborted: platform is shutting down"
         )),
+        ExecutionError::NotStarted => PlatformError::Internal(format!(
+            "{subject} execution not started: platform is shutting down"
+        )),
         ExecutionError::Overloaded {
             retry_after, ran, ..
         } => retry_later(retry_after, ran),

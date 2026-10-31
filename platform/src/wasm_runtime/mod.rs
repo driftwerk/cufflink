@@ -825,7 +825,11 @@ impl WasmEngine {
         handler: &str,
         kind: InvocationKind,
     ) -> budget::Hold {
-        budget::Hold::on(self.budget.account(identity, class, handler, kind))
+        let account = self.budget.account(identity, class, handler, kind);
+        match class {
+            Class::Committed => budget::Hold::unrefused(account),
+            Class::Interactive | Class::Nested | Class::Background => budget::Hold::on(account),
+        }
     }
 
     pub fn refusal(&self, refused: budget::Refused, ran: bool) -> ExecutionError {
@@ -871,7 +875,7 @@ impl WasmEngine {
             biased;
             _ = cancel.cancelled() => Err(ExecutionError::Cancelled),
             _ = hard_deadline, if self.budget.waits_outside_budget(inv.class, inv.kind) => {
-                Err(self.budget.overloaded(budget::Reason::Memory, false))
+                Err(ExecutionError::NotStarted)
             }
             admitted = admitted => admitted,
         }
@@ -2212,8 +2216,8 @@ pub(crate) mod tests {
         assert!(!waiting.is_finished(), "the drain does not end the wait");
         let answered = waiting.await.expect("join");
         assert!(
-            matches!(answered, Err(ExecutionError::Overloaded { ran: false, .. })),
-            "a not-run answer, which a subscription defers and naks: {answered:?}"
+            matches!(answered, Err(ExecutionError::NotStarted)),
+            "a not-started answer, never one of capacity: {answered:?}"
         );
         drop(full);
     }

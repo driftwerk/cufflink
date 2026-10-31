@@ -72,6 +72,7 @@ impl Account {
 pub struct Hold {
     account: Option<Account>,
     bytes: usize,
+    refusable: bool,
 }
 
 impl std::fmt::Debug for Hold {
@@ -88,15 +89,32 @@ impl Hold {
         Self {
             account: None,
             bytes: 0,
+            refusable: true,
         }
     }
 
     pub(crate) fn on(account: Option<Account>) -> Self {
-        Self { account, bytes: 0 }
+        Self {
+            account,
+            bytes: 0,
+            refusable: true,
+        }
+    }
+
+    pub(crate) fn unrefused(account: Option<Account>) -> Self {
+        Self {
+            account,
+            bytes: 0,
+            refusable: false,
+        }
     }
 
     pub(crate) fn sibling(&self) -> Self {
-        Self::on(self.account.clone())
+        Self {
+            account: self.account.clone(),
+            bytes: 0,
+            refusable: self.refusable,
+        }
     }
 
     pub(crate) fn share(&self) -> Option<usize> {
@@ -113,6 +131,10 @@ impl Hold {
         let Some(account) = self.account.as_ref().filter(|_| extra > 0) else {
             return Ok(());
         };
+        if !self.refusable {
+            self.force(extra);
+            return Ok(());
+        }
         match account
             .ledger()
             .grow(account.class(), account.service(), extra)
@@ -306,6 +328,18 @@ mod tests {
         hold.shrink_to(2 * MIB);
         assert_eq!(ledger.in_use(), 2 * MIB);
         drop(hold);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn an_unrefused_hold_and_its_siblings_charge_past_the_share() {
+        let (ledger, account) = owned(true);
+        let mut hold = Hold::unrefused(Some(account));
+        hold.grow(50 * MIB).expect("at the share");
+        let mut sibling = hold.sibling();
+        sibling.grow(MIB).expect("never refused");
+        assert_eq!(ledger.in_use(), 51 * MIB);
+        drop((hold, sibling));
         assert_eq!(ledger.in_use(), 0);
     }
 

@@ -16,6 +16,7 @@ pub enum Outcome {
         reason: String,
     },
     Interrupted,
+    NotStarted,
     Deferred {
         after: Duration,
     },
@@ -64,6 +65,7 @@ pub fn decide(
     seed: u64,
 ) -> Decision {
     match (ack, outcome) {
+        (_, Outcome::NotStarted) => Decision::Nak(Duration::ZERO),
         (_, Outcome::Deferred { .. }) if exhausted(delivered, max_deliver) => {
             give_up(dead_letter, CAPACITY_REASON)
         }
@@ -89,7 +91,7 @@ pub fn result_label(outcome: &Outcome, decision: &Decision) -> &'static str {
         (Decision::Ack, Outcome::Ok) => "ok",
         (Decision::Ack, Outcome::Invalid { .. }) => "invalid",
         (Decision::Ack, _) => "error",
-        (Decision::Nak(_), Outcome::Interrupted) => "nak",
+        (Decision::Nak(_), Outcome::Interrupted | Outcome::NotStarted) => "nak",
         (Decision::Nak(_), Outcome::Deferred { .. }) => "deferred",
         (Decision::Nak(_), _) => "retry",
         (Decision::DeadLetterThenTerm { .. }, _) => "dead_letter",
@@ -198,6 +200,30 @@ mod tests {
                     Decision::Ack,
                     "{outcome:?} {delivered}/{max_deliver}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_not_started_for_shutdown_is_handed_back_at_once_under_both_ack_modes() {
+        for ack in [AckMode::Always, AckMode::OnSuccess] {
+            for (delivered, max_deliver, dead_letter) in [(1, 5, true), (5, 5, true), (9, 3, false)]
+            {
+                let decision = decide(
+                    ack,
+                    &Outcome::NotStarted,
+                    delivered,
+                    max_deliver,
+                    &fixed(),
+                    dead_letter,
+                    1,
+                );
+                assert_eq!(
+                    decision,
+                    Decision::Nak(Duration::ZERO),
+                    "{ack:?} {delivered}/{max_deliver}: never acked, never dead-lettered"
+                );
+                assert_eq!(result_label(&Outcome::NotStarted, &decision), "nak");
             }
         }
     }
