@@ -154,17 +154,21 @@ impl Hold {
         Self::unrefused(self.account.clone())
     }
 
+    fn enforcing_ledger(&self) -> Option<&Arc<Ledger>> {
+        self.account
+            .as_ref()
+            .map(Account::ledger)
+            .filter(|ledger| ledger.enforces())
+    }
+
     pub(crate) async fn make_room(&mut self, bound: impl FnOnce() -> usize) {
-        let enforcing = self.account.as_ref().map(Account::ledger);
-        if let Some(ledger) = enforcing.filter(|ledger| ledger.enforces()) {
+        if let Some(ledger) = self.enforcing_ledger().map(Arc::clone) {
             self.delivery = ledger.delivery(bound(), self.bytes).await;
         }
     }
 
     pub(crate) fn enforcing(&self) -> bool {
-        self.account
-            .as_ref()
-            .is_some_and(|account| account.ledger().enforces())
+        self.enforcing_ledger().is_some()
     }
 
     pub(crate) fn delivered(&mut self) {

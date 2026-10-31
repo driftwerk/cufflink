@@ -1895,25 +1895,38 @@ Recorded as the change was built, each with its reason.
   with small decodes allowed to share the band. Guests and the text of
   queued answers stop at the budget and a room is at most the overrun, so
   a room fits once the rooms ahead of it are done, whatever guests hold.
-  The one holder that outlasts its guest is an open event stream, for up
-  to `timeout_secs`, at most an hour, and its charge is not stopped at the
-  budget. Under `enforce` a stream holds at most 1 MiB, and it opens only
-  after its guest was admitted, so streams stop at the admission line, plus
-  at most 1 MiB for each guest in flight when they reach it: at most
-  `WASM_MAX_CONCURRENT` MiB, 256 by default. That leaves every room space
-  while the budget's headroom above the admission line is larger, which
-  with the defaults is a budget past 2.5 GiB. Below that, with streams
-  holding nearly the whole budget, which takes about one open stream per
-  MiB of it at the largest, a large room can find no space until streams
-  close. It then waits, and the deliveries queued behind it with it, for
-  at most its hard deadline less `KILL_MARGIN`, and ends as
-  `ExecutionError::Undelivered`, below. A delivery never waits on a
-  guest, so a callee's answer cannot deadlock a caller waiting in a host
+  The one holder that outlasts its guest is an open event stream, and its
+  charge is not stopped at the budget. While its client reads, a stream
+  ends by `timeout_secs`, at most an hour. A client that stalls holds it
+  longer: a full channel blocks the stream's loop inside a send, where
+  neither its timeout nor shutdown is polled, until the connection closes.
+  Under `enforce` an opening holds at most 1 MiB, and on a route that runs
+  here it opens only after its guest was admitted, so openings stop at the
+  admission line, plus at most 1 MiB for each guest in flight when they
+  reach it: at most `WASM_MAX_CONCURRENT` MiB, 256 by default. That leaves
+  every room space while the budget's headroom above the admission line is
+  larger, which with the defaults is a budget past 2.5 GiB. Two charges
+  fall outside that sum. A reduction's events wait in the channel behind
+  an admitted reducer, sized by its answer and not by the 1 MiB, for as
+  long as a stalled client leaves them there. A worker-routed stream is
+  charged on the gateway, which admits no guest for it, so the admission
+  line does not stop it and `SSE_MAX_STREAMS_PER_PRINCIPAL` limits it per
+  principal only. When these hold nearly the whole budget, which at the
+  1 MiB maximum takes well over a thousand streams on 1.5 GiB, a large room
+  finds no space until streams close. In normal running nothing else ends
+  that wait, since `hard_deadline` starts at shutdown: the room waits until
+  streams close, and the deliveries queued behind it wait with it. At
+  shutdown a guest's room ends at its hard deadline less `KILL_MARGIN`, as
+  `ExecutionError::Undelivered`, below. A worker reply's room has no
+  deadline arm, so it waits on streams at shutdown too, until the process
+  ends. No such wait runs finished work again: heartbeats and leases keep
+  a fetched message or a job held while it waits. A delivery never waits on
+  a guest, so a callee's answer cannot deadlock a caller waiting in a host
   call, and no holder of a room waits for another. A rendered body a slow
   client has not read holds its text and no room. The platform sets no
   write timeout, since `axum::serve` has none and the `deadline` layer ends
   at the response head, so a deployment needs a proxy with send timeouts
-  (`deployment.md`). A wait that is still queued at the hard deadline, less
+  (`deployment.md`). A guest's room still queued at the hard deadline, less
   `KILL_MARGIN`, ends there as `ExecutionError::Undelivered`, not
   `NotStarted`: the guest ran, so a nack would run finished work again. It
   settles as an answer past the response cap does, below, with no tree, so
@@ -1978,19 +1991,26 @@ Recorded as the change was built, each with its reason.
 - **An open event stream** holds what it retains until its body ends: the
   tree of `state`, `ping`, and `initial` twice, in the spec and rendered in
   the channel. It is measured, not the 1 MiB step its tree was charged in,
-  or a few KiB of stream would hold 1 MiB of share for up to an hour. Under
+  or a few KiB of stream would hold 1 MiB of share for its whole life. Under
   `enforce` an opening that would retain more than 1 MiB, or whose `state`
   passes the 64 KiB of text a reduction may reach, is an invalid answer;
   `off` and `warn` open it. 1 MiB is that step: far above a progress
   stream's opening, and it keeps what streams can hold beyond admission
   small enough to state, above. The retained size is measured, so a dense
   `state` can pass 1 MiB within its 64 KiB of text. A reduction's events
-  stay charged until they leave the 32-slot channel, and only those.
+  stay charged until they leave the 32-slot channel, and only those. A
+  reduction gives its room back once it is read: even a tiny event's room
+  is about 2 MiB, so a few stalled streams, 33 reductions each, would
+  otherwise fill the band, and the ceiling would stop every delivery.
 - **What a response leaves uncharged.** Its head, once its hold ends: at
   most 64 headers of an 8 KiB value and `http`'s 64 KiB name, 4.5 MiB. A
-  stream's `state` once a reducer replaces it, at most 64 KiB of text, since
-  the charge is the opening's. A message forwarded with no reducer, in the
-  channel, at most the NATS payload limit. A before-hook's returned body,
+  stream's `state` once a reducer replaces it, at most 64 KiB of text and
+  about 6 MiB of tree, since the charge is the opening's. A stream's pings,
+  charged once, so up to 33 rendered copies on a stalled stream. A message
+  forwarded with no reducer, in the channel, at most the NATS payload limit
+  a slot, so 32 of them. The messages `buffered` while a stream's handler
+  ran and the NATS subscription's backlog behind a stalled stream, which
+  were uncharged before the budget too. A before-hook's returned body,
   used by the write that follows. A rendered event runs longer than its
   text when its data has many lines, each gaining a `data: ` prefix.
   While a host call runs, an error it logs or returns can quote what the

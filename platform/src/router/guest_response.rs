@@ -878,8 +878,23 @@ mod tests {
             .expect("rendered")
     }
 
+    fn opening(data: usize) -> String {
+        json!({"__v": 2, "__status": 200, "__sse": {
+            "initial": [{"data": "x".repeat(data)}],
+            "keep_alive_secs": 15,
+            "timeout_secs": 60,
+        }})
+        .to_string()
+    }
+
     async fn charged(raw: &str, budget: usize) -> (Arc<Ledger>, Result<Response, String>) {
-        let (ledger, mut hold) = testing::hold(budget);
+        charged_on(raw, testing::hold(budget)).await
+    }
+
+    async fn charged_on(
+        raw: &str,
+        (ledger, mut hold): (Arc<Ledger>, Hold),
+    ) -> (Arc<Ledger>, Result<Response, String>) {
         hold.grow(raw.len()).expect("the response text fits");
         let text = raw.to_string();
         let response = match decode(GuestOutput { text, hold }) {
@@ -1129,16 +1144,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_event_stream_holds_what_it_retains_until_its_body_ends() {
-        let stream = |data: usize| {
-            json!({"__v": 2, "__status": 200, "__sse": {
-                "initial": [{"data": "x".repeat(data)}],
-                "keep_alive_secs": 15,
-                "timeout_secs": 60,
-            }})
-            .to_string()
-        };
         for (data, least, most) in [(16, 32, 1024), (256 * 1024, 512 * 1024, 513 * 1024)] {
-            let (ledger, response) = charged(&stream(data), 64 * MIB).await;
+            let (ledger, response) = charged(&opening(data), 64 * MIB).await;
             let response = response.expect("rendered");
             let held = ledger.in_use();
             assert!((least..=most).contains(&held), "{data}: {held}");
@@ -1149,15 +1156,22 @@ mod tests {
 
     #[tokio::test]
     async fn an_opening_past_what_a_stream_may_hold_is_refused_only_under_enforce() {
-        let raw = json!({"__v": 2, "__status": 200, "__sse": {
-            "initial": [{"data": "x".repeat(MIB)}],
-            "keep_alive_secs": 15,
-            "timeout_secs": 60,
-        }})
-        .to_string();
+        let raw = opening(MIB);
         let (_, response) = charged(&raw, 64 * MIB).await;
         assert!(response.expect_err("refused").contains("__sse"));
-        assert!(decode(output(&raw)).is_ok(), "off and warn open it");
+        let (_, response) = charged_on(&raw, testing::warned(64 * MIB)).await;
+        assert!(response.is_ok(), "warn opens it");
+        assert!(decode(output(&raw)).is_ok(), "off opens it");
+    }
+
+    #[tokio::test]
+    async fn under_warn_a_stream_holds_what_it_retains_past_its_trees_charge() {
+        let data = 2 * MIB;
+        let (ledger, response) = charged_on(&opening(data), testing::warned(64 * MIB)).await;
+        let response = response.expect("rendered");
+        assert!(ledger.in_use() >= 2 * data, "{}", ledger.in_use());
+        drop(response);
+        assert_eq!(ledger.in_use(), 0);
     }
 
     #[test]
@@ -1181,14 +1195,14 @@ mod tests {
 
     #[test]
     fn a_terminal_reason_is_cut_to_the_size_of_a_delivery_block() {
-        let terminal = "\u{e9}".repeat(MAX_DELIVERY_BLOCK);
+        let terminal = format!("a{}", "\u{e9}".repeat(MAX_DELIVERY_BLOCK));
         let response = v2(&json!({
             "__v": 2, "__status": 200, "__delivery": {"terminal": terminal},
         }))
         .expect("v2");
         match response.delivery.as_deref() {
             Some(DeliveryControl::Terminal { terminal }) => {
-                assert_eq!(terminal.len(), MAX_DELIVERY_BLOCK);
+                assert_eq!(terminal.len(), MAX_DELIVERY_BLOCK - 1);
             }
             other => panic!("{other:?}"),
         }

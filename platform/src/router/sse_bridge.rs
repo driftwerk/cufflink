@@ -4,7 +4,7 @@ use crate::registry::{RegisteredService, ServiceIdentity};
 use crate::router::charged_guest_text;
 use crate::router::custom::{execute, Execution};
 use crate::router::sse::SseSlot;
-use crate::wasm_runtime::budget::{ChargedJson, Hold};
+use crate::wasm_runtime::budget::{ChargedJson, Hold, STEP};
 use crate::wasm_runtime::{Class, CompiledModule, GuestOutput, InvocationKind};
 use crate::AppState;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_BUFFERED: usize = 1000;
-const MAX_RETAINED_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_BYTES: usize = STEP;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const REDUCER_BUDGET: Duration = Duration::from_secs(5);
 const TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 1..=3600;
@@ -281,6 +281,7 @@ impl Reduction {
         drop(text);
         let reduction = Self::of(value)?;
         hold.shrink_to(bytes_of(&reduction.events));
+        hold.delivered();
         Ok((reduction, hold))
     }
 
@@ -373,7 +374,7 @@ fn overflowed(buffered: usize) -> bool {
 }
 
 fn state_fits(state: &Value) -> bool {
-    state.to_string().len() <= MAX_STATE_BYTES
+    ChargedJson::measure(state) <= MAX_STATE_BYTES
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,18 +540,24 @@ impl Delivery {
         match reducer.reduce(&self.state, message).await {
             Ok((reduction, hold)) => {
                 counted("reduced");
-                if !send_all(tx, &reduction.events, &Arc::new(hold)).await {
+                let Reduction {
+                    events,
+                    state,
+                    close,
+                } = reduction;
+                let state = state_fits(&state).then_some(state);
+                if !send_all(tx, &events, &Arc::new(hold)).await {
                     return Some(Closed::Client);
                 }
-                if !state_fits(&reduction.state) {
+                let Some(state) = state else {
                     tracing::warn!(
                         handler = %reducer.handler,
                         "Event stream closed: the reducer's state is over {MAX_STATE_BYTES} bytes"
                     );
                     return Some(Closed::Reducer);
-                }
-                self.state = reduction.state;
-                reduction.close.then_some(Closed::Reducer)
+                };
+                self.state = state;
+                close.then_some(Closed::Reducer)
             }
             Err(error) => {
                 counted("reducer_error");
@@ -574,12 +581,15 @@ mod tests {
         .map(|(reduction, _)| reduction)
     }
 
-    #[test]
-    fn a_reduction_holds_only_its_events() {
+    #[tokio::test]
+    async fn a_reduction_holds_only_its_events_and_no_room() {
         let (ledger, mut hold) = testing::hold(64 * MIB);
         let text = json!({"events": [{"data": "x".repeat(4096)}], "state": {"a": 1}}).to_string();
         hold.force(text.len());
+        hold.make_room(|| 8 * MIB).await;
+        assert!(ledger.delivering() > 0);
         let (reduction, hold) = Reduction::read(GuestOutput { text, hold }).expect("reads");
+        assert_eq!(ledger.delivering(), 0);
         assert_eq!(ledger.in_use(), bytes_of(&reduction.events));
         drop(hold);
         assert_eq!(ledger.in_use(), 0);
@@ -619,9 +629,10 @@ mod tests {
         assert!(!spec(at_limit + 1, Value::Null).fits_a_stream());
         assert!(!spec(1, json!("x".repeat(MAX_STATE_BYTES))).fits_a_stream());
         assert!(spec(1, json!("x".repeat(MAX_STATE_BYTES - 2))).fits_a_stream());
-        let dense: Vec<Value> = vec![json!(0); 32 * 1024];
+        let dense = json!(vec![json!(0); 32 * 1024 - 1]);
+        assert!(state_fits(&dense));
         assert!(
-            !spec(1, json!(dense)).fits_a_stream(),
+            !spec(1, dense).fits_a_stream(),
             "what it retains is measured, not its text"
         );
     }

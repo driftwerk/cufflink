@@ -15,7 +15,7 @@ pub use caps::{s3_host_bytes, IMAGE_BYTES_PER_PIXEL};
 pub use caps::{CapExceeded, HostCaps};
 pub use cgroup::{detect as detect_cgroup, CgroupLimit, LimitSource};
 pub use config::{thread_stack_bytes, BudgetConfig};
-pub(crate) use hold::{Account, Capped, Drawing};
+pub(crate) use hold::{Account, Capped, Drawing, STEP};
 pub use hold::{Capacity, Hold, Meter, Refused};
 pub(crate) use json::stepped;
 pub use json::{ChargedJson, ChargedJsonError, Parsed};
@@ -749,6 +749,14 @@ pub(crate) mod testing {
     pub(crate) const MIB: usize = 1024 * 1024;
 
     pub(crate) fn hold(budget: usize) -> (Arc<Ledger>, Hold) {
+        held(budget, true)
+    }
+
+    pub(crate) fn warned(budget: usize) -> (Arc<Ledger>, Hold) {
+        held(budget, false)
+    }
+
+    fn held(budget: usize, enforce: bool) -> (Arc<Ledger>, Hold) {
         let ledger = Arc::new(Ledger::new(Settings {
             limits: Limits {
                 budget,
@@ -757,7 +765,7 @@ pub(crate) mod testing {
                 background: budget,
                 overrun: budget,
             },
-            enforce: true,
+            enforce,
             stack: MIB,
             aging: Duration::from_millis(100),
         }));

@@ -66,7 +66,11 @@ platform or worker past its container's limit.
   opening past that, or with `state` past 64 KiB of text, is refused. Open
   streams count toward admission, so count them when sizing: at the largest
   that is one stream per MiB of a service's share, and
-  `SSE_MAX_STREAMS_PER_PRINCIPAL` limits them per principal only.
+  `SSE_MAX_STREAMS_PER_PRINCIPAL` limits them per principal only. It is
+  all that limits a worker-routed stream, since the gateway admits no guest
+  for one. A client that stalls keeps its stream and the events queued in
+  it past `timeout_secs`, until its connection closes, so the proxy's send
+  timeout is what ends it.
 - **Redis.** Under `enforce` a guest's Redis reads measure, then reserve,
   then read, in two `MULTI` blocks of `STRLEN`, `EXISTS` and `GETRANGE`.
   Give the Redis user those commands with `MULTI` and `EXEC`, and run
