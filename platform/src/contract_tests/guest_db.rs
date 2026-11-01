@@ -64,7 +64,7 @@ async fn legacy_failure_codes_hold_next_to_db_call() {
     let compiled = engine.get_module(id, 1, None).await.expect("cached");
     let state = crate::AppState::minimal(engine.clone()).await;
     let codes = engine
-        .run(
+        .run_text(
             state,
             Invocation {
                 compiled,
@@ -83,6 +83,8 @@ async fn legacy_failure_codes_hold_next_to_db_call() {
                 scope_kind: None,
                 budget: Duration::from_secs(15),
                 cancel: None,
+                class: crate::wasm_runtime::Class::Background,
+                admission: None,
             },
         )
         .await

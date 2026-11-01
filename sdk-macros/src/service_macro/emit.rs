@@ -154,6 +154,7 @@ fn route(r: &RouteEntry, schemas: &Ident) -> TokenStream {
     let forward_auth = r.forward_auth;
     let body_limit = optional(r.body_limit.map(|bytes| quote! { #bytes }));
     let timeout = optional(r.timeout.map(|secs| quote! { #secs }));
+    let max_concurrent = optional(r.max_concurrent.map(|max| quote! { #max }));
     let multipart = r.multipart;
     let sse = optional(r.sse.as_ref().map(sse));
     let audit_redact = r.audit_redact.iter().flatten();
@@ -168,6 +169,7 @@ fn route(r: &RouteEntry, schemas: &Ident) -> TokenStream {
             forward_auth: #forward_auth,
             body_limit_bytes: #body_limit,
             timeout_secs: #timeout,
+            max_concurrent: #max_concurrent,
             multipart: #multipart,
             sse: #sse,
             doc: #doc,

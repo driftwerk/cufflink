@@ -1,6 +1,6 @@
 use crate::error::TestkitError;
 use crate::guest;
-use crate::infra::{free_port, workspace_binary, ChildProcess, Tenant};
+use crate::infra::{free_port, workspace_binary, ChildProcess, Launch, Tenant};
 use serde_json::{json, Value};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -58,17 +58,21 @@ impl PlatformProcess {
     pub async fn start(database_url: &str, nats_url: Option<&str>, extra: &[(&str, &str)]) -> Self {
         let nats = nats_or_unreachable(nats_url);
         let env = environment(database_url, &nats, extra);
-        Self(ChildProcess::spawn(&platform_binary(), "PLATFORM_PORT", &env).await)
+        Self::start_with(&env).await
     }
 
     pub async fn start_with(env: &[(&str, &str)]) -> Self {
-        Self(ChildProcess::spawn(&platform_binary(), "PLATFORM_PORT", env).await)
+        Self(
+            ChildProcess::spawn_as(Launch::Launcher, &platform_binary(), "PLATFORM_PORT", env)
+                .await,
+        )
     }
 
     pub fn launch(database_url: &str, nats_url: Option<&str>, extra: &[(&str, &str)]) -> Self {
         let nats = nats_or_unreachable(nats_url);
         let env = environment(database_url, &nats, extra);
-        Self(ChildProcess::launch_unchecked(
+        Self(ChildProcess::launch_unchecked_as(
+            Launch::Launcher,
             &platform_binary(),
             "PLATFORM_PORT",
             &env,

@@ -14,6 +14,7 @@ pub(super) struct RouteEntry {
     pub(super) forward_auth: bool,
     pub(super) body_limit: Option<u64>,
     pub(super) timeout: Option<u32>,
+    pub(super) max_concurrent: Option<u32>,
     pub(super) multipart: bool,
     pub(super) sse: Option<SseOpts>,
     pub(super) audit_redact: Option<Vec<LitStr>>,
@@ -47,6 +48,7 @@ enum RouteKeyword {
     ForwardAuth,
     BodyLimit,
     Timeout,
+    MaxConcurrent,
     Multipart,
     Sse,
     AuditRedact,
@@ -73,6 +75,7 @@ impl RouteKeyword {
             "forward_auth" => Some(RouteKeyword::ForwardAuth),
             "body_limit" => Some(RouteKeyword::BodyLimit),
             "timeout" => Some(RouteKeyword::Timeout),
+            "max_concurrent" => Some(RouteKeyword::MaxConcurrent),
             "multipart" => Some(RouteKeyword::Multipart),
             "sse" => Some(RouteKeyword::Sse),
             "audit_redact" => Some(RouteKeyword::AuditRedact),
@@ -94,7 +97,7 @@ impl RouteKeyword {
                      owner(\"field\"), scoped(\"area\",\"op\"[, owner = \"field\"]), \
                      internal(\"service\", ...), api_key(\"scope\"), job(...), forward_auth, \
                      body_limit = N, \
-                     timeout = N, multipart, sse(subject = \"...\"), audit_redact = [...], \
+                     timeout = N, max_concurrent = N, multipart, sse(subject = \"...\"), audit_redact = [...], \
                      request = T, \
                      response(s) = ..., query = T, path = T, tags = [...], \
                      operation_id = \"...\", summary = \"...\", description = \"...\", \
@@ -136,6 +139,7 @@ fn parse_route(tuple: ParseStream) -> syn::Result<RouteEntry> {
         forward_auth: false,
         body_limit: None,
         timeout: None,
+        max_concurrent: None,
         multipart: false,
         sse: None,
         audit_redact: None,
@@ -206,6 +210,25 @@ impl RouteEntry {
                 self.timeout = Some(secs);
                 Ok(())
             }
+            RouteKeyword::MaxConcurrent if self.max_concurrent.is_some() => {
+                duplicate("duplicate max_concurrent modifier")
+            }
+            RouteKeyword::MaxConcurrent => {
+                let max = parse_assigned(input)?;
+                let invocations: u32 = max.base10_parse()?;
+                if !CustomRouteDefinition::MAX_CONCURRENT.contains(&invocations) {
+                    return Err(syn::Error::new(
+                        max.span(),
+                        format!(
+                            "max_concurrent must be between {} and {}",
+                            CustomRouteDefinition::MAX_CONCURRENT.start(),
+                            CustomRouteDefinition::MAX_CONCURRENT.end()
+                        ),
+                    ));
+                }
+                self.max_concurrent = Some(invocations);
+                Ok(())
+            }
             RouteKeyword::Multipart if self.multipart => duplicate("duplicate multipart modifier"),
             RouteKeyword::Multipart => {
                 self.multipart = true;
@@ -232,8 +255,8 @@ impl RouteEntry {
                 duplicate("a route may declare at most one posture")
             }
             RouteKeyword::Posture(_) if self.has_trailing_keyword() => duplicate(
-                "the posture comes before body_limit, timeout, multipart, sse, audit_redact \
-                 and documentation keywords, which trail it",
+                "the posture comes before body_limit, timeout, max_concurrent, multipart, sse, \
+                 audit_redact and documentation keywords, which trail it",
             ),
             RouteKeyword::Posture(posture) => {
                 self.posture = Some(parse_posture(posture, input)?);
@@ -249,19 +272,27 @@ impl RouteEntry {
     fn has_trailing_keyword(&self) -> bool {
         self.body_limit.is_some()
             || self.timeout.is_some()
+            || self.max_concurrent.is_some()
             || self.multipart
             || self.sse.is_some()
             || self.audit_redact.is_some()
             || !self.doc.is_empty()
     }
 
-    /// Rules between keywords: a job carries its own timeout, and only a
-    /// method with a body can take a multipart form.
+    /// Rules between keywords: a job carries its own timeout and runs as a
+    /// job, a stream holds no invocation, and only a method with a body can
+    /// take a multipart form.
     fn validate_limits(&self) -> syn::Result<()> {
         if self.timeout.is_some() && self.job.is_some() {
             return Err(syn::Error::new(
                 self.handler.span(),
                 "timeout cannot be combined with job(...); set the job's own timeout",
+            ));
+        }
+        if self.max_concurrent.is_some() && (self.job.is_some() || self.sse.is_some()) {
+            return Err(syn::Error::new(
+                self.handler.span(),
+                "max_concurrent cannot be combined with job(...) or sse(...)",
             ));
         }
         if self.multipart

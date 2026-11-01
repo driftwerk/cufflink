@@ -69,6 +69,9 @@ fn route_limit_violation(route: &CustomRouteDefinition) -> Option<String> {
     let timeout_invalid = route
         .timeout_secs
         .is_some_and(|secs| !CustomRouteDefinition::TIMEOUT_SECS.contains(&secs));
+    let max_concurrent_invalid = route
+        .max_concurrent
+        .is_some_and(|max| !CustomRouteDefinition::MAX_CONCURRENT.contains(&max));
     if body_limit_invalid {
         Some(format!(
             "{}: body_limit_bytes must be between 1 and {}",
@@ -83,6 +86,23 @@ fn route_limit_violation(route: &CustomRouteDefinition) -> Option<String> {
     } else if route.timeout_secs.is_some() && route.job.is_some() {
         Some(format!(
             "{}: timeout_secs cannot be combined with job; the job has its own timeout",
+            name()
+        ))
+    } else if max_concurrent_invalid {
+        Some(format!(
+            "{}: max_concurrent must be between {} and {}",
+            name(),
+            CustomRouteDefinition::MAX_CONCURRENT.start(),
+            CustomRouteDefinition::MAX_CONCURRENT.end()
+        ))
+    } else if route.max_concurrent.is_some() && route.job.is_some() {
+        Some(format!(
+            "{}: max_concurrent cannot be combined with job; the job's guest runs as a job",
+            name()
+        ))
+    } else if route.max_concurrent.is_some() && route.sse.is_some() {
+        Some(format!(
+            "{}: max_concurrent cannot be combined with sse",
             name()
         ))
     } else if route.multipart
@@ -371,6 +391,7 @@ mod tests {
         assert!(limited("POST", |r| {
             r.body_limit_bytes = Some(64 * 1024 * 1024);
             r.timeout_secs = Some(120);
+            r.max_concurrent = Some(1024);
             r.multipart = true;
             r.audit_redact = vec!["card.number".into(), "lines[].sku".into()];
         })
@@ -396,6 +417,36 @@ mod tests {
                     r.job = Some(Default::default());
                 },
                 "cannot be combined with job",
+            ),
+            (
+                "POST",
+                |r| r.max_concurrent = Some(0),
+                "max_concurrent must be between 1 and 1024",
+            ),
+            (
+                "POST",
+                |r| r.max_concurrent = Some(1025),
+                "max_concurrent must be between 1 and 1024",
+            ),
+            (
+                "POST",
+                |r| {
+                    r.max_concurrent = Some(2);
+                    r.job = Some(Default::default());
+                },
+                "max_concurrent cannot be combined with job",
+            ),
+            (
+                "GET",
+                |r| {
+                    r.max_concurrent = Some(2);
+                    r.sse = Some(cufflink_types::SseRouteDef {
+                        subject: "dw.{tenant}.loans.progress".into(),
+                        reducer: None,
+                        anonymous: false,
+                    });
+                },
+                "max_concurrent cannot be combined with sse",
             ),
             ("GET", |r| r.multipart = true, "multipart is only allowed"),
             (

@@ -7,6 +7,82 @@ existed, except where a section says otherwise.
 An install that hosts more than one tenant sets everything
 [tenant isolation](tenant-isolation.md) lists.
 
+## Guest memory budget
+
+`WASM_MEMORY_BUDGET_MODE` ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs))
+bounds what guests in flight together hold, so a burst cannot grow a
+platform or worker past its container's limit.
+
+- **The budget** is the container's limit less the host reserve,
+  `max(256 MiB, 30 %)`. The limit is read from the process's cgroup: the
+  smallest `memory.max` or `memory.high` of its cgroup v2 and every
+  ancestor, or cgroup v1's `hierarchical_memory_limit`. Startup logs the
+  limit, the file it came from, the reserve and the budget. Without a limit
+  the budget is off.
+- **What it counts:** each guest's linear memory and tables, and the stack
+  of every blocking thread that has run a guest, until that thread retires
+  2 s after its last task.
+- **Stacks.** The 2 MiB stack charge (`WASM_THREAD_STACK_KB`) is an upper
+  bound, often about ten times what a thread touches. In a 768 MiB
+  container the 512 MiB budget holds the stacks of 256 invocations, light
+  ones included. For many light concurrent guests, raise the container's
+  memory, lower `WASM_THREAD_STACK_KB` (at least 1024; it sets every runtime
+  thread's stack), or lower `WASM_MAX_CONCURRENT`.
+- **The most it can reach.** Under `enforce`, the memory guests use, and
+  the host uses for them, stays within the budget,
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB` (half the reserve) and one response
+  (`WASM_MAX_RESPONSE_MB`). On a 2 GiB container with the defaults: budget
+  1433.6 MiB, overrun 307.2 MiB, response 64 MiB, 1804.8 MiB in all, which
+  leaves 243.2 MiB for the platform's own heap. On 1.5 GiB it leaves
+  166.4 MiB. Startup warns when the three reach the limit.
+  `cufflink_wasm_memory_in_use_bytes` can read above that figure, about the
+  budget plus twice the overrun at a full budget, since the room of an
+  answer being decoded is counted beside the tree it makes room for.
+- **Measure the heap before `enforce`.** The platform's heap baseline has
+  not been measured, so the figures left for it above are arithmetic, not
+  a proven fit. Measure it under your own modules and load during the
+  `warn` soak, and raise `WASM_MEMORY_HOST_RESERVE_MB` if it does not fit
+  before setting `enforce`.
+- **Run behind a proxy with send timeouts.** The platform sets no timeout
+  on writing a response: `axum::serve` has none, and the `deadline` layer
+  ends at the response head. A client that stops reading keeps its rendered
+  body charged until its connection closes, so put a reverse proxy in front
+  that closes such connections.
+- **The largest answer.** An answer whose text, tree and render alone pass
+  the smaller of the overrun and the service share is refused as too large
+  at any load: its effects stand and a route answers `500`. On 2 GiB that
+  is 307 MiB, about 32 MiB of text of small records, or strings up to
+  `WASM_MAX_RESPONSE_MB`. At the 128 MiB floor, for containers up to
+  853 MiB, it is about 13 MiB of records or 42 MiB of strings. Raise
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB`, below the reserve, to deliver more.
+- **What the reserve holds:** the process's baseline, compiled modules, the
+  core threads' stacks and fragmentation. The host buffers of host calls,
+  requests and responses are charged to the budget. On glibc startup sets
+  `M_MMAP_THRESHOLD` to 1 MiB unless the mode is `off`, so freed buffers of
+  a mebibyte or more go back to the kernel; `MALLOC_MMAP_THRESHOLD_` or
+  `GLIBC_TUNABLES` still overrides it.
+- **Event streams.** An open stream holds share for its life, about what
+  it retains, usually under a KiB and under `enforce` at most 1 MiB: an
+  opening past that, or with `state` past 64 KiB of text, is refused. Open
+  streams count toward admission, so count them when sizing: at the largest
+  that is one stream per MiB of a service's share, and
+  `SSE_MAX_STREAMS_PER_PRINCIPAL` limits them per principal only. It is
+  all that limits a worker-routed stream, since the gateway admits no guest
+  for one. A client that stalls keeps its stream and the events queued in
+  it past `timeout_secs`, until its connection closes, so the proxy's send
+  timeout is what ends it.
+- **Redis.** Under `enforce` a guest's Redis reads measure, then reserve,
+  then read, in two `MULTI` blocks of `STRLEN`, `EXISTS` and `GETRANGE`.
+  Give the Redis user those commands with `MULTI` and `EXEC`, and run
+  Redis 7 or later ([v0.35.0](versions.md#features-added-in-v0350)).
+- **Fairness** is per service: a tenant whose services are busy at once
+  can hold up to the whole budget. Lower
+  `WASM_MEMORY_SERVICE_SHARE_PERCENT` where one tenant runs several heavy
+  services beside others.
+- **Soak** in `warn`, the default, and read
+  `cufflink_wasm_admission_refused_total{mode="warn"}` and
+  `cufflink_wasm_memory_denied_total{mode="warn"}` before setting `enforce`.
+
 ## HTTP request layers
 
 `CUFFLINK_HTTP_PROFILE` picks the defaults; each value can be overridden on

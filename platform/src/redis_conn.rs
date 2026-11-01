@@ -249,6 +249,7 @@ async fn connect_until_ready(inner: Arc<Inner>) {
         .await;
         match attempt {
             Ok(Ok(conn)) => {
+                warn_before_redis_7(conn.clone()).await;
                 inner.connecting.store(false, Ordering::SeqCst);
                 if let Ok(mut slot) = inner.conn.write() {
                     *slot = Some(conn);
@@ -272,9 +273,39 @@ async fn connect_until_ready(inner: Arc<Inner>) {
     }
 }
 
+async fn warn_before_redis_7(mut conn: ConnectionManager) {
+    let info = redis::cmd("INFO")
+        .arg("server")
+        .query_async::<String>(&mut conn)
+        .await;
+    if let Some(major) = info.ok().as_deref().and_then(server_major) {
+        if major < 7 {
+            warn!(
+                major,
+                "Redis is older than 7: a key expiring during a bounded guest read may read as \"\" instead of nil"
+            );
+        }
+    }
+}
+
+fn server_major(info: &str) -> Option<u32> {
+    info.lines()
+        .find_map(|line| line.trim().strip_prefix("redis_version:"))
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_major_is_read_from_info() {
+        let info = "# Server\r\nredis_version:6.2.14\r\nredis_mode:standalone\r\n";
+        assert_eq!(server_major(info), Some(6));
+        assert_eq!(server_major("redis_version:7.4.1"), Some(7));
+        assert_eq!(server_major("# Server\r\n"), None);
+    }
 
     #[test]
     fn timeouts_default_and_ignore_garbage() {

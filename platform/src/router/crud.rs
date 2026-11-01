@@ -13,6 +13,7 @@ use crate::router::authz::{
 use crate::router::bind::{self, SqlValue};
 use crate::router::crud_pk::{parse_pk, PkValue};
 use crate::router::filtering::ListParams;
+use crate::router::guest_response::parse_output;
 use crate::router::map_execution_error;
 use crate::router::postures::ServiceCaller;
 use crate::router::query::{
@@ -23,7 +24,8 @@ use crate::schema_manager::adopt::{AdoptedColumn, AdoptedSchema};
 use crate::schema_manager::introspect::TypeKind;
 use crate::tenant_catalog::TenantEntry;
 use crate::tenant_sessions::{Purpose, ServiceSessions, Statements};
-use crate::wasm_runtime::{Invocation, InvocationKind};
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Refused};
+use crate::wasm_runtime::{Class, ExecutionError, Invocation, InvocationKind, WasmEngine};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, RawQuery, State},
@@ -51,6 +53,7 @@ pub(crate) async fn execute_hook(
 ) -> PlatformResult<Value> {
     execute_hook_as(
         InvocationKind::Hook,
+        Class::of_call(call.map(|call| call.depth)),
         state,
         service,
         hook_name,
@@ -61,8 +64,10 @@ pub(crate) async fn execute_hook(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_hook_as(
     kind: InvocationKind,
+    class: Class,
     state: &Arc<AppState>,
     service: &RegisteredService,
     hook_name: &str,
@@ -70,8 +75,179 @@ pub(crate) async fn execute_hook_as(
     auth_json: Option<Value>,
     call: Option<&ServiceCaller>,
 ) -> PlatformResult<Value> {
+    let hold = state
+        .wasm_engine
+        .as_ref()
+        .map_or_else(Hold::none, |engine| {
+            engine.hold(&service.identity(), class, hook_name, kind)
+        });
+    let request = hook_request(body, hook_name, service, hold, auth_json, call)
+        .map_err(|e| crate::router::request_refused(state, "Hook", e))?;
+    run_hook(state, kind, class, service, hook_name, request, call).await
+}
+
+pub(crate) struct HookRequest {
+    text: String,
+    hold: Hold,
+}
+
+fn hook_request(
+    body: Value,
+    hook_name: &str,
+    service: &RegisteredService,
+    mut hold: Hold,
+    auth_json: Option<Value>,
+    call: Option<&ServiceCaller>,
+) -> Result<HookRequest, ChargedJsonError> {
+    let text = hook_request_text(body, hook_name, service, auth_json, call, &mut hold)?;
+    hold.shrink_to(text.capacity());
+    Ok(HookRequest { text, hold })
+}
+
+struct KeptHook {
+    name: String,
+    request: HookRequest,
+}
+
+struct Keeper<'a> {
+    state: &'a Arc<AppState>,
+    service: &'a RegisteredService,
+    auth: Value,
+    call: Option<&'a ServiceCaller>,
+    before_ran: bool,
+    initial_memory: usize,
+}
+
+impl<'a> Keeper<'a> {
+    async fn new(
+        state: &'a Arc<AppState>,
+        service: &'a RegisteredService,
+        auth_user: &Option<crate::auth::AuthUser>,
+        call: Option<&'a ServiceCaller>,
+        before_ran: bool,
+    ) -> Keeper<'a> {
+        let initial_memory = match state
+            .wasm_engine
+            .as_ref()
+            .filter(|engine| engine.admits_before_running())
+        {
+            Some(engine) => engine
+                .get_module(
+                    service.service_id,
+                    service.version,
+                    service.wasm_hash.as_deref(),
+                )
+                .await
+                .map_or(0, |compiled| compiled.initial_memory),
+            None => 0,
+        };
+        Keeper {
+            auth: guest_auth_json(state, auth_user, service.tenant_id).await,
+            state,
+            service,
+            call,
+            before_ran,
+            initial_memory,
+        }
+    }
+
+    fn refuses(&self) -> bool {
+        self.state
+            .wasm_engine
+            .as_ref()
+            .is_some_and(WasmEngine::admits_before_running)
+    }
+
+    fn keep(&self, name: &str, body: Value) -> Result<Option<KeptHook>, Refused> {
+        let hold = self
+            .state
+            .wasm_engine
+            .as_ref()
+            .map_or_else(Hold::none, |engine| {
+                engine.kept_hold(&self.service.identity(), name, self.initial_memory)
+            });
+        match hook_request(
+            body,
+            name,
+            self.service,
+            hold,
+            Some(self.auth.clone()),
+            self.call,
+        ) {
+            Ok(request) => Ok(Some(KeptHook {
+                name: name.to_string(),
+                request,
+            })),
+            Err(ChargedJsonError::Capacity(refused)) => Err(refused),
+            Err(ChargedJsonError::Syntax(e)) => {
+                tracing::warn!("after hook '{}' error: {}", name, e);
+                Ok(None)
+            }
+        }
+    }
+
+    fn refused(&self, refused: Refused, needs: usize) -> PlatformError {
+        let Some(engine) = self.state.wasm_engine.as_ref() else {
+            return PlatformError::Internal(format!("Hook request refused: {refused}"));
+        };
+        match engine.refusal(refused.needing(needs), self.before_ran) {
+            ExecutionError::TooLarge { requested, share } => {
+                PlatformError::PayloadTooLarge(format!(
+                    "the after-hook requests of this write take {requested} bytes, more than \
+                     the {share} bytes its service may hold; nothing was committed"
+                ))
+            }
+            ExecutionError::Overloaded {
+                retry_after,
+                ran: true,
+                ..
+            } => crate::router::retry_uncommitted(retry_after),
+            error => crate::router::map_execution_error("Hook", error),
+        }
+    }
+}
+
+struct AfterHook<'a> {
+    keeper: Keeper<'a>,
+    name: &'a str,
+}
+
+impl<'a> AfterHook<'a> {
+    async fn of(
+        name: Option<&'a str>,
+        before_ran: bool,
+        state: &'a Arc<AppState>,
+        service: &'a RegisteredService,
+        auth_user: &Option<crate::auth::AuthUser>,
+        call: Option<&'a ServiceCaller>,
+    ) -> Option<AfterHook<'a>> {
+        match name {
+            Some(name) => Some(AfterHook {
+                keeper: Keeper::new(state, service, auth_user, call, before_ran).await,
+                name,
+            }),
+            None => None,
+        }
+    }
+
+    fn keep(&self, body: Value) -> PlatformResult<Option<KeptHook>> {
+        self.keeper
+            .keep(self.name, body)
+            .map_err(|refused| self.keeper.refused(refused, 0))
+    }
+}
+
+async fn run_hook(
+    state: &Arc<AppState>,
+    kind: InvocationKind,
+    class: Class,
+    service: &RegisteredService,
+    hook_name: &str,
+    request: HookRequest,
+    call: Option<&ServiceCaller>,
+) -> PlatformResult<Value> {
     let budget = ServiceCaller::bound(call, HOOK_BUDGET);
-    let request_str = hook_request_text(body, hook_name, service, auth_json, call)?;
+    let HookRequest { text, hold } = request;
 
     tracing::debug!(
         "Executing hook '{}' for {}/{}",
@@ -80,16 +256,24 @@ pub(crate) async fn execute_hook_as(
         service.manifest.name
     );
 
+    let engine = state.wasm_engine.as_ref();
     let worker_routed = kind != InvocationKind::OnMigrate
         && state
             .config
             .is_worker_routed(&service.manifest.name, hook_name);
-    let response_str = if worker_routed {
-        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, request_str);
-        crate::worker_dispatch::execute_on_worker(&state.nats, &service.manifest.name, job, budget)
-            .await?
+    let output = if worker_routed {
+        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, text);
+        crate::worker_dispatch::execute_on_worker(
+            &state.nats,
+            &service.manifest.name,
+            job,
+            budget,
+            &hold,
+            engine,
+        )
+        .await?
     } else {
-        let wasm_engine = state.wasm_engine.as_ref().ok_or_else(|| {
+        let wasm_engine = engine.ok_or_else(|| {
             PlatformError::Internal(format!(
                 "Hook '{}' declared on service '{}' but the WASM runtime is unavailable on \
                  this platform instance",
@@ -118,7 +302,7 @@ pub(crate) async fn execute_hook_as(
                 Invocation {
                     compiled,
                     handler: hook_name.to_string(),
-                    request_json: request_str,
+                    request_json: text,
                     identity: service.identity(),
                     publishes: service.manifest.publishes.clone(),
                     extensions: service.manifest.extensions.clone(),
@@ -126,15 +310,19 @@ pub(crate) async fn execute_hook_as(
                     scope_kind: None,
                     budget,
                     cancel: None,
+                    class,
+                    admission: None,
                 },
             )
             .await
             .map_err(|e| map_execution_error("Hook", e))?
     };
+    drop(hold);
 
-    let response: Value =
-        serde_json::from_str(&response_str).unwrap_or_else(|_| Value::String(response_str.clone()));
-
+    let (response, _response) = parse_output(output).map_err(|refused| match engine {
+        Some(engine) => map_execution_error("Hook", engine.refusal(refused, true)),
+        None => PlatformError::Internal(format!("Hook execution error: {refused}")),
+    })?;
     interpret_hook_response(response)
 }
 
@@ -214,39 +402,43 @@ pub(crate) fn hook_request_text(
     service: &RegisteredService,
     auth_json: Option<Value>,
     call: Option<&ServiceCaller>,
-) -> PlatformResult<String> {
-    crate::router::guest_text(&wrap_hook_request(
-        body, hook_name, service, auth_json, call,
-    ))
+    hold: &mut Hold,
+) -> Result<String, ChargedJsonError> {
+    crate::router::charged_guest_text(
+        &wrap_hook_request(body, hook_name, service, auth_json, call),
+        hold,
+    )
 }
 
 async fn execute_after_hook(
     state: &Arc<AppState>,
     service: &RegisteredService,
     hook_name: &str,
-    body: Value,
-    auth_json: Option<Value>,
+    request: HookRequest,
     call: Option<&ServiceCaller>,
 ) {
     if state
         .config
         .is_worker_routed(&service.manifest.name, hook_name)
     {
-        let request_str = match hook_request_text(body, hook_name, service, auth_json, call) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Failed to serialize after-hook request: {}", e);
-                return;
-            }
-        };
-        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, request_str);
+        let job = crate::worker_dispatch::WasmJob::of(service, hook_name, request.text);
         if let Err(e) =
             crate::worker_dispatch::publish_async_job(&state.jetstream, &service.manifest.name, job)
                 .await
         {
             tracing::warn!("Failed to publish async after-hook '{}': {}", hook_name, e);
         }
-    } else if let Err(e) = execute_hook(state, service, hook_name, body, auth_json, call).await {
+    } else if let Err(e) = run_hook(
+        state,
+        InvocationKind::Hook,
+        Class::Committed,
+        service,
+        hook_name,
+        request,
+        call,
+    )
+    .await
+    {
         tracing::warn!("after hook '{}' error: {}", hook_name, e);
     }
 }
@@ -1072,45 +1264,58 @@ pub(crate) async fn create_handler(
             rows.scoped(),
         ))
     };
-    let mut client = tenant_pool.get().await?;
-    let (result, emission) = if outlet.enforced() || rows.confining().is_some() {
-        let txn = client.transaction().await?;
-        let inserted = run_insert(&txn, &sql, &params, table, &rows).await?;
-        let emission = created(&inserted);
-        outlet
-            .enqueue(&txn, std::slice::from_ref(&emission))
-            .await?;
-        txn.commit().await.map_err(db(CrudOp::Commit))?;
-        (inserted, emission)
-    } else {
-        let inserted = run_insert(&client, &sql, &params, table, &rows).await?;
-        let emission = created(&inserted);
-        (inserted, emission)
+    let after = AfterHook::of(
+        table
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.after_create.as_deref()),
+        table
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.before_create.is_some()),
+        &state,
+        &service,
+        &auth_user,
+        call.as_ref(),
+    )
+    .await;
+    let kept = |result: &Value| {
+        after
+            .as_ref()
+            .map(|after| {
+                after.keep(with_scope(
+                    json!({
+                        "hook": "after_create",
+                        "table": table_name,
+                        "data": row,
+                        "result": result,
+                    }),
+                    &rows,
+                ))
+            })
+            .transpose()
+            .map(Option::flatten)
     };
+    let mut client = tenant_pool.get().await?;
+    let (result, emission, kept) =
+        if outlet.enforced() || rows.confining().is_some() || keeps_first(after.as_ref()) {
+            let txn = client.transaction().await?;
+            let inserted = run_insert(&txn, &sql, &params, table, &rows).await?;
+            let emission = created(&inserted);
+            outlet
+                .enqueue(&txn, std::slice::from_ref(&emission))
+                .await?;
+            let kept = kept(&inserted)?;
+            txn.commit().await.map_err(db(CrudOp::Commit))?;
+            (inserted, emission, kept)
+        } else {
+            let inserted = run_insert(&client, &sql, &params, table, &rows).await?;
+            let emission = created(&inserted);
+            let kept = kept(&inserted)?;
+            (inserted, emission, kept)
+        };
     outlet.publish(emission).await;
-
-    if let Some(ref hooks) = table.hooks {
-        if let Some(ref hook_name) = hooks.after_create {
-            let auth_json = guest_auth_json(&state, &auth_user, service.tenant_id).await;
-            let hook_body = with_scope(
-                json!({
-                    "hook": "after_create",
-                    "table": table_name,
-                    "data": Value::Object(row),
-                    "result": result,
-                }),
-                &rows,
-            );
-            spawn_after_hook(
-                state.clone(),
-                service.clone(),
-                hook_name.clone(),
-                hook_body,
-                Some(auth_json),
-                call.clone(),
-            );
-        }
-    }
+    spawn_after_hooks(&state, &service, kept, call.as_ref());
 
     Ok(Json(columns.shown(result)))
 }
@@ -1307,49 +1512,64 @@ pub(crate) async fn update_handler(
         });
         (emission, updated.row)
     };
-    let mut client = tenant_pool.get().await?;
-    let updated = if outlet.enforced() || rows.confining().is_some() {
-        let txn = client.transaction().await?;
-        let updated = run_update(&txn, &sql, &params, table, &rows)
-            .await?
-            .map(changed);
-        if let Some((emission, _)) = &updated {
-            outlet.enqueue(&txn, std::slice::from_ref(emission)).await?;
-        }
-        txn.commit().await.map_err(db(CrudOp::Commit))?;
-        updated
-    } else {
-        run_update(&client, &sql, &params, table, &rows)
-            .await?
-            .map(changed)
+    let after = AfterHook::of(
+        table
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.after_update.as_deref()),
+        table
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.before_update.is_some()),
+        &state,
+        &service,
+        &auth_user,
+        call.as_ref(),
+    )
+    .await;
+    let kept = |updated: Option<&(Emission, Value)>| {
+        after
+            .as_ref()
+            .zip(updated)
+            .map(|(after, (_, result))| {
+                after.keep(with_scope(
+                    json!({
+                        "hook": "after_update",
+                        "table": table_name,
+                        "id": id,
+                        "data": body,
+                        "result": result,
+                    }),
+                    &rows,
+                ))
+            })
+            .transpose()
+            .map(Option::flatten)
     };
+    let mut client = tenant_pool.get().await?;
+    let (updated, kept) =
+        if outlet.enforced() || rows.confining().is_some() || keeps_first(after.as_ref()) {
+            let txn = client.transaction().await?;
+            let updated = run_update(&txn, &sql, &params, table, &rows)
+                .await?
+                .map(changed);
+            if let Some((emission, _)) = &updated {
+                outlet.enqueue(&txn, std::slice::from_ref(emission)).await?;
+            }
+            let kept = kept(updated.as_ref())?;
+            txn.commit().await.map_err(db(CrudOp::Commit))?;
+            (updated, kept)
+        } else {
+            let updated = run_update(&client, &sql, &params, table, &rows)
+                .await?
+                .map(changed);
+            let kept = kept(updated.as_ref())?;
+            (updated, kept)
+        };
     let (emission, result) =
         updated.ok_or_else(|| PlatformError::NotFound(format!("{} not found", table_name)))?;
     outlet.publish(emission).await;
-
-    if let Some(ref hooks) = table.hooks {
-        if let Some(ref hook_name) = hooks.after_update {
-            let auth_json = guest_auth_json(&state, &auth_user, service.tenant_id).await;
-            let hook_body = with_scope(
-                json!({
-                    "hook": "after_update",
-                    "table": table_name,
-                    "id": id,
-                    "data": body,
-                    "result": result,
-                }),
-                &rows,
-            );
-            spawn_after_hook(
-                state.clone(),
-                service.clone(),
-                hook_name.clone(),
-                hook_body,
-                Some(auth_json),
-                call.clone(),
-            );
-        }
-    }
+    spawn_after_hooks(&state, &service, kept, call.as_ref());
 
     Ok(Json(columns.shown(result)))
 }
@@ -1467,6 +1687,35 @@ pub(crate) async fn delete_handler(
         scope: rows.scoped(),
         before: None,
     });
+    let after = AfterHook::of(
+        table
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.after_delete.as_deref()),
+        table
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.before_delete.is_some()),
+        &state,
+        &service,
+        &auth_user,
+        call.as_ref(),
+    )
+    .await;
+    let kept = after
+        .as_ref()
+        .map(|after| {
+            after.keep(with_scope(
+                json!({
+                    "hook": "after_delete",
+                    "table": table_name,
+                    "id": id,
+                }),
+                &rows,
+            ))
+        })
+        .transpose()?
+        .flatten();
     let mut client = tenant_pool.get().await?;
     if outlet.enforced() {
         let txn = client.transaction().await?;
@@ -1488,28 +1737,7 @@ pub(crate) async fn delete_handler(
             .map_err(db(CrudOp::Delete))?;
     }
     outlet.publish(emission).await;
-
-    if let Some(ref hooks) = table.hooks {
-        if let Some(ref hook_name) = hooks.after_delete {
-            let auth_json = guest_auth_json(&state, &auth_user, service.tenant_id).await;
-            let hook_body = with_scope(
-                json!({
-                    "hook": "after_delete",
-                    "table": table_name,
-                    "id": id,
-                }),
-                &rows,
-            );
-            spawn_after_hook(
-                state.clone(),
-                service.clone(),
-                hook_name.clone(),
-                hook_body,
-                Some(auth_json),
-                call.clone(),
-            );
-        }
-    }
+    spawn_after_hooks(&state, &service, kept, call.as_ref());
 
     Ok(Json(json!({ "deleted": true })))
 }
@@ -1653,6 +1881,13 @@ pub(crate) async fn batch_handler(
     )
     .await?;
 
+    let keeper = match table.hooks.as_ref().filter(|hooks| fires_after(hooks)) {
+        Some(hooks) => {
+            let before_ran = batch.operations.iter().any(|op| fires_before(op, hooks));
+            Some(Keeper::new(&state, &service, &auth_user, call.as_ref(), before_ran).await)
+        }
+        None => None,
+    };
     let mut client = tenant_pool.get().await?;
     let txn = client.transaction().await?;
 
@@ -1754,23 +1989,25 @@ pub(crate) async fn batch_handler(
         }
     }
 
+    let kept = keeper
+        .as_ref()
+        .map(|keeper| {
+            keep_batch_after_hooks(
+                keeper,
+                table,
+                &table_name,
+                &batch.operations,
+                &batch_rows,
+                &prepared,
+                &op_results,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
     outlet.enqueue(&txn, &emissions).await?;
     txn.commit().await.map_err(db(CrudOp::Commit))?;
     outlet.publish_detached(emissions);
-
-    fire_batch_after_hooks(
-        &state,
-        &service,
-        table,
-        &table_name,
-        &auth_user,
-        call.as_ref(),
-        &batch.operations,
-        &batch_rows,
-        &prepared,
-        &op_results,
-    )
-    .await;
+    spawn_after_hooks(&state, &service, kept, call.as_ref());
 
     let results: Vec<Value> = op_results
         .into_iter()
@@ -1929,32 +2166,35 @@ async fn run_batch_before_hooks(
     Ok(prepared)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fire_batch_after_hooks(
-    state: &Arc<AppState>,
-    service: &Arc<RegisteredService>,
-    table: &TableDefinition,
-    table_name: &str,
-    auth_user: &Option<crate::auth::AuthUser>,
-    call: Option<&ServiceCaller>,
-    operations: &[BatchOperation],
-    batch_rows: &BatchRows,
-    prepared: &[PreparedOp],
-    op_results: &[Option<Value>],
-) {
-    let Some(ref hooks) = table.hooks else {
-        return;
-    };
-    if hooks.after_create.is_none() && hooks.after_update.is_none() && hooks.after_delete.is_none()
-    {
-        return;
-    }
-    let auth_json = guest_auth_json(state, auth_user, service.tenant_id).await;
+fn fires_after(hooks: &cufflink_types::TableHooks) -> bool {
+    hooks.after_create.is_some() || hooks.after_update.is_some() || hooks.after_delete.is_some()
+}
 
-    for ((op, prepared_op), result) in operations.iter().zip(prepared).zip(op_results) {
-        let (hook, body) = match prepared_op {
+fn fires_before(op: &BatchOperation, hooks: &cufflink_types::TableHooks) -> bool {
+    match op {
+        BatchOperation::Create { .. } => hooks.before_create.is_some(),
+        BatchOperation::Update { .. } => hooks.before_update.is_some(),
+        BatchOperation::Delete { .. } => hooks.before_delete.is_some(),
+    }
+}
+
+struct BatchHooks<'a> {
+    hooks: &'a cufflink_types::TableHooks,
+    table_name: &'a str,
+    batch_rows: &'a BatchRows,
+}
+
+impl<'a> BatchHooks<'a> {
+    fn body(
+        &self,
+        op: &BatchOperation,
+        prepared: &PreparedOp,
+        result: &Option<Value>,
+    ) -> Option<(&'a str, Value)> {
+        let table_name = self.table_name;
+        let (hook, body) = match prepared {
             PreparedOp::Create { data, .. } => (
-                &hooks.after_create,
+                &self.hooks.after_create,
                 json!({
                     "hook": "after_create",
                     "table": table_name,
@@ -1963,7 +2203,7 @@ async fn fire_batch_after_hooks(
                 }),
             ),
             PreparedOp::Update { id, data } => (
-                &hooks.after_update,
+                &self.hooks.after_update,
                 json!({
                     "hook": "after_update",
                     "table": table_name,
@@ -1973,7 +2213,7 @@ async fn fire_batch_after_hooks(
                 }),
             ),
             PreparedOp::Delete { id, existing } => (
-                &hooks.after_delete,
+                &self.hooks.after_delete,
                 json!({
                     "hook": "after_delete",
                     "table": table_name,
@@ -1982,34 +2222,67 @@ async fn fire_batch_after_hooks(
                 }),
             ),
         };
-        if let Some(hook_name) = hook {
-            spawn_after_hook(
-                state.clone(),
-                service.clone(),
-                hook_name.clone(),
-                match batch_rows.of(op) {
-                    Ok(rows) => with_scope(body, rows),
-                    Err(_) => body,
-                },
-                Some(auth_json.clone()),
-                call.cloned(),
-            );
-        }
+        hook.as_deref().map(|name| {
+            let body = match self.batch_rows.of(op) {
+                Ok(rows) => with_scope(body, rows),
+                Err(_) => body,
+            };
+            (name, body)
+        })
     }
 }
 
-fn spawn_after_hook(
-    state: Arc<AppState>,
-    service: Arc<RegisteredService>,
-    hook_name: String,
-    body: Value,
-    auth_json: Option<Value>,
-    call: Option<ServiceCaller>,
+fn keep_batch_after_hooks(
+    keeper: &Keeper<'_>,
+    table: &TableDefinition,
+    table_name: &str,
+    operations: &[BatchOperation],
+    batch_rows: &BatchRows,
+    prepared: &[PreparedOp],
+    op_results: &[Option<Value>],
+) -> PlatformResult<Vec<KeptHook>> {
+    let Some(hooks) = table.hooks.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let batch = BatchHooks {
+        hooks,
+        table_name,
+        batch_rows,
+    };
+    let bodies = || {
+        operations
+            .iter()
+            .zip(prepared)
+            .zip(op_results)
+            .filter_map(|((op, prepared), result)| batch.body(op, prepared, result))
+    };
+    bodies()
+        .map(|(name, body)| keeper.keep(name, body))
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|refused| {
+            let needs = bodies().map(|(_, body)| ChargedJson::measure(&body)).sum();
+            keeper.refused(refused, needs)
+        })
+}
+
+fn keeps_first(after: Option<&AfterHook<'_>>) -> bool {
+    after.is_some_and(|after| after.keeper.refuses())
+}
+
+fn spawn_after_hooks(
+    state: &Arc<AppState>,
+    service: &Arc<RegisteredService>,
+    kept: impl IntoIterator<Item = KeptHook>,
+    call: Option<&ServiceCaller>,
 ) {
-    let shutdown = state.shutdown.clone();
-    shutdown.spawn("after_hook", async move {
-        execute_after_hook(&state, &service, &hook_name, body, auth_json, call.as_ref()).await;
-    });
+    for hook in kept {
+        let (state, service, call) = (state.clone(), service.clone(), call.cloned());
+        let shutdown = state.shutdown.clone();
+        shutdown.spawn("after_hook", async move {
+            execute_after_hook(&state, &service, &hook.name, hook.request, call.as_ref()).await;
+        });
+    }
 }
 
 fn needs_existing_row(op: &BatchOperation, hooks: Option<&cufflink_types::TableHooks>) -> bool {
@@ -2224,10 +2497,42 @@ mod wrap_hook_request_tests {
             ),
         ] {
             assert_eq!(
-                hook_request_text(body, hook, &fake_service(), auth, None).expect("text"),
+                hook_request_text(body, hook, &fake_service(), auth, None, &mut Hold::none())
+                    .expect("text"),
                 text
             );
         }
+    }
+
+    #[test]
+    fn a_row_too_deep_for_its_envelope_fails_as_syntax_and_never_as_capacity() {
+        let deep = (0..125).fold(json!(1), |inner, _| Value::Array(vec![inner]));
+        let row: Value = serde_json::from_str(&json!({"meta": deep}).to_string())
+            .expect("the request body parses");
+        let body = json!({"hook": "after_create", "table": "items", "data": row, "result": row});
+        assert!(matches!(
+            hook_request(body, "h", &fake_service(), Hold::none(), None, None),
+            Err(ChargedJsonError::Syntax(_))
+        ));
+    }
+
+    #[test]
+    fn a_hook_request_holds_its_text_and_not_a_whole_step() {
+        use crate::wasm_runtime::budget::testing;
+
+        let (ledger, hold) = testing::hold(4 * testing::MIB);
+        let request = hook_request(
+            json!({"hook": "after_create"}),
+            "h",
+            &fake_service(),
+            hold,
+            None,
+            None,
+        )
+        .expect("request");
+        assert_eq!(request.hold.bytes(), request.text.capacity());
+        assert!(request.hold.bytes() < 1024, "{}", request.hold.bytes());
+        assert_eq!(ledger.in_use(), request.hold.bytes());
     }
 
     fn fake_service() -> RegisteredService {
@@ -2337,7 +2642,10 @@ mod wrap_hook_request_tests {
             wrapped["caller"],
             json!({"service": "pricing", "on_behalf_of": null, "depth": 3})
         );
-        assert_eq!(crate::wasm_runtime::host::inbound_depth(&wrapped), 3);
+        assert_eq!(
+            crate::wasm_runtime::host::caller_depth(&wrapped["caller"]),
+            3
+        );
     }
 
     #[test]

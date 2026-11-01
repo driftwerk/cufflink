@@ -598,6 +598,7 @@ fn all_migrations() -> Vec<(i32, String)> {
         (4, "r3".to_string()),
         (5, "extensions".to_string()),
         (6, "runner_keys".to_string()),
+        (7, "capacity_deferrals".to_string()),
     ]
 }
 

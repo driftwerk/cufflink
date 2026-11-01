@@ -22,7 +22,7 @@ async fn clean_recycle_keeps_statement_timeout() {
     {
         let client = pool.get().await.expect("first checkout");
         client
-            .batch_execute("SET statement_timeout = '1ms'; SET search_path TO nowhere")
+            .batch_execute("SET statement_timeout = '25s'; SET search_path TO nowhere")
             .await
             .expect("session changes");
         client

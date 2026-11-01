@@ -374,8 +374,9 @@ pub(super) fn register(
                 .increment(1);
             metrics::histogram!("cufflink_cache_call_duration_seconds", "op" => op)
                 .record(started.elapsed().as_secs_f64());
-            caller.data_mut().host_response = Some(envelope(outcome).to_string());
-            0
+            caller
+                .data_mut()
+                .respond_json("cache_call", &envelope(outcome))
         },
     )
 }

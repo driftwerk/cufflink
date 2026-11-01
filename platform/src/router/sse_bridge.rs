@@ -1,9 +1,11 @@
 use crate::errors::{PlatformError, PlatformResult};
 use crate::nats_manager::subjects::{resolve_subject, subject_covers};
 use crate::registry::{RegisteredService, ServiceIdentity};
+use crate::router::charged_guest_text;
 use crate::router::custom::{execute, Execution};
 use crate::router::sse::SseSlot;
-use crate::wasm_runtime::{CompiledModule, InvocationKind};
+use crate::wasm_runtime::budget::{ChargedJson, Hold, STEP};
+use crate::wasm_runtime::{Class, CompiledModule, GuestOutput, InvocationKind};
 use crate::AppState;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -19,6 +21,7 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
 const MAX_BUFFERED: usize = 1000;
+const MAX_RETAINED_BYTES: usize = STEP;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const REDUCER_BUDGET: Duration = Duration::from_secs(5);
 const TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 1..=3600;
@@ -47,6 +50,11 @@ impl SseEvent {
         })
     }
 
+    fn bytes(&self) -> usize {
+        let field = |field: &Option<String>| field.as_ref().map_or(0, String::len);
+        std::mem::size_of::<Self>() + self.data.len() + field(&self.event) + field(&self.id)
+    }
+
     fn data_only(data: String) -> Self {
         Self {
             event: None,
@@ -66,6 +74,10 @@ impl SseEvent {
             None => event,
         }
     }
+}
+
+fn bytes_of(events: &[SseEvent]) -> usize {
+    events.iter().map(SseEvent::bytes).sum()
 }
 
 fn events(value: &Value) -> Result<Vec<SseEvent>, String> {
@@ -108,6 +120,15 @@ impl SseSpec {
             ping,
             timeout: secs(value, "timeout_secs")?,
         })
+    }
+
+    pub(crate) fn retained(&self) -> usize {
+        let ping = self.ping.as_ref().map_or(0, |(_, event)| event.bytes());
+        2 * bytes_of(&self.initial) + ping + ChargedJson::tree_bytes(&self.state)
+    }
+
+    pub(crate) fn fits_a_stream(&self) -> bool {
+        self.retained() <= MAX_RETAINED_BYTES && state_fits(&self.state)
     }
 }
 
@@ -252,10 +273,24 @@ struct Reduction {
 }
 
 impl Reduction {
-    fn parse(raw: &str) -> Result<Self, String> {
-        let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
-        if value.get("__status").is_some() {
-            return Err(format!("the reducer answered {}", value["__status"]));
+    fn read(output: GuestOutput) -> Result<(Self, Hold), String> {
+        let GuestOutput { text, mut hold } = output;
+        let value = ChargedJson::parse(text.as_bytes(), &mut hold)
+            .map_err(|e| e.to_string())?
+            .value;
+        drop(text);
+        let reduction = Self::of(value)?;
+        hold.shrink_to(bytes_of(&reduction.events));
+        hold.delivered();
+        Ok((reduction, hold))
+    }
+
+    fn of(value: Value) -> Result<Self, String> {
+        if let Some(status) = value.get("__status") {
+            return Err(status.as_u64().map_or_else(
+                || "the reducer answered an invalid status".to_string(),
+                |status| format!("the reducer answered {status}"),
+            ));
         }
         Ok(Self {
             events: events(&value["events"])?,
@@ -270,28 +305,44 @@ impl Reducer {
         &self,
         state: &Value,
         message: &async_nats::Message,
-    ) -> Result<Reduction, String> {
-        let request = crate::router::guest_json(&self.context.request(
-            &self.service.identity(),
-            &self.handler,
-            state,
-            message_json(message),
-        ))
+    ) -> Result<(Reduction, Hold), String> {
+        let identity = self.service.identity();
+        let mut held = self
+            .state
+            .wasm_engine
+            .as_ref()
+            .map_or_else(Hold::none, |engine| {
+                engine.hold(
+                    &identity,
+                    Class::Interactive,
+                    &self.handler,
+                    InvocationKind::SseReducer,
+                )
+            });
+        let request = charged_guest_text(
+            &self
+                .context
+                .request(&identity, &self.handler, state, message_json(message)),
+            &mut held,
+        )
         .map_err(|e| e.to_string())?;
-        let raw = execute(
+        let output = execute(
             &self.state,
             Execution {
                 service: &self.service,
                 handler: &self.handler,
                 compiled: self.compiled.clone(),
-                request: &request,
+                request,
                 kind: InvocationKind::SseReducer,
                 budget: REDUCER_BUDGET,
+                class: Class::Interactive,
+                admission: None,
             },
         )
         .await
         .map_err(|e| e.to_string())?;
-        Reduction::parse(&raw)
+        drop(held);
+        Reduction::read(output)
     }
 }
 
@@ -323,7 +374,7 @@ fn overflowed(buffered: usize) -> bool {
 }
 
 fn state_fits(state: &Value) -> bool {
-    state.to_string().len() <= MAX_STATE_BYTES
+    ChargedJson::measure(state) <= MAX_STATE_BYTES
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +419,7 @@ impl Drop for Active {
     }
 }
 
-type Sender = mpsc::Sender<Result<Event, Infallible>>;
+type Sender = mpsc::Sender<(Event, Arc<Hold>)>;
 
 impl Bridge {
     pub(crate) fn stream(
@@ -395,7 +446,8 @@ impl Bridge {
             metrics::counter!("cufflink_sse_bridge_closed_total", "reason" => closed.label())
                 .increment(1);
         });
-        Sse::new(ReceiverStream::new(rx))
+        let events = ReceiverStream::new(rx).map(|(event, _charge)| Ok::<_, Infallible>(event));
+        Sse::new(events)
             .keep_alive(KeepAlive::new().interval(keep_alive))
             .into_response()
     }
@@ -409,7 +461,7 @@ async fn run(
     tx: &Sender,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Closed {
-    if !send_all(tx, &spec.initial).await {
+    if !send_all(tx, &spec.initial, &uncharged()).await {
         return Closed::Client;
     }
     if overflowed(buffered.len()) {
@@ -441,7 +493,7 @@ async fn run(
             _ = shutdown.cancelled() => return Closed::Shutdown,
             _ = tokio::time::sleep_until(at) => match (tick, &spec.ping) {
                 (Tick::Ping, Some((_, event))) => {
-                    if !send_all(tx, std::slice::from_ref(event)).await {
+                    if !send_all(tx, std::slice::from_ref(event), &uncharged()).await {
                         return Closed::Client;
                     }
                     schedule = schedule.pinged();
@@ -460,9 +512,13 @@ async fn run(
     }
 }
 
-async fn send_all(tx: &Sender, events: &[SseEvent]) -> bool {
+fn uncharged() -> Arc<Hold> {
+    Arc::new(Hold::none())
+}
+
+async fn send_all(tx: &Sender, events: &[SseEvent], charge: &Arc<Hold>) -> bool {
     for event in events {
-        if tx.send(Ok(event.render())).await.is_err() {
+        if tx.send((event.render(), Arc::clone(charge))).await.is_err() {
             return false;
         }
     }
@@ -479,23 +535,29 @@ impl Delivery {
         let Some(reducer) = &self.reducer else {
             counted("forwarded");
             let event = SseEvent::data_only(String::from_utf8_lossy(&message.payload).into_owned());
-            return (!send_all(tx, &[event]).await).then_some(Closed::Client);
+            return (!send_all(tx, &[event], &uncharged()).await).then_some(Closed::Client);
         };
         match reducer.reduce(&self.state, message).await {
-            Ok(reduction) => {
+            Ok((reduction, hold)) => {
                 counted("reduced");
-                if !send_all(tx, &reduction.events).await {
+                let Reduction {
+                    events,
+                    state,
+                    close,
+                } = reduction;
+                let state = state_fits(&state).then_some(state);
+                if !send_all(tx, &events, &Arc::new(hold)).await {
                     return Some(Closed::Client);
                 }
-                if !state_fits(&reduction.state) {
+                let Some(state) = state else {
                     tracing::warn!(
                         handler = %reducer.handler,
                         "Event stream closed: the reducer's state is over {MAX_STATE_BYTES} bytes"
                     );
                     return Some(Closed::Reducer);
-                }
-                self.state = reduction.state;
-                reduction.close.then_some(Closed::Reducer)
+                };
+                self.state = state;
+                close.then_some(Closed::Reducer)
             }
             Err(error) => {
                 counted("reducer_error");
@@ -509,6 +571,71 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm_runtime::budget::testing::{self, MIB};
+
+    fn parsed(raw: &str) -> Result<Reduction, String> {
+        Reduction::read(GuestOutput {
+            text: raw.to_string(),
+            hold: Hold::none(),
+        })
+        .map(|(reduction, _)| reduction)
+    }
+
+    #[tokio::test]
+    async fn a_reduction_holds_only_its_events_and_no_room() {
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        let text = json!({"events": [{"data": "x".repeat(4096)}], "state": {"a": 1}}).to_string();
+        hold.force(text.len());
+        hold.make_room(|| 8 * MIB).await;
+        assert!(ledger.delivering() > 0);
+        let (reduction, hold) = Reduction::read(GuestOutput { text, hold }).expect("reads");
+        assert_eq!(ledger.delivering(), 0);
+        assert_eq!(ledger.in_use(), bytes_of(&reduction.events));
+        drop(hold);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_queued_event_stays_charged_until_it_is_read() {
+        let (ledger, mut hold) = testing::hold(64 * MIB);
+        hold.force(MIB);
+        let (tx, mut rx) = mpsc::channel(4);
+        let events = [
+            SseEvent::data_only("a".into()),
+            SseEvent::data_only("b".into()),
+        ];
+        assert!(send_all(&tx, &events, &Arc::new(hold)).await);
+        assert_eq!(ledger.in_use(), MIB);
+        drop(rx.recv().await);
+        assert_eq!(ledger.in_use(), MIB, "one is still queued");
+        drop(rx.recv().await);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_stream_may_hold_a_small_opening() {
+        let spec = |initial: usize, state: Value| {
+            SseSpec::parse(&json!({
+                "initial": [{"data": "x".repeat(initial)}],
+                "state": state,
+                "keep_alive_secs": 15,
+                "timeout_secs": 60,
+            }))
+            .expect("parses")
+        };
+        let filler = bytes_of(&[SseEvent::data_only(String::new())]);
+        let at_limit = (MAX_RETAINED_BYTES - 2 * filler) / 2;
+        assert!(spec(at_limit, Value::Null).fits_a_stream());
+        assert!(!spec(at_limit + 1, Value::Null).fits_a_stream());
+        assert!(!spec(1, json!("x".repeat(MAX_STATE_BYTES))).fits_a_stream());
+        assert!(spec(1, json!("x".repeat(MAX_STATE_BYTES - 2))).fits_a_stream());
+        let dense = json!(vec![json!(0); 32 * 1024 - 1]);
+        assert!(state_fits(&dense));
+        assert!(
+            !spec(1, dense).fits_a_stream(),
+            "what it retains is measured, not its text"
+        );
+    }
 
     #[test]
     fn a_reduction_carries_the_principal_of_its_route() {
@@ -616,7 +743,7 @@ mod tests {
     #[test]
     fn reductions_come_from_the_reducers_json() {
         assert_eq!(
-            Reduction::parse(
+            parsed(
                 r#"{"events":[{"data":{"type":"all_completed"}}],"state":{"n":2},"close":true}"#
             ),
             Ok(Reduction {
@@ -626,12 +753,12 @@ mod tests {
             })
         );
         assert_eq!(
-            Reduction::parse(r#"{"events":[],"state":null}"#).map(|r| r.close),
+            parsed(r#"{"events":[],"state":null}"#).map(|r| r.close),
             Ok(false)
         );
-        assert!(Reduction::parse(r#"{"__status":400,"__body":{"error":"x"}}"#).is_err());
-        assert!(Reduction::parse("not json").is_err());
-        assert!(Reduction::parse(r#"{"events":[{"event":"a\rb","data":1}]}"#).is_err());
+        assert!(parsed(r#"{"__status":400,"__body":{"error":"x"}}"#).is_err());
+        assert!(parsed("not json").is_err());
+        assert!(parsed(r#"{"events":[{"event":"a\rb","data":1}]}"#).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-error: the posture comes before body_limit, timeout, multipart, sse, audit_redact and documentation keywords, which trail it
+error: the posture comes before body_limit, timeout, max_concurrent, multipart, sse, audit_redact and documentation keywords, which trail it
  --> tests/ui/fail/keyword_before_posture.rs:4:70
   |
 4 |     custom_routes: [("POST", "/import", "import", body_limit = 1024, perm("items", "edit"))],

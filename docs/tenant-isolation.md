@@ -55,6 +55,7 @@ release that changes defaults, changes them.
 | `storage_scope` with `"scope": "strict"` and each tenant's `allowed_buckets` | Guest access to other tenants' objects |
 | `CUFFLINK_POLICY_EGRESS=enforce` | Guest requests to private and internal addresses (the platform, the database, NATS, other tenants' services) |
 | `CUFFLINK_POLICY_WASM_LIMITS=enforce` | One guest exhausting memory every tenant's guests share |
+| `WASM_MEMORY_BUDGET_MODE=enforce` | Many guests together, of one service or several, growing the process into its container's limit, where the kernel kills every tenant's work at once; and one service taking every execution slot |
 | `CUFFLINK_POLICY_TENANT_BINDING=enforce` | Callers' `authorization`, `cookie` and `proxy-authorization` headers reaching guests whose routes do not declare `forward_auth`; a token or key of another tenant is then refused (403) where `warn` serves it as unauthenticated |
 | `CUFFLINK_POLICY_REDIS_SCOPE=enforce` | Fallback reads of unprefixed Redis keys, which any tenant may have written |
 | A NATS user per component, and no anonymous access | Forged jobs, events and results on the platform's subjects |
@@ -190,7 +191,10 @@ or behind authentication
 
 Planned, with no setting today:
 
-- per-tenant concurrency and job quotas on the workers;
+- per-tenant shares of the guest memory budget (per-service concurrency
+  and memory shares are `WASM_MAX_CONCURRENT_PER_SERVICE` and
+  `WASM_MEMORY_SERVICE_SHARE_PERCENT`);
+- job quotas on the workers;
 - per-tenant JetStream limits (storage and message counts of each
   tenant's stream);
 - signed worker jobs, so a job carries proof that the platform made it,

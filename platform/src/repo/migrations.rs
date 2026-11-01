@@ -210,7 +210,8 @@ mod tests {
                 (3, "r2"),
                 (4, "r3"),
                 (5, "extensions"),
-                (6, "runner_keys")
+                (6, "runner_keys"),
+                (7, "capacity_deferrals")
             ]
         );
     }

@@ -1,6 +1,7 @@
 use crate::auth::extractor::AuthMethod;
 use crate::auth::AuthUser;
 use crate::nats_conn::jetstream_publish_bounded;
+use crate::wasm_runtime::budget::{ChargedJson, Meter};
 use crate::AppState;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -305,7 +306,94 @@ fn redacted(value: Option<Value>, rules: &[String]) -> (Option<Value>, BTreeSet<
     }
 }
 
+#[derive(serde::Serialize)]
+struct LegacyPayload<'a> {
+    action: &'a str,
+    data: &'a Option<Value>,
+    previous: &'a Option<Value>,
+    record_id: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+    service: &'a str,
+    table: &'a Option<String>,
+    tenant: &'a str,
+    timestamp: String,
+    user_id: &'a str,
+    user_name: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct DurablePayload<'a> {
+    action: &'a str,
+    actor: Value,
+    data: &'a Option<Value>,
+    previous: Option<&'a Value>,
+    record_id: &'a Option<String>,
+    redacted: &'a [String],
+    request_id: &'a Option<String>,
+    scope: Option<&'a str>,
+    service: &'a str,
+    table: &'a Option<String>,
+    tenant: &'a str,
+    timestamp: String,
+    user_id: &'a str,
+    user_name: &'a str,
+    v: u8,
+}
+
+fn payload_text<T: serde::Serialize, M: Meter + ?Sized>(
+    payload: &T,
+    meter: &mut M,
+    built: impl FnOnce() -> Value,
+) -> Vec<u8> {
+    match ChargedJson::write(payload, meter) {
+        Ok(text) => text.into_bytes(),
+        Err(e) => {
+            tracing::error!(error = %e, "An audit payload was written without its reservation");
+            built().to_string().into_bytes()
+        }
+    }
+}
+
 impl AuditRecord {
+    pub(crate) fn payloads<M: Meter + ?Sized>(&self, meter: &mut M) -> (Vec<u8>, Vec<u8>) {
+        let timestamp = self.timestamp.to_rfc3339();
+        let legacy = LegacyPayload {
+            action: &self.action,
+            data: &self.data,
+            previous: &self.previous,
+            record_id: &self.record_id,
+            scope: self.scope,
+            service: &self.service,
+            table: &self.table,
+            tenant: &self.tenant,
+            timestamp: timestamp.clone(),
+            user_id: &self.user_id,
+            user_name: &self.user_name,
+        };
+        let durable = DurablePayload {
+            action: &self.action,
+            actor: self.actor.to_json(),
+            data: &self.data,
+            previous: self.before.as_ref().or(self.previous.as_ref()),
+            record_id: &self.record_id,
+            redacted: &self.redacted,
+            request_id: &self.request_id,
+            scope: self.scope,
+            service: &self.service,
+            table: &self.table,
+            tenant: &self.tenant,
+            timestamp,
+            user_id: &self.subject,
+            user_name: &self.user_name,
+            v: DURABLE_VERSION,
+        };
+        (
+            payload_text(&legacy, meter, || self.legacy_payload()),
+            payload_text(&durable, meter, || self.durable_payload()),
+        )
+    }
+
     pub fn redact(self, rules: &[String]) -> Self {
         if rules.is_empty() {
             return self;
@@ -578,6 +666,39 @@ pub(crate) mod tests {
 
     fn rules(rules: &[&str]) -> Vec<String> {
         rules.iter().map(|rule| rule.to_string()).collect()
+    }
+
+    #[test]
+    fn the_written_payloads_are_byte_for_byte_the_ones_built_as_values() {
+        let records = [
+            record(
+                "custom:export",
+                Some(json!({"b": [1e2, 1.0], "a": "é\n"})),
+                None,
+            ),
+            AuditRecord {
+                scope: Some("own"),
+                before: Some(json!({"n": 1})),
+                table: None,
+                record_id: None,
+                request_id: None,
+                redacted: vec!["data.ssn".into()],
+                ..record("update", Some(json!({"n": 2})), Some(json!({"n": 0})))
+            },
+            record("delete", None, None),
+        ];
+        for record in &records {
+            let mut meter = crate::wasm_runtime::budget::Hold::none();
+            let (legacy, durable) = record.payloads(&mut meter);
+            assert_eq!(
+                String::from_utf8(legacy).expect("utf8"),
+                record.legacy_payload().to_string()
+            );
+            assert_eq!(
+                String::from_utf8(durable).expect("utf8"),
+                record.durable_payload().to_string()
+            );
+        }
     }
 
     #[test]

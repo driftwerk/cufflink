@@ -1,6 +1,7 @@
 # Guest memory budget and admission control
 
-Design only. Nothing here is implemented yet.
+Implemented in v0.35.0. Section 14 records where the implementation
+differs from this design, and why.
 
 - The maintainer answered section 11's questions on 2026-10-30, accepting
   every proposed default. On the same day the maintainer re-decided
@@ -504,7 +505,7 @@ cannot read:
 | `s3_download_many`, `http_fetch_many` | At most `HOST_FANOUT_MAX_ITEMS` (128) items. Each item takes a sub-charge of its size (`head`, or `HOST_HTTP_MAX_RESPONSE_BYTES` for HTTP) before it starts. **Results stay in input order**, since guests index them by position. Item *i* is written to the response text once items 0 to *i − 1* are written; a result that finishes early waits under its own sub-charge. The total stays under the response cap. Golden tests compare both envelopes byte for byte with today's |
 | `image_transform`, `_multi` | Source objects of at most `IMAGE_MAX_INPUT_MB` (32), read as `s3_download` reads. The header's dimensions are read before decoding, and `width × height × IMAGE_BYTES_PER_PIXEL` is taken as a sub-charge moved into the `spawn_blocking` decode (section 2.2). `image::Limits` caps each side at 16 384 pixels and sets `max_alloc` to the sub-charge. Images over the pixel cap are refused. **`_multi` takes at most `IMAGE_MAX_TARGETS` (16) targets.** Today it encodes every output into a `Vec<Vec<u8>>`, each buffer pre-allocated at a quarter of the raw size, and holds them all until the uploads finish. Instead, each output is encoded under its own sub-charge, charged by its buffer's capacity, then uploaded and dropped before the next is encoded. The uploads happen in the same order and the answer (the sizes) is the same. **The one behaviour difference:** today every output is encoded before anything is uploaded, so an encode failure on any target uploads nothing. With one target at a time, an encode failure on a later target leaves the earlier targets' outputs uploaded, and the call fails as it does today. The release notes and `docs/building-on-cufflink.md` say so. The cap is the smaller of `IMAGE_MAX_PIXELS` (40 megapixels) and the service share ÷ 20 bytes: 40 MP is about 800 MB at 20 bytes a pixel, more than a 2 GiB container's service share, so there the share decides (about 37 MP) |
 | `redis_get`, `redis_mget` | Detailed below the table |
-| CRUD hooks | The hook request is built through `ChargedJson::to_value`. A detached in-process after-hook (`spawn_after_hook`) holds its request **text**, written and charged before it is spawned, not the row's `Value`. The charge is held while it waits for a slot (section 3.2) and until it runs |
+| CRUD hooks | The hook request is built through `ChargedJson::to_value`. A detached in-process after-hook holds its request **text**, not the row's `Value`. Under `enforce` the text is written and charged, refusably, before the write commits (section 4). The charge is held while the hook waits for a slot (section 3.2) and until it runs, and it counts against no committed run of its service (section 14) |
 | Multipart bodies | `body::multipart` copies each field out of the body. Each copy is charged as it is read, against the route's reservation, and so is the `MultipartField` list `ChargedJson::to_value` builds from them |
 | `service_call` | The callee's body is reserved at `HOST_HTTP_MAX_RESPONSE_BYTES` before it is collected, then shrunk to its length. It is encoded into the envelope without the `to_vec` copy. The envelope is charged through `set_host_response` |
 | Host-call inputs | The copy is charged before copying (section 2.2); a parse of it through `ChargedJson` |
@@ -809,6 +810,9 @@ are released if the deadline passes:
   - Under `enforce` they wait for a slot outside their handler budget,
     for up to `WASM_COMMITTED_WAIT_SECS` (300).
   - Past that they are dropped and logged, as a failed after-hook is today.
+  - Their request texts, already charged before the write committed, do
+    not count against their service's share while they wait (section 14),
+    so kept texts cannot stop the hooks that would free them.
   - The slow path for bulk after-hooks remains worker routing, which is
     durable.
 
@@ -928,7 +932,9 @@ reservation held across it would keep an idle durable's
     `V7__capacity_deferrals.sql`: `ADD COLUMN IF NOT EXISTS
     capacity_deferrals INTEGER NOT NULL DEFAULT 0`). It survives
     redelivery and replicas, and any conclusion other than a deferral
-    resets it to 0.
+    resets it to 0. A release (an interrupted claim put back) resets it
+    too: a deferral bound counts consecutive deferrals, and a release is not
+    one.
   - **The bound.** When a deferral would make it exceed
     `WASM_CAPACITY_RETRIES_JOB` (10), the attempt concludes instead as
     `Failed { class: Capacity }`: the attempt counts and the counter
@@ -1033,10 +1039,26 @@ labelled `overloaded`, and `ExecutionError::TooLarge`, labelled
 | Route, `_fn`, before-hook | `PlatformError::RetryLater`: 503, `Retry-After: WASM_ADMISSION_RETRY_AFTER_SECS` (2), `{"error": "guest capacity exhausted; the request was not run"}` | 503 with `Retry-After`, `{"error": "guest capacity exhausted while the request ran; it may have been partly applied"}` |
 | Service call (nested) | the callee's 503 reaches the caller's guest as the call's response | the same |
 | Worker request/reply | `WasmJobResult` gains `retry_after_ms: Option<u64>` and `ran: Option<bool>` (`serde(default)`, skipped when `None`). The platform answers as above when they are set. An older platform ignores them and answers 500; an older worker never sets them | the same |
-| After-hook in process | never refused at once. Under `enforce` it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today | logged like any hook failure |
-| `on_migrate` | never refused; it waits its budget, as today | fails the deploy as any error does |
+| After-hook in process | its write is refused while its text cannot be held: 503 with `Retry-After`, the write not committed, or 413 when the text alone passes the share. When a before-hook ran, the 503 says so and that nothing from the write was committed. The write's other refusals are unchanged. Once its write commits an in-process hook runs at most once: it waits up to `WASM_COMMITTED_WAIT_SECS` (300) for a slot and memory, outside its budget, and is then dropped and logged (`cufflink_wasm_admission_refused_total{class="committed"}`), as a failed after-hook is today, and it is not retried | logged like any hook failure, not retried |
+| `on_migrate` | its text is never refused; it waits its budget, as today | fails the deploy as any error does |
 | SSE reducer | waits at most the reducer's budget, then the event is dropped and counted `reducer_error`, as any reducer failure is today | the same |
 | Subscription, job, worker after-hook | never refused (section 3.5) | section 3.5 |
+
+**Refusable until the effect is durable, unrefusable after.** Before a
+write commits, its after-hook's text is charged refusably, and a refusal
+answers 503 with nothing committed, so nothing is dropped. Mid-run growth
+and host-call buffers stay refusable, and the guest sees `-1` or traps.
+Once the guest has returned, or the write has committed, every buffer that
+only delivers the result is charged past the budget and is never refused:
+hook and `on_migrate` text, `read_response`, the worker reply's decode,
+`guest_response`'s decode and render, `ChargedBody`, `into_payload`, a
+hook's `parse_output` and the subscription decode. Such a buffer waits for
+room instead (section 14), which is not a refusal. A size bound remains:
+`max_response_bytes` caps the response text, and a tree or rendered body
+that alone passes the delivery limit (section 14) is refused as too large,
+whatever else is running. A size refusal does not depend on load, so no retry cures it,
+and a finished message or job is settled by what it answered rather than
+run again for it (section 14).
 
 Every `ExecutionError` is a 500 today, a timeout included. The maintainer
 chose 503 for a mid-run denial (question 8). Its message says the handler
@@ -1138,6 +1160,7 @@ environment still overrides it.
 | `WASM_MEMORY_HOST_RESERVE_MB` | `max(256, 30 % of limit)` | Section 5.2 |
 | `WASM_MEMORY_SERVICE_SHARE_PERCENT` | `50` | Section 3.4 |
 | `WASM_MEMORY_BACKGROUND_SHARE_PERCENT` | `75` | Section 3.4 |
+| `WASM_MEMORY_DELIVERY_OVERRUN_MB` | half the reserve | Section 14 |
 | `WASM_MEMORY_ADMIT_PERCENT` | `90` | Section 3.4 |
 | `WASM_MEMORY_COLD_ESTIMATE_MB` | `32` | Section 2.5 |
 | `WASM_ESTIMATE_MAX_AGE_SECS` / `WASM_ESTIMATE_MAP_MAX` | `600` / `4096` | Section 2.5 |
@@ -1303,6 +1326,10 @@ describing each rule:
   - A trap after a denial is `Overloaded`.
   - A guest that handles `-1` and answers keeps its answer.
   - A denial larger than the service share is `TooLarge`.
+  - A denied grow that leaves the host nowhere to write the request, an
+    allocator's negative pointer or one past its memory, is `Overloaded`
+    with `ran: false`, or `TooLarge`. With no denial it stays a runtime
+    error.
 - **`memory_growing` never blocks.** A WAT guest growing past the budget
   gets `-1` at once, under `enforce`. Under `warn` the grow succeeds and is
   counted.
@@ -1482,10 +1509,10 @@ tenants `acme` and `globex` and services `catalog-service` and
   count.
   - `testkit` gains `CUFFLINK_TEST_PLATFORM_LAUNCHER`, a command prefix
     that `PlatformProcess` puts before the platform binary.
-  - The job sets it to `sudo -E systemd-run --scope --quiet
+  - The job sets it to `sudo systemd-run --scope --quiet
     --unit=cufflink-budget-<pid>-<counter> -p MemoryMax=768M -p MemorySwapMax=0
-    --uid=<runner uid> --gid=<runner gid> --`. `-E` keeps the variables
-    `testkit` sets after it clears the environment.
+    --uid=<runner uid> --gid=<runner gid> --`. `testkit` follows it with
+    `env -i` and the variables it sets, then the binary (section 14).
 - **Running the tests.** The job runs `cargo test -p cufflink-platform
   --test wasm_budget_cgroup -- --ignored`.
   - The tests are `#[ignore = "needs CUFFLINK_TEST_PLATFORM_LAUNCHER with a
@@ -1712,3 +1739,403 @@ accepted as stated.
 22. **The image pixel cap.** Take the smaller of `IMAGE_MAX_PIXELS`
     (40 megapixels) and the service share ÷ 20 bytes, so the cap shrinks on
     small containers (about 37 MP in a 2 GiB container)? *Proposed: yes.*
+
+## 14. Where the implementation differs
+
+Recorded as the change was built, each with its reason.
+
+**Admission and the ledger.**
+
+- **Stack charges.** A stack charge moves to the thread's residue when the
+  guest starts on the thread rather than when it ends, so the running
+  guest's stack counts toward no service share. A thread's residue is
+  credited by a thread-local destructor rather than `on_thread_stop`, and a
+  test ends a real thread to show it.
+- **Pre-fetch check.** The worker's after-hook consumer checks
+  `WASM_MEMORY_JOB_FLOOR_MB` before it fetches, as the long-jobs consumer
+  does, because its one durable carries every handler.
+- **SSE reducers** wait the interactive 1 s bound.
+- **The pressure gate** is cgroup v2 only. Under v1 the budget is still
+  derived, but nothing is gated.
+- **The global pool.** A full global pool under `enforce` is refused with
+  reason `service_concurrency`, since section 6 has no reason for it. Its
+  logs name the pool.
+- **An RPC message deferred for capacity** gets no reply. It is naked with
+  its delay, and the redelivery answers, as an interrupted `on_success`
+  message does today. A requester whose timeout is shorter than the delay
+  sees a timeout.
+- **Holding lower tiers back.** A committed or aged background waiter that
+  does not fit holds back only the work that competes for the limit it
+  passes, judged by the narrowest one: its own service's lower tiers for
+  the service share, other background work for the background share, and
+  everything for the ceiling. A waiter blocked by nothing but the pressure
+  gate holds nothing back: the gate refuses interactive and background
+  work itself, and nested work is not gated (section 3.8), so holding it
+  would free nothing for the waiter. An arrival still joins the queue when
+  a waiter of its tier or above waits; `grant` then decides.
+- **Refusable until durable.** Section 4 states the rule. It replaces the
+  earlier behaviour, where a hook's text was charged past the share after
+  the commit and a reply could be refused after its handler had finished.
+- **A hook's text is written before the commit.** Under `enforce`, a create
+  or update with an in-process or worker after-hook runs in a transaction
+  and writes the exact text after its statement and before its commit, and
+  a delete writes it before its statement. A refusal rolls the write back,
+  and the answer is 503, or 413 when the text alone passes the share. `ran`
+  is true when a before-hook has run, because a retry runs it again, and
+  the message then says that nothing from the write was committed. The
+  exact text is used rather than a bound taken before the before-hook,
+  because a bound would either refuse small updates of large rows or
+  undercharge them. Under `off` and `warn` nothing is refused, so single
+  writes stay autocommit, with no extra round trips. A text that cannot be
+  written at all, for a row nested too deeply for the hook's envelope, is
+  no capacity refusal in any mode: the write stands and the hook is logged
+  and dropped, as a hook failure is.
+- **A kept text costs what it takes.** `ChargedJson` charges in 1 MiB steps,
+  so each text is shrunk to its capacity once written, rather than holding
+  at least 1 MiB for as long as its hook waits.
+- **Kept text and the share.** Kept text counts against the share for
+  everything except a committed run of the same service, both in admission
+  and in growth, and always counts toward the ceiling. Excluding only a
+  hook's own text would still deadlock once several texts queue. A service
+  can therefore hold up to its share in committed runs and up to its share
+  in kept text at once, twice its share, bounded by the ceiling. A text is
+  kept only if it fits the share and `all kept text + this text + one
+  estimate + a stack` fits the admit threshold, so the last queued hook can
+  always run; the texts drain one hook at a time. That check ignores memory
+  in use by running guests, which frees itself, so a write is not refused
+  because guests are busy now. The estimate is the handler's when the text
+  is kept, with the module's initial memory, as admission computes it. The
+  guarantee ends there: a handler whose estimate rises after its text was
+  kept can need more room than was kept for it, and when nothing else frees
+  that room it waits out `WASM_COMMITTED_WAIT_SECS` and is dropped. An
+  in-process after-hook is therefore at-most-once, and work that must
+  happen is routed to a worker, which redelivers it.
+- **A bulk write's texts are written before its commit**, each in turn,
+  rather than as each hook takes its slot. Building them lazily would keep
+  the `Value` trees of the rows alive in detached tasks, which cost more
+  than the text (section 1.4), uncharged or charged at tree cost. So a bulk
+  write is all or nothing: if every text cannot be held, it answers 503,
+  or 413 when the total of the texts of the operations that have a hook
+  passes the share, which no retry cures, and nothing commits. Operations
+  with no hook write no text and are not measured. 1000 small rows cost
+  1000 small texts, since each is shrunk as above.
+- **Shutdown while waiting.** Committed or background work still waiting
+  for memory at the hard deadline ends `NotStarted`, never as a capacity
+  refusal. A message is naked at once under both ack modes, without
+  counting toward the capacity bound or being dead-lettered, and a job is
+  released.
+- **Fairness is per service, not per tenant.** A tenant whose services are
+  busy at once can hold the whole budget. The owner signed off on
+  documenting this for this release, with no per-tenant cap. A tenant share
+  was not added: below 100 % it would cut a single-tenant platform's
+  budget, the common deployment, and at 100 % it does nothing. An operator
+  lowers `WASM_MEMORY_SERVICE_SHARE_PERCENT` instead.
+- **`warn` counts.** Under `warn` a denial is counted where `enforce` would
+  have refused. A host buffer forced past the budget raises the ledger, so
+  later checks in the same window see it, and the count is an upper bound
+  on what `enforce` would have refused.
+
+**Requests and responses.**
+
+- **The request's `auth` and `caller.depth`** are read from the request
+  text by a partial deserialisation, which skips every other field without
+  building it, rather than carried by the `Invocation`.
+- **Multipart parts.** `multer` copies the body into one buffer and the
+  parts are slices of it, so the copy is charged once, at the body's
+  length, before parsing.
+- **A worker's reply** is charged at twice its payload while it is decoded
+  (the payload and the response it carries), then shrunk to the response.
+  It is never refused for what else is running, since the guest has
+  returned.
+- **A delivered buffer's size refusal is at the delivery limit**, the
+  smaller of the service share and `WASM_MEMORY_DELIVERY_OVERRUN_MB`, not
+  the host response cap. Response text is forced, bounded by
+  `max_response_bytes`; `enforce` does not clamp that cap. A tree costs
+  about 95 times its text at worst (683 KiB of `{"":0}` builds 65 MiB), and
+  slots are released before decoding (section 1.4), so a hold that alone
+  passes the limit is refused as too large (500, `too_large`) and counted
+  under `warn`, as is its text, tree and render together. That does not
+  depend on load, so no retry cures it.
+  The limit is what an operator sizes with
+  `WASM_MEMORY_DELIVERY_OVERRUN_MB`, which can rise to just below the
+  reserve. By default it is the overrun, which is below the share on every
+  container of 512 MiB or more: 15 % of the limit above 853 MiB, and 128 MiB
+  from there down to 512 MiB, below which the smaller share rules. What fits
+  it depends on the answer's shape, since a hold counts text, tree and
+  render together. One long string costs three times its text, so strings
+  reach `WASM_MAX_RESPONSE_MB` (64) from a 1.28 GiB container up, and stop
+  at about 42 MiB of text below that. Small records cost about 9.5 times
+  theirs: about 32 MiB of text on 2 GiB and 13 MiB at the 128 MiB floor.
+  The worst shape, about 97 times, is about 3 MiB of text on 2 GiB and
+  1.3 MiB at that floor.
+  What a finished request then gets: its effects stand, and its answer is
+  not delivered. A route answers 500 (`too_large`), with no `Retry-After`;
+  a subscription or schedule settles by the status and `__delivery` read
+  from the bytes (below), and an RPC caller gets an error envelope; a job
+  that answered success fails `Terminal`, naming its result as unreadable;
+  a before-hook's request fails with nothing from the write committed; an
+  after-hook's answer is not read, so it is unaffected.
+- **A delivery takes a room below a ceiling.** Forcing every finished
+  guest's tree would have no global bound: each hold is checked only
+  against its own size, slots are already released, and a burst of small
+  texts could build several budgets' worth of trees. The ceiling is the
+  budget plus `WASM_MEMORY_DELIVERY_OVERRUN_MB`, by default half the host
+  reserve and always below it. When a guest returns, `WasmEngine::run`
+  takes a room of `ChargedJson::delivery_bound(text)`, at most the delivery
+  limit and less what it already holds, while `in_use + room` fits the
+  ceiling, and otherwise queues for it in arrival order, holding no slot,
+  store or linear memory. Rooms up to the overrun stay out of what guests
+  are measured against: `fits`, `breach` and `fitting` compare `in_use`
+  less the smaller of the rooms held and the overrun, so a running guest's
+  growth, a host buffer and a new request see the budget they would see
+  with no delivery running. Guests and rooms still stop at the ceiling:
+  `X + max(0, R - O) <= B` implies `X + R <= B + O`. At a budget that is
+  really full a request's body hold is refused at once, unrun, and does not
+  take the admission wait. The bound is three times the text, for the input,
+  the strings and the render, plus each `{`, `[` and `,` at the tree's
+  worst cost and two steps; a test holds it above the real peak on every
+  shape, and it costs one scan of the text.
+  This is what a review asked for as "one over-budget decode at a time",
+  with small decodes allowed to share the band. Guests and the text of
+  queued answers stop at the budget and a room is at most the overrun, so
+  a room fits once the rooms ahead of it are done, whatever guests hold.
+  The one holder that outlasts its guest is an open event stream, and its
+  charge is not stopped at the budget. While its client reads, a stream
+  ends by `timeout_secs`, at most an hour. A client that stalls holds it
+  longer: a full channel blocks the stream's loop inside a send, where
+  neither its timeout nor shutdown is polled, until the connection closes.
+  Under `enforce` an opening holds at most 1 MiB, and on a route that runs
+  here it opens only after its guest was admitted, so openings stop at the
+  admission line, plus at most 1 MiB for each guest in flight when they
+  reach it: at most `WASM_MAX_CONCURRENT` MiB, 256 by default. That leaves
+  every room space while the budget's headroom above the admission line is
+  larger, which with the defaults is a budget past 2.5 GiB. Two charges
+  fall outside that sum. A reduction's events wait in the channel behind
+  an admitted reducer, sized by its answer and not by the 1 MiB, for as
+  long as a stalled client leaves them there. A worker-routed stream is
+  charged on the gateway, which admits no guest for it, so the admission
+  line does not stop it and `SSE_MAX_STREAMS_PER_PRINCIPAL` limits it per
+  principal only. When these hold nearly the whole budget, which at the
+  1 MiB maximum takes well over a thousand streams on 1.5 GiB, a large room
+  finds no space until streams close. In normal running nothing else ends
+  that wait, since `hard_deadline` starts at shutdown: the room waits until
+  streams close, and the deliveries queued behind it wait with it. At
+  shutdown a guest's room ends at its hard deadline less `KILL_MARGIN`, as
+  `ExecutionError::Undelivered`, below. A worker reply's room has no
+  deadline arm, so it waits on streams at shutdown too, until the process
+  ends. No such wait runs finished work again: heartbeats and leases keep
+  a fetched message or a job held while it waits. A delivery never waits on
+  a guest, so a callee's answer cannot deadlock a caller waiting in a host
+  call, and no holder of a room waits for another. A rendered body a slow
+  client has not read holds its text and no room. The platform sets no
+  write timeout, since `axum::serve` has none and the `deadline` layer ends
+  at the response head, so a deployment needs a proxy with send timeouts
+  (`deployment.md`). A guest's room still queued at the hard deadline, less
+  `KILL_MARGIN`, ends there as `ExecutionError::Undelivered`, not
+  `NotStarted`: the guest ran, so a nack would run finished work again. It
+  settles as an answer past the response cap does, below, with no tree, so
+  no redelivery follows from the shutdown. A route still open then answers
+  500 saying the guest finished. The room is unattributed, so it causes no share denial, and is held
+  beside the tree's own charges rather than drawn from, which overstates
+  `in_use` for the length of a decode and never understates it. It ends
+  when the hold drops or when the body is rendered. A worker's reply is
+  forced like a guest's text and takes a room the same way, since it builds
+  a tree with its guest gone. The
+  audit parse of a request body takes none: it draws on what the request
+  reserved before the guest ran. HTTP fan-out items are charged refusably
+  past their reservation, so a base64 body larger than the reservation
+  cannot pass the budget.
+- **The response copy.** `read_response` copies the text beside the linear
+  memory it came from, so for that moment the text counts twice. Past the
+  ceiling, copies take turns on a mutex held until the store is dropped,
+  which waits only on a copy and a drop, never on memory. So at most one
+  copy is over the ceiling at once, and dropping the store then frees at
+  least what the copy charged.
+- **The bound.** Under `enforce`, the real memory of guests and of what
+  the host holds for them stays within
+  `budget + overrun + max_response_bytes`. What the ledger counts can read
+  above that, because a room is counted beside the tree it makes room for:
+  about budget plus twice the overrun at a full budget. On a 2 GiB
+  container with the defaults that is limit 2048 MiB, reserve 614.4, budget
+  1433.6, overrun 307.2, one response 64: 1804.8 MiB, which leaves
+  243.2 MiB of the limit for the platform's own heap (baseline, compiled
+  modules, core stacks, fragmentation), and 166.4 MiB on 1.5 GiB. That
+  heap baseline has not been measured, so an operator must measure it
+  before setting `enforce`. Budget plus overrun is also the pressure gate's line, the
+  limit less half the reserve. Startup warns when the three sizes reach the
+  limit. `on_migrate`'s request is the one text charged outside this, a
+  small envelope of one deploy.
+- **An answer too large to read still says what it says.** A subscription,
+  schedule or job whose answer's tree cannot be built reads `__v`,
+  `__status` and `__delivery` from the bytes with no tree, as
+  `RequestContext` does, by the same status rules as the tree: a 500 is
+  retried, `__delivery` is obeyed and an invalid envelope is an invalid
+  answer. The tree is limited together with the text it is read from, as a
+  response's is, so the two stay inside a full room, and a tree that would
+  pass it takes this reading instead. Other envelope fields are not checked
+  in that reading, so an
+  invalid `__headers` in such an answer goes unseen. If `__status`, `__v`
+  or `__delivery` is repeated nothing is read, so it reads as a legacy 200,
+  while any other key may repeat.
+  The reading's allocation is bounded and does not grow with the text, as
+  `host_allocations` pins over strings, long numbers, escaped keys, unknown
+  keys, `__delivery` and deep nesting. Each source of one is closed:
+  serde_json skips a value with one scratch byte per level and no limit, so
+  a scan with no allocation gives up on text past the 127 levels a tree
+  stops at, which reads as a legacy 200 as the tree's failure does. It
+  copies a top-level key with an escape into scratch, whole, and no other
+  string, so the scan also gives up on such a key past 64 KiB, far longer
+  than any real key, which costs at most that one buffer since scratch is
+  reused, and this too reads as a legacy 200, unlike the tree, which would
+  read the `__status` beside it. `__status` is parsed as text, since
+  serde_json builds a type error holding a whole string, in `Debug` form,
+  and puts long numbers in scratch. A `__delivery` block past 64 KiB is
+  invalid, since `DeliveryControl` is untagged and would buffer it; one
+  within it costs a few mebibytes at worst.
+- **An open event stream** holds what it retains until its body ends: the
+  tree of `state`, `ping`, and `initial` twice, in the spec and rendered in
+  the channel. It is measured, not the 1 MiB step its tree was charged in,
+  or a few KiB of stream would hold 1 MiB of share for its whole life. Under
+  `enforce` an opening that would retain more than 1 MiB, or whose `state`
+  passes the 64 KiB of text a reduction may reach, is an invalid answer;
+  `off` and `warn` open it. 1 MiB is that step: far above a progress
+  stream's opening, and it keeps what streams can hold beyond admission
+  small enough to state, above. The retained size is measured, so a dense
+  `state` can pass 1 MiB within its 64 KiB of text. A reduction's events
+  stay charged until they leave the 32-slot channel, and only those. A
+  reduction gives its room back once it is read: even a tiny event's room
+  is about 2 MiB, so a few stalled streams, 33 reductions each, would
+  otherwise fill the band, and the ceiling would stop every delivery.
+- **What a response leaves uncharged.** Its head, once its hold ends: at
+  most 64 headers of an 8 KiB value and `http`'s 64 KiB name, 4.5 MiB. A
+  stream's `state` once a reducer replaces it, at most 64 KiB of text and
+  about 6 MiB of tree, since the charge is the opening's. A stream's pings,
+  charged once, so up to 33 rendered copies on a stalled stream. A message
+  forwarded with no reducer, in the channel, at most the NATS payload limit
+  a slot, so 32 of them. The messages `buffered` while a stream's handler
+  ran and the NATS subscription's backlog behind a stalled stream, which
+  were uncharged before the budget too. A before-hook's returned body,
+  used by the write that follows. A rendered event runs longer than its
+  text when its data has many lines, each gaining a `data: ` prefix.
+  While a host call runs, an error it logs or returns can quote what the
+  guest gave it, such as a storage key or a URL: up to `max_guest_len`
+  bytes of input, and several times that where a `Debug` form escapes it.
+  The rest of what a guest sizes is bounded or charged: a content type or a
+  store's stored one takes the 8 KiB of a header value, an error naming a
+  header, a method or a part quotes at most 64 characters of it, a
+  reducer's bad status is not quoted, an object's bucket and key stop at the
+  1 KiB S3 and GCS allow, so a failed open logs no more than that, a dropped
+  header is counted and logged by the entry that denied it, never by the
+  guest's name, and a `__delivery` terminal reason, which is logged and
+  kept on a job after its hold ends, is cut to 64 KiB.
+- **A finished job is not run again for its output.** A job that answered
+  success and whose output cannot be read fails as `Terminal`, with an
+  error saying it finished and its result could not be read. Nothing would
+  cure it on a retry, and the job's effects have happened.
+- **An answer past `WASM_MAX_RESPONSE_MB`** is the same case with no copy
+  made, under `enforce`: `read_response` reads the outline over linear
+  memory and returns `ExecutionError::Undelivered`, so a subscription or
+  schedule settles by the answer, a job as above, and a worker after-hook
+  is acked. A route still answers 500. An invalid envelope there, or at the
+  shutdown above, is settled too: a subscription retries as it does for any
+  invalid answer, a job fails `Terminal` and a worker after-hook is acked.
+  Under `off` and `warn` such an answer stays `ExecutionError::Response`,
+  as before this release: a subscription retries and dead-letters and a job
+  fails as `HandlerError`. An out-of-bounds or non-UTF-8 response stays an
+  ordinary failure, which is retried.
+- **A hook's answer** is charged until the hook returns. A before-hook's
+  returned body, used by the write that follows, is not charged after that.
+
+**Host calls.**
+
+- **Fan-out and image-target inputs.** The item lists of
+  `s3_download_many` and `http_fetch_many`, and `image_transform_multi`'s
+  targets, are charged at their input length before parsing into small
+  typed lists (at most 128 items), rather than parsed through `ChargedJson`
+  into a `Value` first.
+- **A fetched item's charge.** `http_fetch_many` reserves
+  `HOST_HTTP_MAX_RESPONSE_BYTES` per item. When the fetch returns, the
+  charge is set to the result's measured size.
+- **An object read** reads exactly `head`'s size. An object that grew
+  between `head` and the read fails the call without reading the extra
+  byte first. The charge is the bytes plus their padded base64, which the
+  counting-allocator test measures exactly.
+- **Image outputs** are covered by the 20 bytes a pixel the decode is
+  charged, which counts the encoder's buffers. Targets are encoded and
+  uploaded one at a time, so a failure part way leaves the earlier targets
+  uploaded.
+- **`db_query` inside a guest-owned transaction.** That transaction is a
+  `BEGIN` the guest sent on its session, so no portal can be bound in it.
+  Its statements stream with `query_raw` instead. A result stopped at the
+  cap leaves rows unread, so the transaction is abandoned (reason
+  `unread`) and the guest's later calls on it answer `TransactionNotFound`.
+- **A role fallback.** When the statement is wrapped in a `SAVEPOINT` or
+  its own `BEGIN`, ending it after a stop may wait for the server, bounded
+  by `statement_timeout`. Memory stays bounded.
+- **An autocommit statement stopped at the cap** discards its session,
+  even on the portal path, rather than closing the portal and reusing it.
+- **A `db_v2` decode error** keeps reading rows to the end, as the
+  collected render did, so the error and the statement's end are the same
+  as before. Only a refusal stops early.
+- **Redis reads under `enforce` take two transactions**, not the one of
+  section 2.4: a queued command's answer cannot size a later command in
+  the same `MULTI`. The first measures each value (`STRLEN`). The total is
+  checked against the cap, and twice it is reserved, since redis-rs holds
+  the reply frame and the decoded value together. The second reads each
+  value up to its measured length and one byte more. A value that grew in
+  between is measured again, up to three reads in all, and only then fails
+  the call with `-1`, logged at `debug` since it is a harmless race.
+  `redis_mget` takes at most
+  `HOST_FANOUT_MAX_ITEMS` keys. The connection's read buffer keeps the
+  capacity of the largest reply it parsed, which the host reserve holds.
+- **Under `warn`, Redis reads are plain `GET` and `MGET`**, as under `off`,
+  and their result is measured when it is answered.
+- **`service_call`** reserves the callee's response limit and reads no more
+  than that, since the HTTP client reads the body in one piece. Under
+  `enforce` the limit is at most three quarters of the host response cap
+  less 64 KiB, since the envelope base64-encodes the body and carries its
+  headers. The charge then shrinks to the body. A larger response fails the
+  call with a transport error rather than a cap refusal. The allowance
+  assumes the headers an HTTP client accepts; a callee in the same process
+  is not limited to them, and headers past 64 KiB are refused at the
+  envelope's charge, as any over-cap host result is.
+- **Image work's threads.** Decoding and encoding run on blocking-pool
+  threads whose stacks are not charged when they have never run a guest.
+  One runs per image call in flight, so they are bounded by the guests in
+  flight.
+
+**Configuration and tests.**
+
+- **`WASM_ADMISSION_RETRY_AFTER_MS`** sets the capacity delay in
+  milliseconds and is used instead of `WASM_ADMISSION_RETRY_AFTER_SECS`
+  when set. A deferred message or job waits it before it is delivered
+  again, so tests can defer and redeliver within a fraction of a second. A
+  `Retry-After` header is the delay rounded up to whole seconds, at least
+  1.
+- **The launcher passes the platform's environment as arguments.** The
+  runner's `sudo` refuses `-E`, so `testkit` runs `<launcher> env -i
+  NAME=value… <platform binary>` and the job's prefix is `sudo systemd-run
+  … --`. The platform therefore sees exactly the variables `testkit` sets,
+  as it does when launched directly. Those variables are on the command
+  line, where other processes can read them, so only test values go
+  through it. `RuntimeMaxSec` stops a scope a crashed run left behind.
+- **The memory-limit tests** assert that the scope never reached
+  `memory.max`, that the part of a burst holding memory at a gate ran and
+  the rest was refused, and that large Redis values are reserved before
+  they are read. HTTP and object-store cases are not in this change.
+- **A gate's key** is matched by both of its halves in `pg_locks`
+  (`classid` and `objid`), so any `bigint` key works.
+- **`testkit`'s NATS** binds a random loopback port (`-a 127.0.0.1 -p -1`),
+  so it never collides with a server already on 4222.
+- **The image codecs build optimised in the dev profile**
+  (`[profile.dev.package.*]` in the workspace manifest), and the resize goes
+  through `DynamicImage::resize_exact`, so its Lanczos code is built in the
+  `image` crate rather than the platform's. The counting-allocator test's
+  3000 × 2000 transforms take about 20 s instead of 110 s, with the same
+  peaks. What remains is the AV1 encoder code `ravif` inlines into the
+  platform crate, which builds at the platform's level.
+- **The counting-allocator paths run in one test.** The allocator counts
+  every thread, so no other test, nor its result line, may run while one
+  is measured.
+- **The `ChargedJson` shapes** are 200 000 items each, except a million
+  one-key objects and 10 000 arrays nested 120 deep.

@@ -2,14 +2,17 @@ use super::HOP_BY_HOP_HEADERS;
 use crate::errors::{GuestOriginated, PlatformResult};
 use crate::policy::record::LogThrottle;
 use crate::router::sse_bridge::SseSpec;
+use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold, Meter, Refused};
+pub(crate) use crate::wasm_runtime::Answer;
+use crate::wasm_runtime::GuestOutput;
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use base64::{engine::general_purpose, Engine};
 use cufflink_storage::ObjectReader;
 use cufflink_types::delivery::{DeliveryControl, DELIVERY_KEY};
 use futures_util::StreamExt;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::future::Future;
 use std::sync::LazyLock;
@@ -17,6 +20,10 @@ use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_VALUE: usize = 8 * 1024;
+const MAX_OBJECT_NAME: usize = 1024;
+const MAX_TREE_DEPTH: usize = 127;
+const MAX_DELIVERY_BLOCK: usize = 64 * 1024;
+const MAX_ESCAPED_KEY: usize = 64 * 1024;
 
 const DENIED_HEADERS: [&str; 4] = [
     "content-length",
@@ -26,11 +33,14 @@ const DENIED_HEADERS: [&str; 4] = [
 ];
 const DENIED_PREFIXES: [&str; 2] = ["proxy-", "access-control-"];
 
-fn denied(name: &HeaderName) -> bool {
+fn denied(name: &HeaderName) -> Option<&'static str> {
     let name = name.as_str();
-    HOP_BY_HOP_HEADERS.contains(&name)
-        || DENIED_HEADERS.contains(&name)
-        || DENIED_PREFIXES.iter().any(|p| name.starts_with(p))
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .chain(&DENIED_HEADERS)
+        .find(|denied| **denied == name)
+        .or_else(|| DENIED_PREFIXES.iter().find(|p| name.starts_with(**p)))
+        .copied()
 }
 
 #[derive(Debug)]
@@ -44,7 +54,7 @@ pub(crate) struct V2Response {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: V2Body,
-    pub dropped: Vec<HeaderName>,
+    pub dropped: Vec<&'static str>,
     pub delivery: Option<Box<DeliveryControl>>,
 }
 
@@ -85,7 +95,16 @@ pub(crate) trait Bodies {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct GuestResponseError(String);
+pub struct GuestResponseError(String);
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => error.fmt(f),
+            Self::Refused(refused) => write!(f, "response that could not be held: {refused}"),
+        }
+    }
+}
 
 impl std::fmt::Display for GuestResponseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -97,52 +116,197 @@ fn invalid(what: impl Into<String>) -> GuestResponseError {
     GuestResponseError(what.into())
 }
 
-pub(crate) fn decode(raw: String) -> Result<GuestResponse, GuestResponseError> {
-    let value: Value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
+#[derive(Debug)]
+pub(crate) enum DecodeError {
+    Invalid(GuestResponseError),
+    Refused(Refused),
+}
+
+impl From<GuestResponseError> for DecodeError {
+    fn from(error: GuestResponseError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+pub(crate) fn parse_output(output: GuestOutput) -> Result<(Value, Hold), Refused> {
+    let GuestOutput { text, mut hold } = output;
+    let charged = text.len();
+    match ChargedJson::parse(text.as_bytes(), &mut hold) {
+        Ok(parsed) => {
+            drop(text);
+            hold.credit(charged);
+            Ok((parsed.value, hold))
+        }
+        Err(ChargedJsonError::Syntax(_)) => Ok((Value::String(text), hold)),
+        Err(ChargedJsonError::Capacity(refused)) => Err(refused),
+    }
+}
+
+pub(crate) fn decode(output: GuestOutput) -> Result<(GuestResponse, Hold), DecodeError> {
+    let (value, mut hold) = parse_output(output).map_err(DecodeError::Refused)?;
+    decode_value(value, &mut hold).map(|response| (response, hold))
+}
+
+pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError> {
+    let text = output.text.as_bytes();
+    let mut hold = output.hold.beside();
+    let response = match ChargedJson::parse(text, &mut hold) {
+        Ok(parsed) => match decode_value(parsed.value, &mut hold) {
+            Ok(response) => response,
+            Err(DecodeError::Invalid(error)) => return Err(error),
+            Err(DecodeError::Refused(_)) => return outline(text),
+        },
+        Err(ChargedJsonError::Capacity(_)) => return outline(text),
+        Err(ChargedJsonError::Syntax(_)) => GuestResponse::Legacy {
+            status: StatusCode::OK,
+            body: Value::Null,
+        },
+    };
+    Ok(match response {
+        GuestResponse::Legacy { status, .. } => Answer {
+            status,
+            delivery: None,
+        },
+        GuestResponse::V2(v2) => Answer {
+            status: v2.status,
+            delivery: v2.delivery.map(|delivery| *delivery),
+        },
+    })
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct Outline<'a> {
+    #[serde(rename = "__v", borrow)]
+    version: Option<&'a RawValue>,
+    #[serde(rename = "__status", borrow)]
+    status: Option<&'a RawValue>,
+    #[serde(rename = "__delivery", borrow)]
+    delivery: Option<&'a RawValue>,
+}
+
+fn status_number(raw: &RawValue) -> Option<u64> {
+    raw.get().parse().ok()
+}
+
+#[derive(Default)]
+struct OutlineScan {
+    depth: usize,
+    quoted: bool,
+    escaped: bool,
+    at_key: bool,
+    key_bytes: usize,
+    key_escaped: bool,
+}
+
+impl OutlineScan {
+    fn gives_up_at(&mut self, byte: u8) -> bool {
+        self.key_bytes += usize::from(self.quoted && self.at_key);
+        match (self.quoted, self.escaped, byte) {
+            (true, true, _) => self.escaped = false,
+            (true, false, b'\\') => {
+                self.escaped = true;
+                self.key_escaped = self.at_key;
+            }
+            (true, false, b'"') => self.quoted = false,
+            (false, _, b'"') => {
+                self.quoted = true;
+                self.key_bytes = 0;
+                self.key_escaped = false;
+            }
+            (false, _, b'{' | b'[') => {
+                self.depth += 1;
+                self.at_key = self.depth == 1;
+            }
+            (false, _, b'}' | b']') => self.depth = self.depth.saturating_sub(1),
+            (false, _, b',') => self.at_key = self.depth == 1,
+            (false, _, b':') => self.at_key = false,
+            _ => {}
+        }
+        self.depth > MAX_TREE_DEPTH
+            || (self.quoted && self.key_escaped && self.key_bytes > MAX_ESCAPED_KEY)
+    }
+}
+
+fn past_the_reach_of_an_outline(text: &[u8]) -> bool {
+    let mut scan = OutlineScan::default();
+    text.iter().any(|&byte| scan.gives_up_at(byte))
+}
+
+fn delivery_control(block: &RawValue) -> Result<DeliveryControl, GuestResponseError> {
+    (block.get().len() <= MAX_DELIVERY_BLOCK)
+        .then(|| serde_json::from_str(block.get()).ok())
+        .flatten()
+        .ok_or_else(|| invalid(DELIVERY_KEY))
+}
+
+pub fn outline(text: &[u8]) -> Result<Answer, GuestResponseError> {
+    let envelope = (text.trim_ascii_start().starts_with(b"{")
+        && !past_the_reach_of_an_outline(text))
+    .then(|| serde_json::from_slice::<Outline>(text).ok())
+    .flatten()
+    .unwrap_or_default();
+    if envelope.version.is_none_or(|version| version.get() != "2") {
+        return Ok(Answer {
+            status: legacy_status(envelope.status.and_then(status_number)),
+            delivery: None,
+        });
+    }
+    Ok(Answer {
+        status: v2_status(envelope.status.and_then(status_number))?,
+        delivery: envelope.delivery.map(delivery_control).transpose()?,
+    })
+}
+
+fn legacy_status(status: Option<u64>) -> StatusCode {
+    StatusCode::from_u16(status.unwrap_or(200) as u16).unwrap_or(StatusCode::OK)
+}
+
+fn v2_status(status: Option<u64>) -> Result<StatusCode, GuestResponseError> {
+    status
+        .and_then(|status| u16::try_from(status).ok())
+        .filter(|status| (200..=599).contains(status))
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .ok_or_else(|| invalid("status"))
+}
+
+fn decode_value(value: Value, hold: &mut Hold) -> Result<GuestResponse, DecodeError> {
     match value {
         Value::Object(envelope) if envelope.get("__v") == Some(&Value::from(2)) => {
-            decode_v2(envelope).map(GuestResponse::V2)
+            decode_v2(envelope, hold).map(GuestResponse::V2)
         }
         legacy => Ok(decode_legacy(legacy)),
     }
 }
 
 fn decode_legacy(value: Value) -> GuestResponse {
-    let (status, body) = match value.get("__status") {
-        Some(status) => (
-            status.as_u64().unwrap_or(200) as u16,
-            value
-                .get("__body")
-                .cloned()
-                .unwrap_or_else(|| value.clone()),
-        ),
-        None => (200, value),
+    let (status, body) = match value {
+        Value::Object(mut envelope) if envelope.contains_key("__status") => {
+            let status = legacy_status(envelope["__status"].as_u64());
+            match envelope.remove("__body") {
+                Some(body) => (status, body),
+                None => (status, Value::Object(envelope)),
+            }
+        }
+        value => (StatusCode::OK, value),
     };
-    GuestResponse::Legacy {
-        status: StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-        body,
-    }
+    GuestResponse::Legacy { status, body }
 }
 
-fn decode_v2(mut envelope: Map<String, Value>) -> Result<V2Response, GuestResponseError> {
-    let status = envelope
-        .get("__status")
-        .and_then(Value::as_u64)
-        .and_then(|status| u16::try_from(status).ok())
-        .filter(|status| (200..=599).contains(status))
-        .and_then(|status| StatusCode::from_u16(status).ok())
-        .ok_or_else(|| invalid("status"))?;
+fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Response, DecodeError> {
+    let status = v2_status(envelope.get("__status").and_then(Value::as_u64))?;
     let (headers, dropped) = headers(envelope.get("__headers"))?;
     let delivery = envelope
         .remove(DELIVERY_KEY)
         .filter(|delivery| !delivery.is_null())
         .map(|delivery| {
             serde_json::from_value(delivery)
+                .map(bounded_terminal)
                 .map(Box::new)
                 .map_err(|_| invalid(DELIVERY_KEY))
         })
         .transpose()?;
-    let body = body(&mut envelope)?;
+    let body = body(&mut envelope, hold)?;
     let bodiless = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
     Ok(V2Response {
         status,
@@ -153,7 +317,24 @@ fn decode_v2(mut envelope: Map<String, Value>) -> Result<V2Response, GuestRespon
     })
 }
 
-fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<HeaderName>), GuestResponseError> {
+fn bounded_terminal(control: DeliveryControl) -> DeliveryControl {
+    match control {
+        DeliveryControl::Terminal { terminal } if terminal.len() > MAX_DELIVERY_BLOCK => {
+            DeliveryControl::Terminal {
+                terminal: terminal[..terminal.floor_char_boundary(MAX_DELIVERY_BLOCK)].to_string(),
+            }
+        }
+        control => control,
+    }
+}
+
+fn header_value(value: &str) -> Option<HeaderValue> {
+    (value.len() <= MAX_HEADER_VALUE)
+        .then(|| HeaderValue::from_str(value).ok())
+        .flatten()
+}
+
+fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<&'static str>), GuestResponseError> {
     let pairs = match value {
         None | Some(Value::Null) => return Ok((HeaderMap::new(), Vec::new())),
         Some(Value::Object(pairs)) if pairs.len() <= MAX_HEADERS => pairs,
@@ -163,23 +344,23 @@ fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<HeaderName>), GuestR
         (HeaderMap::new(), Vec::new()),
         |(mut allowed, mut dropped), (name, value)| {
             let name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| invalid(format!("header name '{name}'")))?;
+                .map_err(|_| invalid(format!("header name '{name:.64}'")))?;
             let value = value
                 .as_str()
-                .filter(|value| value.len() <= MAX_HEADER_VALUE)
-                .and_then(|value| HeaderValue::from_str(value).ok())
-                .ok_or_else(|| invalid(format!("header value of '{name}'")))?;
-            if denied(&name) {
-                dropped.push(name);
-            } else {
-                allowed.insert(name, value);
+                .and_then(header_value)
+                .ok_or_else(|| invalid(format!("header value of '{name:.64}'")))?;
+            match denied(&name) {
+                Some(denied) => dropped.push(denied),
+                None => {
+                    allowed.insert(name, value);
+                }
             }
             Ok((allowed, dropped))
         },
     )
 }
 
-fn body(envelope: &mut Map<String, Value>) -> Result<V2Body, GuestResponseError> {
+fn body(envelope: &mut Map<String, Value>, hold: &mut Hold) -> Result<V2Body, DecodeError> {
     match (
         envelope.remove("__body"),
         envelope.remove("__body_b64"),
@@ -187,21 +368,27 @@ fn body(envelope: &mut Map<String, Value>) -> Result<V2Body, GuestResponseError>
         envelope.remove("__sse"),
     ) {
         (Some(json), None, None, None) => Ok(V2Body::Json(json)),
-        (None, None, Some(stream), None) => s3_spec(&stream).map(V2Body::S3),
-        (None, None, None, Some(sse)) => SseSpec::parse(&sse)
-            .map(|spec| V2Body::Sse(Box::new(spec)))
-            .map_err(invalid),
+        (None, None, Some(stream), None) => Ok(s3_spec(&stream).map(V2Body::S3)?),
+        (None, None, None, Some(sse)) => {
+            let spec = SseSpec::parse(&sse).map_err(invalid)?;
+            if hold.enforcing() && !spec.fits_a_stream() {
+                return Err(invalid("__sse: more than a stream may hold").into());
+            }
+            Ok(V2Body::Sse(Box::new(spec)))
+        }
         (None, None, None, None) => Ok(V2Body::Empty),
         (None, Some(encoded), None, None) => {
-            let bytes = encoded
-                .as_str()
-                .and_then(|encoded| general_purpose::STANDARD.decode(encoded).ok())
-                .ok_or_else(|| invalid("__body_b64"))?;
+            let encoded = encoded.as_str().ok_or_else(|| invalid("__body_b64"))?;
+            hold.charge(base64::decoded_len_estimate(encoded.len()))
+                .map_err(DecodeError::Refused)?;
+            let bytes = general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| invalid("__body_b64"))?;
             let content_type = match envelope.get("__content_type") {
                 None => HeaderValue::from_static("application/octet-stream"),
                 Some(content_type) => content_type
                     .as_str()
-                    .and_then(|ct| HeaderValue::from_str(ct).ok())
+                    .and_then(header_value)
                     .ok_or_else(|| invalid("__content_type"))?,
             };
             Ok(V2Body::Bytes {
@@ -209,9 +396,7 @@ fn body(envelope: &mut Map<String, Value>) -> Result<V2Body, GuestResponseError>
                 bytes: Bytes::from(bytes),
             })
         }
-        _ => Err(invalid(
-            "body: more than one of __body, __body_b64, __stream, __sse",
-        )),
+        _ => Err(invalid("body: more than one of __body, __body_b64, __stream, __sse").into()),
     }
 }
 
@@ -219,7 +404,7 @@ fn s3_spec(stream: &Value) -> Result<S3Spec, GuestResponseError> {
     let text = |key: &str| {
         stream[key]
             .as_str()
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value.len() <= MAX_OBJECT_NAME)
             .map(str::to_string)
             .ok_or_else(|| invalid(format!("__stream.{key}")))
     };
@@ -231,7 +416,7 @@ fn s3_spec(stream: &Value) -> Result<S3Spec, GuestResponseError> {
         value => Some(
             value
                 .as_str()
-                .and_then(|ct| HeaderValue::from_str(ct).ok())
+                .and_then(header_value)
                 .ok_or_else(|| invalid("__stream.content_type"))?,
         ),
     };
@@ -243,55 +428,142 @@ fn s3_spec(stream: &Value) -> Result<S3Spec, GuestResponseError> {
 }
 
 impl GuestResponse {
-    pub(crate) async fn render(self, service: &str, bodies: &mut impl Bodies) -> Response {
+    pub(crate) async fn render(
+        self,
+        service: &str,
+        bodies: &mut impl Bodies,
+        hold: Hold,
+    ) -> Result<Response, Refused> {
         let rendered = match self {
-            GuestResponse::Legacy { status, body } => Ok((status, Json(body)).into_response()),
-            GuestResponse::V2(v2) => render_v2(v2, service, bodies).await,
+            GuestResponse::Legacy { status, body } => Ok(json_response(status, body, hold)?),
+            GuestResponse::V2(v2) => render_v2(v2, service, bodies, hold).await?,
         };
-        match rendered {
+        Ok(match rendered {
             Ok(mut response) => {
                 response.extensions_mut().insert(GuestOriginated);
                 response
             }
             Err(error) => error.into_response(),
-        }
+        })
     }
+}
+
+fn json_response(status: StatusCode, body: Value, tree: Hold) -> Result<Response, Refused> {
+    let mut text = tree.sibling();
+    let written = ChargedJson::write(&body, &mut text);
+    drop(body);
+    drop(tree);
+    Ok(match written {
+        Ok(written) => (
+            status,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            ChargedBody::wrap(Body::from(written), text),
+        )
+            .into_response(),
+        Err(ChargedJsonError::Capacity(refused)) => return Err(refused),
+        Err(ChargedJsonError::Syntax(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            error.to_string(),
+        )
+            .into_response(),
+    })
 }
 
 async fn render_v2(
     v2: V2Response,
     service: &str,
     bodies: &mut impl Bodies,
-) -> PlatformResult<Response> {
+    mut hold: Hold,
+) -> Result<PlatformResult<Response>, Refused> {
     metrics::counter!("cufflink_guest_response_v2_total", "body" => v2.body.label()).increment(1);
     v2.dropped
         .iter()
-        .for_each(|name| dropped_header(service, name));
+        .for_each(|denied| dropped_header(service, denied));
     let mut response = match v2.body {
         V2Body::Empty => Body::empty().into_response(),
-        V2Body::Json(value) => Json(value).into_response(),
+        V2Body::Json(value) => json_response(StatusCode::OK, value, hold)?,
         V2Body::Bytes {
             content_type,
             bytes,
-        } => ([(header::CONTENT_TYPE, content_type)], bytes).into_response(),
-        V2Body::S3(spec) => stream_object(&spec, bodies.open(&spec).await?),
-        V2Body::Sse(spec) => bodies.sse(*spec)?,
+        } => (
+            [(header::CONTENT_TYPE, content_type)],
+            ChargedBody::wrap(Body::from(bytes), hold),
+        )
+            .into_response(),
+        V2Body::S3(spec) => match bodies.open(&spec).await {
+            Ok(object) => stream_object(&spec, object),
+            Err(error) => return Ok(Err(error)),
+        },
+        V2Body::Sse(spec) => {
+            let retained = spec.retained();
+            hold.force(retained.saturating_sub(hold.bytes()));
+            hold.shrink_to(retained);
+            match bodies.sse(*spec) {
+                Ok(response) => response.map(|body| ChargedBody::wrap(body, hold)),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
     };
     *response.status_mut() = v2.status;
     response.headers_mut().extend(v2.headers);
-    Ok(response)
+    Ok(Ok(response))
+}
+
+pub(crate) struct ChargedBody {
+    inner: Body,
+    hold: Option<Hold>,
+}
+
+impl ChargedBody {
+    pub(crate) fn wrap(inner: Body, mut hold: Hold) -> Body {
+        hold.delivered();
+        match hold.bytes() {
+            0 => inner,
+            _ => Body::new(Self {
+                inner,
+                hold: Some(hold),
+            }),
+        }
+    }
+}
+
+impl http_body::Body for ChargedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            this.hold.take();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn stream_object(spec: &S3Spec, object: ObjectReader) -> Response {
     let content_type = spec
         .content_type
         .clone()
-        .or_else(|| {
-            object
-                .content_type
-                .as_deref()
-                .and_then(|ct| HeaderValue::from_str(ct).ok())
-        })
+        .or_else(|| object.content_type.as_deref().and_then(header_value))
         .unwrap_or(HeaderValue::from_static("application/octet-stream"));
     let stream = object.stream.inspect(|chunk| {
         if let Ok(chunk) = chunk {
@@ -310,32 +582,39 @@ fn stream_object(spec: &S3Spec, object: ObjectReader) -> Response {
     response
 }
 
-static DROPPED_HEADERS: LazyLock<LogThrottle<(String, HeaderName)>> =
+static DROPPED_HEADERS: LazyLock<LogThrottle<(String, &'static str)>> =
     LazyLock::new(|| LogThrottle::new(Duration::from_secs(60)));
 
-fn dropped_header(service: &str, name: &HeaderName) {
-    metrics::counter!("cufflink_guest_header_dropped_total", "name" => name.as_str().to_string())
-        .increment(1);
-    if DROPPED_HEADERS.should_log((service.to_string(), name.clone()), Instant::now()) {
-        tracing::warn!(service, header = %name, "Dropped a response header the platform owns");
+fn dropped_header(service: &str, denied: &'static str) {
+    metrics::counter!("cufflink_guest_header_dropped_total", "name" => denied).increment(1);
+    if DROPPED_HEADERS.should_log((service.to_string(), denied), Instant::now()) {
+        tracing::warn!(
+            service,
+            header = denied,
+            "Dropped a response header the platform owns"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm_runtime::budget::testing::{self, MIB};
+    use crate::wasm_runtime::budget::Ledger;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn legacy(raw: &str) -> (u16, Value) {
-        match decode(raw.to_string()) {
-            Ok(GuestResponse::Legacy { status, body }) => (status.as_u16(), body),
+        match decode(output(raw)) {
+            Ok((GuestResponse::Legacy { status, body }, _)) => (status.as_u16(), body),
             other => panic!("{raw}: {other:?}"),
         }
     }
 
     fn v2(envelope: &Value) -> Result<V2Response, GuestResponseError> {
-        match decode(envelope.to_string())? {
-            GuestResponse::V2(v2) => Ok(v2),
+        match decode(output(&envelope.to_string())) {
+            Ok((GuestResponse::V2(v2), _)) => Ok(v2),
+            Err(DecodeError::Invalid(error)) => Err(error),
             other => panic!("{envelope}: {other:?}"),
         }
     }
@@ -569,9 +848,7 @@ mod tests {
 
     impl Bodies for Objects {
         fn sse(&mut self, _spec: SseSpec) -> PlatformResult<Response> {
-            Err(crate::errors::PlatformError::Internal(
-                "no event stream".into(),
-            ))
+            Ok(Body::empty().into_response())
         }
 
         async fn open(&self, spec: &S3Spec) -> PlatformResult<ObjectReader> {
@@ -586,11 +863,498 @@ mod tests {
         }
     }
 
+    fn output(raw: &str) -> GuestOutput {
+        GuestOutput {
+            text: raw.to_string(),
+            hold: Hold::none(),
+        }
+    }
+
     async fn rendered(raw: &str) -> Response {
-        decode(raw.to_string())
-            .expect("decodes")
-            .render("svc", &mut Objects)
+        let (response, hold) = decode(output(raw)).expect("decodes");
+        response
+            .render("svc", &mut Objects, hold)
             .await
+            .expect("rendered")
+    }
+
+    fn opening(data: usize) -> String {
+        json!({"__v": 2, "__status": 200, "__sse": {
+            "initial": [{"data": "x".repeat(data)}],
+            "keep_alive_secs": 15,
+            "timeout_secs": 60,
+        }})
+        .to_string()
+    }
+
+    async fn charged(raw: &str, budget: usize) -> (Arc<Ledger>, Result<Response, String>) {
+        charged_on(raw, testing::hold(budget)).await
+    }
+
+    async fn charged_on(
+        raw: &str,
+        (ledger, mut hold): (Arc<Ledger>, Hold),
+    ) -> (Arc<Ledger>, Result<Response, String>) {
+        hold.grow(raw.len()).expect("the response text fits");
+        let text = raw.to_string();
+        let response = match decode(GuestOutput { text, hold }) {
+            Ok((response, hold)) => response
+                .render("svc", &mut Objects, hold)
+                .await
+                .map_err(|refused| refused.to_string()),
+            Err(error) => Err(format!("{error:?}")),
+        };
+        (ledger, response)
+    }
+
+    #[tokio::test]
+    async fn finished_guests_trees_take_turns_under_the_ceiling() {
+        let budget = 100 * MIB;
+        let ceiling = 2 * budget;
+        let (ledger, base) = testing::hold(budget);
+        let mut running = base.sibling();
+        running.grow(budget).expect("other guests fill the budget");
+        let text = format!("[{}]", vec![r#"{"":0}"#; 100_000].join(","));
+        let delivery = || async {
+            let mut hold = base.delivering();
+            hold.force(text.len());
+            hold.make_room(|| ChargedJson::delivery_bound(text.as_bytes()))
+                .await;
+            let tree = parse_output(GuestOutput {
+                text: text.clone(),
+                hold,
+            })
+            .expect("never refused for what else is running");
+            tokio::task::yield_now().await;
+            let held = ledger.in_use() - ledger.delivering();
+            drop(tree);
+            held
+        };
+        let held = futures_util::future::join_all((0..8).map(|_| delivery())).await;
+        for held in held {
+            assert!(held > budget, "built beside a full budget");
+            assert!(held <= ceiling, "{} MiB", held / MIB);
+        }
+        assert_eq!(ledger.delivering(), 0);
+        drop(running);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_body_waiting_on_its_client_holds_its_text_and_no_room() {
+        let (ledger, base) = testing::hold(64 * MIB);
+        let mut hold = base.delivering();
+        hold.force(MIB);
+        hold.make_room(|| 8 * MIB).await;
+        let body = ChargedBody::wrap(Body::empty(), hold);
+        assert_eq!(ledger.delivering(), 0);
+        assert_eq!(ledger.in_use(), MIB);
+        drop(body);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rendered_body_ends_the_room_its_tree_was_built_in() {
+        let (ledger, base) = testing::hold(64 * MIB);
+        let mut hold = base.delivering();
+        hold.make_room(|| 8 * MIB).await;
+        assert_eq!(ledger.delivering(), 8 * MIB);
+        let (response, hold) = decode(GuestOutput {
+            text: r#"{"ok":true}"#.to_string(),
+            hold,
+        })
+        .expect("decodes");
+        let response = response
+            .render("catalog-service", &mut Objects, hold)
+            .await
+            .expect("not refused");
+        assert_eq!(ledger.delivering(), 0);
+        drop(response);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn an_outline_reads_what_the_tree_reads() {
+        let terminal = r#"{"__v":2,"__status":200,"__delivery":{"terminal":"poison"}}"#;
+        let retried = r#"{"__v":2,"__status":200,"__delivery":{"retry_after_ms":100}}"#;
+        let read = |answer: Result<Answer, GuestResponseError>| {
+            answer.map(|answer| (answer.status.as_u16(), format!("{:?}", answer.delivery)))
+        };
+        for raw in [
+            r#"{"__status":500,"__body":{"error":"down"}}"#,
+            r#"{"__status":99999}"#,
+            r#"{"__status":"500"}"#,
+            r#"{"__status":-0}"#,
+            r#"{"__status":-1}"#,
+            r#"{"__status":500.0}"#,
+            r#"{"__status":5e2}"#,
+            r#"{"__status":18446744073709551616}"#,
+            r#"{"__status":true}"#,
+            r#"{"__status":[500]}"#,
+            r#"{"__status":  500  }"#,
+            r#"{"__v":2,"__status":-0}"#,
+            r#"{"__v":2,"__status":500.0}"#,
+            r#"{"__v":2,"__status":5e2}"#,
+            r#"{"__v":2,"__status":18446744073709551616}"#,
+            r#"{"__v":2.0,"__status":500}"#,
+            r#"{"__st\u0061tus":500}"#,
+            r#"{"__status":null}"#,
+            r#"{"ok":true}"#,
+            r#"  {"__status":404}"#,
+            r#"[2,500]"#,
+            r#""text""#,
+            "null",
+            "not json",
+            terminal,
+            retried,
+            r#"{"__v":2,"__status":503,"__delivery":null,"__body":[1,2,3]}"#,
+            r#"{"__v":2,"__status":99}"#,
+            r#"{"__v":2,"__status":"200"}"#,
+            r#"{"__v":2}"#,
+            r#"{"__v":3,"__status":500}"#,
+            r#"{"__v":2,"__status":200,"__delivery":{"unknown":1}}"#,
+        ] {
+            assert_eq!(
+                read(outline(raw.as_bytes())),
+                read(answer(&output(raw))),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_outline_stops_at_the_depth_a_tree_stops_at() {
+        let nested = |levels: usize| {
+            format!(
+                r#"{{"__status":500,"a":{}{}}}"#,
+                "[".repeat(levels - 1),
+                "]".repeat(levels - 1)
+            )
+        };
+        let status = |raw: &str| outline(raw.as_bytes()).expect("an outline").status;
+        for raw in [nested(MAX_TREE_DEPTH), nested(MAX_TREE_DEPTH + 1)] {
+            assert_eq!(
+                status(&raw),
+                answer(&output(&raw)).expect("an answer").status
+            );
+        }
+        assert_eq!(
+            status(&nested(MAX_TREE_DEPTH)),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(status(&nested(1 << 20)), StatusCode::OK);
+    }
+
+    #[test]
+    fn brackets_in_a_string_are_not_depth() {
+        let brackets = "[{".repeat(MAX_TREE_DEPTH);
+        for raw in [
+            format!(r#"{{"__status":500,"a":"{brackets}"}}"#),
+            format!(r#"{{"__status":500,"a":"\"{brackets}\\"}}"#),
+            format!(r#"{{"__status":500,"{brackets}":1}}"#),
+        ] {
+            assert_eq!(
+                outline(raw.as_bytes()).expect("an outline").status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{raw}"
+            );
+        }
+        let closed = format!(
+            r#"{{"__status":500,"a":"\\","b":{}{}}}"#,
+            "[".repeat(MAX_TREE_DEPTH),
+            "]".repeat(MAX_TREE_DEPTH)
+        );
+        assert_eq!(
+            outline(closed.as_bytes()).expect("an outline").status,
+            StatusCode::OK,
+            "an escaped backslash ends with its string"
+        );
+    }
+
+    #[test]
+    fn an_answers_tree_is_limited_with_its_text() {
+        let text = format!(
+            r#"{{"__v":2,"__status":500,"__headers":"a tree refuses this","a":"{}"}}"#,
+            "x".repeat(MIB)
+        );
+        let tree = ChargedJson::parse(text.as_bytes(), &mut Hold::none())
+            .expect("the text parses")
+            .cost;
+        let (ledger, base) = testing::hold(tree + text.len() / 2);
+        let mut hold = base.delivering();
+        hold.force(text.len());
+        let output = GuestOutput { text, hold };
+        let answer = answer(&output).expect("an outline does not read the headers");
+        assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(ledger.in_use(), output.text.len());
+    }
+
+    #[test]
+    fn an_invalid_header_is_named_within_a_bounded_message() {
+        let invalid_name = "\u{e9}".repeat(MIB);
+        let valid_name = "x".repeat(60 * 1024);
+        for (name, value) in [(invalid_name, json!("v")), (valid_name, json!(1))] {
+            let error = v2(&json!({"__v": 2, "__status": 200, "__headers": {name: value}}))
+                .expect_err("invalid");
+            assert!(error.0.len() <= 256, "{} bytes", error.0.len());
+        }
+    }
+
+    #[test]
+    fn a_dropped_header_is_reported_by_what_denied_it() {
+        let name = format!("proxy-{}", "x".repeat(1024));
+        let response = v2(&json!({"__v": 2, "__status": 200, "__headers": {
+            name: "x", "set-cookie": "s=1",
+        }}))
+        .expect("v2");
+        assert_eq!(response.dropped, ["proxy-", "set-cookie"]);
+    }
+
+    #[test]
+    fn an_object_is_named_within_what_a_store_allows() {
+        let stream = |bucket: &str, key: &str| {
+            json!({"__v": 2, "__status": 200, "__stream": {
+                "kind": "s3", "bucket": bucket, "key": key,
+            }})
+        };
+        let at_limit = "x".repeat(MAX_OBJECT_NAME);
+        let past_limit = "x".repeat(MAX_OBJECT_NAME + 1);
+        assert!(v2(&stream(&at_limit, &at_limit)).is_ok());
+        assert!(v2(&stream(&past_limit, "k")).is_err());
+        assert!(v2(&stream("b", &past_limit)).is_err());
+    }
+
+    #[test]
+    fn a_content_type_is_limited_as_a_header_value_is() {
+        let at_limit = "x".repeat(MAX_HEADER_VALUE);
+        let past_limit = "x".repeat(MAX_HEADER_VALUE + 1);
+        let bytes = |content_type: &str| json!({"__v": 2, "__status": 200, "__body_b64": "", "__content_type": content_type});
+        let object = |content_type: &str| {
+            json!({"__v": 2, "__status": 200, "__stream": {
+                "kind": "s3", "bucket": "b", "key": "k", "content_type": content_type,
+            }})
+        };
+        for envelope in [bytes(&at_limit), object(&at_limit)] {
+            assert!(v2(&envelope).is_ok());
+        }
+        for envelope in [bytes(&past_limit), object(&past_limit)] {
+            assert!(v2(&envelope).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_holds_what_it_retains_until_its_body_ends() {
+        for (data, least, most) in [(16, 32, 1024), (256 * 1024, 512 * 1024, 513 * 1024)] {
+            let (ledger, response) = charged(&opening(data), 64 * MIB).await;
+            let response = response.expect("rendered");
+            let held = ledger.in_use();
+            assert!((least..=most).contains(&held), "{data}: {held}");
+            drop(response);
+            assert_eq!(ledger.in_use(), 0, "{data}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opening_past_what_a_stream_may_hold_is_refused_only_under_enforce() {
+        let raw = opening(MIB);
+        let (_, response) = charged(&raw, 64 * MIB).await;
+        assert!(response.expect_err("refused").contains("__sse"));
+        let (_, response) = charged_on(&raw, testing::warned(64 * MIB)).await;
+        assert!(response.is_ok(), "warn opens it");
+        assert!(decode(output(&raw)).is_ok(), "off opens it");
+    }
+
+    #[tokio::test]
+    async fn under_warn_a_stream_holds_what_it_retains_past_its_trees_charge() {
+        let data = 2 * MIB;
+        let (ledger, response) = charged_on(&opening(data), testing::warned(64 * MIB)).await;
+        let response = response.expect("rendered");
+        assert!(ledger.in_use() >= 2 * data, "{}", ledger.in_use());
+        drop(response);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_stored_content_type_past_a_header_value_is_not_served() {
+        let spec = S3Spec {
+            bucket: "b".into(),
+            key: "k".into(),
+            content_type: None,
+        };
+        let object = ObjectReader {
+            size: None,
+            content_type: Some("x".repeat(MAX_HEADER_VALUE + 1)),
+            stream: futures_util::stream::empty().boxed(),
+        };
+        let response = stream_object(&spec, object);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn a_terminal_reason_is_cut_to_the_size_of_a_delivery_block() {
+        let terminal = format!("a{}", "\u{e9}".repeat(MAX_DELIVERY_BLOCK));
+        let response = v2(&json!({
+            "__v": 2, "__status": 200, "__delivery": {"terminal": terminal},
+        }))
+        .expect("v2");
+        match response.delivery.as_deref() {
+            Some(DeliveryControl::Terminal { terminal }) => {
+                assert_eq!(terminal.len(), MAX_DELIVERY_BLOCK - 1);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_long_escaped_key_is_past_the_reach_of_an_outline() {
+        let key = |escape: &str, bytes: usize| format!("{escape}{}", "x".repeat(bytes - 2));
+        let status = |key: &str| {
+            let raw = format!(r#"{{"{key}":1,"__status":500}}"#);
+            outline(raw.as_bytes()).expect("an outline").status
+        };
+        assert_eq!(
+            status(&key(r"\n", MAX_ESCAPED_KEY)),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(status(&key(r"\n", MAX_ESCAPED_KEY + 1)), StatusCode::OK);
+        assert_eq!(
+            status(&format!("{}\\n", "x".repeat(MAX_ESCAPED_KEY))),
+            StatusCode::OK,
+            "it costs the same with its escape at the end"
+        );
+        assert_eq!(
+            status(&key("xx", MAX_ESCAPED_KEY + 1)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a key with no escape is borrowed"
+        );
+        let escaped_value = format!(
+            r#"{{"a":"\n{}","__status":500}}"#,
+            "x".repeat(MAX_ESCAPED_KEY)
+        );
+        let nested_key = format!(
+            r#"{{"a":{{"\n{}":1}},"__status":500}}"#,
+            "x".repeat(MAX_ESCAPED_KEY)
+        );
+        for raw in [escaped_value, nested_key] {
+            assert_eq!(
+                outline(raw.as_bytes()).expect("an outline").status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "only a top-level key reaches scratch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delivery_block_is_read_only_at_the_size_of_one() {
+        let block = |terminal: usize| {
+            format!(
+                r#"{{"__v":2,"__status":200,"__delivery":{{"terminal":"{}"}}}}"#,
+                "x".repeat(terminal)
+            )
+        };
+        let wrapping = r#"{"terminal":""}"#.len();
+        assert!(matches!(
+            outline(block(MAX_DELIVERY_BLOCK - wrapping).as_bytes())
+                .expect("an outline")
+                .delivery,
+            Some(DeliveryControl::Terminal { .. })
+        ));
+        assert!(outline(block(MAX_DELIVERY_BLOCK - wrapping + 1).as_bytes()).is_err());
+        let wide = format!(
+            r#"{{"__v":2,"__status":200,"__delivery":[{}0]}}"#,
+            "0,".repeat(MAX_DELIVERY_BLOCK)
+        );
+        assert!(outline(wide.as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_rendered_json_body_is_byte_for_byte_what_axum_writes() {
+        for raw in [
+            r#"{"b":[1.5,1e300,-0.0],"a":"\u00e9\n","c":{"z":null,"y":true}}"#,
+            r#"{"__status":201,"__body":[{"x":1},{"x":2}]}"#,
+            r#"{"__status":202,"kept":"whole"}"#,
+            r#""text""#,
+            "not json at all",
+            r#"{"__v":2,"__status":200,"__body":{"k":[1,2,3]}}"#,
+        ] {
+            let ours = rendered(raw).await;
+            let (status, body) = match decode(output(raw)) {
+                Ok((GuestResponse::Legacy { status, body }, _)) => (status, body),
+                Ok((
+                    GuestResponse::V2(V2Response {
+                        status,
+                        body: V2Body::Json(body),
+                        ..
+                    }),
+                    _,
+                )) => (status, body),
+                other => panic!("{raw}: {other:?}"),
+            };
+            let theirs = (status, axum::Json(body)).into_response();
+            assert_eq!(ours.status(), theirs.status(), "{raw}");
+            assert_eq!(
+                ours.headers()[header::CONTENT_TYPE],
+                theirs.headers()[header::CONTENT_TYPE],
+                "{raw}"
+            );
+            assert_eq!(
+                axum::body::to_bytes(ours.into_body(), 1 << 16)
+                    .await
+                    .expect("ours"),
+                axum::body::to_bytes(theirs.into_body(), 1 << 16)
+                    .await
+                    .expect("theirs"),
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_response_stays_charged_until_its_body_is_sent_or_dropped() {
+        let raw = json!({"rows": vec!["x".repeat(1024); 4096]}).to_string();
+        let (ledger, response) = charged(&raw, 64 * MIB).await;
+        let response = response.expect("rendered");
+        assert!(ledger.in_use() >= raw.len(), "the written text is charged");
+        let body = axum::body::to_bytes(response.into_body(), 64 * MIB)
+            .await
+            .expect("body");
+        assert_eq!(body.len(), raw.len());
+        assert_eq!(ledger.in_use(), 0);
+
+        let (ledger, response) = charged(&raw, 64 * MIB).await;
+        let mut body = response.expect("rendered").into_body().into_data_stream();
+        assert!(ledger.in_use() > 0);
+        drop(body.next());
+        drop(body);
+        assert_eq!(ledger.in_use(), 0, "a client that went away releases it");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_cannot_be_charged_is_refused_and_nothing_stays_held() {
+        let raw = format!("[{}]", vec!["[0]"; 200_000].join(","));
+        let (ledger, response) = charged(&raw, 4 * MIB).await;
+        let error = response.expect_err("refused");
+        assert!(
+            error.contains("Budget") || error.contains("budget"),
+            "{error}"
+        );
+        assert_eq!(ledger.in_use(), 0);
+
+        let bytes = general_purpose::STANDARD.encode(vec![7u8; 3 * MIB]);
+        let envelope = json!({"__v": 2, "__status": 200, "__body_b64": bytes});
+        let Value::Object(envelope) = envelope else {
+            panic!("an object")
+        };
+        let (ledger, mut hold) = testing::hold(2 * MIB);
+        assert!(
+            matches!(decode_v2(envelope, &mut hold), Err(DecodeError::Refused(_))),
+            "the decoded bytes are charged before decoding"
+        );
+        drop(hold);
+        assert_eq!(ledger.in_use(), 0);
     }
 
     #[tokio::test]

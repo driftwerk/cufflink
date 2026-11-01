@@ -1037,4 +1037,37 @@ mod tests {
             declaring.schema_hash().unwrap()
         );
     }
+
+    #[test]
+    fn a_manifest_from_before_route_concurrency_keeps_its_deploy_hash() {
+        let older = serde_json::json!({
+            "name": "catalog-service",
+            "version": "0.1.0",
+            "mode": "wasm",
+            "tables": [],
+            "custom_routes": [{
+                "method": "POST",
+                "path": "/reprice",
+                "handler": "reprice",
+                "posture": {"kind": "public", "reason": "pinned"},
+            }],
+        });
+        let manifest: ServiceManifest = serde_json::from_value(older.clone()).expect("parses");
+        assert_eq!(
+            manifest.deploy_hash().expect("hash"),
+            "6ff5a2b081b2b65d9d9491fa3743817da838dbfe368b3245a815693cce3f1b2c",
+            "a deployed manifest without max_concurrent is not redeployed"
+        );
+        assert!(!manifest
+            .derived_features()
+            .contains(crate::features::ROUTE_CONCURRENCY));
+
+        let mut limited = older;
+        limited["custom_routes"][0]["max_concurrent"] = 2.into();
+        let limited: ServiceManifest = serde_json::from_value(limited).expect("parses");
+        assert_ne!(limited.deploy_hash().ok(), manifest.deploy_hash().ok());
+        assert!(limited
+            .derived_features()
+            .contains(crate::features::ROUTE_CONCURRENCY));
+    }
 }

@@ -739,6 +739,37 @@ async fn a_fire_its_handler_keeps_failing_is_dead_lettered() {
 }
 
 #[tokio::test]
+async fn under_enforce_an_answer_past_the_response_cap_settles_its_fire() {
+    let Some(mut ledger) = ledger(
+        1,
+        &[
+            ("WASM_MEMORY_BUDGET_MODE", "enforce"),
+            ("WASM_MEMORY_BUDGET_MB", "64"),
+            ("WASM_MEMORY_COLD_ESTIMATE_MB", "2"),
+            ("WASM_MAX_RESPONSE_MB", "1"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    ledger.wasm = common::guest::module_bytes();
+    ledger
+        .deploy(&manifest(
+            "0.1.0",
+            vec![every("close", "answer_big_gated", 10)],
+        ))
+        .await;
+    ledger.until_loops(1.0).await;
+    until("the fire is settled", Duration::from_secs(30), || async {
+        ledger.counted("close", "ok").await >= 1.0
+    })
+    .await
+    .expect("in time");
+    assert_eq!(ledger.counted("close", "error").await, 0.0);
+}
+
+#[tokio::test]
 async fn a_failing_schedule_that_fires_faster_than_its_retries_is_never_dead_lettered() {
     let Some(ledger) = ledger(1, &[]).await else {
         return;

@@ -1,6 +1,7 @@
 use super::{block_on, read_guest_string, wrap, HostState};
 use crate::policy::{self, PolicyKey, Violation};
-use crate::wasm_runtime::redis_scope;
+use crate::wasm_runtime::budget::Refused;
+use crate::wasm_runtime::redis_scope::{self, ReadError, Reading};
 use std::collections::HashSet;
 use wasmtime::{Caller, Linker};
 
@@ -25,14 +26,23 @@ pub(super) fn register(
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            match block_on(redis_scope::get(&app_state.redis, &plan)) {
+            let mut held = caller.data().hold();
+            let read = block_on(redis_scope::get(
+                &app_state.redis,
+                &plan,
+                Reading::of(caller.data().caps(), "redis_get"),
+                &mut held,
+            ));
+            match read {
                 Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
-                    caller.data_mut().host_response = read.value;
-                    0
+                    caller
+                        .data_mut()
+                        .respond_held("redis_get", read.value, held)
                 }
+                Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
-                    tracing::error!("[wasm] redis_get error: {}", e);
+                    read_failed("redis_get", &e);
                     -1
                 }
             }
@@ -110,30 +120,43 @@ pub(super) fn register(
             let key = match read_guest_string(&mut caller, "redis_get_status", key_ptr, key_len) {
                 Ok(s) => s,
                 Err(e) => {
-                    caller.data_mut().host_response = Some("invalid key buffer".into());
+                    caller
+                        .data_mut()
+                        .respond("redis_get_status", "invalid key buffer".into());
                     return e.code();
                 }
             };
             let Some(plan) = caller.data().redis_plan(&key) else {
-                caller.data_mut().host_response = Some(RESERVED_REDIS_KEY.into());
+                caller
+                    .data_mut()
+                    .respond("redis_get_status", RESERVED_REDIS_KEY.into());
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            match block_on(redis_scope::get(&app_state.redis, &plan)) {
+            let mut held = caller.data().hold();
+            let read = block_on(redis_scope::get(
+                &app_state.redis,
+                &plan,
+                Reading::of(caller.data().caps(), "redis_get_status"),
+                &mut held,
+            ));
+            match read {
                 Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
                     let found = read.value.is_some();
-                    caller.data_mut().host_response = read.value;
-                    if found {
-                        0
-                    } else {
-                        1
+                    match caller
+                        .data_mut()
+                        .respond_held("redis_get_status", read.value, held)
+                    {
+                        0 if found => 0,
+                        0 => 1,
+                        refused => refused,
                     }
                 }
+                Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
-                    let msg = e.to_string();
-                    tracing::error!("[wasm] redis_get_status error: {}", msg);
-                    caller.data_mut().host_response = Some(msg);
+                    read_failed("redis_get_status", &e);
+                    caller.data_mut().respond("redis_get_status", e.to_string());
                     -1
                 }
             }
@@ -148,7 +171,9 @@ pub(super) fn register(
             let keys_json = match read_guest_string(&mut caller, "redis_mget", keys_ptr, keys_len) {
                 Ok(s) => s,
                 Err(e) => {
-                    caller.data_mut().host_response = Some("invalid keys buffer".into());
+                    caller
+                        .data_mut()
+                        .respond("redis_mget", "invalid keys buffer".into());
                     return e.code();
                 }
             };
@@ -157,38 +182,43 @@ pub(super) fn register(
                 Err(e) => {
                     let msg = format!("invalid keys JSON: {}", e);
                     tracing::error!("[wasm] redis_mget: {}", msg);
-                    caller.data_mut().host_response = Some(msg);
+                    caller.data_mut().respond("redis_mget", msg);
                     return -1;
                 }
             };
             if keys.is_empty() {
-                caller.data_mut().host_response = Some("[]".to_string());
-                return 0;
+                return caller.data_mut().respond("redis_mget", "[]".to_string());
+            }
+            if let Err(cap) = caller.data().caps().fanout("redis_mget", keys.len()) {
+                return caller.data_mut().refused(Refused::Cap(cap));
             }
             let Some(plans) = keys
                 .iter()
                 .map(|key| caller.data().redis_plan(key))
                 .collect::<Option<Vec<_>>>()
             else {
-                caller.data_mut().host_response = Some(RESERVED_REDIS_KEY.into());
+                caller
+                    .data_mut()
+                    .respond("redis_mget", RESERVED_REDIS_KEY.into());
                 return -1;
             };
             let app_state = caller.data().app_state.clone();
-            let result = block_on(redis_scope::mget(&app_state.redis, &plans))
-                .map_err(eyre::Report::from)
-                .and_then(|read| {
+            let mut held = caller.data().hold();
+            let read = block_on(redis_scope::mget(
+                &app_state.redis,
+                &plans,
+                Reading::of(caller.data().caps(), "redis_mget"),
+                &mut held,
+            ));
+            match read {
+                Ok(read) => {
                     caller.data().record_redis_fallback(read.from_fallback);
-                    serde_json::to_string(&read.value).map_err(Into::into)
-                });
-            match result {
-                Ok(json) => {
-                    caller.data_mut().host_response = Some(json);
-                    0
+                    caller.data_mut().respond_json("redis_mget", &read.value)
                 }
+                Err(ReadError::Refused(refused)) => caller.data_mut().refused(refused),
                 Err(e) => {
-                    let msg = e.to_string();
-                    tracing::error!("[wasm] redis_mget error: {}", msg);
-                    caller.data_mut().host_response = Some(msg);
+                    read_failed("redis_mget", &e);
+                    caller.data_mut().respond("redis_mget", e.to_string());
                     -1
                 }
             }
@@ -196,6 +226,13 @@ pub(super) fn register(
     )?;
 
     Ok(())
+}
+
+fn read_failed(call: &str, error: &ReadError) {
+    match error {
+        ReadError::Changed => tracing::debug!("[wasm] {call}: {error}"),
+        _ => tracing::error!("[wasm] {call} error: {error}"),
+    }
 }
 
 impl HostState {

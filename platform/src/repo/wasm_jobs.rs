@@ -78,6 +78,7 @@ pub struct WasmJob {
     pub trace_context: Option<Value>,
     pub dead_lettered_at: Option<DateTime<Utc>>,
     pub idempotency_key: Option<String>,
+    pub capacity_deferrals: i32,
     pub schedule_name: Option<String>,
 }
 
@@ -166,6 +167,7 @@ fn job_of(row: &Row) -> PlatformResult<WasmJob> {
         trace_context: row.try_get("trace_context")?,
         dead_lettered_at: row.try_get("dead_lettered_at")?,
         idempotency_key: row.try_get("idempotency_key")?,
+        capacity_deferrals: row.try_get("capacity_deferrals")?,
         schedule_name: row.try_get("schedule_name")?,
     })
 }
@@ -374,6 +376,7 @@ const LEASE_EXPIRED: &str = "(lease_until < now()
       OR (lease_until IS NULL AND started_at < now() - make_interval(secs => timeout_secs * 2)))";
 
 const UNHELD: &str = "lease_owner = NULL, lease_until = NULL";
+const CONCLUDED: &str = "lease_owner = NULL, lease_until = NULL, capacity_deferrals = 0";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Claim {
@@ -483,7 +486,7 @@ pub async fn complete(
         fence,
         &format!(
             "status = 'completed', result_json = $4, finished_at = now(),
-             expires_at = now() + make_interval(secs => $5), {UNHELD}"
+             expires_at = now() + make_interval(secs => $5), {CONCLUDED}"
         ),
         &[&result, &seconds(retain_for)],
     )
@@ -515,7 +518,7 @@ pub async fn retry(
         fence,
         &format!(
             "status = 'pending', next_attempt_at = $4, last_error = $5, error_class = $6,
-             published_at = CASE WHEN $7 THEN now() END, {UNHELD}"
+             published_at = CASE WHEN $7 THEN now() END, {CONCLUDED}"
         ),
         &[
             &next_attempt_at,
@@ -531,7 +534,7 @@ pub async fn retry(
 fn failed(first: usize) -> String {
     format!(
         "status = 'failed', error = ${first}, last_error = ${first}, error_class = ${},
-         finished_at = now(), expires_at = now() + make_interval(secs => ${}), {UNHELD}",
+         finished_at = now(), expires_at = now() + make_interval(secs => ${}), {CONCLUDED}",
         first + 1,
         first + 2
     )
@@ -558,9 +561,29 @@ pub async fn release(pool: &deadpool_postgres::Pool, fence: &Fence) -> PlatformR
         fence,
         &format!(
             "status = 'pending', attempts = attempts - 1, next_attempt_at = now(),
-             published_at = now(), {UNHELD}"
+             published_at = now(), {CONCLUDED}"
         ),
         &[],
+    )
+    .await
+    .map(held)
+}
+
+pub async fn defer(
+    pool: &deadpool_postgres::Pool,
+    fence: &Fence,
+    after: Duration,
+) -> PlatformResult<Fenced> {
+    fenced(
+        pool,
+        fence,
+        &format!(
+            "status = 'pending', attempts = attempts - 1,
+             capacity_deferrals = capacity_deferrals + 1,
+             next_attempt_at = now() + make_interval(secs => $4),
+             published_at = now(), {UNHELD}"
+        ),
+        &[&seconds(after)],
     )
     .await
     .map(held)

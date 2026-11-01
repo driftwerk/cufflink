@@ -164,6 +164,9 @@ async fn ready(State(state): State<HttpState>) -> impl IntoResponse {
 
 async fn metrics(State(state): State<HttpState>) -> String {
     cufflink_platform::telemetry::record_pool_gauges(&state.app);
+    if let Some(engine) = &state.app.wasm_engine {
+        engine.publish_gauges();
+    }
     state.app.metrics_handle.render()
 }
 

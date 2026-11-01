@@ -104,10 +104,9 @@ pub(super) fn register(
             });
 
             match result {
-                Ok(job_id) => {
-                    caller.data_mut().host_response = Some(job_id.to_string());
-                    0
-                }
+                Ok(job_id) => caller
+                    .data_mut()
+                    .respond("jobs_enqueue", job_id.to_string()),
                 Err(e) => {
                     tracing::error!("[wasm] jobs_enqueue error: {}", e);
                     -1

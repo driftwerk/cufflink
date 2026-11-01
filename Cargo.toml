@@ -122,3 +122,35 @@ postgresql_embedded = { version = "0.20.2", default-features = false, features =
 wat = "1"
 libc = "0.2"
 trybuild = "1"
+
+# The image codecs run the platform's image transforms and the tests that
+# measure them; unoptimised, one transform of a 6-megapixel image takes tens
+# of seconds.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zenwebp]
+opt-level = 3
+[profile.dev.package.zenyuv]
+opt-level = 3
+[profile.dev.package.zenpixels]
+opt-level = 3
+[profile.dev.package.archmage]
+opt-level = 3
+[profile.dev.package.magetypes]
+opt-level = 3
+[profile.dev.package.garb]
+opt-level = 3
+[profile.dev.package.linear-srgb]
+opt-level = 3
+[profile.dev.package.ravif]
+opt-level = 3
+[profile.dev.package.rav1e]
+opt-level = 3
+[profile.dev.package.loop9]
+opt-level = 3
+[profile.dev.package.imgref]
+opt-level = 3
+[profile.dev.package.bitstream-io]
+opt-level = 3

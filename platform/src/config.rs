@@ -1043,7 +1043,15 @@ mod tests {
                     }
                 );
                 assert_eq!(config.deploy_job_retention, DAY * 30);
-                assert_eq!(config.wasm, WasmLimits::default());
+                assert_eq!(
+                    config.wasm,
+                    WasmLimits {
+                        budget: config.wasm.budget.clone(),
+                        ..WasmLimits::default()
+                    },
+                    "everything but what the host's cgroup decides"
+                );
+                assert_eq!(config.wasm.budget.mode, crate::policy::PolicyMode::Warn);
                 assert_eq!(config.max_tenant_pools, 64);
                 assert_eq!(config.max_conns_per_tenant, 4);
                 assert!(config.worker_routes.is_empty());

@@ -4,6 +4,7 @@ use common::PlatformProcess;
 use cufflink_platform::registry::ServiceIdentity;
 use cufflink_platform::tenant_db::TenantPoolManager;
 use cufflink_platform::tenant_sessions::{TenantSessions, STATEMENT_STOP_EVERY};
+use cufflink_platform::wasm_runtime::budget::HostCaps;
 use cufflink_platform::wasm_runtime::host::{db_v2_call, AbandonReason, DbSession, DbTarget};
 use cufflink_types::db::{DbErrorKind, DbRequest, DbResponse, Isolation, Param, RowMap};
 use deadpool_postgres::Pool;
@@ -61,6 +62,7 @@ impl Fixture {
             session: DbSession::new(2),
             budget: Duration::from_secs(30),
             cancel: CancellationToken::new(),
+            caps: HostCaps::default(),
         }
     }
 }
@@ -70,6 +72,7 @@ struct Client<'a> {
     session: DbSession,
     budget: Duration,
     cancel: CancellationToken,
+    caps: HostCaps,
 }
 
 impl Client<'_> {
@@ -80,7 +83,7 @@ impl Client<'_> {
             deadline: Instant::now() + self.budget,
             cancel: &self.cancel,
         };
-        db_v2_call(&mut self.session, &target, request).await
+        db_v2_call(&mut self.session, &target, request, &self.caps).await
     }
 
     async fn query_in(&mut self, tx: Option<u32>, sql: &str, params: Vec<Param>) -> Vec<RowMap> {
@@ -382,13 +385,19 @@ async fn db_v2_errors_are_structured() {
         started.elapsed()
     );
 
+    let mut hold = cufflink_platform::wasm_runtime::budget::Hold::none();
+    let caps = cufflink_platform::wasm_runtime::budget::HostCaps::default();
+    let rows = cufflink_platform::wasm_runtime::host::RowText::legacy(&mut hold, &caps, "db_query");
     let legacy = cufflink_platform::wasm_runtime::host::run_guest_statement(
         &mut cufflink_platform::tenant_sessions::Session::over(
             fixture.pool.get().await.expect("checkout"),
             fixture.schema,
         ),
         Duration::from_secs(30),
-        cufflink_platform::wasm_runtime::host::GuestStatement::Query("SELECT * FROM missing"),
+        cufflink_platform::wasm_runtime::host::GuestStatement::Query(
+            "SELECT * FROM missing",
+            &rows,
+        ),
     )
     .await
     .err()
@@ -1048,4 +1057,54 @@ async fn db_v2_float4_values_that_do_not_fit_are_refused() {
     );
     let rows = client.query("SELECT v FROM m", vec![]).await;
     assert_eq!(rows[0]["v"], json!(0.1));
+}
+
+#[tokio::test]
+async fn db_v2_a_result_past_the_response_cap_is_too_large_and_ends_its_transaction() {
+    let Some(fixture) = Fixture::new("v2_capped", "CREATE TABLE t (id int)").await else {
+        return;
+    };
+    let big = "SELECT generate_series(1, 10000000) AS g, repeat('x', 100) AS pad";
+    let mut client = fixture.session();
+    client.caps = HostCaps {
+        mode: cufflink_platform::policy::PolicyMode::Enforce,
+        response: 64 * 1024,
+        ..HostCaps::default()
+    };
+    let too_large = |response: DbResponse| match response {
+        DbResponse::Failed(error) => assert_eq!(error.kind, DbErrorKind::TooLarge, "{error:?}"),
+        other => panic!("{other:?}"),
+    };
+
+    let started = Instant::now();
+    too_large(
+        client
+            .call(DbRequest::Query {
+                sql: big.into(),
+                params: vec![],
+                tx: None,
+            })
+            .await,
+    );
+    assert_eq!(client.query("SELECT 1 AS one", vec![]).await.len(), 1);
+
+    let tx = client.begin().await;
+    too_large(
+        client
+            .call(DbRequest::Query {
+                sql: big.into(),
+                params: vec![],
+                tx: Some(tx),
+            })
+            .await,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    match client.call(DbRequest::Commit { tx }).await {
+        DbResponse::Failed(error) => assert_eq!(error.kind, DbErrorKind::TransactionNotFound),
+        other => panic!("the transaction was abandoned: {other:?}"),
+    }
 }

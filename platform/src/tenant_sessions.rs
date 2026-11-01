@@ -673,6 +673,20 @@ async fn checkout(pool: &Pool, wait: Option<Duration>) -> Result<Object, Acquire
     .map_err(AcquireError::Checkout)
 }
 
+pub const PORTAL_ROWS: i32 = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    More,
+    Stop,
+}
+
+pub trait RowSink: Sync {
+    fn restart(&self, columns: &[tokio_postgres::Column]);
+
+    fn rows(&self, rows: &[Row]) -> Flow;
+}
+
 #[async_trait]
 pub trait Statements: Sync {
     async fn execute<T>(&self, statement: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
@@ -708,6 +722,13 @@ pub trait Statements: Sync {
         T: ?Sized + ToStatement + Sync + Send;
 
     async fn prepare(&self, sql: &str) -> Result<Statement, Error>;
+
+    async fn query_rows(
+        &self,
+        statement: &Statement,
+        params: &[&(dyn ToSql + Sync)],
+        sink: &dyn RowSink,
+    ) -> Result<(), Error>;
 
     async fn batch_execute(&self, sql: &str) -> Result<(), Error>;
 
@@ -780,6 +801,16 @@ macro_rules! statements_through {
 
             async fn prepare(&self, sql: &str) -> Result<Statement, Error> {
                 self.as_role(|| GenericClient::prepare(&self.$field, sql))
+                    .await
+            }
+
+            async fn query_rows(
+                &self,
+                statement: &Statement,
+                params: &[&(dyn ToSql + Sync)],
+                sink: &dyn RowSink,
+            ) -> Result<(), Error> {
+                self.as_role(|| self.stream_rows(statement, params, sink))
                     .await
             }
 
@@ -991,6 +1022,27 @@ impl Session {
     pub fn discard(self) {
         drop(Object::take(self.client));
     }
+
+    async fn stream_rows(
+        &self,
+        statement: &Statement,
+        params: &[&(dyn ToSql + Sync)],
+        sink: &dyn RowSink,
+    ) -> Result<(), Error> {
+        use futures_util::TryStreamExt;
+        sink.restart(statement.columns());
+        let rows = self
+            .client
+            .query_raw(statement, params.iter().copied())
+            .await?;
+        futures_util::pin_mut!(rows);
+        while let Some(row) = rows.try_next().await? {
+            if sink.rows(std::slice::from_ref(&row)) == Flow::Stop {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn prelude(mode: &RoleMode, schema: &str, scope: Scope, statement_timeout: Duration) -> String {
@@ -1073,6 +1125,23 @@ impl<'a> SessionTx<'a> {
             None => None,
         };
         statement.await
+    }
+
+    async fn stream_rows(
+        &self,
+        statement: &Statement,
+        params: &[&(dyn ToSql + Sync)],
+        sink: &dyn RowSink,
+    ) -> Result<(), Error> {
+        sink.restart(statement.columns());
+        let portal = self.tx.bind(statement, params).await?;
+        loop {
+            let rows = self.tx.query_portal(&portal, PORTAL_ROWS).await?;
+            let finished = rows.len() < PORTAL_ROWS as usize;
+            if sink.rows(&rows) == Flow::Stop || finished {
+                return Ok(());
+            }
+        }
     }
 
     pub async fn commit(self) -> Result<(), Error> {

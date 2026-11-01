@@ -1,12 +1,14 @@
 use super::util::{ended, exchange};
 use super::{
     block_on_within, budget_cap, clamp_to_budget, duration_from_env, fanout_concurrency,
-    read_guest_bytes, read_guest_string, wrap, BatchResult, HostState,
+    read_guest_bytes, read_guest_string, wrap, write_in_order, BatchResult, HostIoError, HostState,
+    ResponseText,
 };
 use crate::egress::{
     EgressDenied, EgressError, EgressGuard, EgressPolicy, EgressTarget, OutboundRequest,
 };
 use crate::policy::PolicySet;
+use crate::wasm_runtime::budget::{Capacity, ChargedJson, ChargedJsonError, Hold, Refused};
 use cufflink_types::host::http::{
     FetchRequestV2, FetchResponseV2, HttpErrorEnvelope, HttpErrorKind, MultipartPart,
 };
@@ -91,12 +93,12 @@ pub(super) fn register(
         names,
         "http_fetch_many",
         |mut caller: Caller<'_, HostState>, items_ptr: i32, items_len: i32| -> i32 {
-            let items_json = host_try!(read_guest_string(
-                &mut caller,
-                "http_fetch_many",
-                items_ptr,
-                items_len
-            ));
+            const PATH: &str = "http_fetch_many";
+            let items_json = host_try!(read_guest_string(&mut caller, PATH, items_ptr, items_len));
+            let mut parsed = caller.data().hold();
+            if let Err(capacity) = parsed.grow(items_json.len()) {
+                return caller.data_mut().refused(Refused::Budget(capacity));
+            }
             let mut items: Vec<HttpItem> = match serde_json::from_str(&items_json) {
                 Ok(v) => v,
                 Err(e) => {
@@ -104,6 +106,12 @@ pub(super) fn register(
                     return -1;
                 }
             };
+            drop(items_json);
+            let limits = Arc::clone(&caller.data().limits);
+            let caps = &limits.budget.caps;
+            if let Err(cap) = caps.fanout(PATH, items.len()) {
+                return caller.data_mut().refused(Refused::Cap(cap));
+            }
             let _span = tracing::info_span!(
                 "http.fetch_many",
                 otel.kind = "client",
@@ -121,41 +129,53 @@ pub(super) fn register(
             let remaining = caller.data().remaining_budget();
             let egress = caller.data().guest_egress();
             let cancel = caller.data().cancel.clone();
+            let item_bytes = fetch_reservation(egress.max_response_bytes());
+            caller.data_mut().clear_host_response();
+            let mut hold = caller.data().hold();
 
             let result = block_on_within(budget_cap(remaining), &cancel, async {
-                let permits = fanout_concurrency();
-                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
                 let egress = &egress;
-                let futs = items.into_iter().map(|item| {
-                    let sem = sem.clone();
+                let fetches = items.into_iter().map(|item| {
+                    let mut held = parsed.sibling();
                     let timeout = clamp_to_budget(
                         item.timeout_ms.map(std::time::Duration::from_millis),
                         default_timeout,
                         remaining,
                     );
                     async move {
-                        let _p = sem.acquire_owned().await.ok();
+                        held.grow(item_bytes).map_err(Refused::Budget)?;
                         let body = item.body.map(String::into_bytes);
-                        match egress
+                        let result = match egress
                             .fetch(&item.method, item.url, &item.headers, body, timeout)
                             .await
                         {
-                            Ok(response) => BatchResult::ok(response),
-                            Err(e) => BatchResult::err(&e),
-                        }
+                            Ok(response) => {
+                                held_at(&mut held, ChargedJson::measure(&response))
+                                    .map_err(Refused::Budget)?;
+                                BatchResult::ok(response)
+                            }
+                            Err(e) => {
+                                held.shrink_to(e.len());
+                                BatchResult::err(&e)
+                            }
+                        };
+                        Ok((result, held))
                     }
                 });
-                let results: Vec<BatchResult> = futures_util::future::join_all(futs)
+                let mut text = ResponseText::new(&mut hold, caps, PATH);
+                write_in_order(fetches, fanout_concurrency(), &mut text)
                     .await
-                    .into_iter()
-                    .collect();
-                Ok::<String, eyre::Report>(serde_json::to_string(&results)?)
+                    .map(|()| text.into_text())
             });
+            drop(parsed);
 
             match result {
-                Ok(json) => {
-                    caller.data_mut().host_response = Some(json);
+                Ok(text) => {
+                    caller.data_mut().set_charged_response(text, hold);
                     0
+                }
+                Err(HostIoError::Failed(ChargedJsonError::Capacity(refused))) => {
+                    caller.data_mut().refused(refused)
                 }
                 Err(e) => {
                     tracing::error!("[wasm] http_fetch_many error: {}", e);
@@ -166,6 +186,20 @@ pub(super) fn register(
     )?;
 
     Ok(())
+}
+
+fn fetch_reservation(max_response_bytes: u64) -> usize {
+    usize::try_from(max_response_bytes).unwrap_or(usize::MAX)
+}
+
+fn held_at(held: &mut Hold, bytes: usize) -> Result<(), Capacity> {
+    match bytes.checked_sub(held.bytes()) {
+        Some(extra) => held.grow(extra),
+        None => {
+            held.shrink_to(bytes);
+            Ok(())
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -240,15 +274,14 @@ fn http_fetch_host(
     });
     crate::telemetry::inject_current_context(&mut headers);
 
-    let body = if body_len > 0 {
-        Some(host_try!(read_guest_bytes(
-            caller,
-            "http_fetch",
-            body_ptr,
-            body_len
-        )))
-    } else {
-        None
+    let (url, _url_held) = url.into_parts();
+    let (body, _body_held) = match body_len > 0 {
+        true => {
+            let (body, held) =
+                host_try!(read_guest_bytes(caller, "http_fetch", body_ptr, body_len)).into_parts();
+            (Some(body), held)
+        }
+        false => (None, Hold::none()),
     };
 
     let timeout = clamp_to_budget(
@@ -266,10 +299,7 @@ fn http_fetch_host(
     .map(|response| response.to_string());
 
     match result {
-        Ok(json_str) => {
-            caller.data_mut().host_response = Some(json_str);
-            0
-        }
+        Ok(json_str) => caller.data_mut().respond("http_fetch", json_str),
         Err(e) => {
             tracing::error!("[wasm] http_fetch error: {}", e);
             -1
@@ -299,6 +329,11 @@ struct Exchanged {
 impl GuestEgress {
     fn policy(&self) -> EgressPolicy<'_> {
         EgressPolicy::new(&self.policies, &self.tenant_slug)
+    }
+
+    fn max_response_bytes(&self) -> u64 {
+        self.guard
+            .effective_max_bytes(self.policy().max_response_bytes())
     }
 
     async fn exchange(
@@ -331,7 +366,7 @@ impl GuestEgress {
             "PUT" => reqwest::Method::PUT,
             "DELETE" => reqwest::Method::DELETE,
             "PATCH" => reqwest::Method::PATCH,
-            _ => return Err(format!("Unsupported HTTP method: {}", method)),
+            _ => return Err(format!("Unsupported HTTP method: {method:.64}")),
         };
         let headers = headers
             .iter()
@@ -344,9 +379,7 @@ impl GuestEgress {
             body,
             timeout,
         };
-        let max_bytes = self
-            .guard
-            .effective_max_bytes(self.policy().max_response_bytes());
+        let max_bytes = self.max_response_bytes();
         let Exchanged {
             status,
             headers,
@@ -419,9 +452,9 @@ impl GuestEgress {
 fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), String> {
     Ok((
         HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| format!("invalid header name {name}: {e}"))?,
+            .map_err(|e| format!("invalid header name {name:.64}: {e}"))?,
         HeaderValue::from_str(value)
-            .map_err(|e| format!("invalid header value for {name}: {e}"))?,
+            .map_err(|e| format!("invalid header value for {name:.64}: {e}"))?,
     ))
 }
 
@@ -581,7 +614,7 @@ fn plan(
         .contains(&method.as_str())
         .then(|| reqwest::Method::from_bytes(method.as_bytes()).ok())
         .flatten()
-        .ok_or_else(|| invalid(format!("unsupported HTTP method: {}", request.method)))?;
+        .ok_or_else(|| invalid(format!("unsupported HTTP method: {:.64}", request.method)))?;
     let mut headers = request
         .headers
         .iter()
@@ -663,7 +696,7 @@ fn part_head(part: &MultipartPart, boundary: &str) -> Result<String, HttpErrorEn
         .map(|content_type| {
             HeaderValue::from_str(content_type)
                 .map(|_| format!("Content-Type: {content_type}\r\n"))
-                .map_err(|_| invalid(format!("invalid content type of part {}", part.name)))
+                .map_err(|_| invalid(format!("invalid content type of part {:.64}", part.name)))
         })
         .transpose()?
         .unwrap_or_default();
@@ -766,6 +799,23 @@ mod v2_tests {
 
     fn refused(request: FetchRequestV2) -> HttpErrorKind {
         planned(request).expect_err("refused").kind
+    }
+
+    #[test]
+    fn an_invalid_request_quotes_a_bounded_part_of_what_it_was_given() {
+        let long = "\u{e9}".repeat(1024 * 1024);
+        let method = planned(request(&long, "https://example.com/")).expect_err("refused");
+        assert!(method.message.len() <= 256, "{}", method.message.len());
+        let unsendable = MultipartPart {
+            content_type: Some("\n".into()),
+            ..part(&long, b"x")
+        };
+        let part = form(&[unsendable], BOUNDARY).expect_err("refused");
+        assert!(part.message.len() <= 256, "{}", part.message.len());
+        let name = header(&long, "v").expect_err("refused");
+        assert!(name.len() <= 256, "{}", name.len());
+        let value = header("x-a", "\n").expect_err("refused");
+        assert!(value.len() <= 256, "{}", value.len());
     }
 
     fn part(name: &str, body: &[u8]) -> MultipartPart {
@@ -1378,5 +1428,45 @@ mod v2_tests {
             ..request("GET", &metadata)
         };
         assert_eq!(failed(&roomy, to_metadata).await, HttpErrorKind::Denied);
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+    use crate::wasm_runtime::budget::testing::{self, MIB};
+
+    #[test]
+    fn a_full_width_fan_out_of_default_fetches_fits_a_small_containers_share() {
+        let (ledger, base) = testing::hold(742 * MIB);
+        let reservation = fetch_reservation(10 * MIB as u64);
+        let held: Vec<Hold> = (0..fanout_concurrency())
+            .map(|_| {
+                let mut held = base.sibling();
+                held.grow(reservation).expect("within the share");
+                held
+            })
+            .collect();
+        assert_eq!(ledger.in_use(), fanout_concurrency() * 10 * MIB);
+        drop(held);
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_finished_item_keeps_only_what_its_result_measures() {
+        let (ledger, mut held) = testing::hold(64 * MIB);
+        held.grow(10 * MIB).expect("fits");
+        held_at(&mut held, 2048).expect("smaller");
+        assert_eq!(ledger.in_use(), 2048);
+        held_at(&mut held, 12 * MIB).expect("fits");
+        assert_eq!(
+            ledger.in_use(),
+            12 * MIB,
+            "a base64 body larger than the reservation"
+        );
+        assert!(
+            held_at(&mut held, 65 * MIB).is_err(),
+            "a host buffer stays refusable"
+        );
     }
 }

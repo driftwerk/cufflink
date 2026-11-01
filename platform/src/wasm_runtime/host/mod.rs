@@ -1,3 +1,6 @@
+use super::budget::{
+    stepped, Capped, ChargedJson, ChargedJsonError, Hold, HostCaps, Meter, Refused,
+};
 use super::{wt, InvocationKind, WasmLimits};
 use crate::nats_manager::subjects::PublishScope;
 use crate::policy::PolicySet;
@@ -18,6 +21,7 @@ pub(crate) enum GuestReadError {
     InvalidLength,
     OutOfBounds,
     NotUtf8,
+    Refused,
 }
 
 impl GuestReadError {
@@ -46,6 +50,7 @@ mod limits;
 mod log;
 mod nats;
 mod redis;
+mod rows;
 mod service_call;
 mod storage;
 mod util;
@@ -56,13 +61,15 @@ pub use db::{
 };
 pub use db_v2::{call as db_v2_call, AbandonReason, DbSession, DbTarget};
 pub use http::{outbound_connect_timeout, FetchLimits};
-pub(crate) use limits::{GuestLimits, LimitContext};
+pub(crate) use limits::{BudgetDenial, GuestLimits, LimitContext};
 pub use nats::NatsPublishPolicy;
 #[cfg(test)]
 pub(crate) use redis::RESERVED_REDIS_KEY;
-pub(crate) use service_call::inbound_depth;
+pub use rows::{RowText, Stopped};
+pub(crate) use service_call::caller_depth;
 pub use service_call::LocalDispatch;
 pub use storage::{max_upload_bytes_from_env, DEFAULT_MAX_UPLOAD_BYTES};
+pub(crate) use storage::{read_object, Fetch};
 pub use util::{sleep_max_from_env, DEFAULT_SLEEP_MAX};
 
 pub(crate) fn guest_memory(caller: &mut Caller<'_, HostState>) -> Result<Memory, GuestReadError> {
@@ -116,18 +123,53 @@ fn checked_guest_len(
     })
 }
 
+pub(crate) struct GuestInput<T> {
+    value: T,
+    hold: Hold,
+}
+
+impl<T> std::ops::Deref for GuestInput<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for GuestInput<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+impl<T> GuestInput<T> {
+    pub(crate) fn into_parts(self) -> (T, Hold) {
+        (self.value, self.hold)
+    }
+}
+
 pub(crate) fn read_guest_bytes(
     caller: &mut Caller<'_, HostState>,
     host_fn: &'static str,
     ptr: i32,
     len: i32,
-) -> Result<Vec<u8>, GuestReadError> {
+) -> Result<GuestInput<Vec<u8>>, GuestReadError> {
     let memory = guest_memory(caller)?;
     let max = caller.data().limits.max_guest_len;
     let len = checked_guest_len(caller, host_fn, len, max)?;
-    let data = memory.data(&*caller);
-    let range = guest_range(ptr, len, data.len())?;
-    Ok(data[range].to_vec())
+    let range = guest_range(ptr, len, memory.data_size(&*caller))?;
+    let mut hold = caller.data().guest_limits.hold();
+    if let Err(capacity) = hold.grow(len) {
+        caller
+            .data_mut()
+            .guest_limits
+            .host_refused(Refused::Budget(capacity));
+        return Err(GuestReadError::Refused);
+    }
+    Ok(GuestInput {
+        value: memory.data(&*caller)[range].to_vec(),
+        hold,
+    })
 }
 
 pub(crate) fn read_guest_string(
@@ -135,21 +177,25 @@ pub(crate) fn read_guest_string(
     host_fn: &'static str,
     ptr: i32,
     len: i32,
-) -> Result<String, GuestReadError> {
-    String::from_utf8(read_guest_bytes(caller, host_fn, ptr, len)?)
+) -> Result<GuestInput<String>, GuestReadError> {
+    let (bytes, hold) = read_guest_bytes(caller, host_fn, ptr, len)?.into_parts();
+    String::from_utf8(bytes)
+        .map(|value| GuestInput { value, hold })
         .map_err(|_| GuestReadError::NotUtf8)
 }
 
-pub(crate) fn write_guest_bytes(
+pub(crate) fn copy_host_response(
     caller: &mut Caller<'_, HostState>,
-    host_fn: &'static str,
     ptr: i32,
     cap: i32,
-    bytes: &[u8],
 ) -> Result<usize, GuestReadError> {
     let memory = guest_memory(caller)?;
-    let cap = checked_guest_len(caller, host_fn, cap, usize::MAX)?;
-    copy_into_guest(memory.data_mut(&mut *caller), ptr, cap, bytes)
+    let cap = checked_guest_len(caller, "get_host_response", cap, usize::MAX)?;
+    let (data, state) = memory.data_and_store_mut(&mut *caller);
+    match &state.host_response {
+        Some(response) => copy_into_guest(data, ptr, cap, response.text.as_bytes()),
+        None => Ok(0),
+    }
 }
 
 fn copy_into_guest(
@@ -251,7 +297,7 @@ pub struct HostState {
     pub(crate) guest_limits: GuestLimits,
     pub kind: InvocationKind,
     pub policies: Arc<PolicySet>,
-    pub host_response: Option<String>,
+    host_response: Option<HostResponse>,
     pub db: DbSession,
     length_violation_logged: bool,
 }
@@ -291,6 +337,111 @@ impl HostState {
             cancel: self.cancel.clone(),
         }
     }
+
+    pub(crate) fn caps(&self) -> &HostCaps {
+        &self.limits.budget.caps
+    }
+
+    pub(crate) fn hold(&self) -> Hold {
+        self.guest_limits.hold()
+    }
+
+    pub(crate) fn host_response_len(&self) -> usize {
+        self.host_response
+            .as_ref()
+            .map_or(0, |response| response.text.len())
+    }
+
+    pub(crate) fn clear_host_response(&mut self) {
+        self.host_response = None;
+    }
+
+    pub(crate) fn set_charged_response(&mut self, text: String, hold: Hold) {
+        self.host_response = Some(HostResponse { text, _hold: hold });
+    }
+
+    pub(crate) fn set_host_response(
+        &mut self,
+        path: &'static str,
+        text: String,
+    ) -> Result<(), Refused> {
+        let hold = self.hold();
+        self.set_held_response(path, text, hold)
+    }
+
+    fn set_held_response(
+        &mut self,
+        path: &'static str,
+        text: String,
+        mut hold: Hold,
+    ) -> Result<(), Refused> {
+        self.host_response = None;
+        self.caps()
+            .response(path, text.len())
+            .map_err(Refused::Cap)?;
+        hold.grow(text.capacity().saturating_sub(hold.bytes()))
+            .map_err(Refused::Budget)?;
+        hold.shrink_to(text.capacity());
+        self.set_charged_response(text, hold);
+        Ok(())
+    }
+
+    pub(crate) fn respond(&mut self, path: &'static str, text: String) -> i32 {
+        match self.set_host_response(path, text) {
+            Ok(()) => 0,
+            Err(refused) => self.refused(refused),
+        }
+    }
+
+    pub(crate) fn respond_held(
+        &mut self,
+        path: &'static str,
+        text: Option<String>,
+        hold: Hold,
+    ) -> i32 {
+        match text.map(|text| self.set_held_response(path, text, hold)) {
+            Some(Ok(())) => 0,
+            Some(Err(refused)) => self.refused(refused),
+            None => {
+                self.clear_host_response();
+                0
+            }
+        }
+    }
+
+    pub(crate) fn respond_json<T: serde::Serialize + ?Sized>(
+        &mut self,
+        path: &'static str,
+        value: &T,
+    ) -> i32 {
+        self.host_response = None;
+        let limits = Arc::clone(&self.limits);
+        let mut hold = self.hold();
+        match ChargedJson::write(
+            value,
+            &mut Capped::new(&mut hold, &limits.budget.caps, path),
+        ) {
+            Ok(text) => {
+                self.set_charged_response(text, hold);
+                0
+            }
+            Err(ChargedJsonError::Capacity(refused)) => self.refused(refused),
+            Err(ChargedJsonError::Syntax(e)) => {
+                tracing::error!("[wasm] {path}: encode failed: {e}");
+                -1
+            }
+        }
+    }
+
+    pub(crate) fn refused(&mut self, refused: Refused) -> i32 {
+        self.guest_limits.host_refused(refused);
+        -1
+    }
+}
+
+struct HostResponse {
+    text: String,
+    _hold: Hold,
 }
 
 fn wrap<Params, Results>(
@@ -398,7 +549,7 @@ pub fn register_host_functions(
 }
 
 #[derive(serde::Serialize)]
-struct BatchResult {
+pub(crate) struct BatchResult {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none", flatten)]
     data: Option<serde_json::Value>,
@@ -421,6 +572,66 @@ impl BatchResult {
             error: Some(msg.to_string()),
         }
     }
+}
+
+pub(crate) struct ResponseText<'a> {
+    text: String,
+    cap: usize,
+    meter: Capped<'a, Hold>,
+}
+
+impl<'a> ResponseText<'a> {
+    pub(crate) fn new(hold: &'a mut Hold, caps: &'a HostCaps, path: &'static str) -> Self {
+        Self {
+            text: String::new(),
+            cap: caps.response,
+            meter: Capped::new(hold, caps, path),
+        }
+    }
+
+    pub(crate) fn push(&mut self, part: &str) -> Result<(), Refused> {
+        let needed = self.text.len().saturating_add(part.len());
+        if needed > self.text.capacity() {
+            let grown = stepped(needed).min(self.cap.max(needed));
+            self.meter.charge(grown - self.text.capacity())?;
+            self.text.reserve_exact(grown - self.text.len());
+        }
+        self.text.push_str(part);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.meter.credit(self.text.capacity());
+        self.text = String::new();
+    }
+
+    pub(crate) fn into_text(self) -> String {
+        self.text
+    }
+}
+
+pub(crate) async fn write_in_order<Fut>(
+    items: impl IntoIterator<Item = Fut>,
+    concurrency: usize,
+    out: &mut ResponseText<'_>,
+) -> Result<(), ChargedJsonError>
+where
+    Fut: Future<Output = Result<(BatchResult, Hold), Refused>>,
+{
+    use futures_util::StreamExt;
+    out.push("[").map_err(ChargedJsonError::Capacity)?;
+    let mut results = futures_util::stream::iter(items).buffered(concurrency.max(1));
+    let mut first = true;
+    while let Some(item) = results.next().await {
+        let (result, mut held) = item.map_err(ChargedJsonError::Capacity)?;
+        let text = ChargedJson::write(&result, &mut held)?;
+        drop(result);
+        if !std::mem::take(&mut first) {
+            out.push(",").map_err(ChargedJsonError::Capacity)?;
+        }
+        out.push(&text).map_err(ChargedJsonError::Capacity)?;
+    }
+    out.push("]").map_err(ChargedJsonError::Capacity)
 }
 
 const FETCH_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);

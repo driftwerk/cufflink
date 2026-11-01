@@ -1,9 +1,17 @@
 use super::CompiledModule;
 use crate::registry::ServiceIdentity;
+use axum::http::StatusCode;
 use cufflink_telemetry::{Kind, Scope};
+use cufflink_types::delivery::DeliveryControl;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug)]
+pub struct Answer {
+    pub status: StatusCode,
+    pub delivery: Option<DeliveryControl>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InvocationKind {
@@ -70,6 +78,8 @@ pub struct Invocation {
     pub scope_kind: Option<Kind>,
     pub budget: Duration,
     pub cancel: Option<CancellationToken>,
+    pub class: super::Class,
+    pub admission: Option<super::Admission>,
 }
 
 impl Invocation {
@@ -87,6 +97,8 @@ pub enum ExecutionError {
     DeadlineExceeded { budget: Duration },
     #[error("WASM execution aborted: platform is shutting down")]
     ShuttingDown,
+    #[error("WASM execution not started: platform is shutting down")]
+    NotStarted,
     #[error("WASM execution cancelled")]
     Cancelled,
     #[error(
@@ -95,18 +107,34 @@ pub enum ExecutionError {
     MemoryLimit { requested: usize, limit: usize },
     #[error("WASM guest returned an invalid response: {0}")]
     Response(String),
+    #[error("{reason}")]
+    Undelivered {
+        reason: String,
+        answer: Option<Answer>,
+    },
     #[error("Handler '{0}' not found in WASM module")]
     HandlerNotFound(String),
     #[error("WASM trap: {0}")]
     Trap(String),
     #[error("WASM runtime error: {0}")]
     Runtime(String),
+    #[error(
+        "WASM guest needs more memory than it may hold (requested {requested} bytes, limit \
+         {share} bytes)"
+    )]
+    TooLarge { requested: usize, share: usize },
+    #[error("WASM guest capacity exhausted ({reason})")]
+    Overloaded {
+        reason: super::budget::Reason,
+        retry_after: Duration,
+        ran: bool,
+    },
 }
 
 impl ExecutionError {
     pub fn interrupted_by_shutdown(&self, at_hard_deadline: bool) -> bool {
         match self {
-            ExecutionError::ShuttingDown => true,
+            ExecutionError::ShuttingDown | ExecutionError::NotStarted => true,
             ExecutionError::DeadlineExceeded { .. } => at_hard_deadline,
             _ => false,
         }
@@ -115,11 +143,14 @@ impl ExecutionError {
     pub(super) fn label(&self) -> &'static str {
         match self {
             ExecutionError::DeadlineExceeded { .. } => "timeout",
-            ExecutionError::ShuttingDown => "shutdown",
+            ExecutionError::ShuttingDown | ExecutionError::NotStarted => "shutdown",
             ExecutionError::Cancelled => "cancelled",
             ExecutionError::MemoryLimit { .. } => "memory_limit",
             ExecutionError::Trap(_) => "trap",
+            ExecutionError::Overloaded { .. } => "overloaded",
+            ExecutionError::TooLarge { .. } => "too_large",
             ExecutionError::Response(_)
+            | ExecutionError::Undelivered { .. }
             | ExecutionError::HandlerNotFound(_)
             | ExecutionError::Runtime(_) => "error",
         }
@@ -151,6 +182,7 @@ mod tests {
             budget: Duration::from_secs(30),
         };
         assert!(ExecutionError::ShuttingDown.interrupted_by_shutdown(false));
+        assert!(ExecutionError::NotStarted.interrupted_by_shutdown(false));
         assert!(deadline.interrupted_by_shutdown(true));
         assert!(!deadline.interrupted_by_shutdown(false));
         assert!(!ExecutionError::Runtime("join".into()).interrupted_by_shutdown(true));

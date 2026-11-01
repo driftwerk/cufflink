@@ -142,7 +142,7 @@ async fn response_v2_shapes() {
         json!({"error": "gone"})
     );
 
-    for name in ["set-cookie", "access-control-allow-origin", "x-request-id"] {
+    for name in ["set-cookie", "access-control-", "x-request-id"] {
         assert_eq!(
             platform
                 .metric("cufflink_guest_header_dropped_total", &[("name", name)])

@@ -1,6 +1,9 @@
-use super::{block_on_bounded, read_guest_string, wrap, HostState};
-use serde_json::{json, Value};
+use super::{block_on_bounded, read_guest_string, wrap, Fetch, HostIoError, HostState};
+use crate::wasm_runtime::budget::Refused;
+use crate::wasm_runtime::image::{transform, transform_multi, ImageBudget, Source};
+use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 use wasmtime::{Caller, Linker};
 
 pub(super) fn register(
@@ -43,9 +46,14 @@ pub(super) fn register(
             let in_key = host_try!(read_guest_string(&mut caller, FN, in_key_ptr, in_key_len));
             let targets_json =
                 host_try!(read_guest_string(&mut caller, FN, targets_ptr, targets_len));
+            let mut input = caller.data().hold();
+            if let Err(capacity) = input.grow(targets_json.len()) {
+                return caller.data_mut().refused(Refused::Budget(capacity));
+            }
             let Ok(targets) = serde_json::from_str::<Value>(&targets_json) else {
                 return -1;
             };
+            drop(targets_json);
 
             let parsed: Option<Vec<(String, u32, u8, crate::wasm_runtime::image::Format)>> =
                 targets.as_array().map(|items| {
@@ -80,22 +88,36 @@ pub(super) fn register(
             if !caller.data().authorize_storage(&bucket, &keys) {
                 return -1;
             }
+            drop(keys);
+            let limits = Arc::clone(&caller.data().limits);
+            let hold = caller.data().hold();
+            let budget = ImageBudget {
+                caps: &limits.budget.caps,
+                share: hold.share(),
+                path: FN,
+            };
+            if let Err(refused) = budget.targets(parsed.len()) {
+                return caller.data_mut().refused(refused);
+            }
 
             let app_state = caller.data().app_state.clone();
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| eyre::eyre!("storage not configured"))?;
-                crate::wasm_runtime::image::transform_multi(storage, &bucket, &in_key, parsed).await
+                let storage = app_state.storage.as_ref().ok_or_else(unconfigured)?;
+                let source = Source::read(storage, &budget, &bucket, &in_key, hold).await?;
+                transform_multi(storage, &budget, &bucket, source, parsed).await
             });
 
             match result {
-                Ok(sizes) => {
-                    let count = sizes.len() as i32;
-                    caller.data_mut().host_response = Some(json!(sizes).to_string());
-                    count
+                Ok(sizes) => match caller
+                    .data_mut()
+                    .respond_json("image_transform_multi", &sizes)
+                {
+                    0 => sizes.len() as i32,
+                    refused => refused,
+                },
+                Err(HostIoError::Failed(Fetch::Refused(refused))) => {
+                    caller.data_mut().refused(refused)
                 }
                 Err(e) => {
                     tracing::error!("[wasm] image_transform_multi error: {}", e);
@@ -106,6 +128,10 @@ pub(super) fn register(
     )?;
 
     Ok(())
+}
+
+fn unconfigured() -> Fetch {
+    Fetch::Failed(eyre::eyre!("storage not configured"))
 }
 
 fn register_image_transform(
@@ -154,16 +180,22 @@ fn register_image_transform(
             }
 
             let app_state = caller.data().app_state.clone();
+            let limits = Arc::clone(&caller.data().limits);
+            let hold = caller.data().hold();
+            let budget = ImageBudget {
+                caps: &limits.budget.caps,
+                share: hold.share(),
+                path: name,
+            };
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| eyre::eyre!("storage not configured"))?;
-                crate::wasm_runtime::image::transform(
+                let storage = app_state.storage.as_ref().ok_or_else(unconfigured)?;
+                let source = Source::read(storage, &budget, &bucket, &in_key, hold).await?;
+                transform(
                     storage,
+                    &budget,
                     &bucket,
-                    &in_key,
+                    source,
                     &out_key,
                     max_dim as u32,
                     quality as u8,
@@ -174,6 +206,9 @@ fn register_image_transform(
 
             match result {
                 Ok(bytes) => bytes as i32,
+                Err(HostIoError::Failed(Fetch::Refused(refused))) => {
+                    caller.data_mut().refused(refused)
+                }
                 Err(e) => {
                     tracing::error!("[wasm] {} error: {}", name, e);
                     -1
