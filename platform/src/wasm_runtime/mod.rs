@@ -1147,12 +1147,20 @@ impl WasmEngine {
             .call(&mut *store, request_len)
             .map_err(|e| classify(store, e, inv.budget, &self.budget))?;
         let request_ptr = usize::try_from(request_ptr).map_err(|_| {
-            ExecutionError::Runtime("guest allocator returned a negative pointer".into())
+            unplaced(
+                store,
+                "guest allocator returned a negative pointer".into(),
+                &self.budget,
+            )
         })?;
         memory
             .write(&mut *store, request_ptr, request_bytes)
             .map_err(|e| {
-                ExecutionError::Runtime(format!("write request into guest memory: {e}"))
+                unplaced(
+                    store,
+                    format!("write request into guest memory: {e}"),
+                    &self.budget,
+                )
             })?;
 
         let handle_fn = instance
@@ -1223,6 +1231,14 @@ fn denied(denial: host::BudgetDenial, memory: &budget::Budget, ran: bool) -> Exe
 
 fn unrun(denial: host::BudgetDenial, memory: &budget::Budget) -> ExecutionError {
     denied(denial, memory, false)
+}
+
+fn unplaced(store: &Store<HostState>, reason: String, memory: &budget::Budget) -> ExecutionError {
+    let limits = &store.data().guest_limits;
+    match (limits.denied(), limits.budget_denial()) {
+        (None, Some(denial)) => unrun(denial, memory),
+        _ => ExecutionError::Runtime(reason),
+    }
 }
 
 fn undelivered(reason: String, text: &[u8]) -> ExecutionError {
@@ -2514,6 +2530,181 @@ pub(crate) mod tests {
             ),
             "a denied 40 MiB step of an 80 MiB guest is its own size, not capacity: {err:?}"
         );
+    }
+
+    const PAST_ITS_MEMORY: i32 = 131_072;
+
+    fn careless_guest(alloc: &str) -> String {
+        format!(
+            r#"(module
+              (memory (export "memory") 2)
+              (func (export "alloc") (param $n i32) (result i32) {alloc})
+              (func (export "refused") (param i32 i32) (result i32) (unreachable))
+              (func (export "answers") (param i32 i32) (result i32) (i32.const 0)))"#
+        )
+    }
+
+    fn ignoring_a_failed_grow(pointer: i32) -> String {
+        careless_guest(&format!(
+            "(if (i32.eq (memory.grow (i32.shr_u (local.get $n) (i32.const 16))) (i32.const -1))
+               (then (return (i32.const {pointer}))))
+             (i32.const 1024)"
+        ))
+    }
+
+    fn sized(call: Invocation, bytes: usize) -> Invocation {
+        Invocation {
+            request_json: "x".repeat(bytes),
+            ..call
+        }
+    }
+
+    fn held_elsewhere(engine: &WasmEngine, handler: &str) -> budget::Charge {
+        engine.budget.record_sample(Uuid::nil(), handler, MIB);
+        let other = super::budget::ServiceKey {
+            tenant: "globex".into(),
+            service: "loan-service".into(),
+        };
+        engine
+            .budget
+            .ledger()
+            .expect("a ledger")
+            .try_reserve(Class::Interactive, &other, 40 * MIB)
+            .expect("fits")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_denied_its_memory_is_unrun_whatever_the_allocator_returns() {
+        for pointer in [PAST_ITS_MEMORY, -1] {
+            let engine = budgeted("enforce", "64");
+            let (_, compiled) = install(&engine, &ignoring_a_failed_grow(pointer));
+            let state = AppState::minimal(engine.clone()).await;
+            let held = held_elsewhere(&engine, "refused");
+            let call = invocation(
+                compiled,
+                "refused",
+                InvocationKind::Route,
+                Duration::from_secs(5),
+            );
+            let err = engine
+                .run_text(state, sized(call, 32 * MIB))
+                .await
+                .expect_err("denied before its handler");
+            assert!(
+                matches!(err, ExecutionError::Overloaded { ran: false, .. }),
+                "{err:?}"
+            );
+            let response = axum::response::IntoResponse::into_response(
+                crate::router::map_execution_error("WASM", err),
+            );
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER));
+            drop(held);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_past_the_whole_share_is_too_large_whatever_the_allocator_returns() {
+        for pointer in [PAST_ITS_MEMORY, -1] {
+            let engine = budgeted("enforce", "64");
+            let (_, compiled) = install(&engine, &ignoring_a_failed_grow(pointer));
+            let state = AppState::minimal(engine.clone()).await;
+            engine.budget.record_sample(Uuid::nil(), "refused", MIB);
+            let call = invocation(
+                compiled,
+                "refused",
+                InvocationKind::Route,
+                Duration::from_secs(5),
+            );
+            let err = engine
+                .run_text(state, sized(call, 80 * MIB))
+                .await
+                .expect_err("can never fit");
+            assert!(
+                matches!(err, ExecutionError::TooLarge { requested, share } if requested > share),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_warn_a_request_past_the_budget_reaches_its_handler() {
+        let engine = budgeted("warn", "64");
+        let (_, compiled) = install(&engine, &ignoring_a_failed_grow(PAST_ITS_MEMORY));
+        let state = AppState::minimal(engine.clone()).await;
+        let held = held_elsewhere(&engine, "answers");
+        let call = invocation(
+            compiled,
+            "answers",
+            InvocationKind::Route,
+            Duration::from_secs(5),
+        );
+        engine
+            .run_text(state, sized(call, 32 * MIB))
+            .await
+            .expect("warn denies nothing");
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bad_pointer_with_no_denial_stays_a_runtime_error_in_every_mode() {
+        for mode in ["off", "warn", "enforce"] {
+            for (pointer, said) in [
+                (PAST_ITS_MEMORY, "write request into guest memory"),
+                (-1, "negative pointer"),
+            ] {
+                let engine = budgeted(mode, "64");
+                let alloc = format!("(i32.const {pointer})");
+                let (_, compiled) = install(&engine, &careless_guest(&alloc));
+                let state = AppState::minimal(engine.clone()).await;
+                let err = engine
+                    .run_text(
+                        state,
+                        invocation(
+                            compiled,
+                            "refused",
+                            InvocationKind::Route,
+                            Duration::from_secs(5),
+                        ),
+                    )
+                    .await
+                    .expect_err("nowhere to put the request");
+                assert!(
+                    matches!(&err, ExecutionError::Runtime(reason) if reason.contains(said)),
+                    "{mode}: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_past_the_memory_cap_is_not_told_to_retry() {
+        let engine = budgeted("enforce", "64");
+        let past_the_cap_then_the_share = format!(
+            "(drop (memory.grow (i32.const 16384)))
+             (drop (memory.grow (i32.const 2048)))
+             (i32.const {PAST_ITS_MEMORY})"
+        );
+        let (_, compiled) = install(&engine, &careless_guest(&past_the_cap_then_the_share));
+        let state = AppState::minimal_with_policies(engine.clone(), &enforce_wasm_limits()).await;
+        let err = engine
+            .run_text(
+                state,
+                invocation(
+                    compiled,
+                    "refused",
+                    InvocationKind::Route,
+                    Duration::from_secs(5),
+                ),
+            )
+            .await
+            .expect_err("denied by both");
+        assert!(matches!(err, ExecutionError::Runtime(_)), "{err:?}");
     }
 
     fn charged_classes(ledger: &budget::Ledger) -> usize {

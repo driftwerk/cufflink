@@ -1326,6 +1326,10 @@ describing each rule:
   - A trap after a denial is `Overloaded`.
   - A guest that handles `-1` and answers keeps its answer.
   - A denial larger than the service share is `TooLarge`.
+  - A denied grow that leaves the host nowhere to write the request, an
+    allocator's negative pointer or one past its memory, is `Overloaded`
+    with `ran: false`, or `TooLarge`. With no denial it stays a runtime
+    error.
 - **`memory_growing` never blocks.** A WAT guest growing past the budget
   gets `-1` at once, under `enforce`. Under `warn` the grow succeeds and is
   counted.

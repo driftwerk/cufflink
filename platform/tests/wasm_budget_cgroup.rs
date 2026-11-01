@@ -198,12 +198,20 @@ async fn large_bodies_and_an_oversized_query_stay_inside_the_limit() {
     let echoes =
         futures_util::future::join_all((0..4).map(|_| limited.post("echo", body.clone()))).await;
     for (status, answer) in &echoes {
-        assert!(matches!(status, 200 | 503), "{status}: {answer}");
+        assert!(
+            matches!(status, 200 | 503),
+            "{status}: {answer}\n{}",
+            limited.platform.output_tail()
+        );
     }
     let queries =
         futures_util::future::join_all((0..3).map(|_| limited.post("big_query", json!({})))).await;
     for (status, answer) in &queries {
-        assert!(matches!(status, 200 | 503), "{status}: {answer}");
+        assert!(
+            matches!(status, 200 | 503),
+            "{status}: {answer}\n{}",
+            limited.platform.output_tail()
+        );
         if *status == 200 {
             assert_eq!(answer, &json!({"rc": -1}));
         }
