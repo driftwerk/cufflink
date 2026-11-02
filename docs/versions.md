@@ -1222,6 +1222,11 @@ The guest memory budget and route concurrency limits
 `warn` by default. v0.34.0 was versioned but never published, so its
 licence change below first ships in this release.
 
+Also the first release of `cufflink-model` (0.1.0), which runs trained text
+classifiers inside a service, with a Python toolkit in `ml/` to train and
+export them ([Text classifiers](models.md)). It's a separate crate with no
+platform feature; services that don't depend on it are unaffected.
+
 ## Changes in v0.34.0
 
 No new module-declared feature and no change in behaviour. The platform and
