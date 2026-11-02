@@ -28,3 +28,8 @@ data/
 
 *.dSYM/
 debug/
+
+# Python toolkit
+ml/.venv/
+__pycache__/
+.pytest_cache/

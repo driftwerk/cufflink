@@ -1247,6 +1247,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cufflink-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cufflink-native"
 version = "0.7.0"
 dependencies = [
