@@ -1,0 +1,16 @@
+[package]
+name = "cufflink-model"
+version = "0.1.0"
+edition = "2021"
+description = "Run small trained text classifiers inside Cufflink services, natively or in WASM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+keywords = ["classifier", "ngram", "wasm", "inference", "nlp"]
+categories = ["wasm", "text-processing", "science"]
+readme = "../README.md"
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

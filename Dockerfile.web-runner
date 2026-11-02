@@ -22,6 +22,7 @@ COPY sdk/ sdk/
 COPY sdk-macros/ sdk-macros/
 COPY cli/ cli/
 COPY cufflink-fn/ cufflink-fn/
+COPY model/ model/
 COPY supervisor/ supervisor/
 COPY web-runner/ web-runner/
 COPY ext-runner/ ext-runner/
