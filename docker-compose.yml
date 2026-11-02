@@ -16,7 +16,7 @@ services:
       retries: 5
 
   nats:
-    image: nats:2.15-alpine@sha256:7ae34c25dfd6fe2e01c6483eabef20d796690fdcac6c4d94ca780a6cf9877fde
+    image: nats:2.15-alpine@sha256:823e7f1d6d8ffe3b30dbd73d4a06bbb939acf94929f7fdf224404da7a05bafb5
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     ports:
       - "4222:4222"
@@ -45,7 +45,7 @@ services:
       retries: 5
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8@sha256:a78d6b79572168cb25886b80a8b5b8d4ed4390743e3eecb810538683e209dd6b
+    image: quay.io/keycloak/keycloak:26.8@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
     command: start-dev --import-realm
     environment:
       KC_DB: postgres
@@ -65,7 +65,7 @@ services:
         condition: service_healthy
 
   redis:
-    image: redis:8.10-alpine@sha256:0bf6577d7774e592b29d093e3ac9390eb91e13d72c21e506afce736de5e0eeb0
+    image: redis:8.10-alpine@sha256:21090af93f8324db2f0f0f4f38a7c60369d47d917e000c3423d89d2ae2883537
     ports:
       - "6379:6379"
     healthcheck:
@@ -86,7 +86,7 @@ services:
       - rustfsdata:/data
 
   bucket-init:
-    image: amazon/aws-cli:latest@sha256:c8156a0e74e13929a42d7e60f0d4e14e7d28d980cd21822505d4bff80e5460c1
+    image: amazon/aws-cli:latest@sha256:d557b3524475d70dd3104cf44d96568ee3188897b73a6ece2b37aa50e1af362f
     environment:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
@@ -106,7 +106,7 @@ services:
     restart: "no"
 
   platform:
-    image: kingsleyh/cufflink-platform:latest@sha256:69fd77b39c5caca215c2d875bd9b5b60bd7a433363893409da0785ddc10622b5
+    image: kingsleyh/cufflink-platform:latest@sha256:80a3b2627674988852fc1fdc3b208bcfeec8e5491831e8db33d084dc384fa184
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -145,7 +145,7 @@ services:
         condition: service_started
 
   wasm-worker:
-    image: kingsleyh/cufflink-worker:latest@sha256:ef3a629980f174388e76aff27e2264c7a7525b26b2988be205f0337590a90b87
+    image: kingsleyh/cufflink-worker:latest@sha256:03fbf03603d8065ad462cd8aeff90b411e19e988c5bf225bfbee9c9a2536fe01
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -172,7 +172,7 @@ services:
         condition: service_started
 
   tenant-init:
-    image: curlimages/curl:8.23.0@sha256:11e64e28c5f58c8d93ee95fcf22ac055f48b0bc440e0ce7d8013bbb5ad6aa8ac
+    image: curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
     entrypoint: ["/bin/sh", "/bootstrap-tenant.sh"]
     volumes:
       - ./infra/compose/bootstrap-tenant.sh:/bootstrap-tenant.sh:ro
@@ -184,7 +184,7 @@ services:
     restart: "no"
 
   otel-collector:
-    image: &collector otel/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
+    image: &collector otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b
     volumes:
       - ./infra/monitoring/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
@@ -235,7 +235,7 @@ services:
       - "9090:9090"
 
   grafana:
-    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
     volumes:
       - ./infra/monitoring/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
       - ./infra/monitoring/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
@@ -252,7 +252,7 @@ services:
       - loki
 
   web-runner:
-    image: kingsleyh/cufflink-web-runner:latest@sha256:a3165454730f4ff3eeb09f8ccfc33ae8b4e370bbe592fcf8bbc847c938e5b13e
+    image: kingsleyh/cufflink-web-runner:latest@sha256:8f9927bb6e8a5f238c3c9109e5972b2f7711ff09cf42c905f065eec46b580898
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -289,7 +289,7 @@ services:
         condition: service_started
 
   ext-runner:
-    image: kingsleyh/cufflink-ext-runner:latest@sha256:563ca576daa8e534d7a4e29e1651ceefe067a8fcbdee6248bceea953aecbcba2
+    image: kingsleyh/cufflink-ext-runner:latest@sha256:20d0df6cf882ee37364d8193e7525cab12083b7da0fcbf1e703c9a16a90fd940
     profiles: ["ext-runner"]
     stop_grace_period: 50s
     platform: linux/amd64
