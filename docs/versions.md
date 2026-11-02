@@ -1215,6 +1215,13 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.35.0
+
+The guest memory budget and route concurrency limits
+([features](#features-added-in-v0350)), with `WASM_MEMORY_BUDGET_MODE`
+`warn` by default. v0.34.0 was versioned but never published, so its
+licence change below first ships in this release.
+
 ## Changes in v0.34.0
 
 No new module-declared feature and no change in behaviour. The platform and
