@@ -48,10 +48,20 @@ pub(super) struct V2 {
 enum Body {
     Empty,
     Json(Value),
-    Bytes { content_type: String, data: Vec<u8> },
+    Bytes {
+        content_type: String,
+        data: Vec<u8>,
+    },
     S3(S3Object),
     Sse(SseSpec),
+    /// One JSON value, as the guest rendered it.
+    #[cfg(feature = "response-raw-json")]
+    RawJson(String),
 }
+
+/// The envelope key of a raw JSON body, whose value is the body's text as
+/// it is.
+const BODY_RAW: &str = "__body_raw";
 
 /// An object the platform streams from storage as the response body, so a
 /// large file never passes through the guest. The guest's own storage
@@ -91,6 +101,8 @@ impl V2 {
         match &self.body {
             Body::Json(value) => value.to_string().into_bytes(),
             Body::Bytes { data, .. } => data.clone(),
+            #[cfg(feature = "response-raw-json")]
+            Body::RawJson(text) => text.clone().into_bytes(),
             Body::Empty | Body::S3(_) | Body::Sse(_) => Vec::new(),
         }
     }
@@ -105,16 +117,39 @@ impl V2 {
         self
     }
 
-    pub(super) fn envelope(self) -> Value {
+    /// The envelope's text. A raw JSON body is written into it as it is,
+    /// after every other key, so it is neither parsed nor escaped.
+    pub(super) fn into_text(self) -> String {
+        let (head, raw) = self.envelope();
+        let mut envelope = Value::Object(head).to_string();
+        match raw {
+            None => envelope,
+            Some(text) => {
+                envelope.pop();
+                envelope.reserve_exact(text.len() + 2 * BODY_RAW.len());
+                envelope.push_str(",\"");
+                envelope.push_str(BODY_RAW);
+                envelope.push_str("\":");
+                envelope.push_str(&text);
+                envelope.push('}');
+                envelope
+            }
+        }
+    }
+
+    /// The envelope's keys, and the text of a raw JSON body, which is no
+    /// value of it.
+    fn envelope(self) -> (Map<String, Value>, Option<String>) {
         let mut envelope = Map::from_iter([
             ("__v".to_string(), json!(2)),
             ("__status".to_string(), json!(self.status)),
             ("__headers".to_string(), json!(self.headers)),
         ]);
-        match self.body {
-            Body::Empty => {}
+        let raw = match self.body {
+            Body::Empty => None,
             Body::Json(value) => {
                 envelope.insert("__body".into(), value);
+                None
             }
             Body::Bytes { content_type, data } => {
                 envelope.insert("__content_type".into(), Value::String(content_type));
@@ -122,9 +157,11 @@ impl V2 {
                     "__body_b64".into(),
                     Value::String(general_purpose::STANDARD.encode(data)),
                 );
+                None
             }
             Body::Sse(spec) => {
                 envelope.insert("__sse".into(), spec.envelope());
+                None
             }
             Body::S3(object) => {
                 envelope.insert(
@@ -136,13 +173,16 @@ impl V2 {
                         "content_type": object.content_type,
                     }),
                 );
+                None
             }
-        }
+            #[cfg(feature = "response-raw-json")]
+            Body::RawJson(text) => Some(text),
+        };
         envelope.extend(
             self.delivery
                 .map(|delivery| (DELIVERY_KEY.to_string(), json!(delivery))),
         );
-        Value::Object(envelope)
+        (envelope, raw)
     }
 }
 
@@ -229,6 +269,21 @@ impl Response {
                 data: body,
             },
         ))
+    }
+
+    /// A 200 whose body is `json`, one JSON value the handler has already
+    /// rendered (rows the database rendered as JSON, say), sent as it is
+    /// with `application/json`: the platform neither parses it into a tree
+    /// nor encodes it, so a large answer costs its length once. Whitespace
+    /// around the value is dropped; everything inside it, key order and
+    /// escapes included, reaches the client unchanged. Fails when `json` is
+    /// not one JSON value. Needs the platform feature `response_raw_json`.
+    #[cfg(feature = "response-raw-json")]
+    pub fn json_text(mut json: String) -> serde_json::Result<Self> {
+        serde_json::from_str::<serde::de::IgnoredAny>(&json)?;
+        json.truncate(json.trim_end().len());
+        json.drain(..json.len() - json.trim_start().len());
+        Ok(Self::v2(V2::new(200, Body::RawJson(json))))
     }
 
     /// A file download: `Content-Disposition: attachment`.
@@ -434,6 +489,37 @@ mod tests {
                 retry_after_ms: u64::MAX
             })
         );
+    }
+
+    #[cfg(feature = "response-raw-json")]
+    #[test]
+    fn a_raw_json_body_is_written_into_the_envelope_as_it_is() {
+        let text = "{\"b\": 1,  \"a\": [\"\\u00e9\\n\", 2.50, {\"__body_raw\": null}]}";
+        let response = Response::json_text(format!(" \n{text}\t "))
+            .expect("one JSON value")
+            .with_status(201)
+            .header("X-Total", "1");
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.body_bytes(), text.as_bytes());
+        assert_eq!(
+            response.json_as::<Value>().expect("json"),
+            serde_json::from_str::<Value>(text).expect("text")
+        );
+        let data = response.into_data();
+        assert!(
+            data.ends_with(&format!(",\"__body_raw\":{text}}}")),
+            "{data}"
+        );
+        assert_eq!(
+            envelope(Response::json_text("[]".into()).expect("json")),
+            json!({"__v": 2, "__status": 200, "__headers": {}, "__body_raw": []})
+        );
+        for invalid in ["", " ", "{", "1 2", "{\"a\":}", "NaN", "{} x"] {
+            assert!(
+                Response::json_text(invalid.to_string()).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
