@@ -43,7 +43,9 @@ pub use config::ConfigMap;
 pub use cufflink_migrate::Plan;
 pub use cufflink_pgcodec::pooler::Pooler;
 pub use cufflink_types::{HistoryMode, MigrationHistory, MigrationLock};
-pub use db::{PgHost, PgOptions, PgRole, ServiceRole, TestDb};
+pub use db::{
+    CloneStrategy, PgHost, PgOptions, PgRole, ServiceRole, TemplateDb, TestDb, TestTemplate,
+};
 pub use error::TestHostError;
 #[cfg(feature = "ext-call")]
 pub use ext::{ExpectingExt, MockExtensions};

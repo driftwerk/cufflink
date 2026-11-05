@@ -24,6 +24,7 @@ pub(crate) const FEATURES: &[&str] = &[
     cufflink_types::features::ROUTE_LIMITS,
     cufflink_types::features::ROUTE_CONCURRENCY,
     cufflink_types::features::RESPONSE_V2,
+    cufflink_types::features::RESPONSE_RAW_JSON,
     cufflink_types::features::ERROR_PROFILE,
     cufflink_types::features::SSE_BRIDGE,
     cufflink_types::features::TYPED_ROUTES,

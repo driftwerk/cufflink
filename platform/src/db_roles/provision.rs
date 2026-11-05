@@ -4,6 +4,7 @@ use crate::db_roles::turns::Turns;
 use crate::db_roles::verify::{
     self, membership_grant, switch_privilege, Candidate, Verdict, VerifyReport, PG16,
 };
+use crate::deployer::manifest::ServiceManifest;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::policy::config::DbRolesConfig;
 use crate::policy::{PolicyKey, PolicyMode};
@@ -63,6 +64,7 @@ pub struct Catalog {
 pub struct Spec<'a> {
     pub role: &'a str,
     pub managed: bool,
+    pub enqueues: bool,
     pub marker: &'a str,
     pub service: &'a str,
     pub schema: &'a str,
@@ -257,8 +259,12 @@ fn reader_statements<'a>(spec: &'a Spec<'_>) -> impl Iterator<Item = String> + u
 }
 
 fn cufflink_statements(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
-    match catalog.cufflink_schema && (spec.managed || catalog.role_exists) {
-        true => std::iter::once(format!(
+    match (
+        catalog.cufflink_schema && (spec.managed || catalog.role_exists),
+        spec.enqueues,
+    ) {
+        (false, _) => vec![],
+        (true, true) => std::iter::once(format!(
             "GRANT USAGE ON SCHEMA {CUFFLINK_SCHEMA} TO {}",
             quote_ident(spec.role)
         ))
@@ -268,7 +274,7 @@ fn cufflink_statements(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
             catalog.enqueue,
         ))
         .collect(),
-        false => vec![],
+        (true, false) => enqueue::narrowing(spec.role, spec.service, catalog.enqueue),
     }
 }
 
@@ -591,6 +597,10 @@ pub struct Provisioning<'a> {
     pub policy: PolicyMode,
     pub config: &'a DbRolesConfig,
     pub actor: &'a str,
+    /// The version being deployed, if any. The role is granted the outbox
+    /// when it or the version the service runs is one the platform
+    /// enqueues for ([`enqueue::in_session`]).
+    pub deploying: Option<&'a ServiceManifest>,
 }
 
 pub async fn apply(
@@ -707,8 +717,14 @@ async fn apply_locked(
         policy,
         config,
         actor,
+        deploying,
     } = *provisioning;
     let existing = service_db_roles::get(platform, service.id).await?;
+    let enqueues = verify::active_manifest(platform, service.id)
+        .await?
+        .iter()
+        .chain(deploying)
+        .any(enqueue::in_session);
     let schema = service.schema();
     let target = target(existing.as_ref(), &change, policy, || {
         names::managed_role(&tenant.slug, &schema, tenant.id, service.id)
@@ -764,6 +780,7 @@ async fn apply_locked(
     let spec = Spec {
         role: &target.role,
         managed: target.managed,
+        enqueues,
         marker: &marker,
         service: &service.name,
         schema: &schema,
@@ -801,6 +818,7 @@ async fn apply_locked(
         &Candidate {
             role: &target.role,
             managed: target.managed,
+            enqueues,
             read_only_role: target.read_only_role.as_deref(),
             password: opened.as_ref(),
         },
@@ -869,14 +887,16 @@ fn unbindable(name: &str, role: &verify::RoleFacts) -> Option<String> {
     ))
 }
 
+async fn entry(state: &AppState, tenant_id: Uuid) -> Option<Arc<TenantEntry>> {
+    state.tenants.get_or_load(tenant_id).await.ok().flatten()
+}
+
+fn asks(entry: &TenantEntry) -> bool {
+    entry.mode(PolicyKey::DbRoles) != PolicyMode::Off
+}
+
 async fn asking(state: &AppState, tenant_id: Uuid) -> Option<Arc<TenantEntry>> {
-    state
-        .tenants
-        .get_or_load(tenant_id)
-        .await
-        .ok()
-        .flatten()
-        .filter(|entry| entry.mode(PolicyKey::DbRoles) != PolicyMode::Off)
+    entry(state, tenant_id).await.filter(|entry| asks(entry))
 }
 
 async fn verified(state: &AppState, service_id: Uuid) -> PlatformResult<bool> {
@@ -887,12 +907,16 @@ async fn verified(state: &AppState, service_id: Uuid) -> PlatformResult<bool> {
     )
 }
 
-async fn refresh(state: &AppState, entry: &TenantEntry, service_id: Uuid) {
-    let service = match crate::repo::services::get_by_id(&state.platform_db, service_id).await {
-        Ok(Some(service)) => service,
-        _ => return,
-    };
-    let refreshed = apply(
+async fn refresh(
+    state: &AppState,
+    entry: &TenantEntry,
+    service_id: Uuid,
+    deploying: Option<&ServiceManifest>,
+) -> PlatformResult<()> {
+    let service = crate::repo::services::get_by_id(&state.platform_db, service_id)
+        .await?
+        .ok_or_else(|| PlatformError::NotFound("Service not found".into()))?;
+    apply(
         state,
         &Provisioning {
             tenant: &entry.tenant,
@@ -900,11 +924,13 @@ async fn refresh(state: &AppState, entry: &TenantEntry, service_id: Uuid) {
             policy: entry.mode(PolicyKey::DbRoles),
             config: entry.config::<DbRolesConfig>(),
             actor: PLATFORM_ACTOR,
+            deploying,
         },
         Change::default(),
     )
-    .await;
-    if let Err(e) = refreshed {
+    .await
+    .map(drop)
+    .inspect_err(|e| {
         metrics::counter!("cufflink_db_role_provision_failures_total", "tenant" => entry.tenant.slug.clone(), "service" => service.name.clone()).increment(1);
         error!(
             tenant = %entry.tenant.slug,
@@ -912,21 +938,70 @@ async fn refresh(state: &AppState, entry: &TenantEntry, service_id: Uuid) {
             error = %e,
             "Database role could not be provisioned for the deploy; `cufflink services db-role verify` reports what is missing"
         );
+    })
+}
+
+/// Whether the version the service runs is one the platform enqueues for;
+/// a version that cannot be read is taken as one that is not, so the
+/// caller provisions for the coming version rather than skip it.
+async fn running_enqueues(state: &AppState, service_id: Uuid) -> bool {
+    let read = async { verify::active_manifest(&state.platform_db.get().await?, service_id).await };
+    match read.await {
+        Ok(active) => active.as_ref().is_some_and(enqueue::in_session),
+        Err(e) => {
+            warn!(service_id = %service_id, error = %e, "The running version could not be read; its database role is provisioned for the coming one");
+            false
+        }
     }
 }
 
-pub async fn before_deploy(state: &AppState, tenant_id: Uuid, service_id: Uuid) {
-    let Some(entry) = asking(state, tenant_id).await else {
-        return;
+async fn verified_or_not(state: &AppState, service_id: Uuid) -> bool {
+    verified(state, service_id).await.unwrap_or_else(|e| {
+        warn!(service_id = %service_id, error = %e, "The database role binding could not be read before the deploy");
+        false
+    })
+}
+
+/// Before `deploying` is activated. A verified binding of a service the
+/// platform comes to enqueue for, and did not, is granted the outbox first,
+/// whatever the tenant's policy, and the deploy fails when it cannot be: a
+/// verified role is one sessions use, now or once the policy asks.
+/// Otherwise a binding not yet verified is provisioned, when the policy
+/// asks, as before, and a failure is logged.
+pub async fn before_deploy(
+    state: &AppState,
+    tenant_id: Uuid,
+    service_id: Uuid,
+    deploying: &ServiceManifest,
+) -> PlatformResult<()> {
+    let Some(entry) = entry(state, tenant_id).await else {
+        return Ok(());
     };
-    if !verified(state, service_id).await.unwrap_or(false) {
-        refresh(state, &entry, service_id).await;
+    let coming = enqueue::in_session(deploying);
+    if !coming && !asks(&entry) {
+        return Ok(());
+    }
+    match (
+        coming,
+        verified_or_not(state, service_id).await,
+        asks(&entry),
+    ) {
+        (true, true, _) if !running_enqueues(state, service_id).await => {
+            refresh(state, &entry, service_id, Some(deploying)).await
+        }
+        (_, false, true) => {
+            let _ = refresh(state, &entry, service_id, Some(deploying)).await;
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
+/// After a version is activated: the binding is provisioned for it. A
+/// grant the service no longer needs is not taken back; verify reports it.
 pub async fn after_deploy(state: &AppState, tenant_id: Uuid, service_id: Uuid) {
     if let Some(entry) = asking(state, tenant_id).await {
-        refresh(state, &entry, service_id).await;
+        let _ = refresh(state, &entry, service_id, None).await;
     }
 }
 
@@ -971,6 +1046,7 @@ mod tests {
         Spec {
             role: "svc_default_stock_service",
             managed: true,
+            enqueues: true,
             marker: MARKER,
             service: "stock-service",
             schema: "stock_service",
@@ -1020,6 +1096,32 @@ mod tests {
                 "ALTER DEFAULT PRIVILEGES FOR ROLE \"svc_default_stock_service\" IN SCHEMA \"stock_service\" GRANT SELECT ON SEQUENCES TO \"dashboard_ro\"",
                 "GRANT \"reports_ro\" TO \"svc_default_stock_service\" WITH INHERIT FALSE, SET TRUE",
             ]
+        );
+    }
+
+    #[test]
+    fn a_role_the_platform_never_enqueues_as_is_granted_nothing_of_its_schema() {
+        let readers = ["reporting_owner".to_string()];
+        let granted = sql(&spec(&readers), &catalog());
+        let bare = sql(
+            &Spec {
+                enqueues: false,
+                ..spec(&readers)
+            },
+            &catalog(),
+        );
+        assert!(
+            bare.iter()
+                .all(|statement| !statement.contains("_cufflink")),
+            "{bare:?}"
+        );
+        assert_eq!(
+            bare,
+            granted
+                .into_iter()
+                .filter(|statement| !statement.contains("_cufflink"))
+                .collect::<Vec<_>>(),
+            "and everything else it is given as before"
         );
     }
 
@@ -1266,6 +1368,7 @@ mod tests {
             &Spec {
                 role: "loan_service_user",
                 managed: false,
+                enqueues: true,
                 marker: MARKER,
                 service: "loan-service",
                 schema: "loan_service",

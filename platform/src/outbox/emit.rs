@@ -6,6 +6,7 @@ use super::writer::{OutboxKind, OutboxRow, OutboxWriter};
 use crate::audit::{self, Actor, AuditRecord, Read};
 use crate::auth::scope::EffectiveScope;
 use crate::auth::AuthUser;
+use crate::db_roles::enqueue;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::nats_conn::{publish_bounded, spawn_publish};
 use crate::policy::{PolicyKey, PolicyMode};
@@ -385,14 +386,15 @@ impl<'a> Sink<'a> {
             self.tenant_slug.to_string(),
         );
         let carries = max_payload(&self.state.nats);
+        let purpose = match enqueue::in_session(&self.service.manifest) {
+            true => Purpose::Crud,
+            false => Purpose::Platform,
+        };
         self.state.shutdown.spawn("audit_outbox", async move {
             let written = tokio::time::timeout(RECORD_WITHIN, async {
                 carries.map_or(Ok(()), |max_payload| carried(&rows, max_payload))?;
                 let seal = Self::seal(&state)?;
-                let sessions = state
-                    .tenant_sessions
-                    .service(&identity, Purpose::Crud)
-                    .await?;
+                let sessions = state.tenant_sessions.service(&identity, purpose).await?;
                 let client = sessions.get().await?;
                 Ok::<_, PlatformError>(
                     OutboxWriter::new(&client, identity.tenant_id, &tenant_slug, seal)

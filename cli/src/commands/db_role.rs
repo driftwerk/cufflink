@@ -104,25 +104,41 @@ fn print_binding(body: &Value) {
 }
 
 fn print_report(report: &Value) {
-    for check in report["checks"].as_array().into_iter().flatten() {
+    let checks: Vec<&Value> = report["checks"].as_array().into_iter().flatten().collect();
+    let detail = |check: &Value| check["detail"].as_str().unwrap_or_default().to_string();
+    for check in &checks {
         let name = check["check"].as_str().unwrap_or_default();
-        match check["ok"].as_bool().unwrap_or(false) {
-            true => println!("  ok      {name}"),
-            false => println!(
-                "  FAILED  {name}: {}",
-                check["detail"].as_str().unwrap_or_default()
-            ),
+        match (
+            check["ok"].as_bool().unwrap_or(false),
+            check["excess"].as_bool().unwrap_or(false),
+        ) {
+            (true, false) => println!("  ok      {name}"),
+            (true, true) => println!("  EXCESS  {name}: {}", detail(check)),
+            (false, _) => println!("  FAILED  {name}: {}", detail(check)),
         }
     }
-    let remediation: Vec<&str> = report["remediation"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    if !remediation.is_empty() {
-        println!("To mend, run on the tenant database:");
-        remediation
+    print_statements(
+        "To mend, run on the tenant database:",
+        report["remediation"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    );
+    print_statements(
+        "To take back what the role holds beyond its need, run on the tenant database:",
+        checks
+            .iter()
+            .filter(|check| check["excess"].as_bool().unwrap_or(false))
+            .filter_map(|check| check["remedy"].as_str()),
+    );
+}
+
+fn print_statements<'a>(heading: &str, statements: impl Iterator<Item = &'a str>) {
+    let statements: Vec<&str> = statements.collect();
+    if !statements.is_empty() {
+        println!("{heading}");
+        statements
             .iter()
             .for_each(|statement| println!("  {statement}"));
     }

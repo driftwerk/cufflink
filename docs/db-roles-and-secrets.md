@@ -252,7 +252,17 @@ comes before the roles are verified:
    can log in, the platform's role is a member of it, the stored password
    works, it may connect to the database, use and create in its schema,
    read and write every served table, switch to its read-only role, and
-   use `_cufflink` and the outbox function. Of a
+   use `_cufflink` and the outbox function. The last two are needed only
+   by a service the platform enqueues for, one that declares a served
+   table (`tables`; `private_tables` do not count) or `publishes`
+   ([outbox](outbox.md#enqueueing-from-a-guest)). The role of
+   any other service is granted nothing of `_cufflink`, so a role bound
+   with `--role` reaches no more than it did, and the platform writes the
+   service's route audit records in its own session. A role that holds
+   them anyway is reported `EXCESS`, with the `REVOKE` that takes each
+   back; that fails nothing, and the platform takes nothing back itself.
+   A deploy that makes a service one the platform enqueues for grants its
+   verified role first, whatever the policy, and fails when it cannot. Of a
    [private table](schema-ownership.md#private-tables) it checks only that
    the table exists: the platform runs no statement of its own there, so a
    role that holds nothing on one, or reaches it only through a function,
