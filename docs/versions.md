@@ -1238,7 +1238,7 @@ Unreleased.
 - The native test host now sets its `statement_timeout` before each
   statement of a transaction, as the platform does.
 
-## Unreleased changes
+## Changes in v0.36.0
 
 No new module-declared feature from these yet.
 
@@ -1250,6 +1250,13 @@ No new module-declared feature from these yet.
   password fails `build()` with `TestHostError::Role`, naming the role
   ([testing](testing.md#the-database)). `ServiceRole`'s `Debug` no longer
   prints the password.
+- `TestTemplate::get_or_create(name, build)` builds a template database
+  once, on the server `TestDb::start` uses, and `TestDb::from_template`
+  clones each test's database from it with `CREATE DATABASE … TEMPLATE`,
+  optionally with a `CloneStrategy`
+  ([testing](testing.md#template-databases)). `TestHostError` has a new
+  variant, `Template`, for a template that could not be built or a
+  database of its name that is not one.
 
 ## Changes in v0.35.0
 

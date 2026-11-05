@@ -20,6 +20,8 @@ pub enum TestHostError {
     /// The role a service's statements run as could not be made, or a
     /// role the test set up could not be logged in as.
     Role(String),
+    /// A template database could not be built or is not one.
+    Template(String),
 }
 
 impl fmt::Display for TestHostError {
@@ -32,7 +34,8 @@ impl fmt::Display for TestHostError {
             TestHostError::File { path, source } => write!(f, "{}: {source}", path.display()),
             TestHostError::Migration(reason)
             | TestHostError::Request(reason)
-            | TestHostError::Role(reason) => f.write_str(reason),
+            | TestHostError::Role(reason)
+            | TestHostError::Template(reason) => f.write_str(reason),
         }
     }
 }
