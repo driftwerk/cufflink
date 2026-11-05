@@ -1,4 +1,6 @@
-use cufflink_storage::{ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
+use cufflink_storage::{
+    Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded,
+};
 use eyre::Result;
 use std::sync::Arc;
 
@@ -120,5 +122,11 @@ impl S3Storage {
 
     pub fn primary_bucket(&self) -> &str {
         self.inner.primary_bucket()
+    }
+
+    pub fn tenant_bucket(&self, bucket: &str, credential: Option<&Credential>) -> Result<Self> {
+        self.inner
+            .tenant_bucket(bucket, credential)
+            .map(Self::from_inner)
     }
 }

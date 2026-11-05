@@ -322,6 +322,13 @@ before they are published.
   (`cufflink_worker_job_identity_mismatch_total`), and answer a
   request/reply job only on an `_INBOX.` inbox, refusing any other reply
   subject unrun (`cufflink_worker_reply_refused_total`).
+- **Tenant buckets**: a bucket registered to a tenant
+  ([tenant buckets](tenant-isolation.md#tenant-buckets)) is refused to
+  every other tenant's guests and holds its own guests to its key prefixes
+  and canned ACLs, whatever the `storage_scope` mode (recorded as
+  `foreign_tenant_bucket`, `key_not_exact`, `key_outside_prefix` and
+  `acl_not_admitted`). An upload naming an ACL is refused in every other
+  bucket (`acl_not_admitted`).
 - **Platform storage prefixes**: no guest may touch `wasm/`, `backups/`,
   `files/` or `web/` in the platform bucket, use `..` key segments, or name
   a bucket that is empty or contains `/`, whatever the `storage_scope` mode

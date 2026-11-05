@@ -2164,6 +2164,37 @@ Object storage through the platform's own credentials (S3-compatible or GCS, wha
 | `storage::upload(bucket, key, content_type, &bytes)` | `Result<Uploaded, StorageError>` | Feature `storage-v2`: store bytes (up to `HOST_STORAGE_MAX_UPLOAD_BYTES`, ≈48 MiB at the defaults); `upload_with` adds `content_disposition` and `cache_control` |
 | `storage::head(bucket, key)` | `Result<Option<ObjectMeta>, StorageError>` | Feature `storage-v2`: an object's size, type and etag without its bytes; `None` when absent |
 
+A bucket a platform admin registers to the guest's tenant
+([tenant buckets](tenant-isolation.md#tenant-buckets)) is reached the same
+way, and differs in three things:
+
+- a key is stored exactly as given, spaces, non-ASCII letters, `%`, `#`,
+  `?` and `+` included. A key with an empty, `.` or `..` segment, a leading
+  or trailing `/`, a control character or more than 1024 bytes is refused
+  (`key_not_exact`), as is one outside the bucket's key prefixes
+  (`key_outside_prefix`). In any other bucket a non-ASCII byte or one of
+  `% # ? * [ ] ~ " < > |` is stored percent-encoded, as in earlier releases;
+- the call is signed with the bucket's own credential when it has one;
+- feature `storage-acl` adds `UploadOptions::acl(CannedAcl::PublicRead)`
+  (or `Private`), admitted only where the bucket lists that ACL
+  (`acl_not_admitted` otherwise, and in every bucket not registered to the
+  tenant).
+
+A bucket registered to another tenant is refused for every call, whatever
+the guest's `storage_scope`.
+
+```rust,ignore
+let stored = storage::upload_with(
+    "example-assets",
+    &format!("logos/{branch_id}/Café façade.png"),
+    "image/png",
+    &png,
+    &UploadOptions::new()
+        .cache_control("public, max-age=86400")
+        .acl(CannedAcl::PublicRead),
+)?;
+```
+
 ```rust
 handler!(upload_url, |req: Request| {
     let key = format!("uploads/{}.jpg", util::generate_uuid());

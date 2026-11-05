@@ -3,7 +3,7 @@ use crate::registry::RegisteredService;
 use crate::router::guest_response::{Bodies, S3Spec};
 use crate::router::sse_bridge::{Bridge, Reducer, SseSpec};
 use crate::tenant_catalog::TenantEntry;
-use crate::wasm_runtime::storage_scope;
+use crate::wasm_runtime::storage_scope::{self, Unserved};
 use crate::AppState;
 use axum::response::Response;
 use cufflink_storage::ObjectReader;
@@ -31,19 +31,23 @@ impl Bodies for GuestBodies<'_> {
     }
 
     async fn open(&self, spec: &S3Spec) -> PlatformResult<ObjectReader> {
-        let storage = self
-            .state
-            .storage
-            .as_ref()
-            .ok_or_else(|| failed("object storage is not configured"))?;
         let guest = storage_scope::Guest {
             tenant_id: self.service.tenant_id,
             tenant_slug: &self.service.tenant_slug,
             service_name: &self.service.name,
             policies: &self.tenant.policies,
         };
-        storage_scope::authorize_guest(self.state, &guest, &spec.bucket, &[&spec.key])
-            .map_err(|_| failed("storage access denied"))?;
+        let storage =
+            storage_scope::resolve(self.state, &guest, &spec.bucket, &[&spec.key], None).map_err(
+                |refused| match refused {
+                    Unserved::Denied(_) => failed("storage access denied"),
+                    Unserved::NotConfigured(why) => failed(why),
+                    Unserved::Backend(e) => {
+                        tracing::error!(service = %self.service.name, bucket = %spec.bucket, error = %e, "Opening a tenant bucket failed");
+                        failed("storage read failed")
+                    }
+                },
+            )?;
         tokio::time::timeout(OPEN_TIMEOUT, storage.open_read(&spec.bucket, &spec.key))
             .await
             .map_err(|_| failed("storage read timed out"))?

@@ -3,14 +3,13 @@ use super::{
     block_on_bounded, fanout_concurrency, read_guest_string, wrap, write_in_order, BatchResult,
     HostIoError, HostState, ResponseText,
 };
-use crate::policy::Denied;
 use crate::storage::S3Storage;
 use crate::wasm_runtime::budget::{
     base64_len, s3_host_bytes, ChargedJsonError, Hold, HostCaps, Refused,
 };
-use crate::wasm_runtime::storage_scope;
+use crate::wasm_runtime::storage_scope::{self, Unserved};
 use base64::{engine::general_purpose, Engine};
-use cufflink_storage::UploadOptions;
+use cufflink_storage::{CannedAcl, UploadOptions};
 use cufflink_types::host::storage::{
     HeadRequest, HeadResponse, StorageErrorEnvelope, StorageErrorKind, UploadRequest,
     UploadResponse,
@@ -48,22 +47,17 @@ pub(super) fn register(
                 key_len
             ));
 
-            if !caller.data().authorize_storage(&bucket, &[&key]) {
+            let Some(storage) = caller.data().guest_store("s3_download", &bucket, &[&key]) else {
                 return -1;
-            }
+            };
 
             caller.data_mut().clear_host_response();
-            let app_state = caller.data().app_state.clone();
             let limits = Arc::clone(&caller.data().limits);
             let mut hold = caller.data().hold();
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| Fetch::Failed(eyre::eyre!("S3 storage not configured")))?;
                 let bytes = fetch_object(
-                    storage,
+                    &storage,
                     &bucket,
                     &key,
                     &mut hold,
@@ -115,42 +109,39 @@ pub(super) fn register(
             if let Err(cap) = caps.fanout(PATH, items.len()) {
                 return caller.data_mut().refused(Refused::Cap(cap));
             }
-            let items: Vec<(S3Item, bool, Hold)> = items
+            let items: Vec<(S3Item, Result<S3Storage, String>, Hold)> = items
                 .into_iter()
                 .map(|item| {
-                    let permitted = caller.data().authorize_storage(&item.bucket, &[&item.key]);
-                    (item, permitted, parsed.sibling())
+                    let store = caller
+                        .data()
+                        .storage_for(&item.bucket, &[&item.key], None)
+                        .map_err(|refused| item_refusal(&refused));
+                    (item, store, parsed.sibling())
                 })
                 .collect();
             caller.data_mut().clear_host_response();
-            let app_state = caller.data().app_state.clone();
             let mut hold = caller.data().hold();
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state.storage.as_ref();
-                let fetches = items
-                    .into_iter()
-                    .map(|(item, permitted, mut held)| async move {
-                        if !permitted {
-                            return Ok((BatchResult::err("storage access denied"), held));
+                let fetches = items.into_iter().map(|(item, store, mut held)| async move {
+                    let storage = match store {
+                        Ok(storage) => storage,
+                        Err(refused) => return Ok((BatchResult::err(&refused), held)),
+                    };
+                    match fetch_object(&storage, &item.bucket, &item.key, &mut held, caps, PATH)
+                        .await
+                    {
+                        Ok(bytes) => {
+                            let b64 = general_purpose::STANDARD.encode(bytes);
+                            Ok((
+                                BatchResult::ok(serde_json::json!({ "data_b64": b64 })),
+                                held,
+                            ))
                         }
-                        let Some(storage) = storage else {
-                            return Ok((BatchResult::err("S3 storage not configured"), held));
-                        };
-                        match fetch_object(storage, &item.bucket, &item.key, &mut held, caps, PATH)
-                            .await
-                        {
-                            Ok(bytes) => {
-                                let b64 = general_purpose::STANDARD.encode(bytes);
-                                Ok((
-                                    BatchResult::ok(serde_json::json!({ "data_b64": b64 })),
-                                    held,
-                                ))
-                            }
-                            Err(Fetch::Failed(e)) => Ok((BatchResult::err(&e.to_string()), held)),
-                            Err(Fetch::Refused(refused)) => Err(refused),
-                        }
-                    });
+                        Err(Fetch::Failed(e)) => Ok((BatchResult::err(&e.to_string()), held)),
+                        Err(Fetch::Refused(refused)) => Err(refused),
+                    }
+                });
                 let mut text = ResponseText::new(&mut hold, caps, PATH);
                 write_in_order(fetches, fanout_concurrency(), &mut text)
                     .await
@@ -206,18 +197,14 @@ pub(super) fn register(
                 content_type_len
             ));
 
-            if !caller.data().authorize_storage(&bucket, &[&key]) {
+            let Some(storage) = caller
+                .data()
+                .guest_store("s3_presign_upload", &bucket, &[&key])
+            else {
                 return -1;
-            }
-
-            let app_state = caller.data().app_state.clone();
+            };
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| eyre::eyre!("S3 storage not configured"))?;
-
                 let url = storage
                     .presign_upload_to_bucket(&bucket, &key, &content_type, expires_secs as u64)
                     .await?;
@@ -258,18 +245,14 @@ pub(super) fn register(
                 key_len
             ));
 
-            if !caller.data().authorize_storage(&bucket, &[&key]) {
+            let Some(storage) = caller
+                .data()
+                .guest_store("s3_presign_download", &bucket, &[&key])
+            else {
                 return -1;
-            }
-
-            let app_state = caller.data().app_state.clone();
+            };
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| eyre::eyre!("S3 storage not configured"))?;
-
                 let url = storage
                     .presign_download_to_bucket(&bucket, &key, expires_secs as u64)
                     .await?;
@@ -309,18 +292,11 @@ pub(super) fn register(
                 key_len
             ));
 
-            if !caller.data().authorize_storage(&bucket, &[&key]) {
+            let Some(storage) = caller.data().guest_store("s3_delete", &bucket, &[&key]) else {
                 return -1;
-            }
-
-            let app_state = caller.data().app_state.clone();
+            };
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| eyre::eyre!("S3 storage not configured"))?;
-
                 storage.delete_from_bucket(&bucket, &key).await?;
                 Ok::<(), eyre::Report>(())
             });
@@ -422,36 +398,60 @@ struct S3Item {
     key: String,
 }
 
-impl HostState {
-    pub(super) fn authorize_storage(&self, bucket: &str, keys: &[&str]) -> bool {
-        self.storage_access(bucket, keys).is_ok()
+fn item_refusal(refused: &Unserved) -> String {
+    match refused {
+        Unserved::Denied(_) => "storage access denied".to_string(),
+        Unserved::NotConfigured(_) | Unserved::Backend(_) => refused.to_string(),
     }
+}
 
-    fn storage_access(&self, bucket: &str, keys: &[&str]) -> Result<(), Denied> {
+impl HostState {
+    pub(super) fn storage_for(
+        &self,
+        bucket: &str,
+        keys: &[&str],
+        acl: Option<CannedAcl>,
+    ) -> Result<S3Storage, Unserved> {
         let guest = storage_scope::Guest {
             tenant_id: self.identity.tenant_id,
             tenant_slug: &self.identity.tenant_slug,
             service_name: &self.identity.service_name,
             policies: &self.policies,
         };
-        storage_scope::authorize_guest(&self.app_state, &guest, bucket, keys)
+        storage_scope::resolve(&self.app_state, &guest, bucket, keys, acl)
     }
 
-    fn guest_storage(&self, bucket: &str, key: &str) -> Result<S3Storage, StorageErrorEnvelope> {
+    /// The store for a call that answers only success or `-1`.
+    pub(super) fn guest_store(
+        &self,
+        path: &'static str,
+        bucket: &str,
+        keys: &[&str],
+    ) -> Option<S3Storage> {
+        self.storage_for(bucket, keys, None)
+            .map_err(|refused| match refused {
+                Unserved::Denied(_) => {}
+                refused => tracing::error!("[wasm] {path}: {refused}"),
+            })
+            .ok()
+    }
+
+    fn guest_storage(
+        &self,
+        bucket: &str,
+        key: &str,
+        acl: Option<CannedAcl>,
+    ) -> Result<S3Storage, StorageErrorEnvelope> {
         if key.is_empty() {
             return Err(error(StorageErrorKind::Denied, "the key is empty"));
         }
-        self.storage_access(bucket, &[key]).map_err(|denied| {
-            error(
-                StorageErrorKind::Denied,
-                format!("storage access denied: {}", denied.code),
-            )
-        })?;
-        self.app_state.storage.clone().ok_or_else(|| {
-            error(
-                StorageErrorKind::NotConfigured,
-                "object storage is not configured",
-            )
+        self.storage_for(bucket, &[key], acl).map_err(|refused| {
+            let kind = match refused {
+                Unserved::Denied(_) => StorageErrorKind::Denied,
+                Unserved::NotConfigured(_) => StorageErrorKind::NotConfigured,
+                Unserved::Backend(_) => StorageErrorKind::Backend,
+            };
+            error(kind, refused.to_string())
         })
     }
 
@@ -480,8 +480,8 @@ pub(super) fn register_v2(
                 &mut caller,
                 "s3_upload",
                 (ptr, len),
-                |reason| uploaded(Err(error(StorageErrorKind::Denied, reason))),
-                |state, request| uploaded(upload(state, request)),
+                |reason| uploaded(None, Err(error(StorageErrorKind::Denied, reason))),
+                |state, request: UploadRequest| uploaded(request.acl, upload(state, request)),
             )
         },
     )?;
@@ -513,11 +513,16 @@ fn count(op: &'static str, result: &'static str) {
         .increment(1);
 }
 
-fn uploaded(outcome: Result<UploadResponse, StorageErrorEnvelope>) -> UploadResponse {
-    count(
-        "upload",
-        outcome.as_ref().map_or_else(|e| e.kind.as_str(), |_| "ok"),
-    );
+fn uploaded(
+    acl: Option<CannedAcl>,
+    outcome: Result<UploadResponse, StorageErrorEnvelope>,
+) -> UploadResponse {
+    let result = outcome.as_ref().map_or_else(|e| e.kind.as_str(), |_| "ok");
+    count("upload", result);
+    if let Some(acl) = acl {
+        metrics::counter!("cufflink_host_storage_acl_total", "acl" => acl.as_str(), "result" => result)
+            .increment(1);
+    }
     outcome.unwrap_or_else(UploadResponse::Error)
 }
 
@@ -542,7 +547,7 @@ fn upload(
         state.limits.max_guest_len,
     );
     let options = admit(&request, cap)?;
-    let storage = state.guest_storage(&request.bucket, &request.key)?;
+    let storage = state.guest_storage(&request.bucket, &request.key, request.acl)?;
     let UploadRequest {
         bucket, key, body, ..
     } = request;
@@ -555,7 +560,7 @@ fn upload(
 }
 
 fn head(state: &HostState, request: &HeadRequest) -> Result<HeadResponse, StorageErrorEnvelope> {
-    let storage = state.guest_storage(&request.bucket, &request.key)?;
+    let storage = state.guest_storage(&request.bucket, &request.key, None)?;
     state
         .stored(storage.head_in_bucket(&request.bucket, &request.key))
         .map(|found| {
@@ -626,6 +631,7 @@ fn admit(request: &UploadRequest, cap: usize) -> Result<UploadOptions, StorageEr
         },
         content_disposition: optional("content_disposition", &request.content_disposition)?,
         cache_control: optional("cache_control", &request.cache_control)?,
+        acl: request.acl,
     })
 }
 
@@ -709,6 +715,7 @@ mod v2_tests {
                 content_type: "application/pdf".into(),
                 content_disposition: Some("attachment; filename=\"receipt.pdf\"".into()),
                 cache_control: Some("private, max-age=60".into()),
+                acl: None,
             })
         );
         for untyped in ["", "  "] {

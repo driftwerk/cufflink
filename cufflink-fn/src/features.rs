@@ -38,6 +38,7 @@ declare_features! {
     "nats-publish-v2" => NATS_PUBLISH_V2 = b"nats_publish_v2\n",
     "http-v2" => HTTP_V2 = b"http_v2\n",
     "storage-v2" => STORAGE_V2 = b"storage_v2\n",
+    "storage-acl" => STORAGE_ACL = b"storage_acl\n",
     "util-v2" => UTIL_V2 = b"util_v2\n",
     "ext-call" => EXT_CALL = b"ext_call\n",
 }
@@ -119,6 +120,7 @@ mod tests {
             features::NATS_PUBLISH_V2,
             features::HTTP_V2,
             features::STORAGE_V2,
+            features::STORAGE_ACL,
             features::UTIL_V2,
             features::EXT_CALL,
         ];

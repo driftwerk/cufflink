@@ -42,6 +42,7 @@ declares.
 | `nats-publish-v2` | `nats_publish_v2` |
 | `http-v2` | `http_v2` |
 | `storage-v2` | `storage_v2` |
+| `storage-acl` | `storage_acl` (and `storage_v2`, which it enables) |
 | `util-v2` | `util_v2` |
 | `ext-call` | `ext_call` |
 | `test-host` | none: it runs handlers natively in `cargo test` ([testing](testing.md)) |
@@ -266,6 +267,57 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 `cufflink services list --features` prints what each deployed service
 requires.
 
+## Features added in the next release (unreleased)
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `tenant_buckets` | never demanded | buckets a platform admin registers to one tenant, with their key prefixes, canned ACLs, credential and exact keys ([tenant buckets](tenant-isolation.md#tenant-buckets)) |
+| `storage_acl` | the guest enables `cufflink-fn/storage-acl` | a canned ACL (`private`, `public-read`) on `storage::upload_with`, admitted per tenant bucket ([storage](wasm-guide.md#storage-module)) |
+
+This release adds tenant buckets: a platform admin registers a bucket to
+one tenant (`PUT /api/tenants/{slug}/buckets/{bucket}`,
+`cufflink tenants buckets set`), with the key prefixes and canned ACLs its
+guests may use and, optionally, a credential that reaches it at the
+platform's `S3_ENDPOINT`. The design is
+[`design-notes/storage-tenant-buckets.md`](design-notes/storage-tenant-buckets.md).
+
+- Every guest storage call on a registered bucket, in every
+  `storage_scope` mode:
+  - a bucket registered to another tenant is refused
+    (`foreign_tenant_bucket`), whatever the guest's own `storage_scope`
+    lists. That covers downloads, `download_many`, presigned URLs,
+    deletes, uploads, `head`, image transforms and `Response::s3_object`;
+  - in the tenant's own bucket, a key must be exact (`key_not_exact`)
+    and within the bucket's prefixes when it has any
+    (`key_outside_prefix`), and `storage_scope` is not consulted;
+  - the call is signed with the bucket's credential, or the platform's
+    when it has none.
+- In a registered bucket a key is stored exactly as given: spaces,
+  non-ASCII letters, `%`, `#`, `?` and `+` included. A key that begins or
+  ends with `/`, has an empty, `.` or `..` segment, has a control
+  character or passes 1024 bytes is refused. Other buckets keep the
+  encoding of earlier releases, which stores a non-ASCII byte or one of
+  `% # ? * [ ] ~ " < > |` percent-encoded in the object's name, so no
+  object already stored moves.
+- `cufflink-fn/storage-acl` adds `UploadOptions::acl(CannedAcl)`. An
+  upload that names an ACL is admitted only to a registered bucket of the
+  guest's tenant that lists it (`acl_not_admitted` otherwise). On `s3` the
+  ACL is sent as a signed `x-amz-acl` header; the `gcs`, `memory` and
+  `local` backends refuse such an upload (`backend`) rather than store it
+  without the ACL.
+- A credential's secret is sealed like every stored secret
+  (`tenant_buckets.secret_access_key`, covered by
+  `cufflink admin secrets reseal` and `verify`). It is never answered,
+  audited or logged. A secret that cannot be opened leaves its bucket's
+  calls refused (`not_configured`) and the rest of the catalog loaded.
+- The SDK's `InMemoryStorage` stores the ACL on `StoredObject`, refuses an
+  ACL that `admit_acl` has not admitted, and records every call in
+  `calls()`.
+- `cufflink_host_storage_acl_total{acl, result}` counts uploads that name
+  an ACL.
+
+Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
+
 ## Changes in v0.33.0
 
 No new module-declared feature. Spec and client changes:
@@ -365,6 +417,15 @@ Rolling a platform back from v0.31.0 to v0.30:
 | Services that declare column permissions (`cufflink services list --features` names them, as `column_permissions`) | **Roll each back first, to a version without them.** The v0.30 platform drops the key it does not know and serves the service without it: every restricted column is answered to, and written by, every caller that reaches the row. Such a service cannot be deployed there (422, naming the feature) |
 | The database | Nothing: v0.31.0 has no migration |
 
+Rolling a platform back from the release that adds tenant buckets:
+
+| What it added | Before rolling the platform back |
+|---------------|----------------------------------|
+| Services that enable `cufflink-fn/storage-acl` (`cufflink services list --features` names them, as `storage_acl`) | **Roll each back first, to a version without it.** The older platform cannot read an upload that names an ACL, and refuses it rather than store it without one. Such a service cannot be deployed there (422, naming the feature) |
+| Tenant buckets | Set each tenant that has some to `storage_scope` `strict` with an allowlist that leaves them out, unless its guests may reach them with the platform's credentials and today's rules. The older platform does not read `tenant_buckets`: their calls fall back to `storage_scope` and the platform's credentials, and under `legacy` with no allowlist they are admitted |
+| Exact keys | Nothing to undo, but objects stored under a key the older encoding changes (non-ASCII, `% # ? * [ ] ~ " < > |`) cannot be read there until the platform is back |
+| The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read |
+
 Rolling a platform back from v0.35.0 to an earlier release:
 
 | What v0.35.0 added | Before rolling the platform back |
@@ -396,7 +457,7 @@ Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
 `V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
-v0.35.0): expected and harmless, as migrations are
+v0.35.0, `V8__tenant_buckets` on the release that adds tenant buckets): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist

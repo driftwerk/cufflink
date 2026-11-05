@@ -5,9 +5,12 @@ use crate::policy::config::{KeyConfig, StorageScopeConfig};
 use crate::policy::{Correction, Denied, PolicyKey, PolicyMode, PolicySet, Violation};
 use crate::repo::extensions::{self, ExtensionRow};
 use crate::repo::nats_claims::{self, ClaimRow};
+use crate::repo::tenant_buckets::{self, BucketRow};
 use crate::repo::tenant_policies::{self, PolicyRow};
 use crate::repo::tenants::{self, Tenant};
+use crate::secrets::SecretBox;
 use crate::shutdown::Shutdown;
+use crate::tenant_buckets::TenantBucket;
 use crate::wasm_runtime::storage_scope::BucketClaims;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -64,6 +67,7 @@ struct Snapshot {
     by_slug: HashMap<String, Uuid>,
     claimed_buckets: HashMap<String, HashSet<Uuid>>,
     subject_claims: Vec<(Uuid, String, String)>,
+    tenant_buckets: HashMap<String, Arc<TenantBucket>>,
 }
 
 impl Snapshot {
@@ -98,6 +102,16 @@ impl Snapshot {
                 entry(tenant, &rows, claims, extensions, defaults)
             })
             .fold(Snapshot::default(), Snapshot::with_entry)
+    }
+
+    fn with_tenant_buckets(self, buckets: Vec<TenantBucket>) -> Self {
+        Self {
+            tenant_buckets: buckets
+                .into_iter()
+                .map(|bucket| (bucket.bucket.clone(), Arc::new(bucket)))
+                .collect(),
+            ..self
+        }
     }
 
     fn foreign_subject_claims(&self, tenant_id: Uuid) -> Vec<(String, String)> {
@@ -184,6 +198,7 @@ pub struct TenantCatalog {
     defaults: Arc<PolicySet>,
     snapshot: Arc<RwLock<Arc<Snapshot>>>,
     reload_lock: Arc<tokio::sync::Mutex<()>>,
+    secrets: Option<SecretBox>,
 }
 
 impl TenantCatalog {
@@ -194,7 +209,33 @@ impl TenantCatalog {
             defaults: Arc::new(defaults),
             snapshot: Arc::default(),
             reload_lock: Arc::default(),
+            secrets: None,
         }
+    }
+
+    /// Opens the credentials of tenant buckets with `secrets`. Without it a
+    /// bucket with a credential of its own is loaded unopenable.
+    pub fn with_secrets(self, secrets: SecretBox) -> Self {
+        Self {
+            secrets: Some(secrets),
+            ..self
+        }
+    }
+
+    async fn tenant_buckets(
+        &self,
+        client: &deadpool_postgres::Client,
+    ) -> PlatformResult<Vec<TenantBucket>> {
+        let rows = tenant_buckets::list_all(client).await?;
+        Ok(match &self.secrets {
+            Some(secrets) => {
+                futures_util::future::join_all(
+                    rows.into_iter().map(|row| row.open(secrets, client)),
+                )
+                .await
+            }
+            None => rows.into_iter().map(BucketRow::unopened).collect(),
+        })
     }
 
     fn current(&self) -> Arc<Snapshot> {
@@ -209,13 +250,11 @@ impl TenantCatalog {
             let client = self.db.get().await?;
             let claims = nats_claims::list_all(&client).await?;
             let extensions = extensions::list_all(&client).await?;
-            PlatformResult::Ok(Snapshot::build(
-                tenants,
-                &rows,
-                claims,
-                extensions,
-                &self.defaults,
-            ))
+            let buckets = self.tenant_buckets(&client).await?;
+            PlatformResult::Ok(
+                Snapshot::build(tenants, &rows, claims, extensions, &self.defaults)
+                    .with_tenant_buckets(buckets),
+            )
         }
         .await;
         let result = if loaded.is_ok() { "ok" } else { "error" };
@@ -242,6 +281,10 @@ impl TenantCatalog {
 
     pub fn bucket_claims(&self, tenant_id: Uuid, bucket: &str) -> BucketClaims {
         self.current().bucket_claims(tenant_id, bucket)
+    }
+
+    pub fn tenant_bucket(&self, bucket: &str) -> Option<Arc<TenantBucket>> {
+        self.current().tenant_buckets.get(bucket).cloned()
     }
 
     pub fn foreign_subject_claims(&self, tenant_id: Uuid) -> Vec<(String, String)> {

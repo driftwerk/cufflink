@@ -55,4 +55,4 @@ pub use nats::NatsRecorder;
 pub use request::{request, AuthBuilder, RequestBuilder, SubscriptionBuilder};
 #[cfg(feature = "service-call")]
 pub use service_call::{MockServiceCalls, ServiceCall};
-pub use storage::{InMemoryStorage, StoredObject};
+pub use storage::{InMemoryStorage, StorageCall, StoredObject};

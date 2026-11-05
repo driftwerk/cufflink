@@ -85,9 +85,9 @@ pub(super) fn register(
             let keys: Vec<&str> = std::iter::once(in_key.as_str())
                 .chain(parsed.iter().map(|(out_key, ..)| out_key.as_str()))
                 .collect();
-            if !caller.data().authorize_storage(&bucket, &keys) {
+            let Some(storage) = caller.data().guest_store(FN, &bucket, &keys) else {
                 return -1;
-            }
+            };
             drop(keys);
             let limits = Arc::clone(&caller.data().limits);
             let hold = caller.data().hold();
@@ -100,12 +100,9 @@ pub(super) fn register(
                 return caller.data_mut().refused(refused);
             }
 
-            let app_state = caller.data().app_state.clone();
-
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state.storage.as_ref().ok_or_else(unconfigured)?;
-                let source = Source::read(storage, &budget, &bucket, &in_key, hold).await?;
-                transform_multi(storage, &budget, &bucket, source, parsed).await
+                let source = Source::read(&storage, &budget, &bucket, &in_key, hold).await?;
+                transform_multi(&storage, &budget, &bucket, source, parsed).await
             });
 
             match result {
@@ -128,10 +125,6 @@ pub(super) fn register(
     )?;
 
     Ok(())
-}
-
-fn unconfigured() -> Fetch {
-    Fetch::Failed(eyre::eyre!("storage not configured"))
 }
 
 fn register_image_transform(
@@ -172,14 +165,13 @@ fn register_image_transform(
                 );
                 return -1;
             }
-            if !caller
+            let Some(storage) = caller
                 .data()
-                .authorize_storage(&bucket, &[&in_key, &out_key])
-            {
+                .guest_store(name, &bucket, &[&in_key, &out_key])
+            else {
                 return -1;
-            }
+            };
 
-            let app_state = caller.data().app_state.clone();
             let limits = Arc::clone(&caller.data().limits);
             let hold = caller.data().hold();
             let budget = ImageBudget {
@@ -189,10 +181,9 @@ fn register_image_transform(
             };
 
             let result = block_on_bounded(&caller.data().bounds(), async {
-                let storage = app_state.storage.as_ref().ok_or_else(unconfigured)?;
-                let source = Source::read(storage, &budget, &bucket, &in_key, hold).await?;
+                let source = Source::read(&storage, &budget, &bucket, &in_key, hold).await?;
                 transform(
-                    storage,
+                    &storage,
                     &budget,
                     &bucket,
                     source,
