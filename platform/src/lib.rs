@@ -26,6 +26,7 @@ pub mod schema_manager;
 pub mod secrets;
 pub mod storage;
 pub mod telemetry;
+pub mod tenant_buckets;
 pub mod tenant_catalog;
 pub mod tenant_db;
 pub mod tenant_sessions;
@@ -99,16 +100,17 @@ impl AppState {
             shutdown,
             service_identity,
         } = parts;
-        let tenants = tenant_catalog::TenantCatalog::new(
-            platform_db.clone(),
-            nats.clone(),
-            config.policy_defaults.clone(),
-        );
         let secrets = secrets::SecretBox::new(
             platform_db.clone(),
             config.secret_keys.clone(),
             config.secret_storage,
         );
+        let tenants = tenant_catalog::TenantCatalog::new(
+            platform_db.clone(),
+            nats.clone(),
+            config.policy_defaults.clone(),
+        )
+        .with_secrets(secrets.clone());
         Self {
             tenant_sessions: tenant_sessions::TenantSessions::new(tenant_pools, tenants.clone())
                 .with_roles(

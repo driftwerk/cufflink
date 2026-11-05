@@ -1,6 +1,6 @@
 [package]
 name = "cufflink-fn"
-version = "0.35.0"
+version = "0.36.0"
 edition = "2021"
 description = "Write custom Cufflink handlers in Rust — compiles to WASM"
 license = "MIT OR Apache-2.0"
@@ -17,9 +17,11 @@ cache = []
 service-call = []
 response-v2 = []
 delivery-control = ["response-v2"]
+response-raw-json = ["response-v2"]
 nats-publish-v2 = []
 http-v2 = []
 storage-v2 = []
+storage-acl = ["storage-v2"]
 util-v2 = []
 ext-call = []
 test-host = [

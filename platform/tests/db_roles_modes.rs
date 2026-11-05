@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 const LOANS: &str = "loan-service";
 const STOCKS: &str = "stock-service";
 const REPORTS: &str = "reports-service";
+const CATALOG: &str = "catalog-service";
 const HANDLERS: [&str; 7] = [
     "query",
     "execute",
@@ -1447,4 +1448,86 @@ async fn db_roles_reporting_views_replumb() {
         "the service's own role was given no view, only its read-only role: {scoped}"
     );
     assert_eq!(test.fallbacks(REPORTS).await, 0.0);
+}
+
+#[tokio::test]
+async fn db_roles_a_guest_that_publishes_nothing_has_its_routes_audited_without_the_outbox() {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    let Some(nats_url) = common::infra()
+        .await
+        .and_then(|infra| infra.require_nats().map(str::to_string))
+    else {
+        return;
+    };
+    let Some(test) = Modes::start("quiet_platform_ro").await else {
+        return;
+    };
+    let slug = test.tenant.slug.clone();
+    test.set_policy("warn", json!({})).await;
+    let (status, body) = test
+        .platform
+        .send(
+            Method::PUT,
+            &format!("/api/tenants/{slug}/policies"),
+            &test.admin,
+            Some(&json!({"policies": {"outbox": {"mode": "enforce"}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    test.sql("CREATE SCHEMA catalog_service").await;
+    let mut manifest = guest_manifest(CATALOG, 0);
+    manifest["schema"] = json!("adopted");
+    manifest["tables"] = json!([]);
+    test.deploy_module(&manifest).await;
+    let role = test.role(CATALOG).await;
+    assert!(
+        !test
+            .one::<bool>(&format!(
+                "SELECT has_schema_privilege('{role}', '_cufflink', 'USAGE')"
+            ))
+            .await,
+        "the role is given nothing of the outbox"
+    );
+
+    let nats = async_nats::connect(nats_url).await.expect("nats");
+    let mut logs = nats
+        .subscribe(format!("dw.{slug}.logs"))
+        .await
+        .expect("subscribe");
+    for mode in ["warn", "enforce"] {
+        test.set_policy(mode, json!({})).await;
+        let before = test.fallbacks(CATALOG).await;
+        test.query(CATALOG, "SELECT 1 AS n").await;
+        let heard = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let message = logs.next().await.expect("a message");
+                let payload = String::from_utf8_lossy(&message.payload).to_string();
+                if payload.contains(CATALOG) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            heard.is_ok(),
+            "the route's audit record is published under {mode}"
+        );
+        assert_eq!(
+            test.fallbacks(CATALOG).await,
+            before,
+            "and nothing of it fell back to the platform's role under {mode}"
+        );
+    }
+    let refused = test
+        .query(
+            CATALOG,
+            "SELECT count(*)::int AS n FROM _cufflink.service_roles",
+        )
+        .await;
+    assert!(
+        refusal(&refused).contains("permission denied"),
+        "the role reaches nothing of the platform's schema: {refused}"
+    );
 }

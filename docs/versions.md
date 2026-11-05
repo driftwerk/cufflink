@@ -38,10 +38,12 @@ declares.
 | `cache` | `cache` |
 | `service-call` | `service_call` |
 | `response-v2` | `response_v2` |
+| `response-raw-json` | `response_raw_json` (and `response_v2`, which it enables) |
 | `delivery-control` | `delivery_control` (and `response_v2`, which it enables) |
 | `nats-publish-v2` | `nats_publish_v2` |
 | `http-v2` | `http_v2` |
 | `storage-v2` | `storage_v2` |
+| `storage-acl` | `storage_acl` (and `storage_v2`, which it enables) |
 | `util-v2` | `util_v2` |
 | `ext-call` | `ext_call` |
 | `guest-statement-timeout` | `guest_statement_timeout` (and `db_v2`, which it enables) |
@@ -267,6 +269,72 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 `cufflink services list --features` prints what each deployed service
 requires.
 
+## Features added in v0.36.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `response_raw_json` | a handler answers with `Response::json_text` (`response-raw-json`) | a v2 response body of pre-rendered JSON, `__body_raw`, sent byte for byte ([responses](routing.md#pre-rendered-json-cufflink-fn-feature-response-raw-json)) |
+| `tenant_buckets` | never demanded | buckets a platform admin registers to one tenant, with their key prefixes, canned ACLs, credential and exact keys ([tenant buckets](tenant-isolation.md#tenant-buckets)) |
+| `storage_acl` | the guest enables `cufflink-fn/storage-acl` | a canned ACL (`private`, `public-read`) on `storage::upload_with`, admitted per tenant bucket ([storage](wasm-guide.md#storage-module)) |
+
+This release adds tenant buckets: a platform admin registers a bucket to
+one tenant (`PUT /api/tenants/{slug}/buckets/{bucket}`,
+`cufflink tenants buckets set`), with the key prefixes and canned ACLs its
+guests may use and, optionally, a credential that reaches it at the
+platform's `S3_ENDPOINT`. The design is
+[`design-notes/storage-tenant-buckets.md`](design-notes/storage-tenant-buckets.md).
+
+- Every bucket name a guest gives is checked against the bucket naming
+  rules (3 to 63 lowercase letters, digits, `.`, `-` or `_`, beginning and
+  ending with a letter or digit, no `..`) on every call, in every mode, and
+  any other name is refused (`invalid_bucket`).
+- Every guest storage call on a registered bucket, in every
+  `storage_scope` mode:
+  - a bucket registered to another tenant is refused
+    (`foreign_tenant_bucket`), whatever the guest's own `storage_scope`
+    lists. That covers downloads, `download_many`, presigned URLs,
+    deletes, uploads, `head`, image transforms and `Response::s3_object`;
+  - in the tenant's own bucket, a key must be exact (`key_not_exact`)
+    and within the bucket's prefixes when it has any
+    (`key_outside_prefix`), and `storage_scope` is not consulted;
+  - a key prefix holds keys on a segment boundary;
+  - the call is signed with the bucket's credential, or the platform's
+    when it has none.
+- Deleting a registration, or its tenant, retires the bucket: it stays
+  claimed and refused to every guest (`bucket_retired`) until
+  `POST /api/buckets/{bucket}/release` (`cufflink tenants buckets release`)
+  frees it, at least two minutes after the retirement. A registered bucket
+  cannot be listed in another tenant group's `allowed_buckets` (409).
+- A replica that has not loaded the tenant buckets for two minutes, its
+  reloads failing, refuses every guest storage call (`not_configured`)
+  until a reload succeeds.
+- In a registered bucket a key is stored exactly as given: spaces,
+  non-ASCII letters, `%`, `#`, `?` and `+` included. A key that begins or
+  ends with `/`, has an empty, `.` or `..` segment, has a control
+  character or passes 1024 bytes is refused. Other buckets keep the
+  encoding of earlier releases, which stores a non-ASCII byte or one of
+  `% # ? * [ ] ~ " < > |` percent-encoded in the object's name, so no
+  object already stored moves.
+- `cufflink-fn/storage-acl` adds `UploadOptions::acl(CannedAcl)`. An
+  upload that names an ACL is admitted only to a registered bucket of the
+  guest's tenant that lists it (`acl_not_admitted` otherwise). On `s3` the
+  ACL is sent as a signed `x-amz-acl` header; the `gcs`, `memory` and
+  `local` backends refuse such an upload (`backend`) rather than store it
+  without the ACL.
+- A credential's secret is sealed like every stored secret
+  (`tenant_buckets.secret_access_key`, covered by
+  `cufflink admin secrets reseal` and `verify`). It is never answered,
+  audited or logged. A secret that cannot be opened leaves its bucket's
+  calls refused (`not_configured`) and the rest of the catalog loaded, as
+  does a row that cannot be read.
+- The SDK's `InMemoryStorage` stores the ACL on `StoredObject`, refuses an
+  ACL that `admit_acl` has not admitted, and records every call in
+  `calls()`.
+- `cufflink_host_storage_acl_total{acl, result}` counts uploads that name
+  an ACL.
+
+Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
+
 ## Features added in v0.37.0
 
 Unreleased.
@@ -382,6 +450,18 @@ Rolling a platform back from v0.35.0 to an earlier release:
 | The guest memory budget | Nothing: the older platform ignores the `WASM_MEMORY_*` variables and admits as before |
 | The database | Nothing: `V7__capacity_deferrals` only adds a column the older binary ignores. A job put off for capacity keeps its later `next_attempt_at` and runs then |
 
+Rolling a platform back from v0.36.0 to an earlier release:
+
+| What v0.36.0 added | Before rolling the platform back |
+|--------------------|----------------------------------|
+| Services that enable `cufflink-fn/response-raw-json` (`cufflink services list --features` names them, as `response_raw_json`) | **Roll each back first, to a version without it.** The older platform does not read `__body_raw` and would answer those responses with an empty body. Such a service cannot be deployed there (422, naming the feature) |
+| Services that enable `cufflink-fn/storage-acl` (`cufflink services list --features` names them, as `storage_acl`) | **Roll each back first, to a version without it.** The older platform cannot read an upload that names an ACL, and refuses it rather than store it without one. Such a service cannot be deployed there (422, naming the feature) |
+| Tenant buckets | Set each tenant that has some to `storage_scope` `strict` with an allowlist that leaves them out, unless its guests may reach them with the platform's credentials and today's rules. The older platform does not read `tenant_buckets`: their calls fall back to `storage_scope` and the platform's credentials, and under `legacy` with no allowlist they are admitted |
+| Exact keys | Nothing to undo, but objects stored under a key the older encoding changes (non-ASCII, `% # ? * [ ] ~ " < > \|`) cannot be read there until the platform is back |
+| Sealed secrets | Run `cufflink admin secrets reseal` and `verify` from this release: the older binary does not know `tenant_buckets` and skips its secrets |
+| Database roles of services the platform does not enqueue for (no served table and no `publishes`), provisioned or bound by this release | A tenant under `db_roles: enforce` goes to `warn` first. The older platform expects every bound role to hold `USAGE` on `_cufflink` and the outbox function, which this release no longer grants such a role, and writes those services' route audit records in their own sessions. Once it runs, apply the statements its `cufflink services db-role verify` prints for each such role, then set `enforce` again, which it refuses while a role is not verified |
+| The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read. Retired claims stay in it, and the older platform does not refuse them either |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -405,7 +485,7 @@ Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
 `V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
-v0.35.0): expected and harmless, as migrations are
+v0.35.0, `V8__tenant_buckets` on v0.36.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist
@@ -1240,7 +1320,9 @@ Unreleased.
 
 ## Changes in v0.36.0
 
-No new module-declared feature from these yet.
+Tenant buckets with their own credentials, exact keys and canned ACLs, and
+pre-rendered JSON responses ([features](#features-added-in-v0360)).
+Migration `V8__tenant_buckets.sql` adds a table. Also:
 
 - `ServiceRole::existing(name, password)` lets a `TestHost` log in as a
   role the test set up, as a service bound with `services db-role set
@@ -1257,6 +1339,28 @@ No new module-declared feature from these yet.
   ([testing](testing.md#template-databases)). `TestHostError` has a new
   variant, `Template`, for a template that could not be built or a
   database of its name that is not one.
+- `Response::json_text(text)` answers with JSON the handler has already
+  rendered, which the platform sends byte for byte without parsing or
+  encoding it ([features](#features-added-in-v0360),
+  [responses](routing.md#pre-rendered-json-cufflink-fn-feature-response-raw-json)).
+- **`db_roles` grants the outbox only to a service the platform enqueues
+  for.** A service whose manifest declares no served table (`tables`;
+  `private_tables` do not count) and nothing it `publishes` has its role
+  granted nothing of `_cufflink`: no `USAGE`, no
+  enqueue function and no `service_roles` row. Provisioning still takes the
+  shared `outbox_enqueue_many` from it and unmaps any other role mapped to
+  the service, as it does for every role. Its route audit records are
+  written in the platform's own session. `db-role verify` no longer
+  requires those grants of it, and reports a role that holds them as
+  `EXCESS`, with the `REVOKE` that takes each back, without failing it
+  ([database roles](db-roles-and-secrets.md)). Existing grants are kept.
+  A deploy that adds a table or `publishes` grants a verified role before
+  the version serves, whatever the tenant's `db_roles` policy, and fails
+  the deploy when it cannot. A guest with no served table (only
+  `private_tables`, or an adopted schema with none served) that calls
+  `_cufflink.outbox_enqueue_own` from its SQL must now declare `publishes`
+  ([outbox](outbox.md#enqueueing-from-a-guest)); without it, a role bound
+  from now on is refused the call.
 
 ## Changes in v0.35.0
 

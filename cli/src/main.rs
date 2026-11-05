@@ -713,6 +713,11 @@ enum TenantsAction {
         #[command(subcommand)]
         action: NatsClaimsAction,
     },
+    /// List, register or remove the buckets registered to a tenant
+    Buckets {
+        #[command(subcommand)]
+        action: commands::tenant_buckets::BucketsAction,
+    },
     /// Create, list or revoke the keys a tenant's runners (its extension
     /// runner and a tenant-scoped web runner) authenticate with
     RunnerKeys {
@@ -1120,6 +1125,9 @@ async fn run() -> eyre::Result<()> {
                     .await?
                 }
             },
+            TenantsAction::Buckets { action } => {
+                commands::tenant_buckets::run(action, api_url.as_deref(), env).await?
+            }
             TenantsAction::RunnerKeys { action } => {
                 commands::runner_keys::run(action, api_url.as_deref(), env).await?
             }

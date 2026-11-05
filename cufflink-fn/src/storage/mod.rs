@@ -13,6 +13,8 @@ mod v2;
 use crate::host::storage::PresignOp;
 #[cfg(target_arch = "wasm32")]
 use crate::{ffi, host_buffer};
+#[cfg(feature = "storage-acl")]
+pub use cufflink_types::host::storage::CannedAcl;
 #[cfg(target_arch = "wasm32")]
 use serde_json::Value;
 #[cfg(feature = "storage-v2")]

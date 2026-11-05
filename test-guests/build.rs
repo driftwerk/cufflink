@@ -94,6 +94,11 @@ const GUESTS: &[Guest] = &[
         features: &["storage-v2", "http-v2"],
     },
     Guest {
+        name: "tenant-buckets",
+        source: "tenant_buckets",
+        features: &["storage-acl", "response-v2"],
+    },
+    Guest {
         name: "util-v2",
         source: "util_v2",
         features: &["util-v2"],

@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "cufflink-sdk-macros",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-cli"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-fn"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-migrate"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "cufflink-types",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-native"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-nats",
  "axum",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-nats"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-nats",
  "eyre",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-pgcodec"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1375,11 +1375,12 @@ dependencies = [
  "wasmtime",
  "wat",
  "zenwebp",
+ "zeroize",
 ]
 
 [[package]]
 name = "cufflink-sdk-macros"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "cufflink-migrate",
  "cufflink-types",
@@ -1434,6 +1435,7 @@ dependencies = [
  "bytes",
  "chrono",
  "cufflink-settings",
+ "cufflink-types",
  "eyre",
  "futures-util",
  "hex",
@@ -1447,6 +1449,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -1540,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-types"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

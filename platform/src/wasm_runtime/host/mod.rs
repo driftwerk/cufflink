@@ -512,6 +512,7 @@ pub const HOST_FEATURES: &[(&str, &[&str])] = &[
     ("nats_publish_v2", &["nats_publish_v2"]),
     ("http_v2", &["http_fetch_v2"]),
     ("storage_v2", &["s3_upload", "s3_head"]),
+    ("storage_acl", &["s3_upload"]),
     ("util_v2", &["util_sleep_ms", "util_now_millis"]),
     ("ext_call", &["ext_call"]),
 ];

@@ -131,6 +131,7 @@ async fn apply(
             policy: policies.mode(PolicyKey::DbRoles),
             config: policies.config::<DbRolesConfig>(),
             actor,
+            deploying: None,
         },
         change,
     )

@@ -8,6 +8,55 @@ use object_store::{
 };
 use std::time::Duration;
 
+/// How a key becomes the object's name: as `object_store` encodes it, or
+/// exactly as given ([`crate::is_exact_key`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Keys {
+    #[default]
+    Encoded,
+    Exact,
+}
+
+impl Keys {
+    pub(crate) fn path(self, key: &str) -> Result<OsPath> {
+        match self {
+            Keys::Encoded => Ok(OsPath::from(key)),
+            Keys::Exact if crate::is_exact_key(key) => {
+                OsPath::parse(key).wrap_err_with(|| format!("the key {key:?} is not exact"))
+            }
+            Keys::Exact => Err(eyre::eyre!("the key {key:?} cannot be stored exactly")),
+        }
+    }
+}
+
+/// Whether a store whose own bucket is `own` may serve `bucket`: a store
+/// built for a tenant's bucket serves that bucket alone, and any other is a
+/// valid bucket name ([`crate::is_bucket_name`]).
+pub(crate) fn admit_bucket(own: &str, keys: Keys, bucket: &str) -> Result<()> {
+    if bucket == own {
+        return Ok(());
+    }
+    eyre::ensure!(
+        keys == Keys::Encoded,
+        "this store serves bucket {own} alone, not {bucket:?}"
+    );
+    eyre::ensure!(
+        crate::is_bucket_name(bucket),
+        "{bucket:?} is not a bucket name"
+    );
+    Ok(())
+}
+
+pub(crate) fn no_acl(backend: &'static str, options: &UploadOptions) -> Result<()> {
+    match options.acl {
+        Some(acl) => Err(eyre::eyre!(
+            "the {backend} backend stores no canned ACL ({})",
+            acl.as_str()
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn attributes(options: &UploadOptions) -> Attributes {
     [
         (Attribute::ContentType, Some(&options.content_type)),
@@ -45,6 +94,7 @@ pub(crate) fn retry_config() -> object_store::RetryConfig {
 pub(crate) async fn put(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     key: &str,
     data: Vec<u8>,
     options: &UploadOptions,
@@ -53,17 +103,18 @@ pub(crate) async fn put(
         attributes: attributes(options),
         ..Default::default()
     };
-    put_with(store, backend, key, data, opts).await
+    put_with(store, backend, keys, key, data, opts).await
 }
 
 pub(crate) async fn put_with(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     key: &str,
     data: Vec<u8>,
     opts: PutOptions,
 ) -> Result<Uploaded> {
-    let path = OsPath::from(key);
+    let path = keys.path(key)?;
     let size = data.len() as u64;
     let payload = PutPayload::from(Bytes::from(data));
     let stored = store
@@ -86,6 +137,7 @@ fn content_type(attributes: &Attributes) -> Option<String> {
 pub(crate) async fn head_meta(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     bucket: &str,
     key: &str,
 ) -> Result<Option<ObjectMeta>> {
@@ -93,7 +145,7 @@ pub(crate) async fn head_meta(
         head: true,
         ..Default::default()
     };
-    match store.get_opts(&OsPath::from(key), head).await {
+    match store.get_opts(&keys.path(key)?, head).await {
         Ok(got) => Ok(Some(ObjectMeta {
             size: got.meta.size,
             content_type: content_type(&got.attributes),
@@ -108,10 +160,11 @@ pub(crate) async fn head_meta(
 pub(crate) async fn get_bytes(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     bucket: Option<&str>,
     key: &str,
 ) -> Result<Vec<u8>> {
-    let path = OsPath::from(key);
+    let path = keys.path(key)?;
     let location = bucket.map_or_else(|| key.to_string(), |b| format!("{b}/{key}"));
     let got = store
         .get(&path)
@@ -127,11 +180,12 @@ pub(crate) async fn get_bytes(
 pub(crate) async fn open_read(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     bucket: &str,
     key: &str,
 ) -> Result<Option<ObjectReader>> {
     let location = format!("{bucket}/{key}");
-    match store.get(&OsPath::from(key)).await {
+    match store.get(&keys.path(key)?).await {
         Ok(got) => Ok(Some(ObjectReader {
             size: Some(got.meta.size),
             content_type: content_type(&got.attributes),
@@ -148,9 +202,10 @@ pub(crate) async fn open_read(
 pub(crate) async fn head_size(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     key: &str,
 ) -> Result<u64> {
-    let path = OsPath::from(key);
+    let path = keys.path(key)?;
     let meta = store
         .head(&path)
         .await
@@ -161,11 +216,12 @@ pub(crate) async fn head_size(
 pub(crate) async fn copy_object(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     src_key: &str,
     dst_key: &str,
 ) -> Result<()> {
-    let from = OsPath::from(src_key);
-    let to = OsPath::from(dst_key);
+    let from = keys.path(src_key)?;
+    let to = keys.path(dst_key)?;
     store
         .copy(&from, &to)
         .await
@@ -177,9 +233,10 @@ pub(crate) async fn copy_object(
 pub(crate) async fn delete_object(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     key: &str,
 ) -> Result<()> {
-    let path = OsPath::from(key);
+    let path = keys.path(key)?;
     store
         .delete(&path)
         .await
@@ -191,9 +248,10 @@ pub(crate) async fn delete_object(
 pub(crate) async fn delete_object_idempotent(
     store: &dyn ObjectStore,
     backend: &'static str,
+    keys: Keys,
     key: &str,
 ) -> Result<()> {
-    let path = OsPath::from(key);
+    let path = keys.path(key)?;
     match store.delete(&path).await {
         Ok(()) => {
             tracing::info!(backend, key = %key, "Deleted");
@@ -230,11 +288,12 @@ pub(crate) async fn delete_prefix(
 pub(crate) async fn presign_url<S: object_store::signer::Signer>(
     signer: &S,
     backend: &'static str,
+    keys: Keys,
     method: http::Method,
     key: &str,
     expires_in_secs: u64,
 ) -> Result<String> {
-    let path = OsPath::from(key);
+    let path = keys.path(key)?;
     let url = signer
         .signed_url(method.clone(), &path, Duration::from_secs(expires_in_secs))
         .await

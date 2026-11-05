@@ -32,6 +32,7 @@ pub use invocation::{Answer, ExecutionError, Invocation, InvocationKind};
 pub(crate) const FEATURES: &[&str] = &[
     "precompiled_modules",
     cufflink_types::features::GUEST_MEMORY_BUDGET,
+    cufflink_types::features::TENANT_BUCKETS,
 ];
 
 pub(super) fn wt(err: wasmtime::Error) -> eyre::Report {

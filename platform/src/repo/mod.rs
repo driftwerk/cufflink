@@ -19,6 +19,7 @@ pub mod schedule_state;
 pub mod service_configs;
 pub mod service_db_roles;
 pub mod services;
+pub mod tenant_buckets;
 pub mod tenant_policies;
 pub mod tenant_streams;
 pub mod tenants;

@@ -1,5 +1,6 @@
+use crate::common::{self, Keys};
 use crate::gcs_v4::{sign_url, BlobSigner, IamSignBlobSigner};
-use crate::{common, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
+use crate::{Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
 use async_trait::async_trait;
 use chrono::Utc;
 use eyre::{Result, WrapErr};
@@ -17,6 +18,7 @@ pub(crate) struct GcsBackend {
     bucket: String,
     sa_key_path: Option<String>,
     iam_signer: Option<Arc<IamSignBlobSigner>>,
+    keys: Keys,
 }
 
 impl GcsBackend {
@@ -44,10 +46,12 @@ impl GcsBackend {
             bucket,
             sa_key_path,
             iam_signer,
+            keys: Keys::Encoded,
         })
     }
 
     fn store_for(&self, bucket: &str) -> Result<Arc<GoogleCloudStorage>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
         if bucket == self.bucket {
             return Ok(Arc::clone(&self.primary));
         }
@@ -64,9 +68,19 @@ impl GcsBackend {
         match self.iam_signer.as_deref() {
             None => {
                 let store = self.store_for(bucket)?;
-                common::presign_url(store.as_ref(), BACKEND, method, key, expires_in_secs).await
+                common::presign_url(
+                    store.as_ref(),
+                    BACKEND,
+                    self.keys,
+                    method,
+                    key,
+                    expires_in_secs,
+                )
+                .await
             }
             Some(signer) => {
+                common::admit_bucket(&self.bucket, self.keys, bucket)?;
+                self.keys.path(key)?;
                 let signer: &dyn BlobSigner = signer;
                 sign_url(signer, Utc::now(), &method, bucket, key, expires_in_secs).await
             }
@@ -113,43 +127,44 @@ impl ObjectStorage for GcsBackend {
         options: &UploadOptions,
     ) -> Result<Uploaded> {
         let store = self.store_for(bucket)?;
-        common::put(store.as_ref(), BACKEND, key, data, options).await
+        common::no_acl(BACKEND, options)?;
+        common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(self.primary.as_ref(), BACKEND, None, key).await
+        common::get_bytes(self.primary.as_ref(), BACKEND, self.keys, None, key).await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         let store = self.store_for(bucket)?;
-        common::get_bytes(store.as_ref(), BACKEND, Some(bucket), key).await
+        common::get_bytes(store.as_ref(), BACKEND, self.keys, Some(bucket), key).await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
         let store = self.store_for(bucket)?;
-        common::open_read(store.as_ref(), BACKEND, bucket, key).await
+        common::open_read(store.as_ref(), BACKEND, self.keys, bucket, key).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
-        common::head_size(self.primary.as_ref(), BACKEND, key).await
+        common::head_size(self.primary.as_ref(), BACKEND, self.keys, key).await
     }
 
     async fn head_in_bucket(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let store = self.store_for(bucket)?;
-        common::head_meta(store.as_ref(), BACKEND, bucket, key).await
+        common::head_meta(store.as_ref(), BACKEND, self.keys, bucket, key).await
     }
 
     async fn copy(&self, src_key: &str, dst_key: &str) -> Result<()> {
-        common::copy_object(self.primary.as_ref(), BACKEND, src_key, dst_key).await
+        common::copy_object(self.primary.as_ref(), BACKEND, self.keys, src_key, dst_key).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        common::delete_object(self.primary.as_ref(), BACKEND, key).await
+        common::delete_object(self.primary.as_ref(), BACKEND, self.keys, key).await
     }
 
     async fn delete_from_bucket(&self, bucket: &str, key: &str) -> Result<()> {
         let store = self.store_for(bucket)?;
-        common::delete_object_idempotent(store.as_ref(), BACKEND, key).await
+        common::delete_object_idempotent(store.as_ref(), BACKEND, self.keys, key).await
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
@@ -200,6 +215,27 @@ impl ObjectStorage for GcsBackend {
 
     fn backend_kind(&self) -> &'static str {
         BACKEND
+    }
+
+    fn tenant_bucket(
+        &self,
+        bucket: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Arc<dyn ObjectStorage>> {
+        eyre::ensure!(
+            credential.is_none(),
+            "the {BACKEND} backend takes no bucket credential"
+        );
+        eyre::ensure!(
+            crate::is_bucket_name(bucket),
+            "{bucket:?} is not a bucket name"
+        );
+        Ok(Arc::new(Self {
+            primary: build_store(bucket, self.sa_key_path.as_deref())?,
+            bucket: bucket.to_string(),
+            keys: Keys::Exact,
+            ..self.clone()
+        }))
     }
 }
 
