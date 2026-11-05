@@ -1,7 +1,11 @@
-use crate::{common, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
+use crate::common::{self, Keys};
+use crate::{
+    CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded,
+};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::ClientOptions;
 use std::sync::Arc;
 
 const BACKEND: &str = "s3";
@@ -12,15 +16,47 @@ const ENV_ACCESS_KEY: &str = "S3_ACCESS_KEY";
 const ENV_SECRET_KEY: &str = "S3_SECRET_KEY";
 const ENV_BUCKET: &str = "S3_BUCKET";
 
+const ACL_HEADER: http::HeaderName = http::HeaderName::from_static("x-amz-acl");
+
 #[derive(Clone)]
-pub(crate) struct S3Backend {
-    primary: Arc<AmazonS3>,
+struct Connection {
     endpoint: String,
     region: String,
     access_key: String,
     secret_key: String,
-    bucket: String,
     allow_http: bool,
+}
+
+impl Connection {
+    fn store(&self, bucket: &str, acl: Option<CannedAcl>) -> Result<Arc<AmazonS3>> {
+        let options = ClientOptions::new().with_allow_http(self.allow_http);
+        let options = match acl {
+            Some(acl) => options.with_default_headers(http::HeaderMap::from_iter([(
+                ACL_HEADER,
+                http::HeaderValue::from_static(acl.as_str()),
+            )])),
+            None => options,
+        };
+        let store = AmazonS3Builder::new()
+            .with_endpoint(&self.endpoint)
+            .with_region(&self.region)
+            .with_access_key_id(&self.access_key)
+            .with_secret_access_key(&self.secret_key)
+            .with_bucket_name(bucket)
+            .with_client_options(options)
+            .with_retry(common::retry_config())
+            .build()
+            .wrap_err("Failed to build S3 client")?;
+        Ok(Arc::new(store))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct S3Backend {
+    primary: Arc<AmazonS3>,
+    connection: Connection,
+    bucket: String,
+    keys: Keys,
 }
 
 impl S3Backend {
@@ -38,38 +74,34 @@ impl S3Backend {
 
     pub(crate) fn from_vars(vars: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let endpoint = env_required(&vars, ENV_ENDPOINT)?;
-        let region = vars(ENV_REGION).unwrap_or_else(|| "us-east-1".to_string());
-        let access_key = env_required(&vars, ENV_ACCESS_KEY)?;
-        let secret_key = env_required(&vars, ENV_SECRET_KEY)?;
+        let connection = Connection {
+            region: vars(ENV_REGION).unwrap_or_else(|| "us-east-1".to_string()),
+            access_key: env_required(&vars, ENV_ACCESS_KEY)?,
+            secret_key: env_required(&vars, ENV_SECRET_KEY)?,
+            allow_http: endpoint.starts_with("http://"),
+            endpoint,
+        };
         let bucket = vars(ENV_BUCKET).unwrap_or_else(|| "cufflink".to_string());
-        let allow_http = endpoint.starts_with("http://");
-
-        let primary = build_store(
-            &endpoint,
-            &region,
-            &access_key,
-            &secret_key,
-            &bucket,
-            allow_http,
-        )?;
+        let backend = Self::new(connection, bucket, Keys::Encoded)?;
 
         tracing::info!(
             backend = BACKEND,
-            endpoint = %endpoint,
-            bucket = %bucket,
-            region = %region,
+            endpoint = %backend.connection.endpoint,
+            bucket = %backend.bucket,
+            region = %backend.connection.region,
             retry_timeout_secs = common::retry_timeout().as_secs(),
             "Object storage configured",
         );
 
+        Ok(backend)
+    }
+
+    fn new(connection: Connection, bucket: String, keys: Keys) -> Result<Self> {
         Ok(Self {
-            primary,
-            endpoint,
-            region,
-            access_key,
-            secret_key,
+            primary: connection.store(&bucket, None)?,
+            connection,
             bucket,
-            allow_http,
+            keys,
         })
     }
 
@@ -77,42 +109,13 @@ impl S3Backend {
         if bucket == self.bucket {
             return Ok(Arc::clone(&self.primary));
         }
-        build_store(
-            &self.endpoint,
-            &self.region,
-            &self.access_key,
-            &self.secret_key,
-            bucket,
-            self.allow_http,
-        )
+        self.connection.store(bucket, None)
     }
-}
-
-fn build_store(
-    endpoint: &str,
-    region: &str,
-    access_key: &str,
-    secret_key: &str,
-    bucket: &str,
-    allow_http: bool,
-) -> Result<Arc<AmazonS3>> {
-    let store = AmazonS3Builder::new()
-        .with_endpoint(endpoint)
-        .with_region(region)
-        .with_access_key_id(access_key)
-        .with_secret_access_key(secret_key)
-        .with_bucket_name(bucket)
-        .with_allow_http(allow_http)
-        .with_retry(common::retry_config())
-        .build()
-        .wrap_err("Failed to build S3 client")?;
-    Ok(Arc::new(store))
 }
 
 fn env_required(vars: impl Fn(&str) -> Option<String>, key: &str) -> Result<String> {
     vars(key).ok_or_else(|| eyre::eyre!("Missing required environment variable: {}", key))
 }
-
 #[async_trait]
 impl ObjectStorage for S3Backend {
     async fn upload(&self, key: &str, data: Vec<u8>, content_type: &str) -> Result<()> {
@@ -140,44 +143,47 @@ impl ObjectStorage for S3Backend {
         data: Vec<u8>,
         options: &UploadOptions,
     ) -> Result<Uploaded> {
-        let store = self.store_for(bucket)?;
-        common::put(store.as_ref(), BACKEND, key, data, options).await
+        let store = match options.acl {
+            Some(acl) => self.connection.store(bucket, Some(acl))?,
+            None => self.store_for(bucket)?,
+        };
+        common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(self.primary.as_ref(), BACKEND, None, key).await
+        common::get_bytes(self.primary.as_ref(), BACKEND, self.keys, None, key).await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         let store = self.store_for(bucket)?;
-        common::get_bytes(store.as_ref(), BACKEND, Some(bucket), key).await
+        common::get_bytes(store.as_ref(), BACKEND, self.keys, Some(bucket), key).await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
         let store = self.store_for(bucket)?;
-        common::open_read(store.as_ref(), BACKEND, bucket, key).await
+        common::open_read(store.as_ref(), BACKEND, self.keys, bucket, key).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
-        common::head_size(self.primary.as_ref(), BACKEND, key).await
+        common::head_size(self.primary.as_ref(), BACKEND, self.keys, key).await
     }
 
     async fn head_in_bucket(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let store = self.store_for(bucket)?;
-        common::head_meta(store.as_ref(), BACKEND, bucket, key).await
+        common::head_meta(store.as_ref(), BACKEND, self.keys, bucket, key).await
     }
 
     async fn copy(&self, src_key: &str, dst_key: &str) -> Result<()> {
-        common::copy_object(self.primary.as_ref(), BACKEND, src_key, dst_key).await
+        common::copy_object(self.primary.as_ref(), BACKEND, self.keys, src_key, dst_key).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        common::delete_object(self.primary.as_ref(), BACKEND, key).await
+        common::delete_object(self.primary.as_ref(), BACKEND, self.keys, key).await
     }
 
     async fn delete_from_bucket(&self, bucket: &str, key: &str) -> Result<()> {
         let store = self.store_for(bucket)?;
-        common::delete_object_idempotent(store.as_ref(), BACKEND, key).await
+        common::delete_object_idempotent(store.as_ref(), BACKEND, self.keys, key).await
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
@@ -187,17 +193,11 @@ impl ObjectStorage for S3Backend {
     async fn presign_upload(
         &self,
         key: &str,
-        _content_type: &str,
+        content_type: &str,
         expires_in_secs: u64,
     ) -> Result<String> {
-        common::presign_url(
-            self.primary.as_ref(),
-            BACKEND,
-            http::Method::PUT,
-            key,
-            expires_in_secs,
-        )
-        .await
+        self.presign_upload_to_bucket(&self.bucket, key, content_type, expires_in_secs)
+            .await
     }
 
     async fn presign_upload_to_bucket(
@@ -211,6 +211,7 @@ impl ObjectStorage for S3Backend {
         common::presign_url(
             store.as_ref(),
             BACKEND,
+            self.keys,
             http::Method::PUT,
             key,
             expires_in_secs,
@@ -219,14 +220,8 @@ impl ObjectStorage for S3Backend {
     }
 
     async fn presign_download(&self, key: &str, expires_in_secs: u64) -> Result<String> {
-        common::presign_url(
-            self.primary.as_ref(),
-            BACKEND,
-            http::Method::GET,
-            key,
-            expires_in_secs,
-        )
-        .await
+        self.presign_download_to_bucket(&self.bucket, key, expires_in_secs)
+            .await
     }
 
     async fn presign_download_to_bucket(
@@ -239,6 +234,7 @@ impl ObjectStorage for S3Backend {
         common::presign_url(
             store.as_ref(),
             BACKEND,
+            self.keys,
             http::Method::GET,
             key,
             expires_in_secs,
@@ -252,6 +248,26 @@ impl ObjectStorage for S3Backend {
 
     fn backend_kind(&self) -> &'static str {
         BACKEND
+    }
+
+    fn tenant_bucket(
+        &self,
+        bucket: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Arc<dyn ObjectStorage>> {
+        let connection = match credential {
+            Some(credential) => Connection {
+                access_key: credential.access_key_id.clone(),
+                secret_key: credential.secret_access_key.clone(),
+                ..self.connection.clone()
+            },
+            None => self.connection.clone(),
+        };
+        Ok(Arc::new(Self::new(
+            connection,
+            bucket.to_string(),
+            Keys::Exact,
+        )?))
     }
 }
 
@@ -318,9 +334,12 @@ mod tests {
             ],
             || {
                 let backend = S3Backend::from_vars(var).expect("should build");
-                assert_eq!(backend.region, "us-east-1");
+                assert_eq!(backend.connection.region, "us-east-1");
                 assert_eq!(backend.bucket, "cufflink");
-                assert!(backend.allow_http, "http:// endpoint must allow_http");
+                assert!(
+                    backend.connection.allow_http,
+                    "http:// endpoint must allow_http"
+                );
             },
         );
     }
@@ -337,7 +356,7 @@ mod tests {
             ],
             || {
                 let backend = S3Backend::from_vars(var).expect("should build");
-                assert!(!backend.allow_http);
+                assert!(!backend.connection.allow_http);
             },
         );
     }
@@ -435,6 +454,7 @@ mod tests {
                     content_type: "application/pdf".into(),
                     content_disposition: Some("attachment; filename=\"receipt.pdf\"".into()),
                     cache_control: Some("no-store".into()),
+                    acl: None,
                 },
             )
             .await
@@ -511,6 +531,258 @@ mod tests {
             .unwrap_or_default()
             .iter()
             .all(|request| request.method.as_str() == "HEAD"));
+    }
+
+    const EXACT: &str = "leads/7/Café façade #2 50%+off?.pdf";
+    const EXACT_ON_THE_WIRE: &str =
+        "/example-documents/leads/7/Caf%C3%A9%20fa%C3%A7ade%20%232%2050%25%2Boff%3F.pdf";
+
+    fn signed_by(request: &wiremock::Request) -> String {
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|auth| auth.split("Credential=").nth(1))
+            .and_then(|credential| credential.split('/').next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn tenant_bucket(server: &str, credential: Option<&Credential>) -> Arc<dyn ObjectStorage> {
+        backend_at(server)
+            .tenant_bucket("example-documents", credential)
+            .expect("tenant bucket")
+    }
+
+    #[tokio::test]
+    async fn a_tenant_bucket_sends_its_keys_exactly_and_signs_with_its_credential() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(EXACT_ON_THE_WIRE))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"e1\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(EXACT_ON_THE_WIRE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "4")
+                    .insert_header("last-modified", "Mon, 28 Sep 2026 10:00:00 GMT")
+                    .set_body_bytes(b"%PDF".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(EXACT_ON_THE_WIRE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "4")
+                    .insert_header("last-modified", "Mon, 28 Sep 2026 10:00:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/example-documents"))
+            .and(wiremock::matchers::query_param("delete", ""))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "<Key>{EXACT}</Key>"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<DeleteResult><Deleted><Key>{EXACT}</Key></Deleted></DeleteResult>"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let credential = Credential {
+            access_key_id: "AKDOCUMENTS".into(),
+            secret_access_key: "documents-secret".into(),
+        };
+        let bucket = tenant_bucket(&server.uri(), Some(&credential));
+        bucket
+            .upload_to_bucket_with(
+                "example-documents",
+                EXACT,
+                b"%PDF".to_vec(),
+                &UploadOptions::content_type("application/pdf"),
+            )
+            .await
+            .expect("uploaded");
+        assert_eq!(
+            bucket
+                .download_from_bucket("example-documents", EXACT)
+                .await
+                .expect("downloaded"),
+            b"%PDF"
+        );
+        assert_eq!(
+            bucket
+                .head_in_bucket("example-documents", EXACT)
+                .await
+                .expect("head")
+                .map(|meta| meta.size),
+            Some(4)
+        );
+        bucket
+            .delete_from_bucket("example-documents", EXACT)
+            .await
+            .expect("deleted");
+        let presigned = bucket
+            .presign_download_to_bucket("example-documents", EXACT, 60)
+            .await
+            .expect("presigned");
+        assert!(presigned.contains(EXACT_ON_THE_WIRE), "{presigned}");
+        assert!(presigned.contains("AKDOCUMENTS"), "{presigned}");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| signed_by(request) == "AKDOCUMENTS"),
+            "every request is signed with the bucket's credential"
+        );
+
+        let platform = tenant_bucket(&server.uri(), None);
+        platform
+            .head_in_bucket("example-documents", EXACT)
+            .await
+            .expect("head");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.last().map(signed_by).as_deref(), Some("ak"));
+    }
+
+    #[tokio::test]
+    async fn the_platforms_buckets_keep_their_encoded_keys() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/receipts/Caf%25C3%25A9%20%25232.pdf"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"e\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        backend_at(&server.uri())
+            .upload_to_bucket("receipts", "Café #2.pdf", b"x".to_vec(), "text/plain")
+            .await
+            .expect("uploaded under the encoded name");
+    }
+
+    #[tokio::test]
+    async fn a_key_that_cannot_be_stored_exactly_is_refused_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let bucket = tenant_bucket(&server.uri(), None);
+        for key in [
+            "",
+            "/leads/a",
+            "leads/",
+            "leads//a",
+            "leads/./a",
+            "a/../b",
+            "a\nb",
+        ] {
+            let refused = bucket
+                .upload_to_bucket("example-documents", key, b"x".to_vec(), "text/plain")
+                .await
+                .expect_err("refused");
+            assert!(refused.to_string().contains("exactly"), "{key}: {refused}");
+            assert!(bucket
+                .download_from_bucket("example-documents", key)
+                .await
+                .is_err());
+            assert!(bucket
+                .delete_from_bucket("example-documents", key)
+                .await
+                .is_err());
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_canned_acl_is_a_signed_header_of_the_upload_that_asked_for_it() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/example-documents/logos/a.png"))
+            .and(header("x-amz-acl", "public-read"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"a\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/example-documents/logos/b.png"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"b\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bucket = tenant_bucket(&server.uri(), None);
+        let public = UploadOptions {
+            acl: Some(CannedAcl::PublicRead),
+            ..UploadOptions::content_type("image/png")
+        };
+        bucket
+            .upload_to_bucket_with("example-documents", "logos/a.png", b"png".to_vec(), &public)
+            .await
+            .expect("public upload");
+        bucket
+            .upload_to_bucket_with(
+                "example-documents",
+                "logos/b.png",
+                b"png".to_vec(),
+                &UploadOptions::content_type("image/png"),
+            )
+            .await
+            .expect("private upload");
+        let requests = server.received_requests().await.unwrap_or_default();
+        let acl_of = |path: &str| {
+            requests
+                .iter()
+                .find(|request| request.url.path() == path)
+                .map(|request| {
+                    let signed = request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|auth| auth.contains("x-amz-acl"));
+                    (
+                        request
+                            .headers
+                            .get("x-amz-acl")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                        signed,
+                    )
+                })
+        };
+        assert_eq!(
+            acl_of("/example-documents/logos/a.png"),
+            Some((Some("public-read".into()), true))
+        );
+        assert_eq!(
+            acl_of("/example-documents/logos/b.png"),
+            Some((None, false))
+        );
+    }
+
+    #[test]
+    fn a_credential_never_shows_its_secret() {
+        let credential = Credential {
+            access_key_id: "AKDOCUMENTS".into(),
+            secret_access_key: "documents-secret".into(),
+        };
+        let shown = format!("{credential:?}");
+        assert!(shown.contains("AKDOCUMENTS"), "{shown}");
+        assert!(!shown.contains("documents-secret"), "{shown}");
     }
 
     #[tokio::test]

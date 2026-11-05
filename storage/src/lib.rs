@@ -3,7 +3,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use futures_util::stream::BoxStream;
+use std::fmt;
 use std::sync::Arc;
+
+pub use cufflink_types::host::storage::CannedAcl;
 
 mod common;
 mod gcs;
@@ -86,6 +89,15 @@ pub trait ObjectStorage: Send + Sync {
     fn primary_bucket(&self) -> &str;
 
     fn backend_kind(&self) -> &'static str;
+
+    /// A backend for one bucket a tenant owns: its keys stored exactly as
+    /// given ([`is_exact_key`]), signed with `credential` when one is given
+    /// and with this backend's own credentials otherwise.
+    fn tenant_bucket(
+        &self,
+        bucket: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Arc<dyn ObjectStorage>>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -93,6 +105,44 @@ pub struct UploadOptions {
     pub content_type: String,
     pub content_disposition: Option<String>,
     pub cache_control: Option<String>,
+    pub acl: Option<CannedAcl>,
+}
+
+/// An access key that reaches a bucket at the platform's endpoint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credential")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
+pub const MAX_KEY_BYTES: usize = 1024;
+
+/// A key the stores can address without changing it: 1 to 1024 bytes, no
+/// leading, trailing or doubled `/`, no `.` or `..` segment and no ASCII
+/// control character.
+pub fn is_exact_key(key: &str) -> bool {
+    key.len() <= MAX_KEY_BYTES && exact_segments(key)
+}
+
+/// A prefix of exact keys: an exact key, or one followed by `/`.
+pub fn is_exact_prefix(prefix: &str) -> bool {
+    prefix.len() <= MAX_KEY_BYTES && exact_segments(prefix.strip_suffix('/').unwrap_or(prefix))
+}
+
+fn exact_segments(key: &str) -> bool {
+    !key.chars().any(|c| c.is_ascii_control())
+        && key
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
 impl UploadOptions {
