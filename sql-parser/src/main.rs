@@ -10,7 +10,7 @@ mod sandbox;
 use cufflink_sql_parse::bounds::MAX_INPUT_BYTES;
 use cufflink_sql_parse::wire::{read_frame, read_message, write_frame, write_message};
 use cufflink_sql_parse::wire::{Answer, Hello, Request};
-use cufflink_sql_parse::{fingerprint, parse_on_this_thread, PARSER, STACK_BYTES};
+use cufflink_sql_parse::{fingerprint_with, parse_on_this_thread, PARSER, STACK_BYTES};
 use cufflink_types::sql_parse::ParseError;
 use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
@@ -28,11 +28,11 @@ fn main() -> ExitCode {
 
 fn run() -> io::Result<()> {
     sandbox::confine()?;
+    let thread = ParseThread::spawn()?;
     let hello = Hello {
         parser: PARSER.to_string(),
-        fingerprint: fingerprint().map_err(io::Error::other)?.to_string(),
+        fingerprint: thread.warm_up()?,
     };
-    let thread = ParseThread::spawn()?;
     sandbox::enter()?;
     serve(
         &hello,
@@ -97,6 +97,28 @@ impl ParseThread {
         Ok(Self { requests, answers })
     }
 
+    /// The fingerprint, parsed on this thread, and a refused statement:
+    /// whatever the first parse, the first refusal and the first wait for
+    /// an answer set up, both threads set up before the process confines
+    /// itself.
+    fn warm_up(&self) -> io::Result<String> {
+        let mut failed = None;
+        let fingerprint = fingerprint_with(|sql| match self.parse(sql.into(), usize::MAX) {
+            Ok(answer) => answer,
+            Err(e) => {
+                failed = Some(e);
+                Err(ParseError::unavailable())
+            }
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        match self.parse("SELEC".into(), usize::MAX)? {
+            Err(ParseError::Syntax(_)) => fingerprint.map_err(io::Error::other),
+            _ => Err(io::Error::other("a statement that is not SQL was not refused")),
+        }
+    }
+
     fn parse(&self, sql: String, max_output: usize) -> io::Result<Result<String, ParseError>> {
         let ended = || io::Error::other("the parse thread ended");
         self.requests.send((sql, max_output)).map_err(|_| ended())?;
@@ -119,7 +141,9 @@ mod tests {
     fn hello() -> Hello {
         Hello {
             parser: PARSER.to_string(),
-            fingerprint: fingerprint().expect("fingerprint").to_string(),
+            fingerprint: cufflink_sql_parse::fingerprint()
+                .expect("fingerprint")
+                .to_string(),
         }
     }
 
@@ -188,6 +212,10 @@ mod tests {
     #[test]
     fn the_parse_thread_answers_in_turn_as_a_parse_does() {
         let thread = ParseThread::spawn().expect("spawned");
+        assert_eq!(
+            thread.warm_up().expect("warmed up"),
+            cufflink_sql_parse::PROBE_FINGERPRINT
+        );
         for sql in ["SELECT 1", "SELEC 1", "SELECT 2"] {
             assert_eq!(
                 thread.parse(sql.into(), usize::MAX).expect("answered"),

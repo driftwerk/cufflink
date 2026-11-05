@@ -84,6 +84,8 @@ const ALLOWED: &[libc::c_long] = &[
     libc::SYS_sched_yield,
     libc::SYS_clock_gettime,
     libc::SYS_getrandom,
+    libc::SYS_getpid,
+    libc::SYS_gettid,
     libc::SYS_rt_sigreturn,
     libc::SYS_rt_sigprocmask,
     libc::SYS_sigaltstack,

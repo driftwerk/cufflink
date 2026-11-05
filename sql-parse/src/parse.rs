@@ -97,17 +97,22 @@ pub fn parsed(sql: &str, max_output: usize) -> Result<Parsed, ParseError> {
 pub fn fingerprint() -> Result<&'static str, ParseError> {
     static COMPUTED: OnceLock<Result<String, ParseError>> = OnceLock::new();
     COMPUTED
-        .get_or_init(|| {
-            PROBE
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .try_fold(Sha256::new(), |hash, sql| {
-                    parse(sql, usize::MAX).map(|text| hash.chain_update(text).chain_update(b"\n"))
-                })
-                .map(|hash| hex::encode(hash.finalize()))
-        })
+        .get_or_init(|| fingerprint_with(|sql| parse(sql, usize::MAX)))
         .as_deref()
         .map_err(Clone::clone)
+}
+
+/// The probe corpus's fingerprint with each statement's tree from `tree`.
+pub fn fingerprint_with(
+    mut tree: impl FnMut(&str) -> Result<String, ParseError>,
+) -> Result<String, ParseError> {
+    PROBE
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .try_fold(Sha256::new(), |hash, sql| {
+            tree(sql).map(|text| hash.chain_update(text).chain_update(b"\n"))
+        })
+        .map(|hash| hex::encode(hash.finalize()))
 }
 
 fn canonical(sql: &str) -> Result<String, ParseError> {

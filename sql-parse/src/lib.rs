@@ -12,7 +12,7 @@ mod parse;
 pub mod wire;
 
 #[cfg(feature = "parser")]
-pub use parse::{fingerprint, parse, parse_on_this_thread, parsed, STACK_BYTES};
+pub use parse::{fingerprint, fingerprint_with, parse, parse_on_this_thread, parsed, STACK_BYTES};
 
 /// The `pg_query` release that parses, which fixes PostgreSQL's grammar.
 pub const PARSER: &str = "6.2.1";
