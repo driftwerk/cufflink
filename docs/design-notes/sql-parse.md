@@ -114,8 +114,9 @@ talks to each over its stdin and stdout:
   glibc).
 - **Confinement.** Before it greets, the process sets its address space
   limit and `oom_score_adj` (below), makes itself undumpable, starts its
-  parse thread, and installs a seccomp filter on every thread, with
-  `no_new_privs`. The filter allows only what a parse and its answer need:
+  parse thread and computes the fingerprint and one refusal through it, so
+  the thread has finished starting, and installs a seccomp filter on every
+  thread, with `no_new_privs`. The filter allows only what a parse and its answer need:
   `read` and `write`, `close`, `dup`, `dup2`/`dup3`, `pipe`/`pipe2`,
   `fcntl` and `fstat` for the parser's capture of its own stderr, the
   allocator's `brk`, `mmap`, `munmap`, `mremap`, `mprotect` and `madvise`,
