@@ -5,11 +5,13 @@
 use super::super::error::TestHostError;
 use super::{apart, execute, execute_file, locked, query, reaching, server};
 use cufflink_pgcodec::session::quote_ident;
+use postgres::error::SqlState;
 use postgres::{Client, Config, NoTls};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// What a template's database is named after its name.
 const PREFIX: &str = "tmpl_";
@@ -19,6 +21,11 @@ const BUILDING: &str = "tmpl__";
 /// The longest name a template may have: a database's name is at most 63
 /// bytes.
 const MAX_NAME: usize = 63 - PREFIX.len();
+/// How long a call waits for another process's build of the same template.
+const LOCK_WAIT: Duration = Duration::from_secs(600);
+/// How long a sealed build waits for its last connections to be gone: a
+/// connection the build closed may still be ending on the server.
+const CLOSING: Duration = Duration::from_secs(2);
 
 /// Each template this process asked for, by name; a slot is held while its
 /// template is built, so it is built once however many ask at once.
@@ -123,14 +130,25 @@ impl Lock {
     fn take(server: &Config, database: &str) -> Result<Self, TestHostError> {
         let key = format!("cufflink-fn template {database}");
         let mut client = apart(|| server.connect(NoTls))?;
-        let held =
-            apart(|| client.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key]));
+        let held = apart(|| {
+            client.batch_execute(&format!("SET lock_timeout = '{}s'", LOCK_WAIT.as_secs()))?;
+            client.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key])
+        });
         let lock = Self {
             client: Some(client),
             key,
         };
-        held?;
-        Ok(lock)
+        match held {
+            Err(e) if e.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) => Err(refused(format!(
+                "template {database} has been built elsewhere for over {}s; \
+                 a process that holds its lock is stuck or still building",
+                LOCK_WAIT.as_secs()
+            ))),
+            held => {
+                held?;
+                Ok(lock)
+            }
+        }
     }
 
     fn client(&mut self) -> Result<&mut Client, TestHostError> {
@@ -294,24 +312,52 @@ fn standing(client: &mut Client, database: &str) -> Result<Option<bool>, TestHos
 fn seal(client: &mut Client, built: &str, database: &str) -> Result<(), TestHostError> {
     let quoted = quote_ident(built);
     client.batch_execute(&format!("ALTER DATABASE {quoted} ALLOW_CONNECTIONS false"))?;
-    let open: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = $1",
-            &[&built],
-        )?
-        .try_get(0)?;
+    let open = open_after_closing(client, built)?;
     if open > 0 {
         return Err(refused(format!(
             "the build of template {database} left {open} connection(s) to its database open; \
              close every connection before the build returns"
         )));
     }
-    client.batch_execute(&format!(
+    let mark = format!(
         "ALTER DATABASE {quoted} IS_TEMPLATE true; \
          ALTER DATABASE {quoted} RENAME TO {}",
         quote_ident(database)
-    ))?;
-    Ok(())
+    );
+    let deadline = Instant::now() + CLOSING;
+    loop {
+        match client.batch_execute(&mark) {
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => {
+                return Err(refused(format!(
+                    "the build of template {database} could not be renamed: \
+                     its database is still in use ({e})"
+                )));
+            }
+            marked => return Ok(marked?),
+        }
+    }
+}
+
+/// The client connections to `built` still open once those that are ending
+/// have had [`CLOSING`] to go.
+fn open_after_closing(client: &mut Client, built: &str) -> Result<i64, TestHostError> {
+    let deadline = Instant::now() + CLOSING;
+    loop {
+        let open: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = $1 AND backend_type = 'client backend'",
+                &[&built],
+            )?
+            .try_get(0)?;
+        if open == 0 || Instant::now() >= deadline {
+            return Ok(open);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]

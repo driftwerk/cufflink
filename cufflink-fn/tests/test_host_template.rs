@@ -305,6 +305,7 @@ fn a_clone_keeps_the_templates_owners_and_grants_and_its_service_role_takes_the_
 }
 
 #[test]
+#[ignore = "a benchmark: it compares wall-clock times, run it with --ignored on a quiet machine"]
 fn cloning_a_template_takes_a_fraction_of_building_its_schema() {
     let Some(admin) = database() else {
         return;

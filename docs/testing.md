@@ -188,7 +188,11 @@ fn an_order_is_placed() {
   closed to connections (`ALLOW_CONNECTIONS false`), made a template
   (`IS_TEMPLATE true`) and renamed `tmpl_<name>`. Later calls return it,
   and concurrent first calls wait for one build, in the process and, under
-  an advisory lock, across processes on one server.
+  an advisory lock, across processes on one server. The lock is taken in
+  the database the server's URL names, so processes share it when they
+  reach the server through the same database; a call waits at most ten
+  minutes for another's build before it fails with
+  `TestHostError::Template`.
 - A name is 1 to 58 lowercase letters, digits and underscores. A server
   that outlives the process keeps the template and a later run uses it
   without building it, so name it after what `build` makes (a hash of the
@@ -210,6 +214,10 @@ fn an_order_is_placed() {
   server `CUFFLINK_TEST_DATABASE_URL` names they stay, for the next run;
   drop one with `ALTER DATABASE tmpl_<name> IS_TEMPLATE false` and
   `DROP DATABASE tmpl_<name>`.
+  A process killed while it builds leaves its build database,
+  `tmpl__<uuid>`, which nothing uses again; list them with
+  `SELECT datname FROM pg_database WHERE datname LIKE 'tmpl\_\_%'` and
+  drop each the same way when no test run is building.
 
 ## The testkit
 
