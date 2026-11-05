@@ -17,7 +17,8 @@ pub enum TestHostError {
     Migration(String),
     /// A request the platform would never send.
     Request(String),
-    /// The role a service's statements run as could not be made.
+    /// The role a service's statements run as could not be made, or a
+    /// role the test set up could not be logged in as.
     Role(String),
 }
 

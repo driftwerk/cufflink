@@ -267,13 +267,13 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 `cufflink services list --features` prints what each deployed service
 requires.
 
-## Features added in v0.36.0
+## Features added in v0.37.0
 
 Unreleased.
 
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
-| `sql_parse` | the guest enables `cufflink-fn/sql-parse` | PostgreSQL's parse tree of a statement, from parser processes beside the platform; advertised only once one has answered ([design](design-notes/sql-parse.md)) |
+| `sql_parse` | the guest enables `cufflink-fn/sql-parse` | PostgreSQL's parse tree of a statement, from parser processes beside the platform; advertised while one answers ([design](design-notes/sql-parse.md)) |
 
 ## Changes in v0.33.0
 
@@ -1225,7 +1225,7 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
-## Changes in v0.36.0
+## Changes in v0.37.0
 
 Unreleased.
 
@@ -1245,6 +1245,19 @@ Unreleased.
 - The new crate `cufflink-sql-parse` 0.1.0 is published before
   `cufflink-fn`. With `test-host` and `sql-parse` both on, `cufflink-fn`
   builds `pg_query`, which needs a C compiler and libclang.
+
+## Unreleased changes
+
+No new module-declared feature from these yet.
+
+- `ServiceRole::existing(name, password)` lets a `TestHost` log in as a
+  role the test set up, as a service bound with `services db-role set
+  --role` logs in under `db_roles: enforce`. The role is not created, given
+  the schema or granted the read-only role, its own settings apply where
+  the session prelude does not set them, and a missing role or a wrong
+  password fails `build()` with `TestHostError::Role`, naming the role
+  ([testing](testing.md#the-database)). `ServiceRole`'s `Debug` no longer
+  prints the password.
 
 ## Changes in v0.35.0
 

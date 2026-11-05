@@ -98,8 +98,10 @@ impl<'a> TestHostBuilder<'a> {
 
     /// Who the service's statements run as; unless set, a login as the
     /// role [`TestDb::service_role`] makes for the service, as under
-    /// `db_roles: enforce`. [`PgRole::Connection`] runs them as the test
-    /// server's user, as under `db_roles: off`.
+    /// `db_roles: enforce`. A login as a role the test made itself
+    /// ([`ServiceRole::existing`](super::db::ServiceRole::existing)) changes
+    /// nothing about the role or the schema. [`PgRole::Connection`] runs
+    /// them as the test server's user, as under `db_roles: off`.
     pub fn role(self, role: PgRole) -> Self {
         Self {
             role: Some(role),
@@ -131,8 +133,9 @@ impl<'a> TestHostBuilder<'a> {
     }
 
     /// The role `db::query_read_only` runs as; it has to exist. A service
-    /// that logs in as its role is granted it, as the platform grants the
-    /// read-only role its binding names.
+    /// that logs in as the role the test database made for it is granted
+    /// it, as the platform grants the read-only role its binding names; an
+    /// existing role is granted nothing.
     pub fn read_only_role(self, role: &str) -> Self {
         Self {
             options: PgOptions {
@@ -235,7 +238,9 @@ fn database(
         None => PgRole::Login(db.service_role(schema)?),
     };
     if let (PgRole::Login(role), Some(read_only)) = (&role, &options.read_only_role) {
-        db.grant_read_only(role, read_only)?;
+        if role.made() {
+            db.grant_read_only(role, read_only)?;
+        }
     }
     PgHost::connect(db, schema, PgOptions { role, ..options })
 }
