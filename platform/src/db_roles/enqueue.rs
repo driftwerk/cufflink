@@ -34,6 +34,8 @@ pub enum Enqueue {
         execute: bool,
         shared: bool,
         mapped: bool,
+        /// Another role is mapped to the service.
+        stale: bool,
     },
 }
 
@@ -54,20 +56,24 @@ pub async fn facts(
     let (shared_exists, own_exists): (bool, bool) = (row.get(0), row.get(1));
     let (shared, own): (bool, bool) = (row.get(2), row.get(3));
     Ok(match (own_exists, shared_exists) {
-        (true, _) => Enqueue::Own {
-            execute: own,
-            shared,
-            mapped: client
+        (true, _) => {
+            let mapping = client
                 .query_one(
                     &format!(
-                        "SELECT COALESCE(bool_and(role = $1::name), false)
+                        "SELECT COALESCE(bool_and(role = $1::name), false),
+                                COALESCE(bool_or(role <> $1::name), false)
                          FROM {SERVICE_ROLES} WHERE service = $2"
                     ),
                     &[&role, &service],
                 )
-                .await?
-                .get(0),
-        },
+                .await?;
+            Enqueue::Own {
+                execute: own,
+                shared,
+                mapped: mapping.get(0),
+                stale: mapping.get(1),
+            }
+        }
         (false, true) => Enqueue::Shared { execute: shared },
         (false, false) => Enqueue::Absent,
     })
@@ -83,6 +89,7 @@ pub fn statements(role: &str, service: &str, enqueue: Enqueue) -> Vec<String> {
             execute,
             shared,
             mapped,
+            ..
         } => (!execute)
             .then(|| grant(OWN))
             .into_iter()
@@ -92,14 +99,42 @@ pub fn statements(role: &str, service: &str, enqueue: Enqueue) -> Vec<String> {
     }
 }
 
+/// What a role the platform never enqueues as is made to hold no more of:
+/// the shared function, which enqueues for any service, and the service's
+/// mapping to any role but its own. It grants nothing.
+pub fn narrowing(role: &str, service: &str, enqueue: Enqueue) -> Vec<String> {
+    match enqueue {
+        Enqueue::Absent | Enqueue::Shared { .. } => vec![],
+        Enqueue::Own { shared, stale, .. } => shared
+            .then(|| {
+                format!(
+                    "REVOKE EXECUTE ON FUNCTION {SHARED} FROM {}",
+                    quote_ident(role)
+                )
+            })
+            .into_iter()
+            .chain(stale.then(|| unmap_others(role, service)))
+            .collect(),
+    }
+}
+
+fn unmap_others(role: &str, service: &str) -> String {
+    format!(
+        "DELETE FROM {SERVICE_ROLES} WHERE service = {} AND role <> {}",
+        quote_literal(service),
+        quote_literal(role)
+    )
+}
+
 fn map(role: &str, service: &str) -> [String; 2] {
-    let (role, service) = (quote_literal(role), quote_literal(service));
     [
         format!(
-            "INSERT INTO {SERVICE_ROLES} (role, service) VALUES ({role}, {service})
-             ON CONFLICT (role) DO UPDATE SET service = EXCLUDED.service"
+            "INSERT INTO {SERVICE_ROLES} (role, service) VALUES ({}, {})
+             ON CONFLICT (role) DO UPDATE SET service = EXCLUDED.service",
+            quote_literal(role),
+            quote_literal(service)
         ),
-        format!("DELETE FROM {SERVICE_ROLES} WHERE service = {service} AND role <> {role}"),
+        unmap_others(role, service),
     ]
 }
 
@@ -137,6 +172,7 @@ pub fn checks(role: &str, service: &str, enqueue: Enqueue) -> Vec<Check> {
             execute: granted,
             shared,
             mapped,
+            ..
         } => vec![
             execute(OWN, granted),
             Check::of("outbox_confined", !shared, || {
@@ -200,6 +236,7 @@ pub fn excess(role: &str, usage: bool, enqueue: Enqueue) -> Vec<Check> {
             execute,
             shared,
             mapped,
+            ..
         } => vec![
             executes(OWN, execute, mapped),
             Check::of("outbox_confined", !shared, || {
@@ -235,6 +272,7 @@ mod tests {
             execute: false,
             shared: true,
             mapped: false,
+            stale: false,
         };
         assert_eq!(
             statements(ROLE, "note's-service", fresh),
@@ -254,6 +292,7 @@ mod tests {
             execute: true,
             shared: false,
             mapped: true,
+            stale: false,
         };
         assert!(statements(ROLE, "loan-service", settled).is_empty());
         assert!(checks(ROLE, "loan-service", settled).iter().all(|c| c.ok));
@@ -268,6 +307,7 @@ mod tests {
                 execute: false,
                 shared: true,
                 mapped: false,
+                stale: false,
             },
         );
         assert_eq!(
@@ -307,6 +347,7 @@ mod tests {
             execute: false,
             shared: false,
             mapped: false,
+            stale: false,
         };
         let checks = excess(ROLE, false, bare);
         assert_eq!(
@@ -335,6 +376,7 @@ mod tests {
             execute: true,
             shared: false,
             mapped: true,
+            stale: false,
         };
         let checks = excess(ROLE, true, granted);
         assert!(checks.iter().all(|c| c.ok));
@@ -365,11 +407,43 @@ mod tests {
                 execute: false,
                 shared: true,
                 mapped: false,
+                stale: false,
             },
         );
         assert!(
             !shared[2].ok && !shared[2].excess,
             "enqueueing for any service stays a failure: {shared:?}"
         );
+    }
+
+    #[test]
+    fn a_role_that_needs_no_outbox_is_narrowed_and_granted_nothing() {
+        let held = Enqueue::Own {
+            execute: true,
+            shared: true,
+            mapped: false,
+            stale: true,
+        };
+        assert_eq!(
+            narrowing(ROLE, "note's-service", held),
+            [
+                format!("REVOKE EXECUTE ON FUNCTION {SHARED} FROM \"{ROLE}\""),
+                format!(
+                    "DELETE FROM _cufflink.service_roles WHERE service = 'note''s-service' AND role <> '{ROLE}'"
+                ),
+            ]
+        );
+        let own = Enqueue::Own {
+            execute: true,
+            shared: false,
+            mapped: true,
+            stale: false,
+        };
+        assert!(
+            narrowing(ROLE, "loan-service", own).is_empty(),
+            "what the role holds of its own is reported, not taken back"
+        );
+        assert!(narrowing(ROLE, "loan-service", Enqueue::Shared { execute: true }).is_empty());
+        assert!(narrowing(ROLE, "loan-service", Enqueue::Absent).is_empty());
     }
 }

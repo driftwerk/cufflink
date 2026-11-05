@@ -19,7 +19,7 @@ use cufflink_types::ServiceMode;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub(crate) fn deploy_hash(manifest: &ServiceManifest) -> PlatformResult<String> {
@@ -415,8 +415,16 @@ pub(crate) async fn rollback_locked(
     let identity = service.identity(&user.tenant_slug);
     let new_version = service.current_version + 1;
     if manifest.mode.runs_on_platform() {
-        crate::db_roles::provision::before_deploy(state, service.tenant_id, service_id, &manifest)
-            .await?;
+        let provisioned = crate::db_roles::provision::before_deploy(
+            state,
+            service.tenant_id,
+            service_id,
+            &manifest,
+        )
+        .await;
+        if let Err(e) = provisioned {
+            warn!(service = %service.name, error = %e, "The rolled-back version's database role could not be granted the outbox; the rollback goes on, and `cufflink services db-role verify` reports what is missing");
+        }
     }
 
     let (schema, eventing, deployment) = match manifest.mode {

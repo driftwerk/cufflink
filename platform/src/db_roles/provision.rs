@@ -259,8 +259,12 @@ fn reader_statements<'a>(spec: &'a Spec<'_>) -> impl Iterator<Item = String> + u
 }
 
 fn cufflink_statements(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
-    match spec.enqueues && catalog.cufflink_schema && (spec.managed || catalog.role_exists) {
-        true => std::iter::once(format!(
+    match (
+        catalog.cufflink_schema && (spec.managed || catalog.role_exists),
+        spec.enqueues,
+    ) {
+        (false, _) => vec![],
+        (true, true) => std::iter::once(format!(
             "GRANT USAGE ON SCHEMA {CUFFLINK_SCHEMA} TO {}",
             quote_ident(spec.role)
         ))
@@ -270,7 +274,7 @@ fn cufflink_statements(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
             catalog.enqueue,
         ))
         .collect(),
-        false => vec![],
+        (true, false) => enqueue::narrowing(spec.role, spec.service, catalog.enqueue),
     }
 }
 
@@ -593,9 +597,10 @@ pub struct Provisioning<'a> {
     pub policy: PolicyMode,
     pub config: &'a DbRolesConfig,
     pub actor: &'a str,
-    /// Whether the platform may enqueue in the service's session
-    /// ([`enqueue::in_session`]), so its role is granted the outbox.
-    pub enqueues: bool,
+    /// The version being deployed, if any. The role is granted the outbox
+    /// when it or the version the service runs is one the platform
+    /// enqueues for ([`enqueue::in_session`]).
+    pub deploying: Option<&'a ServiceManifest>,
 }
 
 pub async fn apply(
@@ -712,9 +717,14 @@ async fn apply_locked(
         policy,
         config,
         actor,
-        enqueues,
+        deploying,
     } = *provisioning;
     let existing = service_db_roles::get(platform, service.id).await?;
+    let enqueues = verify::active_manifest(platform, service.id)
+        .await?
+        .iter()
+        .chain(deploying)
+        .any(enqueue::in_session);
     let schema = service.schema();
     let target = target(existing.as_ref(), &change, policy, || {
         names::managed_role(&tenant.slug, &schema, tenant.id, service.id)
@@ -897,17 +907,11 @@ async fn verified(state: &AppState, service_id: Uuid) -> PlatformResult<bool> {
     )
 }
 
-/// Whether the platform may enqueue in the session of the service running
-/// `active`; a service that has never been deployed runs nothing.
-pub fn enqueues(active: Option<&ServiceManifest>) -> bool {
-    active.is_some_and(enqueue::in_session)
-}
-
 async fn refresh(
     state: &AppState,
     entry: &TenantEntry,
     service_id: Uuid,
-    enqueues: bool,
+    deploying: Option<&ServiceManifest>,
 ) -> PlatformResult<()> {
     let service = crate::repo::services::get_by_id(&state.platform_db, service_id)
         .await?
@@ -920,7 +924,7 @@ async fn refresh(
             policy: entry.mode(PolicyKey::DbRoles),
             config: entry.config::<DbRolesConfig>(),
             actor: PLATFORM_ACTOR,
-            enqueues,
+            deploying,
         },
         Change::default(),
     )
@@ -937,16 +941,33 @@ async fn refresh(
     })
 }
 
-async fn active(state: &AppState, service_id: Uuid) -> PlatformResult<Option<ServiceManifest>> {
-    verify::active_manifest(&state.platform_db.get().await?, service_id).await
+/// Whether the version the service runs is one the platform enqueues for;
+/// a version that cannot be read is taken as one that is not, so the
+/// caller provisions for the coming version rather than skip it.
+async fn running_enqueues(state: &AppState, service_id: Uuid) -> bool {
+    let read = async { verify::active_manifest(&state.platform_db.get().await?, service_id).await };
+    match read.await {
+        Ok(active) => active.as_ref().is_some_and(enqueue::in_session),
+        Err(e) => {
+            warn!(service_id = %service_id, error = %e, "The running version could not be read; its database role is provisioned for the coming one");
+            false
+        }
+    }
+}
+
+async fn verified_or_not(state: &AppState, service_id: Uuid) -> bool {
+    verified(state, service_id).await.unwrap_or_else(|e| {
+        warn!(service_id = %service_id, error = %e, "The database role binding could not be read before the deploy");
+        false
+    })
 }
 
 /// Before `deploying` is activated. A verified binding of a service the
-/// platform comes to enqueue for is granted the outbox first, whatever the
-/// tenant's policy, and the deploy fails when it cannot be: a verified role
-/// is one sessions use, now or once the policy asks. A binding not yet
-/// verified is provisioned, when the policy asks, as the running and the
-/// coming version together need, and a failure is logged.
+/// platform comes to enqueue for, and did not, is granted the outbox first,
+/// whatever the tenant's policy, and the deploy fails when it cannot be: a
+/// verified role is one sessions use, now or once the policy asks.
+/// Otherwise a binding not yet verified is provisioned, when the policy
+/// asks, as before, and a failure is logged.
 pub async fn before_deploy(
     state: &AppState,
     tenant_id: Uuid,
@@ -956,16 +977,20 @@ pub async fn before_deploy(
     let Some(entry) = entry(state, tenant_id).await else {
         return Ok(());
     };
-    let running = enqueues(active(state, service_id).await?.as_ref());
     let coming = enqueue::in_session(deploying);
+    if !coming && !asks(&entry) {
+        return Ok(());
+    }
     match (
-        coming && !running,
-        verified(state, service_id).await?,
+        coming,
+        verified_or_not(state, service_id).await,
         asks(&entry),
     ) {
-        (true, true, _) => refresh(state, &entry, service_id, true).await,
+        (true, true, _) if !running_enqueues(state, service_id).await => {
+            refresh(state, &entry, service_id, Some(deploying)).await
+        }
         (_, false, true) => {
-            let _ = refresh(state, &entry, service_id, running || coming).await;
+            let _ = refresh(state, &entry, service_id, Some(deploying)).await;
             Ok(())
         }
         _ => Ok(()),
@@ -975,17 +1000,9 @@ pub async fn before_deploy(
 /// After a version is activated: the binding is provisioned for it. A
 /// grant the service no longer needs is not taken back; verify reports it.
 pub async fn after_deploy(state: &AppState, tenant_id: Uuid, service_id: Uuid) {
-    let Some(entry) = asking(state, tenant_id).await else {
-        return;
-    };
-    let running = match active(state, service_id).await {
-        Ok(manifest) => enqueues(manifest.as_ref()),
-        Err(e) => {
-            error!(service_id = %service_id, error = %e, "The deployed version could not be read to provision its database role");
-            return;
-        }
-    };
-    let _ = refresh(state, &entry, service_id, running).await;
+    if let Some(entry) = asking(state, tenant_id).await {
+        let _ = refresh(state, &entry, service_id, None).await;
+    }
 }
 
 #[cfg(test)]

@@ -983,3 +983,48 @@ async fn db_roles_an_existing_role_bound_to_a_service_without_the_outbox_reaches
     );
     assert_eq!(body["report"]["verified"], true, "{body}");
 }
+
+#[tokio::test]
+async fn db_roles_a_role_switch_of_a_service_without_the_outbox_leaves_no_other_role_mapped() {
+    let Some(test) = Provisioning::start().await else {
+        return;
+    };
+    let (status, body) = test.policy("warn", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    test.sql(
+        "CREATE SCHEMA stock_service;
+         CREATE TABLE stock_service.items (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), body TEXT)",
+    )
+    .await;
+    test.deploy_adopted(&["items"]).await;
+    let managed = test._db.managed_role(&test.tenant, "stock-service").await;
+    assert_eq!(outbox_held(&test, &managed).await, (true, true, 1));
+    test.deploy_adopted(&[]).await;
+    let mapped = || async {
+        test.one::<i64>(
+            "SELECT count(*) FROM _cufflink.service_roles WHERE service = 'stock-service'",
+        )
+        .await
+    };
+    assert_eq!(
+        mapped().await,
+        1,
+        "a deploy that narrows takes nothing back"
+    );
+
+    let role = test._db.role("stock_reader");
+    test.sql(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'theirs' NOINHERIT;
+         GRANT USAGE, CREATE ON SCHEMA stock_service TO {role}"
+    ))
+    .await;
+    let (status, body) = test.set(json!({"role": role, "password": "theirs"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        mapped().await,
+        0,
+        "the role it was bound to before enqueues in its name no more"
+    );
+    assert_eq!(outbox_held(&test, &role).await, (false, false, 0));
+    assert!(reach(&test, &role).await.is_empty());
+}
