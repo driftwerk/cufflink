@@ -24,7 +24,7 @@ pub const PROBE: &str = include_str!("../probe.sql");
 /// statement in order, its tree's canonical text and a `\n`. A parser
 /// process whose fingerprint differs is not used.
 pub const PROBE_FINGERPRINT: &str =
-    "31ade59b7c0a7ba53a2ee8c99473df4cc65c2c4d0112996d791bb19b89f0c9bc";
+    "98e4c9b72f500c15ea6a9d2c34124cc5a5aedf1b1d5a33e94754473b1a1c2030";
 
 /// What surrounds a tree's canonical text in the `sql_parse` host
 /// function's answer, a `ParseResponse::Ok`, so that the tree is written
