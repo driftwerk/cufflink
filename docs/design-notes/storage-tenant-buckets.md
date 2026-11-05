@@ -127,8 +127,9 @@ guest:
 - an ACL that is not `private` or `public-read`;
 - a credential on a platform whose backend is not `s3`.
 
-Refused with `409`, naming the owner: a bucket another tenant has registered,
-and one another tenant group lists in its `storage_scope` `allowed_buckets`.
+Refused with `409`: a bucket another tenant has registered (naming that
+tenant), and one another tenant group lists in its `storage_scope`
+`allowed_buckets`.
 
 A tenant bucket is outside `storage_scope`. Its rules are its own, and
 they hold in every policy mode: no tenant relies on them yet, which is how
