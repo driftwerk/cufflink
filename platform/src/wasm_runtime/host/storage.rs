@@ -889,6 +889,27 @@ mod bounded_tests {
     }
 
     #[tokio::test]
+    async fn an_attachment_of_25_mib_is_read_under_the_default_caps() {
+        let attachment = vec![7; 25 * MIB];
+        let storage = stored(&[("leads/7/Café façade.pdf", attachment.clone())]).await;
+        let (_ledger, mut hold) = testing::hold(64 * MIB);
+        let read = fetch_object(
+            &storage,
+            "media",
+            "leads/7/Café façade.pdf",
+            &mut hold,
+            &enforced(),
+            "s3_download",
+        )
+        .await;
+        assert!(
+            read.as_ref().is_ok_and(|bytes| *bytes == attachment),
+            "{}",
+            read.map_or_else(|e| e.to_string(), |bytes| bytes.len().to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn a_read_stops_at_the_size_it_was_reserved_for() {
         let chunks = futures_util::stream::iter([
             Ok(bytes::Bytes::from_static(b"abc")),
