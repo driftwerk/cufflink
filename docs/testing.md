@@ -157,6 +157,60 @@ so every statement, connection and drop runs on a thread of its own and the
 test's runtime never sees it; a handler still runs to completion inside
 `call`, as it does on the platform.
 
+#### Template databases
+
+A schema that takes seconds to build, such as another tool's migrations
+or a large dump, is built once and cloned for each test with
+`CREATE DATABASE … TEMPLATE`:
+
+```rust
+use cufflink_fn::testing::{TestDb, TestTemplate};
+use std::path::Path;
+
+fn orders() -> TestTemplate {
+    TestTemplate::get_or_create("orders_v42", |db| {
+        db.execute("CREATE SCHEMA order_service")?;
+        db.execute_file(Path::new("schema.sql"))
+    })
+    .expect("template")
+}
+
+#[test]
+fn an_order_is_placed() {
+    let db = TestDb::from_template(&orders()).expect("database");
+    // …
+}
+```
+
+- `get_or_create(name, build)` builds the template on the server
+  `TestDb::start` uses, the first time it is asked for, in a database of
+  its own and as the server's user. When `build` returns, the database is
+  closed to connections (`ALLOW_CONNECTIONS false`), made a template
+  (`IS_TEMPLATE true`) and renamed `tmpl_<name>`. Later calls return it,
+  and concurrent first calls wait for one build, in the process and, under
+  an advisory lock, across processes on one server.
+- A name is 1 to 58 lowercase letters, digits and underscores. A server
+  that outlives the process keeps the template and a later run uses it
+  without building it, so name it after what `build` makes (a hash of the
+  migration files, say). A database of that name that is not a template is
+  refused with `TestHostError::Template`.
+- `build` gets a `TemplateDb`, with `execute`, `execute_file`, `query` and
+  `config`. Every connection it opens must be closed before it returns: a
+  build that leaves one open is refused with `TestHostError::Template`,
+  rather than waited on. A build that fails or is refused is dropped, and
+  the next call builds again.
+- `TestDb::from_template(&template)` clones it as `test_<uuid>`; the clone
+  is otherwise a `TestDb` like any other. Its objects keep the template's
+  owners and grants, whose roles are the server's, and `service_role`
+  gives the schema to a fresh role as on a database `start` creates.
+  `template.strategy(CloneStrategy::FileCopy)` clones by copying files
+  (`STRATEGY FILE_COPY`, Postgres 15 and later) rather than through the
+  write-ahead log.
+- The embedded server takes its templates with it when it stops. On a
+  server `CUFFLINK_TEST_DATABASE_URL` names they stay, for the next run;
+  drop one with `ALTER DATABASE tmpl_<name> IS_TEMPLATE false` and
+  `DROP DATABASE tmpl_<name>`.
+
 ## The testkit
 
 `cufflink-testkit` starts the platform inside the test's process, on a

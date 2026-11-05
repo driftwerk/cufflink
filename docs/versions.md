@@ -1215,6 +1215,18 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Unreleased changes
+
+No new module-declared feature from these yet.
+
+- `TestTemplate::get_or_create(name, build)` builds a template database
+  once, on the server `TestDb::start` uses, and `TestDb::from_template`
+  clones each test's database from it with `CREATE DATABASE … TEMPLATE`,
+  optionally with a `CloneStrategy`
+  ([testing](testing.md#template-databases)). `TestHostError` has a new
+  variant, `Template`, for a template that could not be built or a
+  database of its name that is not one.
+
 ## Changes in v0.35.0
 
 The guest memory budget and route concurrency limits

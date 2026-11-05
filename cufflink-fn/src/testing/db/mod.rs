@@ -11,9 +11,11 @@ mod embedded;
 mod host;
 mod migrate;
 mod role;
+mod template;
 
 pub use host::{PgHost, PgOptions, PgRole};
 pub use role::ServiceRole;
+pub use template::{CloneStrategy, TemplateDb, TestTemplate};
 
 use super::error::TestHostError;
 use cufflink_migrate::{scan_dir, Plan};
@@ -58,14 +60,66 @@ fn parsed(url: &str, source: &str) -> Result<Config, TestHostError> {
         .map_err(|e| TestHostError::Unavailable(format!("{source} is not a Postgres URL: {e}")))
 }
 
+/// The server `CUFFLINK_TEST_DATABASE_URL` names; `None` when it is not set.
+fn env_server() -> Result<Option<Config>, TestHostError> {
+    std::env::var(DATABASE_URL)
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| parsed(&url, DATABASE_URL))
+        .transpose()
+}
+
+fn embedded_server() -> Result<Config, TestHostError> {
+    parsed(&embedded::admin_url()?, "the embedded server's URL")
+}
+
+/// The server [`TestDb::start`] creates its databases on.
+fn server() -> Result<Config, TestHostError> {
+    env_server()?.map_or_else(embedded_server, Ok)
+}
+
+/// `config` with `database` as its database.
+fn reaching(config: &Config, database: &str) -> Config {
+    let mut config = config.clone();
+    config.dbname(database);
+    config
+}
+
+/// `work` on a connection of its own to `config`, with the server's
+/// defaults: no schema of a service is on its search path.
+fn connected<T: Send>(
+    config: &Config,
+    work: impl FnOnce(&mut Client) -> Result<T, TestHostError> + Send,
+) -> Result<T, TestHostError> {
+    apart(|| work(&mut config.connect(NoTls)?))
+}
+
+fn execute(config: &Config, sql: &str) -> Result<(), TestHostError> {
+    connected(config, |client| Ok(client.batch_execute(sql)?))
+}
+
+fn execute_file(config: &Config, path: &Path) -> Result<(), TestHostError> {
+    let sql = std::fs::read_to_string(path).map_err(|source| TestHostError::File {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    execute(config, &sql)
+}
+
+fn query(config: &Config, sql: &str) -> Result<Vec<Value>, TestHostError> {
+    connected(config, |client| {
+        Ok(cufflink_pgcodec::render::legacy_rows(
+            &client.query(sql, &[])?,
+        ))
+    })
+}
+
 impl TestDb {
     /// A database on the server of `CUFFLINK_TEST_DATABASE_URL`; `None`
     /// when the variable is not set.
     pub fn from_env() -> Result<Option<TestDb>, TestHostError> {
-        std::env::var(DATABASE_URL)
-            .ok()
-            .filter(|url| !url.trim().is_empty())
-            .map(|url| parsed(&url, DATABASE_URL).and_then(Self::create))
+        env_server()?
+            .map(|admin| Self::create(admin, None))
             .transpose()
     }
 
@@ -73,8 +127,7 @@ impl TestDb {
     /// call starts and the process's exit stops. Postgres is installed
     /// once, under `CUFFLINK_TEST_POSTGRES_DIR` when that is set.
     pub fn embedded() -> Result<TestDb, TestHostError> {
-        let url = embedded::admin_url()?;
-        parsed(&url, "the embedded server's URL").and_then(Self::create)
+        Self::create(embedded_server()?, None)
     }
 
     /// A database on the server the environment names, else on the
@@ -83,18 +136,24 @@ impl TestDb {
         Self::from_env()?.map_or_else(Self::embedded, Ok)
     }
 
-    fn create(admin: Config) -> Result<TestDb, TestHostError> {
+    /// A database cloned from `template` (`CREATE DATABASE … TEMPLATE`),
+    /// on the server the template is on: what the template's build made is
+    /// there, with its owners and grants, and the database is otherwise
+    /// what [`start`](Self::start) creates.
+    pub fn from_template(template: &TestTemplate) -> Result<TestDb, TestHostError> {
+        Self::create(template.server().clone(), Some(template))
+    }
+
+    fn create(admin: Config, template: Option<&TestTemplate>) -> Result<TestDb, TestHostError> {
         let name = format!("test_{}", uuid::Uuid::new_v4().simple());
-        apart(|| {
-            admin
-                .connect(NoTls)?
-                .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-        })?;
-        let mut config = admin.clone();
-        config.dbname(&name);
+        let statement = format!(
+            "CREATE DATABASE \"{name}\"{}",
+            template.map_or_else(String::new, TestTemplate::clause)
+        );
+        apart(|| admin.connect(NoTls)?.batch_execute(&statement))?;
         Ok(TestDb {
+            config: reaching(&admin, &name),
             name,
-            config,
             admin,
             roles: Mutex::default(),
         })
@@ -109,40 +168,27 @@ impl TestDb {
         &self.config
     }
 
-    /// `work` on a connection of its own, with the server's defaults: no
-    /// schema of a service is on its search path.
-    fn connected<T>(
+    fn connected<T: Send>(
         &self,
         work: impl FnOnce(&mut Client) -> Result<T, TestHostError> + Send,
-    ) -> Result<T, TestHostError>
-    where
-        T: Send,
-    {
-        apart(|| work(&mut self.config.connect(NoTls)?))
+    ) -> Result<T, TestHostError> {
+        connected(&self.config, work)
     }
 
     /// Run `sql`, any number of statements, to seed what a test needs.
     pub fn execute(&self, sql: &str) -> Result<(), TestHostError> {
-        self.connected(|client| Ok(client.batch_execute(sql)?))
+        execute(&self.config, sql)
     }
 
     /// [`execute`](Self::execute) the statements of a file.
     pub fn execute_file(&self, path: &Path) -> Result<(), TestHostError> {
-        let sql = std::fs::read_to_string(path).map_err(|source| TestHostError::File {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        self.execute(&sql)
+        execute_file(&self.config, path)
     }
 
     /// The rows of one statement, in the legacy encoding of `db::query`,
     /// for a test to assert on.
     pub fn query(&self, sql: &str) -> Result<Vec<Value>, TestHostError> {
-        self.connected(|client| {
-            Ok(cufflink_pgcodec::render::legacy_rows(
-                &client.query(sql, &[])?,
-            ))
-        })
+        query(&self.config, sql)
     }
 
     /// The role the platform makes under `db_roles` for the service whose
