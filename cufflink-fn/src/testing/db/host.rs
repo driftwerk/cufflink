@@ -18,6 +18,7 @@ use cufflink_pgcodec::tx::{
 };
 use cufflink_pgcodec::{bind, check_columns_v2, from_pg, server_message};
 use cufflink_types::db::{DbError, DbErrorKind, DbRequest, DbResponse, Isolation, Param};
+use postgres::error::SqlState;
 use postgres::types::ToSql;
 use postgres::{Client, Config, GenericClient, NoTls};
 use serde_json::Value;
@@ -101,6 +102,25 @@ impl PgOptions {
             config.user(role.name()).password(role.password());
         }
         config
+    }
+
+    /// Why the first connection failed; a login as a role the test set up
+    /// names the role.
+    fn not_connected(&self, error: postgres::Error) -> TestHostError {
+        let refused_login = error.code().is_some_and(|code| {
+            *code == SqlState::INVALID_PASSWORD
+                || *code == SqlState::INVALID_AUTHORIZATION_SPECIFICATION
+        });
+        match &self.role {
+            PgRole::Login(role) if !role.made() && refused_login => TestHostError::Role(format!(
+                "could not log in as role {}: {}",
+                role.name(),
+                server_message(&error)
+            )),
+            PgRole::Connection | PgRole::Set(_) | PgRole::Login(_) => {
+                TestHostError::Database(error)
+            }
+        }
     }
 
     fn refused(&self, sql: &str) -> Option<&'static str> {
@@ -335,7 +355,7 @@ impl PgHost {
     /// The host of the service whose schema is `schema`, in `db`.
     pub fn connect(db: &TestDb, schema: &str, options: PgOptions) -> Result<Self, TestHostError> {
         let config = options.connection(db);
-        let autocommit = apart(|| config.connect(NoTls))?;
+        let autocommit = apart(|| config.connect(NoTls)).map_err(|e| options.not_connected(e))?;
         Ok(Self {
             inner: Rc::new(Inner {
                 config,

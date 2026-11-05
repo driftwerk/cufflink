@@ -5,8 +5,8 @@ mod support;
 use cufflink_fn::db;
 use cufflink_fn::host::db::DbHost;
 use cufflink_fn::testing::{
-    HistoryMode, MigrationHistory, MigrationLock, PgHost, PgOptions, PgRole, Plan, Pooler, TestDb,
-    TestHost, TestHostError,
+    HistoryMode, MigrationHistory, MigrationLock, PgHost, PgOptions, PgRole, Plan, Pooler,
+    ServiceRole, TestDb, TestHost, TestHostError,
 };
 use cufflink_pgcodec::pooler::pooler_refusal;
 use cufflink_types::db::{DbErrorKind, DbRequest, DbResponse, Isolation, Param};
@@ -1007,6 +1007,200 @@ fn a_service_logs_in_as_its_own_role_and_reaches_nothing_else() {
                 "the server's user, as under db_roles: off"
             );
         });
+}
+
+/// Roles a test made on the server, dropped once the databases whose
+/// objects they own are gone: made before them, they drop after them.
+struct ServerRoles {
+    admin: TestDb,
+    names: Vec<String>,
+}
+
+impl ServerRoles {
+    fn named(admin: TestDb, prefix: &str, count: usize) -> Self {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            admin,
+            names: (0..count)
+                .map(|index| format!("{prefix}_{index}_{}", &suffix[..12]))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for ServerRoles {
+    fn drop(&mut self) {
+        self.names.iter().for_each(|name| {
+            let _ = self
+                .admin
+                .execute(&format!("DROP ROLE IF EXISTS \"{name}\""));
+        });
+    }
+}
+
+const READER_PASSWORD: &str = "reader-secret-7f3a";
+
+/// A schema owned by `owner`, with one table `reader` may read and one it
+/// may not, and `reader` a login with settings of its own.
+fn adopted(db: &TestDb, owner: &str, reader: &str, read_only: &str) {
+    db.execute(&format!(
+        "CREATE ROLE \"{owner}\" NOLOGIN; \
+         CREATE ROLE \"{read_only}\" NOLOGIN; \
+         CREATE ROLE \"{reader}\" LOGIN NOINHERIT PASSWORD '{READER_PASSWORD}'; \
+         ALTER ROLE \"{reader}\" SET work_mem = '1MB'; \
+         ALTER ROLE \"{reader}\" SET temp_file_limit = '2MB'; \
+         ALTER ROLE \"{reader}\" SET statement_timeout = '7s'; \
+         CREATE SCHEMA loan_service AUTHORIZATION \"{owner}\"; \
+         CREATE TABLE loan_service.loans (id int); \
+         CREATE TABLE loan_service.ledger (id int); \
+         INSERT INTO loan_service.loans VALUES (1), (2); \
+         ALTER TABLE loan_service.loans OWNER TO \"{owner}\"; \
+         ALTER TABLE loan_service.ledger OWNER TO \"{owner}\"; \
+         GRANT USAGE ON SCHEMA loan_service TO \"{reader}\"; \
+         GRANT SELECT ON loan_service.loans TO \"{reader}\""
+    ))
+    .expect("an adopted schema and its roles");
+}
+
+fn owners(db: &TestDb) -> Vec<Value> {
+    db.query(
+        "SELECT n.nspowner::regrole::text AS schema, \
+                (SELECT string_agg(c.relowner::regrole::text, ',' ORDER BY c.relname) \
+                 FROM pg_class c WHERE c.relnamespace = n.oid) AS tables \
+         FROM pg_namespace n WHERE n.nspname = 'loan_service'",
+    )
+    .expect("owners")
+}
+
+#[test]
+fn a_service_logs_in_as_an_existing_role_and_changes_nothing_about_it() {
+    let Some(admin) = database() else {
+        return;
+    };
+    let roles = ServerRoles::named(admin, "loan_reader", 3);
+    let Some(db) = database() else {
+        return;
+    };
+    let [owner, reader, read_only] = [&roles.names[0], &roles.names[1], &roles.names[2]];
+    adopted(&db, owner, reader, read_only);
+    let before = owners(&db);
+    let host = TestHost::builder()
+        .service("loan-service")
+        .db(&db)
+        .role(PgRole::Login(ServiceRole::existing(
+            reader,
+            READER_PASSWORD,
+        )))
+        .read_only_role(read_only)
+        .build()
+        .expect("a login as the existing role");
+    host.run(|| {
+        assert_eq!(
+            db::query_one("SELECT current_user AS role, session_user AS login"),
+            Some(json!({"role": reader, "login": reader}))
+        );
+        assert_eq!(
+            db::query_one(
+                "SELECT current_setting('work_mem') AS work_mem, \
+                        current_setting('temp_file_limit') AS temp_file_limit, \
+                        current_setting('statement_timeout') AS statement_timeout"
+            ),
+            Some(json!({"work_mem": "1MB", "temp_file_limit": "2MB", "statement_timeout": "30s"})),
+            "the role's own settings, except where the prelude sets one"
+        );
+        assert_eq!(
+            db::query("SELECT id FROM loans ORDER BY id"),
+            [json!({"id": 1}), json!({"id": 2})]
+        );
+        assert_eq!(db::execute("INSERT INTO loans VALUES (3)"), -1);
+    });
+    let DbResponse::Failed(denied) =
+        host.db
+            .as_ref()
+            .expect("a database")
+            .call(&query("SELECT id FROM ledger", vec![], None))
+    else {
+        panic!("a table the role was granted nothing on was read");
+    };
+    assert_eq!(
+        (denied.kind, denied.message.as_str()),
+        (
+            DbErrorKind::InsufficientPrivilege,
+            "permission denied for table ledger"
+        )
+    );
+    drop(host);
+    assert_eq!(
+        owners(&db),
+        before,
+        "the schema and its tables keep their owner"
+    );
+    assert_eq!(
+        owners(&db),
+        [json!({"schema": owner, "tables": format!("{owner},{owner}")})]
+    );
+    assert_eq!(
+        db.query(&format!(
+            "SELECT pg_has_role('{reader}', '{read_only}', 'MEMBER') AS member"
+        ))
+        .expect("membership"),
+        [json!({"member": false})],
+        "an existing role is granted no read-only role"
+    );
+    drop(db);
+    assert_eq!(
+        roles
+            .admin
+            .query(&format!(
+                "SELECT count(*) AS roles FROM pg_roles WHERE rolname = '{reader}'"
+            ))
+            .expect("pg_roles"),
+        [json!({"roles": 1})],
+        "an existing role outlives the database"
+    );
+}
+
+#[test]
+fn a_login_as_an_existing_role_fails_at_build_naming_the_role_and_not_the_password() {
+    let Some(admin) = database() else {
+        return;
+    };
+    let roles = ServerRoles::named(admin, "loan_reader", 4);
+    let Some(db) = database() else {
+        return;
+    };
+    let [owner, reader, read_only, missing] = [
+        &roles.names[0],
+        &roles.names[1],
+        &roles.names[2],
+        &roles.names[3],
+    ];
+    adopted(&db, owner, reader, read_only);
+    let refused = |role: &str, password: &str| match TestHost::builder()
+        .service("loan-service")
+        .db(&db)
+        .role(PgRole::Login(ServiceRole::existing(role, password)))
+        .build()
+    {
+        Err(TestHostError::Role(message)) => message,
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("{role} logged in with a wrong password"),
+    };
+    for (role, password) in [
+        (reader.as_str(), "not-the-password-9c1e"),
+        (missing.as_str(), READER_PASSWORD),
+    ] {
+        let message = refused(role, password);
+        assert!(
+            message.starts_with(&format!("could not log in as role {role}: ")),
+            "{message}"
+        );
+        assert!(!message.contains(password), "{message}");
+    }
+    let role = ServiceRole::existing(reader, READER_PASSWORD);
+    assert!(!format!("{role:?}").contains(READER_PASSWORD));
+    let made = db.service_role("loan_service").expect("a fresh role");
+    assert!(!format!("{made:?}").contains(made.password()));
 }
 
 #[test]

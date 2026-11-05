@@ -267,7 +267,7 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 `cufflink services list --features` prints what each deployed service
 requires.
 
-## Features added in v0.36.0
+## Features added in v0.37.0
 
 Unreleased.
 
@@ -1224,7 +1224,7 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
-## Changes in v0.36.0
+## Changes in v0.37.0
 
 Unreleased.
 
@@ -1232,11 +1232,24 @@ Unreleased.
   a new feature, `guest-statement-timeout`: `Tx::statement_timeout` sets
   a transaction's own timeout, and each of its statements, savepoints and
   its commit run under the shorter of that and the platform's
-  ([features](#features-added-in-v0360)). With no value set, a
+  ([features](#features-added-in-v0370)). With no value set, a
   transaction's statements are timed exactly as before. The feature adds
   only a method, so turning it on changes no other code in the build.
 - The native test host now sets its `statement_timeout` before each
   statement of a transaction, as the platform does.
+
+## Unreleased changes
+
+No new module-declared feature from these yet.
+
+- `ServiceRole::existing(name, password)` lets a `TestHost` log in as a
+  role the test set up, as a service bound with `services db-role set
+  --role` logs in under `db_roles: enforce`. The role is not created, given
+  the schema or granted the read-only role, its own settings apply where
+  the session prelude does not set them, and a missing role or a wrong
+  password fails `build()` with `TestHostError::Role`, naming the role
+  ([testing](testing.md#the-database)). `ServiceRole`'s `Debug` no longer
+  prints the password.
 
 ## Changes in v0.35.0
 

@@ -144,13 +144,41 @@ what fails there fails in the test:
 
 | | Default | Set with |
 |---|---|---|
-| Role | a login as the service's own role, as under `db_roles: enforce`: made by `TestDb::service_role(schema)` as the platform makes it (no superuser, owns its schema and what the server's user made in it, no `CREATE` in `public`, nothing of another schema). `migrate` runs the migrations as it. | `.role(PgRole::Set(name))` sets a role on each transaction; `.role(PgRole::Connection)` runs as the server's user, as under `db_roles: off` |
+| Role | a login as the service's own role, as under `db_roles: enforce`: made by `TestDb::service_role(schema)` as the platform makes it (no superuser, owns its schema and what the server's user made in it, no `CREATE` in `public`, nothing of another schema). `migrate` runs the migrations as it. | `.role(PgRole::Login(ServiceRole::existing(name, password)))` logs in as a role the test set up; `.role(PgRole::Set(name))` sets a role on each transaction; `.role(PgRole::Connection)` runs as the server's user, as under `db_roles: off` |
 | Pooler | `pgbouncer_transaction`: a statement that must run outside a transaction, and `SET`/`RESET`, are refused with the platform's messages | `.pooler(Pooler::Direct)` |
 | `db::query_read_only` | the service's role; with `.read_only_role(name)`, that role, which the service's role is granted | |
 | Statement timeout | 30 s, set again before each statement, savepoint and commit of a transaction as the platform does; a guest's own shorter value (`guest-statement-timeout`) wins, and one past the timeout plus 0.5 s is refused, as the platform refuses one past the route's budget | `.statement_timeout(d)` |
 
 `TestDb::service_role` needs a server user that may create roles (a
 superuser, or `CREATEROLE`); the roles are dropped with the database.
+
+A service bound to a role of its own (`cufflink services db-role set
+--role R --password-stdin`) logs in as that role under `db_roles:
+enforce`, and the role's own settings (`ALTER ROLE … SET work_mem`,
+`temp_file_limit`, …) apply. A test logs in the same way:
+
+```rust,ignore
+db.execute_file(Path::new("tests/fixtures/roles.sql"))?; // creates loan_reader, its grants
+let host = TestHost::builder()
+    .service("loan-service")
+    .db(&db)
+    .role(PgRole::Login(ServiceRole::existing("loan_reader", "its-password")))
+    .build()?;
+```
+
+Nothing is done to an existing role: it is not created, it is not given
+the schema or what is in it, it is not granted `.read_only_role(name)`, and
+it is not dropped with the database. The test, or the migrations it ran,
+makes every grant, as the operator does in production. Build the schema
+with `execute` or `execute_file`, not `migrate`: `migrate` runs as a role
+it makes, `svc_<uuid>`, and gives that role the schema, so the existing role
+would no longer hold what the operator granted it. The session runs the
+same prelude as any login (`search_path` and `statement_timeout`), so every
+other setting is the role's. A role that does not exist, or a wrong
+password, fails `build()` with `TestHostError::Role`, which names the role
+and never the password; `ServiceRole`'s `Debug` prints no password either.
+Roles are the server's, so give a role a name of its own in each test that
+creates one and drop it after the databases whose objects it owns.
 
 A test of a handler may be a plain `#[test]` or a `#[tokio::test]` of
 either flavour. The client is synchronous and drives a runtime of its own,
