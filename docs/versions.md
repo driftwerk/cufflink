@@ -44,6 +44,7 @@ declares.
 | `storage-v2` | `storage_v2` |
 | `util-v2` | `util_v2` |
 | `ext-call` | `ext_call` |
+| `guest-statement-timeout` | `guest_statement_timeout` (and `db_v2`, which it enables) |
 | `test-host` | none: it runs handlers natively in `cargo test` ([testing](testing.md)) |
 | `stripe` | none |
 
@@ -265,6 +266,14 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 
 `cufflink services list --features` prints what each deployed service
 requires.
+
+## Features added in v0.36.0
+
+Unreleased.
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `guest_statement_timeout` | the guest enables `cufflink-fn/guest-statement-timeout` | a transaction's own `statement_timeout`, bounded by the invocation's remaining budget ([db_v2](db-v2.md#a-statement-timeout-of-the-guests-own)) |
 
 ## Changes in v0.33.0
 
@@ -1214,6 +1223,21 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.36.0
+
+Unreleased.
+
+- `db_call` takes a new operation, `statement_timeout`, and `cufflink-fn`
+  a new feature, `guest-statement-timeout`: `TxOptions::statement_timeout`
+  and `Tx::statement_timeout` set a transaction's own timeout, and each of
+  its statements runs under the shorter of that and the platform's
+  ([features](#features-added-in-v0360)). With no value set, a
+  transaction's statements are timed exactly as before.
+- With the feature on, `TxOptions` has a third field, so a struct literal
+  needs `..TxOptions::default()`.
+- The native test host now sets its `statement_timeout` before each
+  statement of a transaction, as the platform does.
 
 ## Changes in v0.35.0
 

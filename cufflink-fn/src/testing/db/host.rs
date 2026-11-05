@@ -10,10 +10,11 @@ use cufflink_pgcodec::render::{legacy_rows, rows_v2};
 use cufflink_pgcodec::session::{self, Scope};
 use cufflink_pgcodec::statement::{controls_transaction, requires_autocommit, rows_as_json};
 use cufflink_pgcodec::tx::{
-    admit, in_failed_transaction, invalid_savepoint, isolation_sql, next,
-    parameters_outside_transaction, rolled_back_by_commit, savepoint_sql, savepoints_after,
-    transaction_control_refused, transaction_limit, transaction_not_found, unknown_savepoint,
-    valid_savepoint, Next, Outcome, Phase, SavepointOp, SlotOp,
+    admit, budget_of, effective_statement_timeout, guest_statement_timeout, in_failed_transaction,
+    invalid_savepoint, isolation_sql, next, parameters_outside_transaction, rolled_back_by_commit,
+    savepoint_sql, savepoints_after, transaction_control_refused, transaction_limit,
+    transaction_not_found, unknown_savepoint, valid_savepoint, Next, Outcome, Phase, SavepointOp,
+    SlotOp,
 };
 use cufflink_pgcodec::{bind, check_columns_v2, from_pg, server_message};
 use cufflink_types::db::{DbError, DbErrorKind, DbRequest, DbResponse, Isolation, Param};
@@ -47,7 +48,10 @@ pub enum PgRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgOptions {
     /// How long a statement may run; the platform's follows from what is
-    /// left of the handler's budget.
+    /// left of the handler's budget. A transaction sets it before each of
+    /// its statements, as the platform does, and a guest's own shorter
+    /// timeout wins. The handler's budget is taken to be half a second
+    /// longer, the margin the platform keeps.
     pub statement_timeout: Duration,
     /// Interactive transactions open at once (`WASM_MAX_OPEN_TX`).
     pub max_open_transactions: usize,
@@ -108,7 +112,10 @@ struct Slot {
     client: Client,
     phase: Phase,
     savepoints: Vec<String>,
+    statement_timeout: Option<Duration>,
 }
+
+const SET_STATEMENT_TIMEOUT: &str = "SELECT set_config('statement_timeout', $1, true)";
 
 struct Slots {
     open: BTreeMap<u32, Slot>,
@@ -514,7 +521,17 @@ impl Inner {
                 let mut slots = locked(&self.slots);
                 let slot = slots.slot(tx)?;
                 admit(slot.phase, SlotOp::Statement).map_err(in_failed_transaction)?;
-                let result = work.run(&mut slot.client);
+                let timeout = effective_statement_timeout(
+                    slot.statement_timeout,
+                    self.options.statement_timeout,
+                )
+                .as_millis()
+                .to_string();
+                let result = slot
+                    .client
+                    .execute(SET_STATEMENT_TIMEOUT, &[&timeout])
+                    .map_err(Failure::server)
+                    .and_then(|_| work.run(&mut slot.client));
                 let outcome = result
                     .as_ref()
                     .map_or_else(|failure| failure.outcome, |_| Outcome::Ok);
@@ -550,6 +567,7 @@ impl Inner {
                 client,
                 phase: Phase::Open,
                 savepoints: Vec::new(),
+                statement_timeout: None,
             },
         );
         Ok(id)
@@ -596,6 +614,15 @@ impl Inner {
         result.map(|()| DbResponse::Done).map_err(|e| from_pg(&e))
     }
 
+    fn set_statement_timeout(&self, tx: u32, ms: Option<u64>) -> Result<DbResponse, DbError> {
+        let budget = budget_of(self.options.statement_timeout);
+        let timeout = ms
+            .map(|ms| guest_statement_timeout(ms, budget))
+            .transpose()?;
+        locked(&self.slots).slot(tx)?.statement_timeout = timeout;
+        Ok(DbResponse::Done)
+    }
+
     fn dispatch(&self, request: &DbRequest) -> Result<DbResponse, DbError> {
         match request {
             DbRequest::Query { sql, params, tx } => self.statement(*tx, Kind::Query, sql, params),
@@ -613,6 +640,7 @@ impl Inner {
             DbRequest::RollbackTo { tx, name } => {
                 self.savepoint(*tx, SavepointOp::RollbackTo, name)
             }
+            DbRequest::StatementTimeout { tx, ms } => self.set_statement_timeout(*tx, *ms),
         }
     }
 }

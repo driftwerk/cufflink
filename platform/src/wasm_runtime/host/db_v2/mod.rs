@@ -14,10 +14,10 @@ use crate::tenant_sessions::{
 use crate::wasm_runtime::budget::{Hold, HostCaps};
 use cufflink_pgcodec::bind;
 use cufflink_pgcodec::tx::{
-    admit, in_failed_transaction, invalid_savepoint, isolation_sql, next,
-    parameters_outside_transaction, rolled_back_by_commit, savepoint_sql, savepoints_after,
-    transaction_control_refused, unknown_savepoint, valid_savepoint, Next, Outcome, Phase,
-    SavepointOp, SlotOp,
+    admit, effective_statement_timeout, guest_statement_timeout, in_failed_transaction,
+    invalid_savepoint, isolation_sql, next, parameters_outside_transaction, rolled_back_by_commit,
+    savepoint_sql, savepoints_after, transaction_control_refused, unknown_savepoint,
+    valid_savepoint, Next, Outcome, Phase, SavepointOp, SlotOp,
 };
 use cufflink_types::db::{DbError, DbErrorKind, DbRequest, DbResponse, Isolation, Param};
 use session::TxEnd;
@@ -69,6 +69,7 @@ fn handle(state: &mut HostState, request: DbRequest) -> i32 {
     let target = DbTarget {
         sessions: &app_state.tenant_sessions,
         identity: &state.identity,
+        budget: state.budget,
         deadline: state.deadline,
         cancel: &state.cancel,
     };
@@ -95,6 +96,7 @@ fn handle(state: &mut HostState, request: DbRequest) -> i32 {
 pub struct DbTarget<'a> {
     pub sessions: &'a TenantSessions,
     pub identity: &'a ServiceIdentity,
+    pub budget: Duration,
     pub deadline: Instant,
     pub cancel: &'a CancellationToken,
 }
@@ -214,6 +216,7 @@ async fn dispatch(
         DbRequest::RollbackTo { tx, name } => {
             savepoint(session, target, tx, SavepointOp::RollbackTo, &name).await
         }
+        DbRequest::StatementTimeout { tx, ms } => set_statement_timeout(session, target, tx, ms),
     };
     response.map(Reply::Response)
 }
@@ -384,9 +387,12 @@ async fn in_transaction(
 ) -> Result<Reply, DbError> {
     let slot = session.slot(tx)?;
     admit(slot.phase, SlotOp::Statement).map_err(in_failed_transaction)?;
-    let timeout_ms = statement_timeout_for(remaining(target.deadline))
-        .as_millis()
-        .to_string();
+    let timeout_ms = effective_statement_timeout(
+        slot.statement_timeout,
+        statement_timeout_for(remaining(target.deadline)),
+    )
+    .as_millis()
+    .to_string();
     let client = slot.client()?;
     let outcome = target
         .run(client.stop(), async {
@@ -489,6 +495,19 @@ async fn end(
             Err(from_pg(&e))
         }
     }
+}
+
+fn set_statement_timeout(
+    session: &mut DbSession,
+    target: &DbTarget<'_>,
+    tx: u32,
+    ms: Option<u64>,
+) -> Result<DbResponse, DbError> {
+    let timeout = ms
+        .map(|ms| guest_statement_timeout(ms, target.budget))
+        .transpose()?;
+    session.slot(tx)?.statement_timeout = timeout;
+    Ok(DbResponse::Done)
 }
 
 async fn savepoint(

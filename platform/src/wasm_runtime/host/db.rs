@@ -6,6 +6,7 @@ pub(crate) use cufflink_pgcodec::pooler::pooler_refusal;
 use cufflink_pgcodec::session as pg_session;
 use cufflink_pgcodec::statement::rows_as_json;
 pub(crate) use cufflink_pgcodec::statement::{controls_transaction, requires_autocommit};
+pub(crate) use cufflink_pgcodec::tx::statement_timeout_for;
 use serde_json::json;
 use std::collections::HashSet;
 use std::ops::AsyncFnOnce;
@@ -254,15 +255,6 @@ fn pooler_refused(state: &HostState, sql: &str) -> bool {
         );
     }
     refusal.is_some()
-}
-
-const STATEMENT_DEADLINE_MARGIN: Duration = Duration::from_millis(500);
-const STATEMENT_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
-
-pub(crate) fn statement_timeout_for(remaining: Duration) -> Duration {
-    remaining
-        .saturating_sub(STATEMENT_DEADLINE_MARGIN)
-        .max(STATEMENT_TIMEOUT_FLOOR)
 }
 
 #[derive(Debug)]
@@ -622,26 +614,4 @@ fn db_span(op: &str, sql: &str) -> tracing::span::EnteredSpan {
         db.operation = %kind
     )
     .entered()
-}
-
-#[cfg(test)]
-mod guest_statement_tests {
-    use super::statement_timeout_for;
-    use std::time::Duration;
-
-    #[test]
-    fn statement_timeout_keeps_a_margin_and_a_floor() {
-        assert_eq!(
-            statement_timeout_for(Duration::from_secs(30)),
-            Duration::from_millis(29_500)
-        );
-        assert_eq!(
-            statement_timeout_for(Duration::from_millis(1_200)),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            statement_timeout_for(Duration::ZERO),
-            Duration::from_secs(1)
-        );
-    }
 }

@@ -147,6 +147,7 @@ what fails there fails in the test:
 | Role | a login as the service's own role, as under `db_roles: enforce`: made by `TestDb::service_role(schema)` as the platform makes it (no superuser, owns its schema and what the server's user made in it, no `CREATE` in `public`, nothing of another schema). `migrate` runs the migrations as it. | `.role(PgRole::Set(name))` sets a role on each transaction; `.role(PgRole::Connection)` runs as the server's user, as under `db_roles: off` |
 | Pooler | `pgbouncer_transaction`: a statement that must run outside a transaction, and `SET`/`RESET`, are refused with the platform's messages | `.pooler(Pooler::Direct)` |
 | `db::query_read_only` | the service's role; with `.read_only_role(name)`, that role, which the service's role is granted | |
+| Statement timeout | 30 s, set again before each statement of a transaction as the platform does; a guest's own shorter value (`guest-statement-timeout`) wins, and one past the timeout plus 0.5 s is refused, as the platform refuses one past the route's budget | `.statement_timeout(d)` |
 
 `TestDb::service_role` needs a server user that may create roles (a
 superuser, or `CREATEROLE`); the roles are dropped with the database.

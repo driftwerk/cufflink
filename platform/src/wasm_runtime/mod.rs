@@ -1067,6 +1067,7 @@ impl WasmEngine {
                 ),
                 nats_publish_scope,
                 extensions: inv.extensions.as_slice().into(),
+                budget: inv.budget,
                 deadline,
                 cancel,
                 limits: Arc::clone(&self.limits),

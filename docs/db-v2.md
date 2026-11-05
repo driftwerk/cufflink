@@ -83,7 +83,7 @@ sql::transaction(|tx| {
 
 - `Ok` commits (a failed commit is the error); `Err` rolls back and returns the
   closure's error.
-- `transaction_with(TxOptions { isolation, read_only }, …)` picks the isolation
+- `transaction_with(TxOptions { isolation, read_only, .. }, …)` picks the isolation
   level; `retry_transaction(max_attempts, options, f)` reruns on retryable
   errors.
 - Inside, `tx.set_local(name, value)`, `tx.advisory_xact_lock(key)`,
@@ -94,6 +94,46 @@ sql::transaction(|tx| {
   are bounded by the invocation's remaining budget. One the guest abandons
   (a trap, the deadline) is discarded and rolled back by the server.
 - Session advisory locks are deliberately not offered.
+
+### A statement timeout of the guest's own
+
+Before every statement in a transaction the platform sets
+`statement_timeout` to the invocation's remaining budget less 0.5 s, and
+never below 1 s, so a `SET LOCAL statement_timeout` or a `set_local` of it
+lasts only until the next statement. A guest that must cut some statements
+off sooner than the route's whole budget, such as a query a caller supplied,
+sets its own instead. It needs the `guest-statement-timeout` feature, which
+enables `db-v2` and records `guest_statement_timeout` in the module:
+
+```rust
+let options = TxOptions {
+    read_only: true,
+    statement_timeout: Some(Duration::from_secs(2)),
+    ..TxOptions::default()
+};
+sql::transaction_with(options, |tx| {
+    let rows = tx.query(user_sql, &[])?;      // stopped after 2 s: QueryCanceled
+    tx.statement_timeout(None)?;               // the platform's timeout again
+    Ok(rows)
+})?;
+```
+
+- Each statement runs under the shorter of the guest's value and the
+  platform's. A value under the platform's 1 s floor stands; the floor only
+  keeps a nearly spent budget usable.
+- `tx.statement_timeout(Some(d))` changes it for the statements that
+  follow, `None` hands it back to the platform. The value is the platform's
+  to keep, so a rollback to a savepoint does not revert it, and it may be
+  set while the transaction has failed.
+- It is sent in whole milliseconds, rounded up. Zero, which Postgres reads
+  as no timeout, and anything past the invocation's whole budget are
+  refused as `InvalidParameter`.
+- With no value set, the platform sets exactly what it did before.
+- The native test host applies the same rule to its own
+  `statement_timeout` ([testing](testing.md)), and takes the handler's budget
+  to be that timeout plus the platform's 0.5 s margin.
+- A role's own `ALTER ROLE … SET statement_timeout` takes no part: the
+  platform's value, or the guest's, always replaces it.
 
 Every statement runs inside a transaction, so `db_v2` works unchanged behind
 PgBouncer in transaction mode ([deployment](deployment.md#tenant-databases-and-pgbouncer)).

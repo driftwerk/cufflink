@@ -80,6 +80,7 @@ impl Client<'_> {
         let target = DbTarget {
             sessions: &self.fixture.sessions,
             identity: &self.fixture.identity,
+            budget: self.budget,
             deadline: Instant::now() + self.budget,
             cancel: &self.cancel,
         };
@@ -678,6 +679,139 @@ async fn db_v2_statements_of_a_cancelled_invocation_are_stopped_by_the_server() 
         )
         .await;
     assert_eq!(sleeping[0]["n"], json!(0), "nothing runs on at the server");
+}
+
+fn timeout(tx: u32, ms: Option<u64>) -> DbRequest {
+    DbRequest::StatementTimeout { tx, ms }
+}
+
+impl Client<'_> {
+    async fn statement_timeout_in(&mut self, tx: u32) -> Duration {
+        let rows = self
+            .query_in(
+                Some(tx),
+                "SELECT setting::bigint AS ms FROM pg_settings WHERE name = 'statement_timeout'",
+                vec![],
+            )
+            .await;
+        let ms = rows[0]["ms"].as_i64().expect("statement_timeout in ms");
+        Duration::from_millis(u64::try_from(ms).expect("non-negative"))
+    }
+}
+
+#[tokio::test]
+async fn db_v2_a_guest_statement_timeout_cuts_a_statement_short_within_the_budget() {
+    let Some(fixture) = Fixture::new("v2_guest_timeout", "").await else {
+        return;
+    };
+    let mut client = fixture.session();
+    let tx = client.begin().await;
+    let platform = client.statement_timeout_in(tx).await;
+    assert!(
+        platform > Duration::from_secs(29) && platform <= Duration::from_millis(29_500),
+        "with no guest value the platform's remaining budget less 0.5 s stands: {platform:?}"
+    );
+    client.done(timeout(tx, Some(200))).await;
+    assert_eq!(
+        client.statement_timeout_in(tx).await,
+        Duration::from_millis(200)
+    );
+    let started = Instant::now();
+    let slow = client
+        .failure(query("SELECT pg_sleep(1)", vec![], Some(tx)))
+        .await;
+    assert_eq!(slow.kind, DbErrorKind::QueryCanceled, "{slow}");
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    client.done(DbRequest::Rollback { tx }).await;
+
+    let next = client.begin().await;
+    assert_eq!(
+        client
+            .query_in(Some(next), "SELECT 1 AS one FROM pg_sleep(0.3)", vec![])
+            .await
+            .len(),
+        1,
+        "a new transaction starts with the platform's timeout"
+    );
+    client.done(timeout(next, Some(30_000))).await;
+    assert!(
+        client.statement_timeout_in(next).await <= Duration::from_millis(29_500),
+        "a guest value as long as the budget gives way to what is left of it less 0.5 s"
+    );
+    client.done(timeout(next, Some(5_000))).await;
+    assert_eq!(
+        client.statement_timeout_in(next).await,
+        Duration::from_secs(5)
+    );
+    client.done(timeout(next, None)).await;
+    assert!(client.statement_timeout_in(next).await > Duration::from_secs(29));
+    client.done(DbRequest::Commit { tx: next }).await;
+}
+
+#[tokio::test]
+async fn db_v2_a_guest_statement_timeout_may_pass_the_floor_and_survives_a_failure() {
+    let Some(fixture) = Fixture::new("v2_guest_timeout_floor", "").await else {
+        return;
+    };
+    let mut client = fixture.session();
+    client.budget = Duration::from_millis(1_200);
+    let tx = client.begin().await;
+    assert_eq!(
+        client.statement_timeout_in(tx).await,
+        Duration::from_secs(1),
+        "the platform's own timeout never goes below a second"
+    );
+    client.done(timeout(tx, Some(150))).await;
+    client
+        .done(DbRequest::Savepoint {
+            tx,
+            name: "sp_0".into(),
+        })
+        .await;
+    let slow = client
+        .failure(query("SELECT pg_sleep(1)", vec![], Some(tx)))
+        .await;
+    assert_eq!(slow.kind, DbErrorKind::QueryCanceled, "{slow}");
+    client.done(timeout(tx, Some(250))).await;
+    client
+        .done(DbRequest::RollbackTo {
+            tx,
+            name: "sp_0".into(),
+        })
+        .await;
+    assert_eq!(
+        client.statement_timeout_in(tx).await,
+        Duration::from_millis(250),
+        "a value set while the transaction had failed holds after a rollback to a savepoint"
+    );
+    client.done(DbRequest::Rollback { tx }).await;
+}
+
+#[tokio::test]
+async fn db_v2_a_guest_statement_timeout_is_positive_and_within_the_route_budget() {
+    let Some(fixture) = Fixture::new("v2_guest_timeout_bounds", "").await else {
+        return;
+    };
+    let mut client = fixture.session();
+    let tx = client.begin().await;
+    for ms in [0, 30_001, u64::MAX] {
+        let refused = client.failure(timeout(tx, Some(ms))).await;
+        assert_eq!(
+            refused.kind,
+            DbErrorKind::InvalidParameter,
+            "{ms}: {refused}"
+        );
+    }
+    client.done(timeout(tx, Some(30_000))).await;
+    let unknown = client.failure(timeout(tx + 1, Some(200))).await;
+    assert_eq!(unknown.kind, DbErrorKind::TransactionNotFound, "{unknown}");
+    client.done(DbRequest::Commit { tx }).await;
+    let ended = client.failure(timeout(tx, None)).await;
+    assert_eq!(ended.kind, DbErrorKind::TransactionNotFound, "{ended}");
 }
 
 #[tokio::test]

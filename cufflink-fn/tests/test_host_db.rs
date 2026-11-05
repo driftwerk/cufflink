@@ -1198,3 +1198,67 @@ fn the_roles_of_a_database_go_with_it() {
     drop(db);
     assert_eq!(roles(), [json!({"roles": 0})]);
 }
+
+fn statement_timeout_in(host: &PgHost, tx: u32) -> Value {
+    rows(host.call(&query(
+        "SELECT current_setting('statement_timeout') AS timeout",
+        vec![],
+        Some(tx),
+    )))[0]["timeout"]
+        .clone()
+}
+
+#[test]
+fn a_guest_statement_timeout_is_the_shorter_one_as_on_the_platform() {
+    let Some((db, _test)) = loans() else {
+        return;
+    };
+    let host = PgHost::connect(
+        &db,
+        "loan_service",
+        PgOptions {
+            statement_timeout: std::time::Duration::from_secs(2),
+            ..PgOptions::default()
+        },
+    )
+    .expect("host");
+    let tx = begin(&host);
+    let timeout = |ms| DbRequest::StatementTimeout { tx, ms };
+    assert_eq!(statement_timeout_in(&host, tx), "2s");
+    assert_eq!(host.call(&timeout(Some(200))), DbResponse::Done);
+    assert_eq!(statement_timeout_in(&host, tx), "200ms");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        kind(host.call(&query("SELECT pg_sleep(1)", vec![], Some(tx)))),
+        DbErrorKind::QueryCanceled
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(900));
+    assert_eq!(host.call(&timeout(Some(300))), DbResponse::Done);
+    assert_eq!(
+        host.call(&DbRequest::Rollback { tx }),
+        DbResponse::Done,
+        "a failed transaction still takes a new timeout, and rolls back"
+    );
+
+    let tx = begin(&host);
+    let timeout = |ms| DbRequest::StatementTimeout { tx, ms };
+    assert_eq!(statement_timeout_in(&host, tx), "2s");
+    assert_eq!(host.call(&timeout(Some(2_400))), DbResponse::Done);
+    assert_eq!(statement_timeout_in(&host, tx), "2s");
+    assert_eq!(host.call(&timeout(Some(1_500))), DbResponse::Done);
+    assert_eq!(statement_timeout_in(&host, tx), "1500ms");
+    assert_eq!(host.call(&timeout(None)), DbResponse::Done);
+    assert_eq!(statement_timeout_in(&host, tx), "2s");
+    for ms in [0, 2_501] {
+        assert_eq!(
+            kind(host.call(&timeout(Some(ms)))),
+            DbErrorKind::InvalidParameter,
+            "{ms}"
+        );
+    }
+    assert_eq!(host.call(&DbRequest::Commit { tx }), DbResponse::Done);
+    assert_eq!(
+        kind(host.call(&timeout(Some(200)))),
+        DbErrorKind::TransactionNotFound
+    );
+}
