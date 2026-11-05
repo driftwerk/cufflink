@@ -1,18 +1,29 @@
-//! The role a service's statements run as under `db_roles`, made in a
-//! test database as the platform makes it: a login that is no superuser,
-//! owns the service's schema and what is in it, and reaches nothing else.
+//! The role a service's statements run as under `db_roles`: made in a
+//! test database as the platform makes it (a login that is no superuser,
+//! owns the service's schema and what is in it, and reaches nothing else),
+//! or one the test set up itself, as an operator binds a role of their own.
 
 use super::super::error::TestHostError;
 use cufflink_pgcodec::roles::OWNED_BY_THE_USER;
 use cufflink_pgcodec::session::quote_ident;
 use cufflink_types::manifest::validate::{folded, folded_ident};
 use postgres::Client;
+use std::fmt;
 
-/// A role the test database made for a service, and how it logs in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A role a service's statements run as, and how it logs in.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServiceRole {
     name: String,
     password: String,
+    origin: Origin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// Made by [`TestDb::service_role`](super::TestDb::service_role).
+    Made,
+    /// Set up by the test, which owns everything about it.
+    Existing,
 }
 
 impl ServiceRole {
@@ -22,7 +33,29 @@ impl ServiceRole {
         Self {
             name: format!("svc_{}", uuid::Uuid::new_v4().simple()),
             password: uuid::Uuid::new_v4().simple().to_string(),
+            origin: Origin::Made,
         }
+    }
+
+    /// The role `name`, which the test created and logs in with `password`,
+    /// as a service bound with `cufflink services db-role set --role name
+    /// --password-stdin` logs in under `db_roles: enforce`. Nothing is done
+    /// to it: it is not created, given a schema or granted a read-only
+    /// role, and it outlives the test database. Its own settings
+    /// (`ALTER ROLE … SET`) apply wherever the session prelude does not set
+    /// them.
+    pub fn existing(name: &str, password: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            password: password.to_string(),
+            origin: Origin::Existing,
+        }
+    }
+
+    /// Whether the test database made the role, and so may grant it what
+    /// the platform grants the roles it makes.
+    pub(in crate::testing) fn made(&self) -> bool {
+        self.origin == Origin::Made
     }
 
     pub fn name(&self) -> &str {
@@ -107,5 +140,14 @@ impl ServiceRole {
     /// Drop the role once its database is gone.
     pub(super) fn drop_statement(&self) -> String {
         format!("DROP ROLE IF EXISTS {}", quote_ident(&self.name))
+    }
+}
+
+impl fmt::Debug for ServiceRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceRole")
+            .field("name", &self.name)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
     }
 }
