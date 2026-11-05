@@ -196,13 +196,11 @@ the platform makes every control unconditional ([policies](../policies.md)).
 
 In order, for the bucket and every key of the call:
 
-1. **Reserved checks** (section 1.1), now with every bucket name validated
-   by the rule of section 2.1 for every call, whatever the mode: a name
-   that is not one is refused `invalid_bucket` before any lookup, since a
-   name such as `example-documents\`, `a?b` or one in capitals would miss
-   the registration and could still be rewritten into another bucket's
-   path by the HTTP client. Each store also refuses an invalid name, and a
-   store built for a tenant bucket serves that bucket alone.
+1. **Reserved checks** (section 1.1), with every bucket name validated by
+   the rule of section 2.1 on every call, in every mode, before any
+   lookup: any other name is refused `invalid_bucket`. Each store also
+   refuses an invalid name, and a store built for a tenant bucket serves
+   that bucket alone.
 2. **Another tenant's bucket.** The bucket is a tenant bucket whose tenant
    is not the guest's: refused, `foreign_tenant_bucket`, in every mode,
    whatever the guest's `storage_scope` says. A preview tenant is a tenant
@@ -516,7 +514,7 @@ credential.
 - validation of a row (section 2.1), and the `409`s;
 - a snapshot with an unopenable secret, or an unreadable row, loads, and
   that bucket is `not_configured` to its tenant and refused to every other;
-- every disguised bucket name is `invalid_bucket` on every call, in every
+- every name outside the bucket naming rules is `invalid_bucket` on every call, in every
   mode;
 - a retired or orphaned claim is refused to every tenant;
 - `TENANT_BUCKET_SECRET` is in `columns::ALL`, so `reseal` and `verify`
