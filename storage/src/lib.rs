@@ -291,7 +291,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_bucket_name_cannot_change_the_request_path() {
+    fn bucket_names_follow_the_s3_naming_rules() {
         for name in ["example-documents", "a.b_c", "abc", "1st-bucket"] {
             assert!(is_bucket_name(name), "{name}");
         }

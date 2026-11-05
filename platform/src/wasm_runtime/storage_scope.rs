@@ -277,7 +277,7 @@ mod tests {
         }
     }
 
-    const DISGUISED: [&str; 14] = [
+    const INVALID_NAMES: [&str; 14] = [
         "",
         ".",
         "..",
@@ -324,7 +324,7 @@ mod tests {
     fn bucket_names_that_could_alias_a_path_are_refused() {
         let legacy = config(StorageScopeKind::Legacy, &[]);
         let c = ctx(&legacy, false);
-        for bucket in DISGUISED
+        for bucket in INVALID_NAMES
             .iter()
             .copied()
             .chain(["cufflink-platform/wasm", "../x", "/"])
@@ -769,7 +769,7 @@ mod tests {
                 let config = config(scope, &["example-documents"]);
                 let policies = policies(mode, &config);
                 let context = ctx(policies.config::<StorageScopeConfig>(), false);
-                for bucket in DISGUISED {
+                for bucket in INVALID_NAMES {
                     for owned in [None, Some(&documents)] {
                         for acl in [None, Some(CannedAcl::PublicRead)] {
                             assert_eq!(

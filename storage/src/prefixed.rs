@@ -440,17 +440,14 @@ mod tests {
     #[tokio::test]
     async fn a_store_serves_valid_bucket_names_and_a_tenant_store_its_own_alone() {
         let backend = PrefixedBackend::memory("example-platform".to_string());
-        for disguised in [
+        for invalid in [
             ".", "..", "a\\b", "a?b", "a#b", "a\tb", "a\nb", "Example", "%2e", "a..b",
         ] {
             assert!(
-                backend.download_from_bucket(disguised, "k").await.is_err(),
-                "{disguised:?}"
+                backend.download_from_bucket(invalid, "k").await.is_err(),
+                "{invalid:?}"
             );
-            assert!(
-                backend.tenant_bucket(disguised, None).is_err(),
-                "{disguised:?}"
-            );
+            assert!(backend.tenant_bucket(invalid, None).is_err(), "{invalid:?}");
         }
         let documents = backend
             .tenant_bucket("example-documents", None)

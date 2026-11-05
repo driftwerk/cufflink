@@ -179,7 +179,7 @@ fn png() -> Vec<u8> {
     png
 }
 
-const DISGUISED: [&str; 12] = [
+const INVALID_NAMES: [&str; 12] = [
     ".",
     "..",
     "example-documents\\",
@@ -704,7 +704,7 @@ async fn tenant_buckets() {
     };
 
     let before = seen_count(&store);
-    for bucket in DISGUISED {
+    for bucket in INVALID_NAMES {
         for guest in [&ours, &theirs] {
             guest.refuses_every_call(bucket, "archive/a.pdf").await;
         }
@@ -712,7 +712,7 @@ async fn tenant_buckets() {
     assert_eq!(
         seen_count(&store),
         before,
-        "no disguised bucket name reaches the store"
+        "no invalid bucket name reaches the store"
     );
 
     store.lock().expect("the stand-in's store").objects.insert(

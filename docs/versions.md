@@ -284,8 +284,7 @@ platform's `S3_ENDPOINT`. The design is
 - Every bucket name a guest gives is checked against the bucket naming
   rules (3 to 63 lowercase letters, digits, `.`, `-` or `_`, beginning and
   ending with a letter or digit, no `..`) on every call, in every mode, and
-  any other name is refused (`invalid_bucket`). Earlier releases refused
-  only an empty name or one containing `/`.
+  any other name is refused (`invalid_bucket`).
 - Every guest storage call on a registered bucket, in every
   `storage_scope` mode:
   - a bucket registered to another tenant is refused
