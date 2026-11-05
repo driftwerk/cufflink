@@ -14,7 +14,7 @@ use crate::tenant_buckets::TenantBucket;
 use crate::wasm_runtime::storage_scope::BucketClaims;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -23,6 +23,11 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a retired tenant bucket stays claimed before it may be
 /// released: long enough for every replica to have reloaded its retirement.
 pub const RETIREMENT_GRACE: Duration = Duration::from_secs(2 * RELOAD_INTERVAL.as_secs());
+
+/// The tenant buckets were last loaded longer ago than `RETIREMENT_GRACE`,
+/// or never: a bucket released since may have changed hands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleBuckets;
 
 #[derive(Debug)]
 pub struct TenantEntry {
@@ -71,6 +76,7 @@ struct Snapshot {
     claimed_buckets: HashMap<String, HashSet<Uuid>>,
     subject_claims: Vec<(Uuid, String, String)>,
     tenant_buckets: HashMap<String, Arc<TenantBucket>>,
+    buckets_loaded_at: Option<Instant>,
 }
 
 impl Snapshot {
@@ -107,13 +113,27 @@ impl Snapshot {
             .fold(Snapshot::default(), Snapshot::with_entry)
     }
 
-    fn with_tenant_buckets(self, buckets: Vec<TenantBucket>) -> Self {
+    fn with_tenant_buckets(self, buckets: Vec<TenantBucket>, loaded_at: Instant) -> Self {
         Self {
             tenant_buckets: buckets
                 .into_iter()
                 .map(|bucket| (bucket.bucket.clone(), Arc::new(bucket)))
                 .collect(),
+            buckets_loaded_at: Some(loaded_at),
             ..self
+        }
+    }
+
+    fn tenant_bucket(
+        &self,
+        bucket: &str,
+        now: Instant,
+    ) -> Result<Option<Arc<TenantBucket>>, StaleBuckets> {
+        match self.buckets_loaded_at {
+            Some(loaded_at) if now.saturating_duration_since(loaded_at) <= RETIREMENT_GRACE => {
+                Ok(self.tenant_buckets.get(bucket).cloned())
+            }
+            _ => Err(StaleBuckets),
         }
     }
 
@@ -247,6 +267,7 @@ impl TenantCatalog {
 
     pub async fn reload(&self) -> eyre::Result<()> {
         let _serialised = self.reload_lock.lock().await;
+        let started = Instant::now();
         let loaded = async {
             let tenants = tenants::list_all(&self.db).await?;
             let rows = tenant_policies::list_all(&self.db).await?;
@@ -256,7 +277,7 @@ impl TenantCatalog {
             let buckets = self.tenant_buckets(&client).await?;
             PlatformResult::Ok(
                 Snapshot::build(tenants, &rows, claims, extensions, &self.defaults)
-                    .with_tenant_buckets(buckets),
+                    .with_tenant_buckets(buckets, started),
             )
         }
         .await;
@@ -286,8 +307,10 @@ impl TenantCatalog {
         self.current().bucket_claims(tenant_id, bucket)
     }
 
-    pub fn tenant_bucket(&self, bucket: &str) -> Option<Arc<TenantBucket>> {
-        self.current().tenant_buckets.get(bucket).cloned()
+    /// The bucket's registration, refused while the catalog's tenant buckets
+    /// are older than `RETIREMENT_GRACE`.
+    pub fn tenant_bucket(&self, bucket: &str) -> Result<Option<Arc<TenantBucket>>, StaleBuckets> {
+        self.current().tenant_bucket(bucket, Instant::now())
     }
 
     pub fn foreign_subject_claims(&self, tenant_id: Uuid) -> Vec<(String, String)> {
@@ -399,6 +422,8 @@ impl TenantCatalog {
         );
     }
 
+    /// Adds the tenant, as a load would, to a catalog that holds no tenant
+    /// bucket.
     #[cfg(test)]
     pub(crate) fn seed(&self, tenant: Tenant, rows: &[PolicyRow]) {
         self.insert_if_absent(entry(
@@ -408,6 +433,12 @@ impl TenantCatalog {
             BTreeMap::new(),
             &self.defaults,
         ));
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        *current =
+            Arc::new(Snapshot::clone(&current).with_tenant_buckets(Vec::new(), Instant::now()));
     }
 }
 
@@ -638,6 +669,44 @@ pub(crate) mod tests {
             snapshot.bucket_claims(legacy, "app"),
             claims(false, true),
             "a preview that predates the link is its own group"
+        );
+    }
+
+    #[test]
+    fn tenant_buckets_older_than_the_grace_are_refused() {
+        let loaded_at = Instant::now();
+        let bucket = TenantBucket {
+            owner: Some(Uuid::new_v4()),
+            bucket: "example-documents".into(),
+            state: crate::tenant_buckets::State::Retired,
+        };
+        let snapshot = Snapshot::default().with_tenant_buckets(vec![bucket], loaded_at);
+        let found = |at: Instant, name: &str| {
+            snapshot
+                .tenant_bucket(name, at)
+                .map(|found| found.map(|bucket| bucket.bucket.clone()))
+        };
+        assert_eq!(
+            found(loaded_at, "example-documents"),
+            Ok(Some("example-documents".into()))
+        );
+        assert_eq!(
+            found(loaded_at + RETIREMENT_GRACE, "example-other"),
+            Ok(None)
+        );
+        assert_eq!(
+            found(
+                loaded_at + RETIREMENT_GRACE + Duration::from_secs(1),
+                "example-documents"
+            ),
+            Err(StaleBuckets)
+        );
+        assert!(
+            matches!(
+                Snapshot::default().tenant_bucket("example-documents", loaded_at),
+                Err(StaleBuckets)
+            ),
+            "a catalog never loaded serves no bucket"
         );
     }
 

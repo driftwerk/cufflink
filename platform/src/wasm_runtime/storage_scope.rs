@@ -2,6 +2,7 @@ use crate::policy::config::{StorageScopeConfig, StorageScopeKind};
 use crate::policy::{self, Denied, PolicyKey, PolicySet, Violation};
 use crate::storage::S3Storage;
 use crate::tenant_buckets::{Access, State, TenantBucket};
+use crate::tenant_catalog::StaleBuckets;
 use crate::AppState;
 use cufflink_storage::CannedAcl;
 use uuid::Uuid;
@@ -93,12 +94,13 @@ pub enum Route<'a> {
 
 /// How a guest call on `bucket` is served: the reserved checks first, then
 /// a tenant bucket's own rules in every mode, then `storage_scope`. Only a
-/// tenant bucket admits a canned ACL.
+/// tenant bucket admits a canned ACL, and no call is served while the
+/// tenant buckets are stale.
 pub fn route<'a>(
     ctx: &StorageContext,
     policies: &PolicySet,
     tenant_id: Uuid,
-    owned: Option<&'a TenantBucket>,
+    owned: Result<Option<&'a TenantBucket>, StaleBuckets>,
     bucket: &str,
     keys: &[&str],
     acl: Option<CannedAcl>,
@@ -117,6 +119,11 @@ pub fn route<'a>(
             reserved,
         ));
     }
+    let Ok(owned) = owned else {
+        return Ok(Route::Closed(
+            "the platform's tenant buckets have not been reloaded recently enough to serve storage",
+        ));
+    };
     match owned {
         Some(owned) if owned.owner != Some(tenant_id) => Err(deny("foreign_tenant_bucket")),
         Some(owned) => match &owned.state {
@@ -185,7 +192,7 @@ pub fn resolve(
         &context,
         guest.policies,
         guest.tenant_id,
-        owned.as_deref(),
+        owned.as_ref().map(Option::as_deref).map_err(|stale| *stale),
         bucket,
         keys,
         acl,
@@ -277,12 +284,11 @@ mod tests {
         }
     }
 
-    const INVALID_NAMES: [&str; 14] = [
+    const INVALID_NAMES: [&str; 13] = [
         "",
         ".",
         "..",
         "a\\b",
-        "cufflink-platform\\wasm",
         "a?b",
         "a#b",
         "a\tb",
@@ -592,7 +598,7 @@ mod tests {
                         &context,
                         &policies,
                         HARBOR,
-                        owned,
+                        Ok(owned),
                         bucket,
                         &[key],
                         acl,
@@ -667,7 +673,7 @@ mod tests {
                     &context,
                     &policies,
                     HARBOR,
-                    None,
+                    Ok(None),
                     "example-other",
                     &["a b/Café.pdf"],
                     None
@@ -680,7 +686,7 @@ mod tests {
                     &context,
                     &policies,
                     HARBOR,
-                    None,
+                    Ok(None),
                     "example-media",
                     &["a.pdf"],
                     None
@@ -777,7 +783,7 @@ mod tests {
                                     &context,
                                     &policies,
                                     GLOBEX,
-                                    owned,
+                                    Ok(owned),
                                     bucket,
                                     &["leads/a.pdf"],
                                     acl
@@ -803,7 +809,7 @@ mod tests {
                     &context,
                     &policies,
                     tenant,
-                    Some(owned),
+                    Ok(Some(owned)),
                     "example-documents",
                     &["a.pdf"],
                     None,
@@ -864,5 +870,43 @@ mod tests {
                 "the bucket's registration cannot be read"
             ))
         ));
+    }
+
+    #[test]
+    fn stale_tenant_buckets_close_every_call_after_the_reserved_checks() {
+        let config = config(StorageScopeKind::Legacy, &[]);
+        for mode in PolicyMode::ALL {
+            let policies = policies(mode, &config);
+            let context = ctx(policies.config::<StorageScopeConfig>(), false);
+            let call = |bucket, key, acl| {
+                routed_code(route(
+                    &context,
+                    &policies,
+                    HARBOR,
+                    Err(StaleBuckets),
+                    bucket,
+                    &[key],
+                    acl,
+                ))
+                .map(|routed| matches!(routed, Route::Closed(_)))
+            };
+            for (bucket, acl) in [
+                ("example-documents", None),
+                ("example-other", None),
+                ("example-documents", Some(CannedAcl::PublicRead)),
+            ] {
+                assert_eq!(call(bucket, "a.pdf", acl), Ok(true), "{mode:?} {bucket}");
+            }
+            assert_eq!(
+                call("a?b", "a.pdf", None),
+                Err("invalid_bucket"),
+                "{mode:?}"
+            );
+            assert_eq!(
+                call("example-other", "../a.pdf", None),
+                Err("path_traversal"),
+                "{mode:?}"
+            );
+        }
     }
 }

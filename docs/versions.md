@@ -302,6 +302,9 @@ platform's `S3_ENDPOINT`. The design is
   `POST /api/buckets/{bucket}/release` (`cufflink tenants buckets release`)
   frees it, at least two minutes after the retirement. A registered bucket
   cannot be listed in another tenant group's `allowed_buckets` (409).
+- A replica that has not loaded the tenant buckets for two minutes, its
+  reloads failing, refuses every guest storage call (`not_configured`)
+  until a reload succeeds.
 - In a registered bucket a key is stored exactly as given: spaces,
   non-ASCII letters, `%`, `#`, `?` and `+` included. A key that begins or
   ends with `/`, has an empty, `.` or `..` segment, has a control

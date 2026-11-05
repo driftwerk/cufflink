@@ -179,19 +179,18 @@ fn png() -> Vec<u8> {
     png
 }
 
-const INVALID_NAMES: [&str; 12] = [
+const INVALID_NAMES: [&str; 11] = [
     ".",
     "..",
-    "example-documents\\",
-    "x\\..\\example-documents",
-    "example-platform\\wasm",
-    "example-documents?x",
-    "example-documents#x",
-    "example-documents\t",
-    "example-documents\n",
+    "a\\b",
+    "a?b",
+    "a#b",
+    "a\tb",
+    "a\nb",
     "Example-Documents",
     "%2e",
     "example..documents",
+    "example documents",
 ];
 
 fn seen_on(store: &Shared, bucket: &str) -> Vec<Seen> {

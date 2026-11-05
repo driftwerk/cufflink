@@ -146,7 +146,9 @@ credentials.
   tenant's included, until a `set` by that tenant revives it. Deleting a
   tenant retires its buckets the same way. Only `release` frees a retired
   bucket, and only once it has been retired for two minutes, so every
-  replica holds the retirement before another tenant may register it.
+  replica holds the retirement before another tenant may register it. A
+  released bucket goes back to `storage_scope`, where the default policy
+  admits it with the platform's credentials.
 - A row the platform cannot read leaves its bucket refused to every other
   tenant and `not_configured` to its own, and the rest of the catalog
   loaded.
@@ -155,7 +157,9 @@ credentials.
   them, block public ACLs in the bucket's policy.
 - Each change is audited (`tenant.bucket.set`, `tenant.bucket.delete`,
   `tenant.bucket.release`) and reaches every replica on the change
-  notification, or at the latest at its next one-minute reload.
+  notification, or at the latest at its next one-minute reload. A replica
+  that has not loaded the tenant buckets for two minutes refuses every guest
+  storage call (`not_configured`) until a reload succeeds.
 
 ### Egress, memory, binding and Redis
 

@@ -138,7 +138,7 @@ pub const MAX_KEY_BYTES: usize = 1024;
 
 /// A bucket name every backend accepts as it is: 3 to 63 lowercase letters,
 /// digits, `.`, `-` or `_`, beginning and ending with a letter or digit,
-/// with no `..`. Nothing in such a name can change the request's path.
+/// with no `..`.
 pub fn is_bucket_name(bucket: &str) -> bool {
     let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
     (3..=63).contains(&bucket.len())
