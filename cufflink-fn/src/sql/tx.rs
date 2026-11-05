@@ -14,10 +14,6 @@ use std::time::Duration;
 pub struct TxOptions {
     pub isolation: Isolation,
     pub read_only: bool,
-    /// Each statement's `statement_timeout`, as [`Tx::statement_timeout`]
-    /// sets it; `None` leaves the platform's.
-    #[cfg(feature = "guest-statement-timeout")]
-    pub statement_timeout: Option<Duration>,
 }
 
 /// The platform accepts savepoint names `sp_0` to `sp_999`.
@@ -48,7 +44,7 @@ pub fn transaction_with<T>(
     })?
     .begun()?;
     let mut tx = Tx::new(id, 0);
-    match prepare(&mut tx, &options).and_then(|()| f(&mut tx)) {
+    match f(&mut tx) {
         Ok(value) => call(&DbRequest::Commit { tx: id })?.done().map(|()| value),
         Err(error) => {
             if let Err(rollback) = call(&DbRequest::Rollback { tx: id }) {
@@ -59,18 +55,6 @@ pub fn transaction_with<T>(
             Err(error)
         }
     }
-}
-
-#[cfg(feature = "guest-statement-timeout")]
-fn prepare(tx: &mut Tx, options: &TxOptions) -> Result<(), DbError> {
-    options
-        .statement_timeout
-        .map_or(Ok(()), |timeout| tx.statement_timeout(Some(timeout)))
-}
-
-#[cfg(not(feature = "guest-statement-timeout"))]
-fn prepare(_: &mut Tx, _: &TxOptions) -> Result<(), DbError> {
-    Ok(())
 }
 
 /// [`transaction_with`], run again while it fails with a serialization

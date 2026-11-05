@@ -1229,13 +1229,12 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 Unreleased.
 
 - `db_call` takes a new operation, `statement_timeout`, and `cufflink-fn`
-  a new feature, `guest-statement-timeout`: `TxOptions::statement_timeout`
-  and `Tx::statement_timeout` set a transaction's own timeout, and each of
-  its statements runs under the shorter of that and the platform's
+  a new feature, `guest-statement-timeout`: `Tx::statement_timeout` sets
+  a transaction's own timeout, and each of its statements, savepoints and
+  its commit run under the shorter of that and the platform's
   ([features](#features-added-in-v0360)). With no value set, a
-  transaction's statements are timed exactly as before.
-- With the feature on, `TxOptions` has a third field, so a struct literal
-  needs `..TxOptions::default()`.
+  transaction's statements are timed exactly as before. The feature adds
+  only a method, so turning it on changes no other code in the build.
 - The native test host now sets its `statement_timeout` before each
   statement of a transaction, as the platform does.
 

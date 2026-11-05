@@ -212,22 +212,17 @@ mod tests {
 
     #[cfg(feature = "guest-statement-timeout")]
     #[test]
-    fn a_statement_timeout_follows_begin_and_each_change_in_whole_milliseconds() {
+    fn a_statement_timeout_is_sent_in_whole_milliseconds_and_a_refusal_rolls_back() {
         use std::time::Duration;
         let (result, seen) = mock::with(platform, || {
-            transaction_with(
-                TxOptions {
-                    statement_timeout: Some(Duration::from_micros(200_001)),
-                    ..TxOptions::default()
-                },
-                |tx| {
-                    tx.query("SELECT 1", &[])?;
-                    tx.statement_timeout(Some(Duration::from_nanos(1)))?;
-                    tx.statement_timeout(Some(Duration::ZERO))?;
-                    tx.statement_timeout(Some(Duration::MAX))?;
-                    tx.statement_timeout(None)
-                },
-            )
+            transaction(|tx| {
+                tx.statement_timeout(Some(Duration::from_micros(200_001)))?;
+                tx.query("SELECT 1", &[])?;
+                tx.statement_timeout(Some(Duration::from_nanos(1)))?;
+                tx.statement_timeout(Some(Duration::ZERO))?;
+                tx.statement_timeout(Some(Duration::MAX))?;
+                tx.statement_timeout(None)
+            })
         });
         assert!(result.is_ok());
         let sent: Vec<_> = seen
@@ -253,15 +248,7 @@ mod tests {
                 DbRequest::StatementTimeout { .. } => failure(DbErrorKind::InvalidParameter),
                 other => platform(other),
             },
-            || {
-                transaction_with(
-                    TxOptions {
-                        statement_timeout: Some(Duration::from_secs(1)),
-                        ..TxOptions::default()
-                    },
-                    |_| Ok(()),
-                )
-            },
+            || transaction(|tx| tx.statement_timeout(Some(Duration::from_secs(1)))),
         );
         assert_eq!(
             refused.err().map(|e| e.kind),

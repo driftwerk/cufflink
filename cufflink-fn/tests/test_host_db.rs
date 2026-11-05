@@ -1262,3 +1262,46 @@ fn a_guest_statement_timeout_is_the_shorter_one_as_on_the_platform() {
         DbErrorKind::TransactionNotFound
     );
 }
+
+#[test]
+fn a_guest_statement_timeout_covers_the_commit_as_on_the_platform() {
+    let Some((db, _test)) = loans() else {
+        return;
+    };
+    db.execute(
+        "CREATE TABLE loan_service.seen (timeout text); \
+         CREATE FUNCTION loan_service.note_timeout() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN INSERT INTO loan_service.seen \
+                 VALUES (current_setting('statement_timeout')); RETURN NULL; END $$; \
+         CREATE CONSTRAINT TRIGGER at_commit AFTER INSERT ON loan_service.loans \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             EXECUTE FUNCTION loan_service.note_timeout()",
+    )
+    .expect("commit trigger");
+    let host = host_of(&db);
+    let tx = begin(&host);
+    assert_eq!(
+        host.call(&DbRequest::StatementTimeout {
+            tx,
+            ms: Some(5_000)
+        }),
+        DbResponse::Done
+    );
+    assert_eq!(
+        host.call(&execute(&insert(1, "kept"), vec![], Some(tx))),
+        DbResponse::Affected(1)
+    );
+    assert_eq!(
+        host.call(&DbRequest::StatementTimeout {
+            tx,
+            ms: Some(1_500)
+        }),
+        DbResponse::Done
+    );
+    assert_eq!(host.call(&DbRequest::Commit { tx }), DbResponse::Done);
+    assert_eq!(
+        db.query("SELECT timeout FROM loan_service.seen")
+            .expect("rows"),
+        [json!({"timeout": "1500ms"})]
+    );
+}

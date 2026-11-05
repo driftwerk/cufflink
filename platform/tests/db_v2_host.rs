@@ -814,6 +814,61 @@ async fn db_v2_a_guest_statement_timeout_is_positive_and_within_the_route_budget
     assert_eq!(ended.kind, DbErrorKind::TransactionNotFound, "{ended}");
 }
 
+const AT_COMMIT_DDL: &str = "\
+    CREATE TABLE seen (timeout text); \
+    CREATE TABLE t (id int); \
+    CREATE FUNCTION note_timeout() RETURNS trigger LANGUAGE plpgsql AS $$ \
+        BEGIN INSERT INTO v2_guest_timeout_end.seen \
+            VALUES (current_setting('statement_timeout')); RETURN NULL; END $$; \
+    CREATE CONSTRAINT TRIGGER at_commit AFTER INSERT ON t \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION note_timeout();";
+
+#[tokio::test]
+async fn db_v2_a_guest_statement_timeout_covers_the_commit_and_ends_with_the_transaction() {
+    let Some(fixture) = Fixture::with_pool_size("v2_guest_timeout_end", AT_COMMIT_DDL, 1).await
+    else {
+        return;
+    };
+    let connection = || async {
+        let pooled = fixture.pool.get().await.expect("checkout");
+        let row = pooled
+            .query_one(
+                "SELECT pg_backend_pid() AS pid, current_setting('statement_timeout') AS timeout",
+                &[],
+            )
+            .await
+            .expect("session settings");
+        (row.get::<_, i32>("pid"), row.get::<_, String>("timeout"))
+    };
+    let before = connection().await;
+    let mut client = fixture.session();
+
+    let tx = client.begin().await;
+    client.done(timeout(tx, Some(5_000))).await;
+    client
+        .execute_in(Some(tx), "INSERT INTO t VALUES (1)", vec![])
+        .await;
+    client.done(timeout(tx, Some(1_500))).await;
+    client.done(DbRequest::Commit { tx }).await;
+    let seen: Vec<Value> = client
+        .query("SELECT timeout FROM seen", vec![])
+        .await
+        .into_iter()
+        .map(Value::Object)
+        .collect();
+    assert_eq!(
+        seen,
+        [json!({"timeout": "1500ms"})],
+        "the commit runs under the value set after the last statement"
+    );
+
+    assert_eq!(
+        connection().await,
+        before,
+        "the pooled connection goes back with its own session timeout"
+    );
+}
+
 #[tokio::test]
 async fn db_v2_tx_limit_and_pool_pressure() {
     let Some(fixture) =

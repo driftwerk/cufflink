@@ -117,6 +117,19 @@ struct Slot {
 
 const SET_STATEMENT_TIMEOUT: &str = "SELECT set_config('statement_timeout', $1, true)";
 
+impl Slot {
+    /// Set what the transaction's next command runs under, as the platform
+    /// does before each statement, savepoint and end of an open one.
+    fn apply_timeout(&mut self, platform: Duration) -> Result<(), postgres::Error> {
+        let timeout = effective_statement_timeout(self.statement_timeout, platform)
+            .as_millis()
+            .to_string();
+        self.client
+            .execute(SET_STATEMENT_TIMEOUT, &[&timeout])
+            .map(drop)
+    }
+}
+
 struct Slots {
     open: BTreeMap<u32, Slot>,
     next_id: u32,
@@ -521,17 +534,10 @@ impl Inner {
                 let mut slots = locked(&self.slots);
                 let slot = slots.slot(tx)?;
                 admit(slot.phase, SlotOp::Statement).map_err(in_failed_transaction)?;
-                let timeout = effective_statement_timeout(
-                    slot.statement_timeout,
-                    self.options.statement_timeout,
-                )
-                .as_millis()
-                .to_string();
                 let result = slot
-                    .client
-                    .execute(SET_STATEMENT_TIMEOUT, &[&timeout])
+                    .apply_timeout(self.options.statement_timeout)
                     .map_err(Failure::server)
-                    .and_then(|_| work.run(&mut slot.client));
+                    .and_then(|()| work.run(&mut slot.client));
                 let outcome = result
                     .as_ref()
                     .map_or_else(|failure| failure.outcome, |_| Outcome::Ok);
@@ -582,7 +588,12 @@ impl Inner {
             SlotOp::Commit => "COMMIT",
             _ => "ROLLBACK",
         };
-        match slot.client.batch_execute(sql) {
+        let ended = match slot.phase {
+            Phase::Open => slot.apply_timeout(self.options.statement_timeout),
+            Phase::Failed => Ok(()),
+        }
+        .and_then(|()| slot.client.batch_execute(sql));
+        match ended {
             Ok(()) if slot.phase == Phase::Failed && op == SlotOp::Commit => {
                 Err(rolled_back_by_commit())
             }
@@ -600,7 +611,11 @@ impl Inner {
         admit(slot.phase, op.slot_op()).map_err(in_failed_transaction)?;
         let known = slot.savepoints.iter().rposition(|held| held == name);
         let sql = savepoint_sql(op, name, known).ok_or_else(|| unknown_savepoint(name, tx))?;
-        let result = slot.client.batch_execute(&sql);
+        let result = match slot.phase {
+            Phase::Open => slot.apply_timeout(self.options.statement_timeout),
+            Phase::Failed => Ok(()),
+        }
+        .and_then(|()| slot.client.batch_execute(&sql));
         let outcome = match result {
             Ok(()) => Outcome::Ok,
             Err(_) => Outcome::ServerError,

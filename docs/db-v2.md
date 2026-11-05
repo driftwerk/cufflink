@@ -108,20 +108,22 @@ enables `db-v2` and records `guest_statement_timeout` in the module:
 ```rust
 let options = TxOptions {
     read_only: true,
-    statement_timeout: Some(Duration::from_secs(2)),
     ..TxOptions::default()
 };
 sql::transaction_with(options, |tx| {
+    tx.statement_timeout(Some(Duration::from_secs(2)))?;
     let rows = tx.query(user_sql, &[])?;      // stopped after 2 s: QueryCanceled
     tx.statement_timeout(None)?;               // the platform's timeout again
     Ok(rows)
 })?;
 ```
 
-- Each statement runs under the shorter of the guest's value and the
-  platform's. A value under the platform's 1 s floor stands; the floor only
+- Each statement, and each savepoint, commit and rollback while the
+  transaction has not failed, runs under the shorter of the guest's value
+  and the platform's. The value is local to the transaction: the next
+  transaction on the same connection starts with the platform's. A value under the platform's 1 s floor stands; the floor only
   keeps a nearly spent budget usable.
-- `tx.statement_timeout(Some(d))` changes it for the statements that
+- `tx.statement_timeout(Some(d))` changes it for the commands that
   follow, `None` hands it back to the platform. The value is the platform's
   to keep, so a rollback to a savepoint does not revert it, and it may be
   set while the transaction has failed.
