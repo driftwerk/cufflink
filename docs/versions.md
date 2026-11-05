@@ -38,6 +38,7 @@ declares.
 | `cache` | `cache` |
 | `service-call` | `service_call` |
 | `response-v2` | `response_v2` |
+| `response-raw-json` | `response_raw_json` (and `response_v2`, which it enables) |
 | `delivery-control` | `delivery_control` (and `response_v2`, which it enables) |
 | `nats-publish-v2` | `nats_publish_v2` |
 | `http-v2` | `http_v2` |
@@ -265,6 +266,12 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 
 `cufflink services list --features` prints what each deployed service
 requires.
+
+## Features added in v0.36.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `response_raw_json` | a handler answers with `Response::json_text` (`response-raw-json`) | a v2 response body of pre-rendered JSON, `__body_raw`, sent byte for byte ([responses](routing.md#pre-rendered-json-cufflink-fn-feature-response-raw-json)) |
 
 ## Changes in v0.33.0
 
@@ -1215,10 +1222,27 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
-## Unreleased changes
+## Changes in v0.36.0
 
-No new module-declared feature from these yet.
-
+- `ServiceRole::existing(name, password)` lets a `TestHost` log in as a
+  role the test set up, as a service bound with `services db-role set
+  --role` logs in under `db_roles: enforce`. The role is not created, given
+  the schema or granted the read-only role, its own settings apply where
+  the session prelude does not set them, and a missing role or a wrong
+  password fails `build()` with `TestHostError::Role`, naming the role
+  ([testing](testing.md#the-database)). `ServiceRole`'s `Debug` no longer
+  prints the password.
+- `TestTemplate::get_or_create(name, build)` builds a template database
+  once, on the server `TestDb::start` uses, and `TestDb::from_template`
+  clones each test's database from it with `CREATE DATABASE … TEMPLATE`,
+  optionally with a `CloneStrategy`
+  ([testing](testing.md#template-databases)). `TestHostError` has a new
+  variant, `Template`, for a template that could not be built or a
+  database of its name that is not one.
+- `Response::json_text(text)` answers with JSON the handler has already
+  rendered, which the platform sends byte for byte without parsing or
+  encoding it ([features](#features-added-in-v0360),
+  [responses](routing.md#pre-rendered-json-cufflink-fn-feature-response-raw-json)).
 - **`db_roles` grants the outbox only to a service the platform enqueues
   for.** A service whose manifest declares no served table (`tables`;
   `private_tables` do not count) and nothing it `publishes` has its role

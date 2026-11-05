@@ -143,6 +143,7 @@ mod tests {
             COLUMN_PERMISSIONS,
             ROUTE_CONCURRENCY,
             GUEST_MEMORY_BUDGET,
+            RESPONSE_RAW_JSON,
         ] {
             assert!(supports.contains(&finished), "{finished}");
         }

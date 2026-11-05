@@ -153,7 +153,7 @@ impl Response {
         match self.repr {
             Repr::Legacy { data, status } => legacy_data(data, status),
             #[cfg(feature = "response-v2")]
-            Repr::V2(v2) => v2.envelope().to_string(),
+            Repr::V2(v2) => v2.into_text(),
         }
     }
 }
