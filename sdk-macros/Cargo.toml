@@ -13,7 +13,7 @@ readme = "../README.md"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
+syn = { version = "3.0.9", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 cufflink-types = { workspace = true, features = ["schedule-eval"] }
