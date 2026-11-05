@@ -45,6 +45,17 @@ fn the_test_host_refuses_as_the_platform_does_and_quotes_nothing() {
 }
 
 #[test]
+fn a_tree_too_deep_for_a_guest_to_read_is_too_large_as_on_the_platform() {
+    let host = host();
+    host.run(|| {
+        let within = sql::parse(&format!("SELECT 1{}", "+1".repeat(35))).expect("at the limit");
+        assert_eq!(within.tree["version"], 170_007);
+        let deeper = sql::parse(&format!("SELECT 1{}", "+1".repeat(40))).expect_err("too deep");
+        assert!(matches!(deeper, ParseError::TooLarge(_)), "{deeper}");
+    });
+}
+
+#[test]
 fn without_a_host_the_parser_is_unavailable() {
     assert!(matches!(
         sql::parse("SELECT 1"),

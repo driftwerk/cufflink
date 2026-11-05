@@ -38,13 +38,14 @@ fn parse(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
     };
     let state = caller.data();
     let parser = Arc::clone(&state.app_state.sql_parser);
+    let tenant = state.identity.tenant_id;
     let caps = state.caps().clone();
     let bounds = state.bounds();
     let mut hold = state.hold();
     let parsed = block_on_within(
         bounds.remaining,
         &bounds.cancel,
-        parser.parse(sql, max_tree(&caps), bounds.remaining, |len| {
+        parser.parse(tenant, sql, max_tree(&caps), bounds.remaining, |len| {
             charged(&caps, &mut hold, len)
         }),
     );

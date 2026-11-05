@@ -505,17 +505,21 @@ Every host call is bounded by the handler's remaining execution budget. Guest `d
 
 `sql_parse` ([design](design-notes/sql-parse.md)) runs PostgreSQL's parser in
 `cufflink-sql-parser` processes, never in the platform's own. The platform
-and the worker each start a pool at startup and advertise `sql_parse` only
-once a process has answered with this release's parser and fingerprint;
-without one, startup logs a warning, and deploys that need the feature are
-refused until the process restarts with one.
+and the worker each start a pool at startup, waiting at most 5 s for the
+first process, and advertise `sql_parse` while a process has answered with
+this release's parser and fingerprint. Without one, startup logs a warning
+and deploys that need the feature are refused; processes keep being
+started in the background, and the first that answers advertises it. The
+platform and the worker make themselves undumpable on Linux, so they write
+no core dumps.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SQL_PARSER_BIN` | `cufflink-sql-parser` beside the platform's binary | The parser binary; the images ship it at `/usr/local/bin/cufflink-sql-parser` |
 | `SQL_PARSE_PROCESSES` | `2` | Parser processes, and so parses at once; more calls wait their turn within their budget |
-| `SQL_PARSE_MEMORY_MB` | `1024` | Each process's address space, on Linux (`RLIMIT_AS`); a parse past it costs that call `Unavailable` |
-| `SQL_PARSE_TIMEOUT_MS` | `5000` | Longest one parse lasts, and never past the handler's remaining budget; the process is then killed and the call is `Unavailable` |
+| `SQL_PARSE_PER_TENANT` | half of `SQL_PARSE_PROCESSES`, at least `1` | One tenant's parses at once; its further calls wait for one of its own turns |
+| `SQL_PARSE_MEMORY_MB` | `1024` | Each process's address space, on Linux (`RLIMIT_AS`); a parse that runs out of it is `TooLarge`, or `Unavailable` where it ends the process |
+| `SQL_PARSE_TIMEOUT_MS` | `5000` | Longest one parse lasts; the process is then killed and replaced. A caller whose budget runs out first is answered `Unavailable` and the parse finishes without it |
 
 Zero or unparseable values are refused at startup, naming the variable.
 

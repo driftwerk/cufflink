@@ -11,21 +11,32 @@ use cufflink_sql_parse::wire::{self, Answer, Hello, Request, MAX_CONTROL_FRAME};
 use cufflink_sql_parse::{PARSER, PROBE_FINGERPRINT};
 use cufflink_types::sql_parse::ParseError;
 use eyre::{eyre, Result};
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
 
 const BINARY: &str = "cufflink-sql-parser";
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const REAP_EVERY: Duration = Duration::from_secs(1);
+
+/// The least of an invocation's budget a parse is started with.
+pub const MIN_PARSE_BUDGET: Duration = Duration::from_millis(100);
+
+/// Failed starts in a row, with no process left, after which `sql_parse`
+/// is no longer advertised.
+const UNREADY_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlParseSettings {
@@ -34,6 +45,9 @@ pub struct SqlParseSettings {
     pub binary: PathBuf,
     /// `SQL_PARSE_PROCESSES`: parses at once.
     pub processes: usize,
+    /// `SQL_PARSE_PER_TENANT`: parses of one tenant at once, by default
+    /// half the processes and at least one.
+    pub per_tenant: usize,
     /// `SQL_PARSE_MEMORY_MB`: each process's address space, on Linux.
     pub memory_mb: usize,
     /// `SQL_PARSE_TIMEOUT_MS`: the longest one parse may take.
@@ -42,25 +56,33 @@ pub struct SqlParseSettings {
 
 impl Default for SqlParseSettings {
     fn default() -> Self {
+        let processes = 2;
         Self {
             binary: std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(|dir| dir.join(BINARY)))
                 .unwrap_or_else(|| PathBuf::from(BINARY)),
-            processes: 2,
+            processes,
+            per_tenant: half(processes),
             memory_mb: 1024,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
         }
     }
 }
 
+fn half(processes: usize) -> usize {
+    (processes / 2).max(1)
+}
+
 impl SqlParseSettings {
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let defaults = Self::default();
         let positive = |name: &str, default: usize| positive_var(name, var(name), default);
+        let processes = positive("SQL_PARSE_PROCESSES", defaults.processes)?;
         Ok(Self {
             binary: var("SQL_PARSER_BIN").map_or(defaults.binary, PathBuf::from),
-            processes: positive("SQL_PARSE_PROCESSES", defaults.processes)?,
+            processes,
+            per_tenant: positive("SQL_PARSE_PER_TENANT", half(processes))?,
             memory_mb: positive("SQL_PARSE_MEMORY_MB", defaults.memory_mb)?,
             timeout: positive_var(
                 "SQL_PARSE_TIMEOUT_MS",
@@ -87,68 +109,111 @@ impl<E> From<ParseError> for ParseFailure<E> {
 }
 
 pub struct SqlParser {
+    pool: Arc<Pool>,
+}
+
+/// The processes and who holds them. A parse runs in a task of its own
+/// that owns its process from the request to the answer's last byte, so a
+/// caller that gives up costs no process: the task finishes the exchange
+/// within `SQL_PARSE_TIMEOUT_MS` and returns the process. Replacements are
+/// started by a task of their own, never under a caller's deadline.
+struct Pool {
     settings: SqlParseSettings,
     ready: AtomicBool,
     idle: Mutex<Vec<Process>>,
-    turns: Semaphore,
-    backoff: Mutex<Backoff>,
+    /// One permit for each process in `idle`.
+    available: Semaphore,
+    tenants: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+    health: Mutex<Health>,
+    wanted: mpsc::UnboundedSender<()>,
+    started: Mutex<Option<mpsc::UnboundedReceiver<()>>>,
 }
 
 #[derive(Default)]
-struct Backoff {
+struct Health {
+    live: usize,
+    /// Processes lost and starts failed since a process last answered.
     failures: u32,
-    until: Option<Instant>,
+    /// Starts failed in a row.
+    failed_starts: u32,
+}
+
+impl Health {
+    fn backoff(&self) -> Duration {
+        match self.failures {
+            0 => Duration::ZERO,
+            n => FIRST_BACKOFF
+                .saturating_mul(1 << (n - 1).min(16))
+                .min(MAX_BACKOFF),
+        }
+    }
 }
 
 impl SqlParser {
     pub fn new(settings: SqlParseSettings) -> Self {
+        let (wanted, requests) = mpsc::unbounded_channel();
         Self {
-            turns: Semaphore::new(settings.processes),
-            settings,
-            ready: AtomicBool::new(false),
-            idle: Mutex::new(Vec::new()),
-            backoff: Mutex::new(Backoff::default()),
+            pool: Arc::new(Pool {
+                available: Semaphore::new(0),
+                ready: AtomicBool::new(false),
+                idle: Mutex::new(Vec::new()),
+                tenants: Mutex::new(HashMap::new()),
+                health: Mutex::new(Health::default()),
+                wanted,
+                started: Mutex::new(Some(requests)),
+                settings,
+            }),
         }
     }
 
-    /// Starts the first process, and answers whether it is ready. Until
-    /// one has answered with this release's parser and fingerprint,
-    /// `sql_parse` is not advertised and every call is `Unavailable`.
+    /// Starts the processes in the background, and answers whether the
+    /// first was ready within its handshake's time. Until one has answered
+    /// with this release's parser and fingerprint, `sql_parse` is not
+    /// advertised and every call is `Unavailable`.
     pub async fn start(&self) -> bool {
-        match Process::spawn(&self.settings).await {
-            Ok(process) => {
-                self.lock_idle().push(process);
-                self.ready.store(true, Ordering::Release);
-                tracing::info!(
-                    parser = PARSER,
-                    processes = self.settings.processes,
-                    "SQL parser ready"
-                );
-                true
-            }
-            Err(error) => {
-                tracing::warn!(%error, "SQL parser unavailable; sql_parse is not advertised");
-                false
-            }
+        let Some(requests) = lock(&self.pool.started).take() else {
+            return self.is_ready();
+        };
+        let (first, answered) = oneshot::channel();
+        tokio::spawn(supervise(Arc::downgrade(&self.pool), requests, first));
+        tokio::spawn(reap_idle(Arc::downgrade(&self.pool)));
+        (0..self.pool.settings.processes).for_each(|_| self.pool.want());
+        let ready = tokio::time::timeout(HANDSHAKE_TIMEOUT, answered)
+            .await
+            .is_ok_and(|started| started.unwrap_or(false));
+        match ready {
+            true => tracing::info!(
+                parser = PARSER,
+                processes = self.pool.settings.processes,
+                "SQL parser ready"
+            ),
+            false => tracing::warn!(
+                "SQL parser not ready; sql_parse is not advertised until a process starts"
+            ),
         }
+        ready
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.pool.ready.load(Ordering::Acquire)
     }
 
     /// The canonical text of `sql`'s tree, written after what `hold` gives
     /// back for the tree's length, at most `max_output` bytes. `hold` runs
-    /// before the tree is read, so it can charge for it first.
+    /// before the tree is read, so it can charge for it first. `tenant`'s
+    /// parses at once are limited to `SQL_PARSE_PER_TENANT`.
     pub async fn parse<E>(
         &self,
+        tenant: Uuid,
         sql: &str,
         max_output: usize,
         within: Duration,
         hold: impl FnOnce(usize) -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, ParseFailure<E>> {
         let started = Instant::now();
-        let outcome = self.parse_timed(sql, max_output, within, hold).await;
+        let outcome = self
+            .parse_timed(tenant, sql, max_output, within, hold)
+            .await;
         let result = match &outcome {
             Ok(_) => "ok",
             Err(ParseFailure::Refused(ParseError::Syntax(_))) => "syntax",
@@ -164,98 +229,275 @@ impl SqlParser {
 
     async fn parse_timed<E>(
         &self,
+        tenant: Uuid,
         sql: &str,
         max_output: usize,
         within: Duration,
         hold: impl FnOnce(usize) -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, ParseFailure<E>> {
         bounds::check(sql)?;
-        if !self.is_ready() {
+        if !self.is_ready() || within < MIN_PARSE_BUDGET {
             return Err(ParseError::unavailable().into());
         }
-        let deadline = tokio::time::Instant::now() + within.min(self.settings.timeout);
-        let _turn = tokio::time::timeout_at(deadline, self.turns.acquire())
+        let deadline = tokio::time::Instant::now() + within.min(self.pool.settings.timeout);
+        let turn = before(deadline, TenantTurn::take(&self.pool, tenant))
             .await
-            .ok()
-            .and_then(Result::ok)
+            .flatten()
             .ok_or_else(ParseError::unavailable)?;
-        let mut process = tokio::time::timeout_at(deadline, self.take_process())
+        let process = before(deadline, self.pool.take())
             .await
-            .map_err(|_| ParseError::unavailable())??;
-        match tokio::time::timeout_at(deadline, process.exchange(sql, max_output, hold)).await {
-            Ok(Ok(exchanged)) => {
-                self.lock_idle().push(process);
-                match exchanged {
-                    Exchanged::Tree(tree) => Ok(tree),
-                    Exchanged::Refused(error) => Err(error.into()),
-                    Exchanged::Unheld(unheld) => Err(ParseFailure::Unheld(unheld)),
+            .flatten()
+            .ok_or_else(ParseError::unavailable)?;
+        let mut frames = Vec::with_capacity(sql.len() + 64);
+        wire::write_message(
+            &mut frames,
+            &Request {
+                max_output: u64::try_from(max_output).unwrap_or(u64::MAX),
+            },
+        )
+        .and_then(|()| wire::write_frame(&mut frames, sql.as_bytes()))
+        .map_err(|_| ParseError::unavailable())?;
+        let (header, headed) = oneshot::channel();
+        let (buffer, given) = oneshot::channel();
+        let (tree, read) = oneshot::channel();
+        tokio::spawn(serve(
+            Arc::clone(&self.pool),
+            process,
+            turn,
+            Job {
+                frames,
+                max_output,
+                header,
+                given,
+                tree,
+            },
+        ));
+        match before(deadline, headed).await.and_then(Result::ok) {
+            None => Err(ParseError::unavailable().into()),
+            Some(Header::Refused(error)) => Err(error.into()),
+            Some(Header::Tree(len)) => match hold(len) {
+                Err(unheld) => {
+                    let _ = buffer.send(None);
+                    Err(ParseFailure::Unheld(unheld))
+                }
+                Ok(out) => {
+                    let _ = buffer.send(Some(out));
+                    before(deadline, read)
+                        .await
+                        .and_then(Result::ok)
+                        .ok_or_else(|| ParseError::unavailable().into())
+                }
+            },
+        }
+    }
+}
+
+async fn before<T>(deadline: tokio::time::Instant, work: impl Future<Output = T>) -> Option<T> {
+    tokio::time::timeout_at(deadline, work).await.ok()
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Pool {
+    fn want(&self) {
+        let _ = self.wanted.send(());
+    }
+
+    /// A live idle process, waiting for one to come back or be started.
+    async fn take(&self) -> Option<Process> {
+        loop {
+            self.available.acquire().await.ok()?.forget();
+            if let Some(mut process) = lock(&self.idle).pop() {
+                match process.is_alive() {
+                    true => return Some(process),
+                    false => self.lost("an idle parser process ended", &"exited", "idle"),
                 }
             }
-            Ok(Err(fault)) => Err(lost("the parser process failed", &fault).into()),
-            Err(_) => Err(lost("the parser process did not answer in time", &"timed out").into()),
         }
     }
 
-    /// A live idle process, or a new one unless the last one to start
-    /// failed less than its backoff ago.
-    async fn take_process(&self) -> Result<Process, ParseError> {
-        let idle = std::iter::from_fn(|| self.lock_idle().pop()).find_map(|mut process| {
-            process.is_alive().then_some(process).or_else(|| {
-                lost("an idle parser process ended", &"exited");
-                None
-            })
-        });
-        if let Some(process) = idle {
-            return Ok(process);
+    /// Idle processes that ended, killed by the kernel for instance, are
+    /// replaced without waiting for a call to find them.
+    fn reap(&self) {
+        let ended = lock(&self.idle)
+            .extract_if(.., |process| !process.is_alive())
+            .count();
+        for _ in 0..ended {
+            if let Ok(permit) = self.available.try_acquire() {
+                permit.forget();
+            }
+            self.lost("an idle parser process ended", &"exited", "idle");
         }
-        if self
-            .lock_backoff()
-            .until
-            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn give_back(&self, process: Process) {
+        lock(&self.health).failures = 0;
+        lock(&self.idle).push(process);
+        self.available.add_permits(1);
+    }
+
+    /// A process that failed is dropped, which kills it, and another is
+    /// started in its place.
+    fn lost(&self, what: &str, error: &dyn std::fmt::Display, stage: &'static str) {
+        metrics::counter!("cufflink_sql_parser_failures_total", "stage" => stage).increment(1);
+        tracing::warn!(%error, "{what}");
         {
-            return Err(ParseError::unavailable());
+            let mut health = lock(&self.health);
+            health.live = health.live.saturating_sub(1);
+            health.failures = health.failures.saturating_add(1);
+            metrics::gauge!("cufflink_sql_parser_processes").set(health.live as f64);
         }
-        match Process::spawn(&self.settings).await {
-            Ok(process) => {
-                *self.lock_backoff() = Backoff::default();
-                Ok(process)
-            }
-            Err(error) => {
-                let mut backoff = self.lock_backoff();
-                let delay = FIRST_BACKOFF
-                    .saturating_mul(1 << backoff.failures.min(16))
-                    .min(MAX_BACKOFF);
-                backoff.failures = backoff.failures.saturating_add(1);
-                backoff.until = Some(Instant::now() + delay);
-                metrics::counter!("cufflink_sql_parser_failures_total", "stage" => "start")
-                    .increment(1);
-                tracing::warn!(%error, ?delay, "a SQL parser process did not start");
-                Err(ParseError::unavailable())
-            }
-        }
+        self.want();
     }
 
-    fn lock_idle(&self) -> std::sync::MutexGuard<'_, Vec<Process>> {
-        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    fn started(&self, process: Process) {
+        {
+            let mut health = lock(&self.health);
+            health.live += 1;
+            health.failed_starts = 0;
+            metrics::gauge!("cufflink_sql_parser_processes").set(health.live as f64);
+        }
+        if !self.ready.swap(true, Ordering::AcqRel) {
+            tracing::info!(
+                parser = PARSER,
+                "a SQL parser process answered; sql_parse is advertised"
+            );
+        }
+        lock(&self.idle).push(process);
+        self.available.add_permits(1);
     }
 
-    fn lock_backoff(&self) -> std::sync::MutexGuard<'_, Backoff> {
-        self.backoff.lock().unwrap_or_else(PoisonError::into_inner)
+    fn failed_to_start(&self, error: &eyre::Report) {
+        metrics::counter!("cufflink_sql_parser_failures_total", "stage" => "start").increment(1);
+        let mut health = lock(&self.health);
+        health.failures = health.failures.saturating_add(1);
+        health.failed_starts = health.failed_starts.saturating_add(1);
+        let delay = health.backoff();
+        tracing::warn!(%error, ?delay, "a SQL parser process did not start");
+        if health.live == 0
+            && health.failed_starts >= UNREADY_AFTER
+            && self.ready.swap(false, Ordering::AcqRel)
+        {
+            tracing::warn!("no SQL parser process can start; sql_parse is no longer advertised");
+        }
     }
 }
 
-/// A process that failed is dropped, which kills it; the next call starts
-/// another.
-fn lost(what: &str, error: &dyn std::fmt::Display) -> ParseError {
-    metrics::counter!("cufflink_sql_parser_failures_total", "stage" => "parse").increment(1);
-    tracing::warn!(%error, "{what}");
-    ParseError::unavailable()
+/// Starts a process each time one is wanted, one at a time, after the
+/// backoff the failures since a process last answered call for.
+async fn supervise(
+    pool: Weak<Pool>,
+    mut requests: mpsc::UnboundedReceiver<()>,
+    first: oneshot::Sender<bool>,
+) {
+    let mut first = Some(first);
+    while requests.recv().await.is_some() {
+        loop {
+            let Some((settings, delay)) = pool
+                .upgrade()
+                .map(|pool| (pool.settings.clone(), lock(&pool.health).backoff()))
+            else {
+                return;
+            };
+            tokio::time::sleep(delay).await;
+            let spawned = Process::spawn(&settings).await;
+            let Some(pool) = pool.upgrade() else {
+                return;
+            };
+            let ready = spawned.is_ok();
+            match spawned {
+                Ok(process) => pool.started(process),
+                Err(error) => pool.failed_to_start(&error),
+            }
+            if let Some(first) = first.take() {
+                let _ = first.send(ready);
+            }
+            if ready {
+                break;
+            }
+        }
+    }
 }
 
-enum Exchanged<E> {
-    Tree(Vec<u8>),
+async fn reap_idle(pool: Weak<Pool>) {
+    let mut every = tokio::time::interval(REAP_EVERY);
+    loop {
+        every.tick().await;
+        match pool.upgrade() {
+            Some(pool) => pool.reap(),
+            None => return,
+        }
+    }
+}
+
+/// A tenant's hold on one of its parses at once, released when the
+/// exchange it was taken for ends, whether or not its caller waited. A
+/// tenant's calls past its share wait for one of its own turns, never for
+/// another tenant's.
+struct TenantTurn {
+    pool: Arc<Pool>,
+    tenant: Uuid,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl TenantTurn {
+    async fn take(pool: &Arc<Pool>, tenant: Uuid) -> Option<Self> {
+        let turns = Arc::clone(
+            lock(&pool.tenants)
+                .entry(tenant)
+                .or_insert_with(|| Arc::new(Semaphore::new(pool.settings.per_tenant))),
+        );
+        let permit = turns.acquire_owned().await.ok()?;
+        Some(Self {
+            pool: Arc::clone(pool),
+            tenant,
+            permit: Some(permit),
+        })
+    }
+}
+
+impl Drop for TenantTurn {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let mut tenants = lock(&self.pool.tenants);
+        if tenants
+            .get(&self.tenant)
+            .is_some_and(|turns| Arc::strong_count(turns) == 1)
+        {
+            tenants.remove(&self.tenant);
+        }
+    }
+}
+
+enum Header {
+    Tree(usize),
     Refused(ParseError),
-    Unheld(E),
+}
+
+/// One request and the caller's side of its answer: the header first, then
+/// the buffer the caller charged for, or none, then the tree read into it.
+struct Job {
+    frames: Vec<u8>,
+    max_output: usize,
+    header: oneshot::Sender<Header>,
+    given: oneshot::Receiver<Option<Vec<u8>>>,
+    tree: oneshot::Sender<Vec<u8>>,
+}
+
+async fn serve(pool: Arc<Pool>, mut process: Process, turn: TenantTurn, job: Job) {
+    let timeout = pool.settings.timeout;
+    match tokio::time::timeout(timeout, process.exchange(job)).await {
+        Ok(Ok(())) => pool.give_back(process),
+        Ok(Err(fault)) => pool.lost("the parser process failed", &fault, "parse"),
+        Err(_) => pool.lost(
+            "the parser process did not answer in time",
+            &"timed out",
+            "parse",
+        ),
+    }
+    drop(turn);
 }
 
 /// One parser process. Dropping it kills it; tokio reaps it.
@@ -305,44 +547,43 @@ impl Process {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    async fn exchange<E>(
-        &mut self,
-        sql: &str,
-        max_output: usize,
-        hold: impl FnOnce(usize) -> Result<Vec<u8>, E>,
-    ) -> io::Result<Exchanged<E>> {
-        let request = Request {
-            max_output: u64::try_from(max_output).unwrap_or(u64::MAX),
-        };
-        let mut frames = Vec::with_capacity(sql.len() + 64);
-        wire::write_message(&mut frames, &request)?;
-        wire::write_frame(&mut frames, sql.as_bytes())?;
-        self.stdin.write_all(&frames).await?;
+    /// The whole exchange of `job`, to the answer's last byte, whether or
+    /// not its caller is still waiting.
+    async fn exchange(&mut self, job: Job) -> io::Result<()> {
+        self.stdin.write_all(&job.frames).await?;
         self.stdin.flush().await?;
         match self.message().await? {
-            Answer::Error(error) => Ok(Exchanged::Refused(error)),
-            Answer::Tree => {
-                let len = self.frame_len(max_output).await?;
-                let mut out = match hold(len) {
-                    Ok(out) => out,
-                    Err(unheld) => {
-                        let skip = u64::try_from(len).unwrap_or(u64::MAX);
-                        let skipped = tokio::io::copy(
-                            &mut (&mut self.stdout).take(skip),
-                            &mut tokio::io::sink(),
-                        )
-                        .await?;
-                        return match skipped == skip {
-                            true => Ok(Exchanged::Unheld(unheld)),
-                            false => Err(io::ErrorKind::UnexpectedEof.into()),
-                        };
-                    }
-                };
-                let start = out.len();
-                out.resize(start + len, 0);
-                self.stdout.read_exact(&mut out[start..]).await?;
-                Ok(Exchanged::Tree(out))
+            Answer::Error(error) => {
+                let _ = job.header.send(Header::Refused(error));
+                Ok(())
             }
+            Answer::Tree => {
+                let len = self.frame_len(job.max_output).await?;
+                let given = match job.header.send(Header::Tree(len)) {
+                    Ok(()) => job.given.await.ok().flatten(),
+                    Err(_) => None,
+                };
+                match given {
+                    Some(mut out) => {
+                        let start = out.len();
+                        out.resize(start + len, 0);
+                        self.stdout.read_exact(&mut out[start..]).await?;
+                        let _ = job.tree.send(out);
+                        Ok(())
+                    }
+                    None => self.skip(len).await,
+                }
+            }
+        }
+    }
+
+    async fn skip(&mut self, len: usize) -> io::Result<()> {
+        let skip = u64::try_from(len).unwrap_or(u64::MAX);
+        let skipped =
+            tokio::io::copy(&mut (&mut self.stdout).take(skip), &mut tokio::io::sink()).await?;
+        match skipped == skip {
+            true => Ok(()),
+            false => Err(io::ErrorKind::UnexpectedEof.into()),
         }
     }
 
@@ -373,6 +614,7 @@ mod tests {
             match name {
                 "SQL_PARSER_BIN" => Some("/opt/parser"),
                 "SQL_PARSE_PROCESSES" => Some("4"),
+                "SQL_PARSE_PER_TENANT" => Some("3"),
                 "SQL_PARSE_MEMORY_MB" => Some("512"),
                 "SQL_PARSE_TIMEOUT_MS" => Some("250"),
                 _ => None,
@@ -385,12 +627,23 @@ mod tests {
             SqlParseSettings {
                 binary: PathBuf::from("/opt/parser"),
                 processes: 4,
+                per_tenant: 3,
                 memory_mb: 512,
                 timeout: Duration::from_millis(250),
             }
         );
+        assert_eq!(
+            SqlParseSettings::from_vars(|name| {
+                (name == "SQL_PARSE_PROCESSES").then(|| "5".to_string())
+            })
+            .expect("processes")
+            .per_tenant,
+            2,
+            "a tenant may hold half the processes by default"
+        );
         for name in [
             "SQL_PARSE_PROCESSES",
+            "SQL_PARSE_PER_TENANT",
             "SQL_PARSE_MEMORY_MB",
             "SQL_PARSE_TIMEOUT_MS",
         ] {
@@ -399,6 +652,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn starts_back_off_with_every_loss_and_failure_since_a_process_last_answered() {
+        let delays: Vec<_> = [0, 1, 2, 3, 7, 30]
+            .into_iter()
+            .map(|failures| {
+                Health {
+                    failures,
+                    ..Health::default()
+                }
+                .backoff()
+            })
+            .collect();
+        assert_eq!(
+            delays,
+            [0, 100, 200, 400, 5_000, 5_000].map(Duration::from_millis)
+        );
     }
 
     #[tokio::test]
@@ -410,9 +681,13 @@ mod tests {
         assert!(!parser.start().await);
         assert!(!parser.is_ready());
         let refused = parser
-            .parse("SELECT 1", 1024, Duration::from_secs(1), |_| {
-                Ok::<_, ()>(Vec::new())
-            })
+            .parse(
+                Uuid::nil(),
+                "SELECT 1",
+                1024,
+                Duration::from_secs(1),
+                |_| Ok::<_, ()>(Vec::new()),
+            )
             .await;
         assert!(matches!(
             refused,
@@ -420,6 +695,7 @@ mod tests {
         ));
         let bounded = parser
             .parse(
+                Uuid::nil(),
                 &"x".repeat(bounds::MAX_INPUT_BYTES + 1),
                 1024,
                 Duration::from_secs(1),

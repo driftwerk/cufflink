@@ -417,8 +417,9 @@ additive and the older binary does not abort on a newer schema. It serves `_fn`,
    with the rest on every release. Then `cufflink init`'s scaffold (a unit
    test pins it to the workspace versions).
 2. `cargo publish --dry-run -p cufflink-types -p cufflink-migrate -p cufflink-pgcodec
-   -p cufflink-fn -p cufflink-sdk-macros -p cufflink -p cufflink-cli -p cufflink-nats
-   -p cufflink-native` on a clean tree.
+   -p cufflink-sql-parse -p cufflink-fn -p cufflink-sdk-macros -p cufflink -p cufflink-cli
+   -p cufflink-nats -p cufflink-native` on a clean tree. `cufflink-sql-parse`'s first
+   release is a new crate on crates.io, so step 3 applies to it.
 3. A crate crates.io has never had is published only by a token with the
    `publish-new` scope whose crate pattern covers its name: check
    `CARGO_REGISTRY_TOKEN` before tagging a release that adds one, and add
@@ -1234,10 +1235,13 @@ Unreleased.
   fingerprint of its probe corpus
   ([design](design-notes/sql-parse.md)). The parse runs in
   `cufflink-sql-parser` processes, which the platform and worker images
-  ship beside their binaries; `SQL_PARSER_BIN`, `SQL_PARSE_PROCESSES`,
-  `SQL_PARSE_MEMORY_MB` and `SQL_PARSE_TIMEOUT_MS` configure them
-  ([setup](setup.md#sql-parser)). The probe corpus's fingerprint is
-  `PROBE_FINGERPRINT` in `cufflink-sql-parse`.
+  ship beside their binaries and which confine themselves with a seccomp
+  allowlist before they serve; `SQL_PARSER_BIN`, `SQL_PARSE_PROCESSES`,
+  `SQL_PARSE_PER_TENANT`, `SQL_PARSE_MEMORY_MB` and `SQL_PARSE_TIMEOUT_MS`
+  configure them ([setup](setup.md#sql-parser)). The probe corpus's
+  fingerprint is `PROBE_FINGERPRINT` in `cufflink-sql-parse`.
+- The platform and the worker make themselves undumpable on Linux at
+  start, as the runners do, so they no longer write core dumps.
 - The new crate `cufflink-sql-parse` 0.1.0 is published before
   `cufflink-fn`. With `test-host` and `sql-parse` both on, `cufflink-fn`
   builds `pg_query`, which needs a C compiler and libclang.

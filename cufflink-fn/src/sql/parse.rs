@@ -11,7 +11,8 @@ use cufflink_types::sql_parse::{ParseError, ParseResponse, Parsed};
 /// guest that matches trees can pin what it was written against.
 ///
 /// No error quotes `sql`. A statement past the platform's bounds (1 MiB,
-/// or nested deeper than the parser is allowed to go) is
+/// nested deeper than the parser is allowed to go, or a tree nested
+/// deeper than 120 levels, which a guest's JSON reader cannot take) is
 /// [`ParseError::TooLarge`]; outside the platform, without a test host,
 /// every call is [`ParseError::Unavailable`].
 ///
@@ -19,7 +20,7 @@ use cufflink_types::sql_parse::{ParseError, ParseResponse, Parsed};
 /// let parsed = sql::parse("SELECT id FROM orders WHERE total > 10")?;
 /// let only_selects = parsed.tree["stmts"]
 ///     .as_array()
-///     .is_some_and(|stmts| stmts.iter().all(|s| s["stmt"].get("SelectStmt").is_some()));
+///     .is_some_and(|stmts| stmts.iter().all(|s| s["stmt"]["node"].get("SelectStmt").is_some()));
 /// ```
 pub fn parse(sql: &str) -> Result<Parsed, ParseError> {
     exchange(sql).into()
