@@ -1215,10 +1215,18 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
-## Unreleased changes
+## Changes in v0.36.0
 
 No new module-declared feature from these yet.
 
+- `ServiceRole::existing(name, password)` lets a `TestHost` log in as a
+  role the test set up, as a service bound with `services db-role set
+  --role` logs in under `db_roles: enforce`. The role is not created, given
+  the schema or granted the read-only role, its own settings apply where
+  the session prelude does not set them, and a missing role or a wrong
+  password fails `build()` with `TestHostError::Role`, naming the role
+  ([testing](testing.md#the-database)). `ServiceRole`'s `Debug` no longer
+  prints the password.
 - `TestTemplate::get_or_create(name, build)` builds a template database
   once, on the server `TestDb::start` uses, and `TestDb::from_template`
   clones each test's database from it with `CREATE DATABASE … TEMPLATE`,
