@@ -115,7 +115,9 @@ impl ParseThread {
         }
         match self.parse("SELEC".into(), usize::MAX)? {
             Err(ParseError::Syntax(_)) => fingerprint.map_err(io::Error::other),
-            _ => Err(io::Error::other("a statement that is not SQL was not refused")),
+            _ => Err(io::Error::other(
+                "a statement that is not SQL was not refused",
+            )),
         }
     }
 
