@@ -36,6 +36,10 @@ pub struct Check {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inconclusive: bool,
+    /// The role holds more than the service needs. It is reported, with
+    /// what takes it back, and fails nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub excess: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +52,7 @@ impl Check {
             check: check.to_string(),
             ok: true,
             inconclusive: false,
+            excess: false,
             detail: None,
             remedy: None,
         }
@@ -58,6 +63,7 @@ impl Check {
             check: check.to_string(),
             ok: false,
             inconclusive: false,
+            excess: false,
             detail: Some(detail.into()),
             remedy,
         }
@@ -67,6 +73,21 @@ impl Check {
         Self {
             inconclusive: true,
             ..Self::failed(check, detail, None)
+        }
+    }
+
+    pub fn excess(check: &str, held: bool, reach: impl FnOnce() -> (String, String)) -> Self {
+        match held {
+            false => Self::passed(check),
+            true => {
+                let (detail, remedy) = reach();
+                Self {
+                    excess: true,
+                    detail: Some(detail),
+                    remedy: Some(remedy),
+                    ..Self::passed(check)
+                }
+            }
         }
     }
 
@@ -105,7 +126,11 @@ impl VerifyReport {
             verified: checks.iter().all(|c| c.ok),
             checked_at: now,
             server_version_num,
-            remediation: checks.iter().filter_map(|c| c.remedy.clone()).collect(),
+            remediation: checks
+                .iter()
+                .filter(|c| !c.excess)
+                .filter_map(|c| c.remedy.clone())
+                .collect(),
             checks,
         }
     }
@@ -181,6 +206,7 @@ pub struct Facts {
 pub struct Expected<'a> {
     pub role: &'a str,
     pub managed: bool,
+    pub enqueues: bool,
     pub service: &'a str,
     pub schema: &'a str,
     pub tables: &'a [(String, Holds)],
@@ -323,6 +349,9 @@ fn read_only_check(
 }
 
 fn cufflink_checks(expected: &Expected<'_>, (usage, enqueue): (bool, Enqueue)) -> Vec<Check> {
+    if !expected.enqueues {
+        return enqueue::excess(expected.role, usage, enqueue);
+    }
     std::iter::once(Check::of("cufflink_schema", usage, || {
         (
             format!("the role lacks USAGE on schema {CUFFLINK_SCHEMA}"),
@@ -684,10 +713,12 @@ pub(crate) fn requirements(manifest: &ServiceManifest) -> Vec<(String, Holds)> {
         .collect()
 }
 
-async fn declared_tables(
+/// The manifest of the version the service runs; `None` before its first
+/// deploy.
+pub async fn active_manifest(
     client: &impl GenericClient,
     service_id: Uuid,
-) -> PlatformResult<Vec<(String, Holds)>> {
+) -> PlatformResult<Option<ServiceManifest>> {
     Ok(client
         .query_opt(
             "SELECT d.manifest FROM services s
@@ -697,9 +728,7 @@ async fn declared_tables(
         )
         .await?
         .map(|row| serde_json::from_value::<ServiceManifest>(row.get(0)))
-        .transpose()?
-        .map(|manifest| requirements(&manifest))
-        .unwrap_or_default())
+        .transpose()?)
 }
 
 pub async fn inspect(
@@ -709,11 +738,15 @@ pub async fn inspect(
     service: &Service,
     binding: &Candidate<'_>,
 ) -> PlatformResult<VerifyReport> {
-    let tables = declared_tables(platform, service.id).await?;
+    let tables = active_manifest(platform, service.id)
+        .await?
+        .map(|manifest| requirements(&manifest))
+        .unwrap_or_default();
     let schema = service.schema();
     let expected = Expected {
         role: binding.role,
         managed: binding.managed,
+        enqueues: binding.enqueues,
         service: &service.name,
         schema: &schema,
         tables: &tables,
@@ -745,6 +778,7 @@ pub async fn inspect(
 pub struct Candidate<'a> {
     pub role: &'a str,
     pub managed: bool,
+    pub enqueues: bool,
     pub read_only_role: Option<&'a str>,
     pub password: Option<&'a SecretString>,
 }
@@ -785,6 +819,7 @@ mod tests {
         Expected {
             role: "loan_service_user",
             managed: false,
+            enqueues: true,
             service: "loan-service",
             schema: "loan_service",
             tables: &[],
@@ -822,6 +857,44 @@ mod tests {
                 "read_only_role",
                 "cufflink_schema",
                 "outbox_enqueue"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_role_of_a_service_the_platform_never_enqueues_as_needs_nothing_of_the_outbox() {
+        let bare = Expected {
+            enqueues: false,
+            ..expected()
+        };
+        let without = Facts {
+            cufflink: Some((false, Enqueue::Shared { execute: false })),
+            ..all_good()
+        };
+        let needed = report(&bare, &without, now());
+        assert!(needed.verified, "{needed:?}");
+        assert!(needed.checks.iter().all(|c| !c.excess));
+        let held = report(&bare, &all_good(), now());
+        assert!(
+            held.verified,
+            "a grant beyond the need fails nothing: {held:?}"
+        );
+        assert!(held.remediation.is_empty(), "nor is it mended: {held:?}");
+        assert_eq!(
+            held.checks
+                .iter()
+                .filter(|c| c.excess)
+                .map(|c| (c.check.as_str(), c.remedy.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "cufflink_schema_unneeded",
+                    "REVOKE USAGE ON SCHEMA _cufflink FROM \"loan_service_user\";"
+                ),
+                (
+                    "outbox_enqueue_unneeded",
+                    "REVOKE EXECUTE ON FUNCTION _cufflink.outbox_enqueue_many(TEXT[], TEXT[], TEXT[], BYTEA[], JSONB[], UUID[]) FROM \"loan_service_user\";"
+                ),
             ]
         );
     }

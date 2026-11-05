@@ -135,6 +135,30 @@ Response::s3_object(S3Object { bucket, key, content_type: None, disposition: Som
 - Hooks (`before_*`/`after_*`, `on_migrate`, subscriptions) read the
   response as they always have; a v2 envelope there is plain JSON.
 
+### Pre-rendered JSON (`cufflink-fn` feature `response-raw-json`)
+
+A handler that already holds its answer as JSON text, such as rows the
+database rendered with `json_agg`, sends it as it is:
+
+```rust
+let rows: String = /* SELECT json_agg(b) FROM books b … */;
+Ok(Response::json_text(rows)?.header("cache-control", "no-store"))
+```
+
+`Response::json_text(text)` fails unless `text` is one JSON value, drops the
+whitespace around it, and answers 200 `application/json` (set
+`content-type` for another JSON type). The platform finds the value in the
+envelope without parsing it into a tree or encoding it, and sends those
+bytes unchanged, key order and escapes included, so a large answer costs
+its length once against the response budget. The feature enables
+`response-v2` and needs a platform advertising `response_raw_json`; an
+older one would answer such a response with an empty body, which is why a
+deploy that needs it is refused there. A raw body that is not one JSON
+value answers `500 {"error": "WASM execution error: invalid response
+__body_raw"}`. Hooks (`before_*`/`after_*`, subscriptions) and a job's stored
+result read the response as JSON, as they read every v2 envelope, and find
+the body there as a value under `__body_raw`.
+
 ## Error profile
 
 ```rust
