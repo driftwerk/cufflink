@@ -1243,6 +1243,24 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   rendered, which the platform sends byte for byte without parsing or
   encoding it ([features](#features-added-in-v0360),
   [responses](routing.md#pre-rendered-json-cufflink-fn-feature-response-raw-json)).
+- **`db_roles` grants the outbox only to a service the platform enqueues
+  for.** A service whose manifest declares no served table (`tables`;
+  `private_tables` do not count) and nothing it `publishes` has its role
+  granted nothing of `_cufflink`: no `USAGE`, no
+  enqueue function and no `service_roles` row. Provisioning still takes the
+  shared `outbox_enqueue_many` from it and unmaps any other role mapped to
+  the service, as it does for every role. Its route audit records are
+  written in the platform's own session. `db-role verify` no longer
+  requires those grants of it, and reports a role that holds them as
+  `EXCESS`, with the `REVOKE` that takes each back, without failing it
+  ([database roles](db-roles-and-secrets.md)). Existing grants are kept.
+  A deploy that adds a table or `publishes` grants a verified role before
+  the version serves, whatever the tenant's `db_roles` policy, and fails
+  the deploy when it cannot. A guest with no served table (only
+  `private_tables`, or an adopted schema with none served) that calls
+  `_cufflink.outbox_enqueue_own` from its SQL must now declare `publishes`
+  ([outbox](outbox.md#enqueueing-from-a-guest)); without it, a role bound
+  from now on is refused the call.
 
 ## Changes in v0.35.0
 
