@@ -870,6 +870,52 @@ async fn db_v2_a_guest_statement_timeout_covers_the_commit_and_ends_with_the_tra
 }
 
 #[tokio::test]
+async fn db_v2_a_commit_whose_timeout_cannot_be_set_discards_its_connection() {
+    let Some(fixture) =
+        Fixture::with_pool_size("v2_guest_timeout_unset", "CREATE TABLE t (id int);", 1).await
+    else {
+        return;
+    };
+    let pid = || async {
+        let pooled = fixture.pool.get().await.expect("checkout");
+        let row = pooled
+            .query_one("SELECT pg_backend_pid() AS pid", &[])
+            .await
+            .expect("pid");
+        row.get::<_, i32>("pid")
+    };
+    let before = pid().await;
+    let mut client = fixture.session();
+
+    let tx = client.begin().await;
+    client
+        .execute_in(Some(tx), "INSERT INTO t VALUES (1)", vec![])
+        .await;
+    client.execute_in(Some(tx), "DEALLOCATE ALL", vec![]).await;
+    let failed = client.failure(DbRequest::Commit { tx }).await;
+    assert!(
+        failed.message.contains("prepared statement"),
+        "the timeout's own statement is what failed: {failed}"
+    );
+    assert_eq!(client.session.open_count(), 0);
+    assert_eq!(
+        fixture.pool.status().size,
+        0,
+        "the connection left the pool when its transaction ended"
+    );
+
+    assert!(
+        client.query("SELECT id FROM t", vec![]).await.is_empty(),
+        "nothing is committed"
+    );
+    assert_ne!(
+        pid().await,
+        before,
+        "the connection that could not take the timeout is not reused"
+    );
+}
+
+#[tokio::test]
 async fn db_v2_tx_limit_and_pool_pressure() {
     let Some(fixture) =
         Fixture::with_pool_size("v2_pressure", "CREATE TABLE items (id int PRIMARY KEY);", 1).await
