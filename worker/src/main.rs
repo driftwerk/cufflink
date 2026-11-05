@@ -91,6 +91,7 @@ fn subscribe_pattern(configured: Option<String>) -> eyre::Result<String> {
 }
 
 fn main() -> eyre::Result<()> {
+    cufflink_supervisor::runner_api::forbid_inspection()?;
     cufflink_platform::wasm_runtime::budget::runtime()?.block_on(run())
 }
 

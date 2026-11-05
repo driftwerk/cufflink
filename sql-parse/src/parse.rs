@@ -1,8 +1,7 @@
 //! The parse itself: `pg_query` over a statement that passed the bounds, on
-//! a thread of its own with a stack sized for them, one at a time in the
-//! process.
+//! a thread with a stack sized for them, one at a time in the process.
 
-use crate::{bounds, PARSER, PROBE};
+use crate::{bounds, MAX_TREE_NESTING, PARSER, PROBE};
 use cufflink_types::sql_parse::{ParseError, Parsed};
 use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -17,25 +16,69 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// The tree of `sql` as canonical text: `serde_json::to_value` of
 /// `pg_query`'s protobuf, written with sorted keys and no whitespace.
-/// Refuses input past the bounds, and a text past `max_output` bytes.
+/// Refuses input past the bounds, a text past `max_output` bytes, and one
+/// nesting deeper than [`MAX_TREE_NESTING`]. Runs on a thread of its own
+/// with [`STACK_BYTES`] of stack.
 pub fn parse(sql: &str, max_output: usize) -> Result<String, ParseError> {
-    bounds::check(sql)?;
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-    let text = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("sql-parse".into())
             .stack_size(STACK_BYTES)
-            .spawn_scoped(scope, || canonical(sql))
+            .spawn_scoped(scope, || parse_on_this_thread(sql, max_output))
             .map_err(|_| ParseError::unavailable())?
             .join()
             .map_err(|_| ParseError::unavailable())?
-    })?;
-    match text.len() > max_output {
-        true => Err(ParseError::TooLarge(format!(
+    })
+}
+
+/// [`parse`] on the calling thread, which must have [`STACK_BYTES`] of
+/// stack, for a process that keeps one such thread for every parse.
+pub fn parse_on_this_thread(sql: &str, max_output: usize) -> Result<String, ParseError> {
+    bounds::check(sql)?;
+    let text = {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        canonical(sql)?
+    };
+    if text.len() > max_output {
+        return Err(ParseError::TooLarge(format!(
             "the parse tree is over {max_output} bytes"
+        )));
+    }
+    match nesting(&text) > MAX_TREE_NESTING {
+        true => Err(ParseError::TooLarge(format!(
+            "the parse tree nests deeper than {MAX_TREE_NESTING} levels"
         ))),
         false => Ok(text),
     }
+}
+
+/// The deepest the objects and arrays of JSON `text` nest.
+fn nesting(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'"' => {
+                while let Some(inner) = bytes.next() {
+                    match inner {
+                        b'\\' => {
+                            bytes.next();
+                        }
+                        b'"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// [`parse`], read back as the tree a guest is given, with this parser's
@@ -73,9 +116,14 @@ fn canonical(sql: &str) -> Result<String, ParseError> {
     serde_json::to_string(&tree).map_err(|_| ParseError::unavailable())
 }
 
-/// No message of the parser's reaches the guest: they quote the input.
+/// No message of the parser's reaches the guest: they quote the input. A
+/// parse that ran out of memory, which PostgreSQL reports as an error of
+/// its own, is too large rather than wrong.
 fn refusal(error: pg_query::Error) -> ParseError {
     match error {
+        pg_query::Error::Parse(message) if message.starts_with("out of memory") => {
+            ParseError::TooLarge("the statement needs more memory than the parser has".into())
+        }
         pg_query::Error::Parse(_) | pg_query::Error::Conversion(_) => ParseError::syntax(),
         pg_query::Error::Decode(_) => ParseError::TooLarge(
             "the statement nests deeper than the parser's tree decoder allows".into(),
@@ -161,6 +209,11 @@ mod tests {
             format!("SELECT 1{}", "::int".repeat(links / 3 - 2)),
             format!("SELECT 1{}", " UNION SELECT 1".repeat(links / 4 - 2)),
             format!("SELECT 1 FROM a{}", " JOIN a ON true".repeat(links / 5 - 2)),
+            format!(
+                "SELECT 1{}",
+                " BETWEEN 1 AND 1 IS TRUE".repeat(links / 6 - 2)
+            ),
+            format!("SELECT 1{}", " BETWEEN 1 AND NOT 1".repeat(links / 5 - 2)),
             format!("SELECT {}true", "NOT ".repeat(links - 3)),
             format!("SELECT {}1", "- ".repeat(links - 3)),
             format!(
@@ -209,6 +262,40 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn a_tree_nesting_past_the_limit_is_too_large() {
+        let within = format!("SELECT 1{}", "+1".repeat(35));
+        let text = parse(&within, usize::MAX).expect("parses");
+        assert_eq!(nesting(&text), MAX_TREE_NESTING);
+        let deeper = format!("SELECT 1{}", "+1".repeat(36));
+        assert!(matches!(
+            parse(&deeper, usize::MAX),
+            Err(ParseError::TooLarge(message)) if message.contains("levels")
+        ));
+    }
+
+    #[test]
+    fn a_parse_out_of_memory_is_too_large_and_quotes_nothing() {
+        let refused = refusal(pg_query::Error::Parse(
+            "out of memory: Failed on request of size 1024 zq_sentinel_9f".into(),
+        ));
+        assert!(matches!(&refused, ParseError::TooLarge(_)), "{refused}");
+        assert!(!refused.to_string().contains("zq_sentinel_9f"));
+        assert_eq!(
+            refusal(pg_query::Error::Parse(
+                "syntax error at or near \"x\"".into()
+            )),
+            ParseError::syntax()
+        );
+    }
+
+    #[test]
+    fn nesting_counts_brackets_outside_strings() {
+        assert_eq!(nesting("1"), 0);
+        assert_eq!(nesting(r#"{"a":[{"b":"[[[\"{{"}]}"#), 3);
+        assert_eq!(nesting(r#"["\\",["x"]]"#), 2);
     }
 
     #[test]

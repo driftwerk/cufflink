@@ -23,11 +23,15 @@ pub const MAX_CHAIN_DEPTH: u32 = 10_000;
 ///
 /// Within one level, every token but `,`, `AND` and `OR` counts towards the
 /// current segment, and those three end it: their operands are siblings,
-/// since lists are flat and the grammar flattens `AND` and `OR`. `UNION`,
-/// `INTERSECT`, `EXCEPT` and `JOIN` chains cross commas and `AND`s, so they
-/// also count towards the whole level until its statement ends. A level is
-/// 1 deep, plus its whole-level count, plus its deepest segment, where a
-/// segment is its own count plus the deepest level nested inside it.
+/// since lists are flat and the grammar flattens `AND` and `OR`. The `AND`
+/// of a `BETWEEN` is the exception: it joins the bounds of one expression,
+/// which can nest, so it counts as any other token. `UNION`, `INTERSECT`,
+/// `EXCEPT` and `JOIN` chains cross commas and `AND`s, so they also count
+/// towards the whole level until its statement ends. A level is 1 deep,
+/// plus its whole-level count, plus its deepest segment, where a segment is
+/// its own count plus the deepest level nested inside it. The scan stops at
+/// the first count past [`MAX_CHAIN_DEPTH`], since a depth is at least any
+/// of its counts.
 pub fn check(sql: &str) -> Result<(), ParseError> {
     if sql.len() > MAX_INPUT_BYTES {
         return Err(too_large(format!(
@@ -36,15 +40,17 @@ pub fn check(sql: &str) -> Result<(), ParseError> {
     }
     let depth = Scan::new(sql.as_bytes()).depth()?;
     match depth > MAX_CHAIN_DEPTH {
-        true => Err(too_large(format!(
-            "the statement nests deeper than {MAX_CHAIN_DEPTH}"
-        ))),
+        true => Err(too_deep()),
         false => Ok(()),
     }
 }
 
 fn too_large(message: String) -> ParseError {
     ParseError::TooLarge(message)
+}
+
+fn too_deep() -> ParseError {
+    too_large(format!("the statement nests deeper than {MAX_CHAIN_DEPTH}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +61,24 @@ enum Opened {
     Case,
 }
 
+impl Opened {
+    fn index(self) -> usize {
+        match self {
+            Opened::Root => 0,
+            Opened::Paren => 1,
+            Opened::Square => 2,
+            Opened::Case => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
     Open(Opened),
     Close(Opened),
     Separator,
+    And,
+    Between,
     Statement,
     Chain,
     Case,
@@ -75,6 +94,8 @@ struct Level {
     nested: u32,
     deepest_segment: u32,
     deepest_statement: u32,
+    /// `BETWEEN`s whose `AND` is still to come.
+    betweens: u32,
 }
 
 impl Level {
@@ -86,11 +107,20 @@ impl Level {
             nested: 0,
             deepest_segment: 0,
             deepest_statement: 0,
+            betweens: 0,
         }
     }
 
     fn count(&mut self) {
         self.segment = self.segment.saturating_add(1);
+    }
+
+    /// The least depth this level already reaches.
+    fn reached(&self) -> u32 {
+        self.whole
+            .saturating_add(self.segment)
+            .saturating_add(self.nested)
+            .saturating_add(1)
     }
 
     fn end_segment(&mut self) {
@@ -108,6 +138,7 @@ impl Level {
             .max(self.whole.saturating_add(self.deepest_segment));
         self.whole = 0;
         self.deepest_segment = 0;
+        self.betweens = 0;
     }
 
     fn depth(mut self) -> u32 {
@@ -120,6 +151,8 @@ struct Scan<'a> {
     sql: &'a [u8],
     at: usize,
     levels: Vec<Level>,
+    /// The levels of each kind open, so a close finds its own in O(1).
+    open: [u32; 4],
 }
 
 impl<'a> Scan<'a> {
@@ -128,6 +161,7 @@ impl<'a> Scan<'a> {
             sql,
             at: 0,
             levels: vec![Level::new(Opened::Root)],
+            open: [1, 0, 0, 0],
         }
     }
 
@@ -135,9 +169,7 @@ impl<'a> Scan<'a> {
         while let Some(token) = self.next_token() {
             self.take(token)?;
         }
-        while self.levels.len() > 1 {
-            self.close_top();
-        }
+        while self.close_top().is_some() {}
         Ok(self.levels.pop().map_or(0, Level::depth))
     }
 
@@ -159,6 +191,21 @@ impl<'a> Scan<'a> {
                 self.close_top();
             }
             Token::Separator => self.top().end_segment(),
+            Token::And => {
+                let level = self.top();
+                match level.betweens {
+                    0 => level.end_segment(),
+                    _ => {
+                        level.betweens -= 1;
+                        level.count();
+                    }
+                }
+            }
+            Token::Between => {
+                let level = self.top();
+                level.betweens = level.betweens.saturating_add(1);
+                level.count();
+            }
             Token::Statement => self.top().end_statement(),
             Token::Chain => {
                 let level = self.top();
@@ -167,7 +214,10 @@ impl<'a> Scan<'a> {
             }
             Token::End | Token::Other => self.top().count(),
         }
-        Ok(())
+        match self.top().reached() > MAX_CHAIN_DEPTH {
+            true => Err(too_deep()),
+            false => Ok(()),
+        }
     }
 
     fn open(&mut self, opened: Opened) -> Result<(), ParseError> {
@@ -177,6 +227,7 @@ impl<'a> Scan<'a> {
                 "the statement opens more than {MAX_BRACKET_DEPTH} brackets at once"
             )));
         }
+        self.open[opened.index()] += 1;
         self.levels.push(Level::new(opened));
         Ok(())
     }
@@ -185,22 +236,28 @@ impl<'a> Scan<'a> {
     /// with no bracket of its kind open is an ordinary token, which the
     /// parser refuses.
     fn close(&mut self, opened: Opened) {
-        match self.levels.iter().rposition(|level| level.opened == opened) {
-            Some(at) if at > 0 => {
-                while self.levels.len() > at {
-                    self.close_top();
+        match self.open[opened.index()] {
+            0 => self.top().count(),
+            _ => {
+                while let Some(closed) = self.close_top() {
+                    if closed == opened {
+                        break;
+                    }
                 }
             }
-            _ => self.top().count(),
         }
     }
 
-    fn close_top(&mut self) {
-        if let Some(closed) = self.levels.pop() {
-            let depth = closed.depth();
-            let parent = self.top();
-            parent.nested = parent.nested.max(depth);
+    fn close_top(&mut self) -> Option<Opened> {
+        if self.levels.len() < 2 {
+            return None;
         }
+        let closed = self.levels.pop()?;
+        self.open[closed.opened.index()] -= 1;
+        let depth = closed.depth();
+        let parent = self.top();
+        parent.nested = parent.nested.max(depth);
+        Some(closed.opened)
     }
 
     fn peek(&self, ahead: usize) -> Option<u8> {
@@ -368,8 +425,12 @@ impl<'a> Scan<'a> {
 
 fn keyword(word: &[u8]) -> Token {
     let is = |keyword: &str| word.eq_ignore_ascii_case(keyword.as_bytes());
-    if is("and") || is("or") {
+    if is("or") {
         Token::Separator
+    } else if is("and") {
+        Token::And
+    } else if is("between") {
+        Token::Between
     } else if is("union") || is("intersect") || is("except") || is("join") {
         Token::Chain
     } else if is("case") {
@@ -397,10 +458,13 @@ fn is_dollar_tag(byte: u8) -> bool {
 mod tests {
     use super::*;
 
+    /// The depth the scan finds, or `u32::MAX` where it stopped early.
     fn depth(sql: &str) -> u32 {
-        Scan::new(sql.as_bytes())
-            .depth()
-            .expect("within the brackets")
+        match Scan::new(sql.as_bytes()).depth() {
+            Ok(depth) => depth,
+            Err(ParseError::TooLarge(message)) if message.contains("deeper") => u32::MAX,
+            Err(other) => panic!("{other:?}"),
+        }
     }
 
     fn refused(sql: &str) -> String {
@@ -419,6 +483,49 @@ mod tests {
         assert!(check(&conjunction).is_ok());
         let columns = format!("SELECT a{} FROM t", ", a AS b".repeat(50_000));
         assert!(depth(&columns) < 10);
+        let ranges = format!(
+            "SELECT 1 WHERE {}true",
+            "x NOT BETWEEN SYMMETRIC 1 AND 2 AND ".repeat(20_000)
+        );
+        assert!(depth(&ranges) < 20, "{}", depth(&ranges));
+        let frames = format!(
+            "SELECT {}1",
+            "sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AND ".repeat(5_000)
+        );
+        assert!(depth(&frames) < 20, "{}", depth(&frames));
+    }
+
+    #[test]
+    fn the_and_of_a_between_does_not_end_its_segment() {
+        for chain in [
+            format!("SELECT 1{}", " BETWEEN 1 AND 1 IS TRUE".repeat(2_000)),
+            format!("SELECT 1{}", " BETWEEN 1 AND NOT 1".repeat(2_500)),
+        ] {
+            assert!(depth(&chain) > MAX_CHAIN_DEPTH, "{}", depth(&chain));
+            refused(&chain);
+        }
+    }
+
+    #[test]
+    fn unmatched_closes_cost_one_step_each() {
+        let started = std::time::Instant::now();
+        let closes = format!(
+            "SELECT {}1{}",
+            "(".repeat(1_000),
+            "]".repeat(MAX_INPUT_BYTES - 2_000)
+        );
+        assert!(refused(&closes).contains("deeper"));
+        let cases = format!(
+            "SELECT {}1{}",
+            "CASE WHEN true THEN (".repeat(400),
+            ")".repeat(400)
+        );
+        assert!(check(&cases).is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

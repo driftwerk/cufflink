@@ -2,26 +2,22 @@
 //! over stdin and stdout (`cufflink_sql_parse::wire`), so that a fault in
 //! the parser ends this process and not the platform.
 //!
-//! On Linux it caps its own address space at `SQL_PARSE_MEMORY_MB` and
-//! asks to be the first process the kernel kills when memory runs out.
+//! It confines itself before it greets ([`sandbox`]): a platform never
+//! sends a statement to a process that could not.
+
+mod sandbox;
 
 use cufflink_sql_parse::bounds::MAX_INPUT_BYTES;
 use cufflink_sql_parse::wire::{read_frame, read_message, write_frame, write_message};
 use cufflink_sql_parse::wire::{Answer, Hello, Request};
-use cufflink_sql_parse::{fingerprint, parse, PARSER};
+use cufflink_sql_parse::{fingerprint, parse_on_this_thread, PARSER, STACK_BYTES};
 use cufflink_types::sql_parse::ParseError;
 use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
+use std::sync::mpsc;
 
 fn main() -> ExitCode {
-    if let Err(e) = confine() {
-        eprintln!("cufflink-sql-parser: {e}");
-        return ExitCode::FAILURE;
-    }
-    match serve(
-        &mut io::stdin().lock(),
-        &mut BufWriter::new(io::stdout().lock()),
-    ) {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("cufflink-sql-parser: {e}");
@@ -30,20 +26,40 @@ fn main() -> ExitCode {
     }
 }
 
-fn serve(input: &mut impl Read, out: &mut impl Write) -> io::Result<()> {
+fn run() -> io::Result<()> {
+    sandbox::confine()?;
     let hello = Hello {
         parser: PARSER.to_string(),
         fingerprint: fingerprint().map_err(io::Error::other)?.to_string(),
     };
-    write_message(out, &hello)?;
+    let thread = ParseThread::spawn()?;
+    sandbox::enter()?;
+    serve(
+        &hello,
+        |sql, max_output| thread.parse(sql, max_output),
+        &mut io::stdin().lock(),
+        &mut BufWriter::new(io::stdout().lock()),
+    )
+}
+
+/// Greets with `hello`, then answers each request in turn with `parse`
+/// until the input ends.
+fn serve(
+    hello: &Hello,
+    mut parse: impl FnMut(String, usize) -> io::Result<Result<String, ParseError>>,
+    input: &mut impl Read,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    write_message(out, hello)?;
     out.flush()?;
     while let Some(request) = read_message::<Request>(input)? {
         let sql = read_frame(input, MAX_INPUT_BYTES)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         let max_output = usize::try_from(request.max_output).unwrap_or(usize::MAX);
-        let answer = std::str::from_utf8(&sql)
-            .map_err(|_| ParseError::syntax())
-            .and_then(|sql| parse(sql, max_output));
+        let answer = match String::from_utf8(sql) {
+            Ok(sql) => parse(sql, max_output)?,
+            Err(_) => Err(ParseError::syntax()),
+        };
         match answer {
             Ok(text) => {
                 write_message(out, &Answer::Tree)?;
@@ -52,61 +68,70 @@ fn serve(input: &mut impl Read, out: &mut impl Write) -> io::Result<()> {
             Err(error) => write_message(out, &Answer::Error(error))?,
         }
         out.flush()?;
+        sandbox::release_memory();
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn confine() -> io::Result<()> {
-    if let Some(mb) = memory_limit_mb()? {
-        let bytes: libc::rlim_t = mb.saturating_mul(1024 * 1024);
-        let limit = libc::rlimit {
-            rlim_cur: bytes,
-            rlim_max: bytes,
-        };
-        // SAFETY: setrlimit reads the struct it is given and nothing else.
-        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "1000") {
-        eprintln!("cufflink-sql-parser: oom_score_adj not raised: {e}");
-    }
-    Ok(())
+/// The one thread every parse runs on, started before the process
+/// confines itself, so no thread is started after.
+struct ParseThread {
+    requests: mpsc::Sender<(String, usize)>,
+    answers: mpsc::Receiver<Result<String, ParseError>>,
 }
 
-#[cfg(not(target_os = "linux"))]
-fn confine() -> io::Result<()> {
-    memory_limit_mb().map(drop)
-}
+impl ParseThread {
+    fn spawn() -> io::Result<Self> {
+        let (requests, jobs) = mpsc::channel::<(String, usize)>();
+        let (answer, answers) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("sql-parse".into())
+            .stack_size(STACK_BYTES)
+            .spawn(move || {
+                for (sql, max_output) in jobs {
+                    if answer.send(parse_on_this_thread(&sql, max_output)).is_err() {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self { requests, answers })
+    }
 
-fn memory_limit_mb() -> io::Result<Option<u64>> {
-    match std::env::var("SQL_PARSE_MEMORY_MB") {
-        Ok(mb) => mb
-            .parse::<u64>()
-            .ok()
-            .filter(|mb| *mb > 0)
-            .map(Some)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SQL_PARSE_MEMORY_MB is not a positive number",
-                )
-            }),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+    fn parse(&self, sql: String, max_output: usize) -> io::Result<Result<String, ParseError>> {
+        let ended = || io::Error::other("the parse thread ended");
+        self.requests.send((sql, max_output)).map_err(|_| ended())?;
+        self.answers.recv().map_err(|_| ended())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cufflink_sql_parse::parse;
 
     fn request(sql: &[u8], max_output: u64) -> Vec<u8> {
         let mut wire = Vec::new();
         write_message(&mut wire, &Request { max_output }).expect("request");
         write_frame(&mut wire, sql).expect("statement");
         wire
+    }
+
+    fn hello() -> Hello {
+        Hello {
+            parser: PARSER.to_string(),
+            fingerprint: fingerprint().expect("fingerprint").to_string(),
+        }
+    }
+
+    fn served(input: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        serve(
+            &hello(),
+            |sql, max_output| Ok(parse(&sql, max_output)),
+            &mut &input[..],
+            &mut out,
+        )
+        .map(|()| out)
     }
 
     #[test]
@@ -118,11 +143,10 @@ mod tests {
             request(b"SELECT 1", 2),
         ]
         .concat();
-        let mut out = Vec::new();
-        serve(&mut input.as_slice(), &mut out).expect("served");
+        let out = served(&input).expect("served");
         let mut answers = out.as_slice();
-        let hello: Hello = read_message(&mut answers).expect("read").expect("hello");
-        assert_eq!(hello.parser, PARSER);
+        let greeting: Hello = read_message(&mut answers).expect("read").expect("hello");
+        assert_eq!(greeting, hello());
         assert_eq!(
             read_message(&mut answers).expect("read"),
             Some(Answer::Tree)
@@ -156,8 +180,19 @@ mod tests {
                 .expect("fits")
                 .to_be_bytes(),
         );
-        assert!(serve(&mut wire.as_slice(), &mut Vec::new()).is_err());
+        assert!(served(&wire).is_err());
         let cut = request(b"SELECT 1", 1);
-        assert!(serve(&mut &cut[..cut.len() - 1], &mut Vec::new()).is_err());
+        assert!(served(&cut[..cut.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn the_parse_thread_answers_in_turn_as_a_parse_does() {
+        let thread = ParseThread::spawn().expect("spawned");
+        for sql in ["SELECT 1", "SELEC 1", "SELECT 2"] {
+            assert_eq!(
+                thread.parse(sql.into(), usize::MAX).expect("answered"),
+                parse(sql, usize::MAX)
+            );
+        }
     }
 }

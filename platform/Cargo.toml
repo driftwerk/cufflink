@@ -76,6 +76,7 @@ ring = { workspace = true }
 cufflink-storage = { workspace = true }
 cufflink-telemetry = { workspace = true }
 cufflink-shutdown = { workspace = true }
+cufflink-supervisor = { workspace = true }
 cufflink-nats = { workspace = true }
 redis = { workspace = true }
 regex = { workspace = true }
