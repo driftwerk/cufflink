@@ -12,6 +12,7 @@ pub const DB_V2: &str = "db_v2";
 pub const CACHE: &str = "cache";
 pub const SERVICE_CALL: &str = "service_call";
 pub const RESPONSE_V2: &str = "response_v2";
+pub const RESPONSE_RAW_JSON: &str = "response_raw_json";
 pub const SSE_BRIDGE: &str = "sse_bridge";
 pub const ROUTE_MATCHING: &str = "route_matching";
 pub const ROUTE_LIMITS: &str = "route_limits";
