@@ -21,6 +21,7 @@ fn settings(binary: PathBuf, processes: usize) -> SqlParseSettings {
         per_tenant: processes,
         memory_mb: 1024,
         timeout: WITHIN,
+        tenant_cooldown: WITHIN,
     }
 }
 
@@ -266,6 +267,55 @@ async fn a_process_past_the_parse_timeout_is_killed_and_replaced_in_the_backgrou
     })
     .await;
     assert_eq!(tree(&parser, "SELECT 1").await, own("SELECT 1"));
+}
+
+#[tokio::test]
+async fn a_tenant_whose_parses_keep_losing_processes_is_refused_for_its_cooldown() {
+    let cooldown = Duration::from_secs(2);
+    let Some((binary, parser)) = started_with(1, |settings| SqlParseSettings {
+        timeout: MIN_PARSE_BUDGET,
+        tenant_cooldown: cooldown,
+        ..settings
+    })
+    .await
+    else {
+        return;
+    };
+    let losing = Uuid::from_u128(1);
+    let slow = slow();
+    for _ in 0..3 {
+        let before = binary.processes();
+        assert!(matches!(
+            tree_within(&parser, losing, &slow, WITHIN).await,
+            Err(ParseError::Unavailable(_))
+        ));
+        wait_for(|| {
+            let now = binary.processes();
+            now.len() == 1 && now != before
+        })
+        .await;
+    }
+    let cooled = Instant::now();
+    let before = binary.processes();
+    assert!(
+        matches!(
+            tree_within(&parser, losing, "SELECT 1", WITHIN).await,
+            Err(ParseError::Unavailable(_))
+        ),
+        "the tenant is refused during its cooldown"
+    );
+    assert_eq!(
+        tree_within(&parser, Uuid::from_u128(2), "SELECT 1", WITHIN).await,
+        own("SELECT 1"),
+        "another tenant is served meanwhile"
+    );
+    assert_eq!(binary.processes(), before, "a refusal costs no process");
+    tokio::time::sleep(cooldown.saturating_sub(cooled.elapsed())).await;
+    assert_eq!(
+        tree_within(&parser, losing, "SELECT 1", WITHIN).await,
+        own("SELECT 1"),
+        "the tenant is served once its cooldown ends"
+    );
 }
 
 #[tokio::test]

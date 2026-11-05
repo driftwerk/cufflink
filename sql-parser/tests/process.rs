@@ -13,12 +13,16 @@ struct Parser {
 
 impl Parser {
     fn start() -> Self {
+        Self::start_with(Stdio::null())
+    }
+
+    fn start_with(stderr: Stdio) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_cufflink-sql-parser"))
             .env_clear()
             .env("SQL_PARSE_MEMORY_MB", "1024")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .expect("spawned");
         let input = child.stdin.take().expect("stdin");
@@ -60,6 +64,28 @@ impl Parser {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn proc_field(&self, file: &str, name: &str) -> Option<String> {
+        let text = std::fs::read_to_string(format!("/proc/{}/{file}", self.child.id()))
+            .expect("proc file");
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|value| value.trim().to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_confined(&self) {
+        assert_eq!(self.proc_field("status", "Seccomp:").as_deref(), Some("2"));
+        assert_eq!(
+            self.proc_field("status", "NoNewPrivs:").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            self.proc_field("oom_score_adj", "").as_deref(),
+            Some("1000")
+        );
+    }
+
     fn end(mut self) {
         drop(self.input);
         assert!(self.child.wait().expect("waited").success());
@@ -88,19 +114,7 @@ fn the_confined_process_answers_as_the_library_does() {
     let mut parser = Parser::start();
     parser.hello();
     #[cfg(target_os = "linux")]
-    {
-        let status =
-            std::fs::read_to_string(format!("/proc/{}/status", parser.child.id())).expect("status");
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .map(str::trim)
-                .map(str::to_string)
-        };
-        assert_eq!(field("Seccomp:").as_deref(), Some("2"), "{status}");
-        assert_eq!(field("NoNewPrivs:").as_deref(), Some("1"), "{status}");
-    }
+    parser.assert_confined();
     let brackets = MAX_BRACKET_DEPTH as usize;
     let links = MAX_CHAIN_DEPTH as usize;
     let statements = PROBE
@@ -129,4 +143,25 @@ fn the_confined_process_answers_as_the_library_does() {
         );
     }
     parser.end();
+}
+
+/// A confined process may still report on its stderr: a request it cannot
+/// read ends it with its own failure, not with the allowlist's kill.
+#[test]
+fn the_confined_process_reports_a_broken_request_on_stderr_and_fails() {
+    let mut parser = Parser::start_with(Stdio::piped());
+    let mut stderr = parser.child.stderr.take().expect("stderr");
+    parser.hello();
+    #[cfg(target_os = "linux")]
+    parser.assert_confined();
+    parser
+        .input
+        .write_all(&u32::MAX.to_be_bytes())
+        .expect("header");
+    drop(parser.input);
+    let status = parser.child.wait().expect("waited");
+    let mut report = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut report).expect("stderr");
+    assert_eq!(status.code(), Some(1), "{status}");
+    assert!(report.starts_with("cufflink-sql-parser: "), "{report}");
 }

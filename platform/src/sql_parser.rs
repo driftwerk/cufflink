@@ -29,6 +29,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_TENANT_COOLDOWN_MS: u64 = 60_000;
+/// Processes a tenant's parses may lose within its cooldown before its
+/// parses are refused for that long.
+const LOSSES_BEFORE_COOLDOWN: usize = 3;
 const REAP_EVERY: Duration = Duration::from_secs(1);
 
 /// The least of an invocation's budget a parse is started with.
@@ -52,6 +56,9 @@ pub struct SqlParseSettings {
     pub memory_mb: usize,
     /// `SQL_PARSE_TIMEOUT_MS`: the longest one parse may take.
     pub timeout: Duration,
+    /// `SQL_PARSE_TENANT_COOLDOWN_MS`: how long a tenant whose parses lost
+    /// three processes within it has its parses refused.
+    pub tenant_cooldown: Duration,
 }
 
 impl Default for SqlParseSettings {
@@ -66,6 +73,7 @@ impl Default for SqlParseSettings {
             per_tenant: half(processes),
             memory_mb: 1024,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            tenant_cooldown: Duration::from_millis(DEFAULT_TENANT_COOLDOWN_MS),
         }
     }
 }
@@ -78,18 +86,17 @@ impl SqlParseSettings {
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let defaults = Self::default();
         let positive = |name: &str, default: usize| positive_var(name, var(name), default);
+        let millis = |name: &str, default: u64| {
+            positive_var(name, var(name), default).map(Duration::from_millis)
+        };
         let processes = positive("SQL_PARSE_PROCESSES", defaults.processes)?;
         Ok(Self {
             binary: var("SQL_PARSER_BIN").map_or(defaults.binary, PathBuf::from),
             processes,
             per_tenant: positive("SQL_PARSE_PER_TENANT", half(processes))?,
             memory_mb: positive("SQL_PARSE_MEMORY_MB", defaults.memory_mb)?,
-            timeout: positive_var(
-                "SQL_PARSE_TIMEOUT_MS",
-                var("SQL_PARSE_TIMEOUT_MS"),
-                DEFAULT_TIMEOUT_MS,
-            )
-            .map(Duration::from_millis)?,
+            timeout: millis("SQL_PARSE_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)?,
+            tenant_cooldown: millis("SQL_PARSE_TENANT_COOLDOWN_MS", DEFAULT_TENANT_COOLDOWN_MS)?,
         })
     }
 }
@@ -124,6 +131,7 @@ struct Pool {
     /// One permit for each process in `idle`.
     available: Semaphore,
     tenants: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+    losses: Mutex<HashMap<Uuid, Losses>>,
     health: Mutex<Health>,
     wanted: mpsc::UnboundedSender<()>,
     started: Mutex<Option<mpsc::UnboundedReceiver<()>>>,
@@ -136,6 +144,24 @@ struct Health {
     failures: u32,
     /// Starts failed in a row.
     failed_starts: u32,
+}
+
+/// The processes one tenant's parses lost within its cooldown, and until
+/// when its parses are refused.
+#[derive(Default)]
+struct Losses {
+    at: Vec<Instant>,
+    refused_until: Option<Instant>,
+}
+
+impl Losses {
+    fn refused(&self, now: Instant) -> bool {
+        self.refused_until.is_some_and(|until| now < until)
+    }
+
+    fn recent(&self, now: Instant, window: Duration) -> bool {
+        self.refused(now) || self.at.iter().any(|at| now.duration_since(*at) < window)
+    }
 }
 
 impl Health {
@@ -158,6 +184,7 @@ impl SqlParser {
                 ready: AtomicBool::new(false),
                 idle: Mutex::new(Vec::new()),
                 tenants: Mutex::new(HashMap::new()),
+                losses: Mutex::new(HashMap::new()),
                 health: Mutex::new(Health::default()),
                 wanted,
                 started: Mutex::new(Some(requests)),
@@ -201,7 +228,8 @@ impl SqlParser {
     /// The canonical text of `sql`'s tree, written after what `hold` gives
     /// back for the tree's length, at most `max_output` bytes. `hold` runs
     /// before the tree is read, so it can charge for it first. `tenant`'s
-    /// parses at once are limited to `SQL_PARSE_PER_TENANT`.
+    /// parses at once are limited to `SQL_PARSE_PER_TENANT`, and a tenant
+    /// whose parses keep losing processes is refused for a cooldown.
     pub async fn parse<E>(
         &self,
         tenant: Uuid,
@@ -236,7 +264,7 @@ impl SqlParser {
         hold: impl FnOnce(usize) -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, ParseFailure<E>> {
         bounds::check(sql)?;
-        if !self.is_ready() || within < MIN_PARSE_BUDGET {
+        if !self.is_ready() || within < MIN_PARSE_BUDGET || self.pool.refuses(tenant) {
             return Err(ParseError::unavailable().into());
         }
         let deadline = tokio::time::Instant::now() + within.min(self.pool.settings.timeout);
@@ -329,6 +357,36 @@ impl Pool {
                 permit.forget();
             }
             self.lost("an idle parser process ended", &"exited", "idle");
+        }
+    }
+
+    fn refuses(&self, tenant: Uuid) -> bool {
+        lock(&self.losses)
+            .get(&tenant)
+            .is_some_and(|losses| losses.refused(Instant::now()))
+    }
+
+    /// A process lost to `tenant`'s parse, which past
+    /// `LOSSES_BEFORE_COOLDOWN` within the cooldown refuses its parses for
+    /// the cooldown, so a tenant whose statements keep costing processes
+    /// does not keep the others waiting on their replacements.
+    fn lost_to(&self, tenant: Uuid) {
+        let now = Instant::now();
+        let window = self.settings.tenant_cooldown;
+        let mut all = lock(&self.losses);
+        all.retain(|_, losses| losses.recent(now, window));
+        let losses = all.entry(tenant).or_default();
+        losses.at.retain(|at| now.duration_since(*at) < window);
+        losses.at.push(now);
+        if losses.at.len() >= LOSSES_BEFORE_COOLDOWN {
+            losses.at.clear();
+            losses.refused_until = Some(now + window);
+            metrics::counter!("cufflink_sql_parse_tenant_cooldowns_total").increment(1);
+            tracing::warn!(
+                %tenant,
+                cooldown = ?window,
+                "a tenant's parses keep losing parser processes; its parses are refused for the cooldown"
+            );
         }
     }
 
@@ -490,12 +548,18 @@ async fn serve(pool: Arc<Pool>, mut process: Process, turn: TenantTurn, job: Job
     let timeout = pool.settings.timeout;
     match tokio::time::timeout(timeout, process.exchange(job)).await {
         Ok(Ok(())) => pool.give_back(process),
-        Ok(Err(fault)) => pool.lost("the parser process failed", &fault, "parse"),
-        Err(_) => pool.lost(
-            "the parser process did not answer in time",
-            &"timed out",
-            "parse",
-        ),
+        Ok(Err(fault)) => {
+            pool.lost_to(turn.tenant);
+            pool.lost("the parser process failed", &fault, "parse");
+        }
+        Err(_) => {
+            pool.lost_to(turn.tenant);
+            pool.lost(
+                "the parser process did not answer in time",
+                &"timed out",
+                "parse",
+            );
+        }
     }
     drop(turn);
 }
@@ -617,6 +681,7 @@ mod tests {
                 "SQL_PARSE_PER_TENANT" => Some("3"),
                 "SQL_PARSE_MEMORY_MB" => Some("512"),
                 "SQL_PARSE_TIMEOUT_MS" => Some("250"),
+                "SQL_PARSE_TENANT_COOLDOWN_MS" => Some("1500"),
                 _ => None,
             }
             .map(String::from)
@@ -630,6 +695,7 @@ mod tests {
                 per_tenant: 3,
                 memory_mb: 512,
                 timeout: Duration::from_millis(250),
+                tenant_cooldown: Duration::from_millis(1500),
             }
         );
         assert_eq!(
@@ -646,6 +712,7 @@ mod tests {
             "SQL_PARSE_PER_TENANT",
             "SQL_PARSE_MEMORY_MB",
             "SQL_PARSE_TIMEOUT_MS",
+            "SQL_PARSE_TENANT_COOLDOWN_MS",
         ] {
             assert!(
                 SqlParseSettings::from_vars(|n| (n == name).then(|| "0".to_string())).is_err(),

@@ -520,6 +520,7 @@ no core dumps.
 | `SQL_PARSE_PER_TENANT` | half of `SQL_PARSE_PROCESSES`, at least `1` | One tenant's parses at once; its further calls wait for one of its own turns |
 | `SQL_PARSE_MEMORY_MB` | `1024` | Each process's address space, on Linux (`RLIMIT_AS`); a parse that runs out of it is `TooLarge`, or `Unavailable` where it ends the process |
 | `SQL_PARSE_TIMEOUT_MS` | `5000` | Longest one parse lasts; the process is then killed and replaced. A caller whose budget runs out first is answered `Unavailable` and the parse finishes without it |
+| `SQL_PARSE_TENANT_COOLDOWN_MS` | `60000` | A tenant whose parses lose three processes within this long, by timing out or ending them, has its parses answered `Unavailable` for this long |
 
 Zero or unparseable values are refused at startup, naming the variable.
 

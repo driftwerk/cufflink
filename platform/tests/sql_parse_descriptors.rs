@@ -28,6 +28,7 @@ async fn parses_leave_no_descriptor_behind_and_the_platforms_stderr_alone() {
         per_tenant: 4,
         memory_mb: 1024,
         timeout: Duration::from_millis(300),
+        tenant_cooldown: Duration::from_secs(60),
     }));
     assert!(parser.start().await);
     let round = || async {
@@ -62,7 +63,7 @@ async fn parses_leave_no_descriptor_behind_and_the_platforms_stderr_alone() {
     for _ in 0..4 {
         let refused = parser
             .parse(
-                Uuid::nil(),
+                Uuid::from_u128(1),
                 &slow,
                 usize::MAX,
                 Duration::from_secs(20),

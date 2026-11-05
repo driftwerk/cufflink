@@ -154,13 +154,20 @@ talks to each over its stdin and stdout:
   `SQL_PARSE_PER_TENANT` (half the processes, at least one); its further
   calls wait for one of its own turns, within their budget. A turn is held
   until the exchange ends, whether or not its caller waited, so a tenant
-  whose calls give up early still holds no more than its share.
+  whose calls give up early still holds no more than its share. A tenant
+  whose parses lose three processes, by timing out or ending them, within
+  `SQL_PARSE_TENANT_COOLDOWN_MS` (60 s) has its parses answered
+  `Unavailable` for that long, without asking a process, so its statements
+  cannot keep the other tenants waiting on replacements. The count is the
+  tenant's own: other tenants' answers do not reset it.
 - **Memory.** On Linux each process caps its own address space at
   `SQL_PARSE_MEMORY_MB` (1024) with `setrlimit(RLIMIT_AS)`. A parse that
   runs out of it inside PostgreSQL's allocator is `TooLarge`; one that runs
-  out elsewhere ends the process (`Unavailable`). Where `/proc` allows, it
-  also sets its `oom_score_adj` to 1000, so under memory pressure the
-  kernel kills a parser before the platform. The processes share the
+  out elsewhere ends the process (`Unavailable`). It sets its
+  `oom_score_adj` to 1000, so under memory pressure the kernel kills a
+  parser before the platform; it does so before it makes itself
+  undumpable, which hands its `/proc` entries to root, and a process that
+  cannot is never started. The processes share the
   platform's cgroup and sit outside the guest memory budget's ledger: their
   worst case, `SQL_PARSE_PROCESSES × SQL_PARSE_MEMORY_MB`, has to fit in
   the memory the budget leaves outside itself

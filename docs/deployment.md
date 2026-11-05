@@ -95,7 +95,8 @@ an idle process holds a few MiB, as it hands back what a parse freed. A
 and that worst case, or lower `SQL_PARSE_MEMORY_MB`: a parse past it costs
 only that call. The processes ask the kernel to kill them first
 (`oom_score_adj` 1000). `SQL_PARSE_PER_TENANT` keeps one tenant from
-holding every process.
+holding every process, and `SQL_PARSE_TENANT_COOLDOWN_MS` refuses a tenant
+whose parses keep losing them.
 
 ## HTTP request layers
 

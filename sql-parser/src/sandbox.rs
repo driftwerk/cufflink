@@ -18,12 +18,13 @@ pub fn confine() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    // An undumpable process's /proc entries belong to root, so the score
+    // is raised while they are still its own.
+    std::fs::write("/proc/self/oom_score_adj", "1000")
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot raise oom_score_adj: {e}")))?;
     // SAFETY: PR_SET_DUMPABLE takes plain integers and touches no memory.
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
-    }
-    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "1000") {
-        eprintln!("cufflink-sql-parser: oom_score_adj not raised: {e}");
     }
     Ok(())
 }
