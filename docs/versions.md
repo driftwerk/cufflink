@@ -433,16 +433,6 @@ Rolling a platform back from v0.31.0 to v0.30:
 | Services that declare column permissions (`cufflink services list --features` names them, as `column_permissions`) | **Roll each back first, to a version without them.** The v0.30 platform drops the key it does not know and serves the service without it: every restricted column is answered to, and written by, every caller that reaches the row. Such a service cannot be deployed there (422, naming the feature) |
 | The database | Nothing: v0.31.0 has no migration |
 
-Rolling a platform back from the release that adds tenant buckets:
-
-| What it added | Before rolling the platform back |
-|---------------|----------------------------------|
-| Services that enable `cufflink-fn/storage-acl` (`cufflink services list --features` names them, as `storage_acl`) | **Roll each back first, to a version without it.** The older platform cannot read an upload that names an ACL, and refuses it rather than store it without one. Such a service cannot be deployed there (422, naming the feature) |
-| Tenant buckets | Set each tenant that has some to `storage_scope` `strict` with an allowlist that leaves them out, unless its guests may reach them with the platform's credentials and today's rules. The older platform does not read `tenant_buckets`: their calls fall back to `storage_scope` and the platform's credentials, and under `legacy` with no allowlist they are admitted |
-| Exact keys | Nothing to undo, but objects stored under a key the older encoding changes (non-ASCII, `% # ? * [ ] ~ " < > |`) cannot be read there until the platform is back |
-| Sealed secrets | Run `cufflink admin secrets reseal` and `verify` from this release: the older binary does not know `tenant_buckets` and skips its secrets |
-| The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read. Retired claims stay in it, and the older platform does not refuse them either |
-
 Rolling a platform back from v0.35.0 to an earlier release:
 
 | What v0.35.0 added | Before rolling the platform back |
@@ -450,6 +440,18 @@ Rolling a platform back from v0.35.0 to an earlier release:
 | Services that declare `max_concurrent` on a route (`cufflink services list --features` names them, as `route_concurrency`) | Nothing must be done first. The older platform drops the key it does not know and runs the route without its limit. Such a service cannot be deployed there (422, naming the feature) |
 | The guest memory budget | Nothing: the older platform ignores the `WASM_MEMORY_*` variables and admits as before |
 | The database | Nothing: `V7__capacity_deferrals` only adds a column the older binary ignores. A job put off for capacity keeps its later `next_attempt_at` and runs then |
+
+Rolling a platform back from v0.36.0 to an earlier release:
+
+| What v0.36.0 added | Before rolling the platform back |
+|--------------------|----------------------------------|
+| Services that enable `cufflink-fn/response-raw-json` (`cufflink services list --features` names them, as `response_raw_json`) | **Roll each back first, to a version without it.** The older platform does not read `__body_raw` and would answer those responses with an empty body. Such a service cannot be deployed there (422, naming the feature) |
+| Services that enable `cufflink-fn/storage-acl` (`cufflink services list --features` names them, as `storage_acl`) | **Roll each back first, to a version without it.** The older platform cannot read an upload that names an ACL, and refuses it rather than store it without one. Such a service cannot be deployed there (422, naming the feature) |
+| Tenant buckets | Set each tenant that has some to `storage_scope` `strict` with an allowlist that leaves them out, unless its guests may reach them with the platform's credentials and today's rules. The older platform does not read `tenant_buckets`: their calls fall back to `storage_scope` and the platform's credentials, and under `legacy` with no allowlist they are admitted |
+| Exact keys | Nothing to undo, but objects stored under a key the older encoding changes (non-ASCII, `% # ? * [ ] ~ " < > \|`) cannot be read there until the platform is back |
+| Sealed secrets | Run `cufflink admin secrets reseal` and `verify` from this release: the older binary does not know `tenant_buckets` and skips its secrets |
+| Database roles of services the platform does not enqueue for (no served table and no `publishes`), provisioned or bound by this release | A tenant under `db_roles: enforce` goes to `warn` first. The older platform expects every bound role to hold `USAGE` on `_cufflink` and the outbox function, which this release no longer grants such a role, and writes those services' route audit records in their own sessions. Once it runs, apply the statements its `cufflink services db-role verify` prints for each such role, then set `enforce` again, which it refuses while a role is not verified |
+| The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read. Retired claims stay in it, and the older platform does not refuse them either |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
@@ -474,7 +476,7 @@ Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
 `V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
-v0.35.0, `V8__tenant_buckets` on the release that adds tenant buckets): expected and harmless, as migrations are
+v0.35.0, `V8__tenant_buckets` on v0.36.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist
@@ -1294,6 +1296,10 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
 ## Changes in v0.36.0
+
+Tenant buckets with their own credentials, exact keys and canned ACLs, and
+pre-rendered JSON responses ([features](#features-added-in-v0360)).
+Migration `V8__tenant_buckets.sql` adds a table. Also:
 
 - `ServiceRole::existing(name, password)` lets a `TestHost` log in as a
   role the test set up, as a service bound with `services db-role set
