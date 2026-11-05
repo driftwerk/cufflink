@@ -225,7 +225,7 @@ struct RawScan<'a> {
     in_body: bool,
     body: Option<&'a RawValue>,
     other_body: bool,
-    head: Vec<(String, &'a RawValue)>,
+    head: [Option<&'a RawValue>; HEAD.len()],
 }
 
 impl<'de> DeserializeSeed<'de> for &mut RawScan<'de> {
@@ -256,8 +256,8 @@ impl<'de> Visitor<'de> for &mut RawScan<'de> {
                 self.v2 = value.get() == "2";
             }
             self.other_body |= OTHER_BODIES.contains(&key.as_str());
-            if HEAD.contains(&key.as_str()) {
-                self.head.push((key, value));
+            if let Some(at) = HEAD.iter().position(|head| *head == key) {
+                self.head[at] = Some(value);
             }
         }
         Ok(())
@@ -291,9 +291,10 @@ fn raw_envelope(text: &str, hold: &mut Hold) -> Result<Option<RawEnvelope>, Deco
         .checked_sub(text.as_ptr() as usize)
         .filter(|start| text.get(*start..start + body.get().len()) == Some(body.get()))
         .ok_or_else(|| invalid(BODY_RAW))?;
-    let head = scan
-        .head
-        .into_iter()
+    let head = HEAD
+        .iter()
+        .zip(scan.head)
+        .filter_map(|(key, value)| value.map(|value| (key.to_string(), value)))
         .map(|(key, value)| {
             ChargedJson::parse(value.get().as_bytes(), hold)
                 .map(|parsed| (key, parsed.value))
@@ -1707,6 +1708,31 @@ mod tests {
         let nested =
             v2(&json!({"__v": 2, "__status": 200, "__body": {"__body_raw": 1}})).expect("v2");
         assert_eq!(nested.body, V2Body::Json(json!({"__body_raw": 1})));
+    }
+
+    #[tokio::test]
+    async fn a_raw_envelope_reads_each_head_key_once_and_its_headers_win() {
+        let text = r#"{"__v":2,"__status":500,"__status":200,"__headers":{"content-type":"application/geo+json"},"__body_raw":{"type":"Point"}}"#;
+        let (response, hold) = decode(output(text)).expect("decodes");
+        let response = response
+            .render("svc", &mut Objects, hold)
+            .await
+            .expect("rendered");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the last of a key is read"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/geo+json"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body"),
+            r#"{"type":"Point"}"#.as_bytes()
+        );
     }
 
     #[test]

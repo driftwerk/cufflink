@@ -493,6 +493,26 @@ mod tests {
 
     #[cfg(feature = "response-raw-json")]
     #[test]
+    fn a_raw_json_body_carries_the_content_type_a_handler_sets() {
+        let text = Response::json_text(r#"{"type":"Point"}"#.into())
+            .expect("one JSON value")
+            .header("content-type", "application/geo+json")
+            .into_data();
+        assert!(
+            text.ends_with(r#","__body_raw":{"type":"Point"}}"#),
+            "{text}"
+        );
+        let envelope: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(
+            envelope["__headers"]["content-type"],
+            "application/geo+json"
+        );
+        assert_eq!(envelope["__v"], 2);
+        assert!(envelope.get("__content_type").is_none(), "{text}");
+    }
+
+    #[cfg(feature = "response-raw-json")]
+    #[test]
     fn a_raw_json_body_is_written_into_the_envelope_as_it_is() {
         let text = "{\"b\": 1,  \"a\": [\"\\u00e9\\n\", 2.50, {\"__body_raw\": null}]}";
         let response = Response::json_text(format!(" \n{text}\t "))

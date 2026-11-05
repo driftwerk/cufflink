@@ -155,7 +155,9 @@ its length once against the response budget. The feature enables
 older one would answer such a response with an empty body, which is why a
 deploy that needs it is refused there. A raw body that is not one JSON
 value answers `500 {"error": "WASM execution error: invalid response
-__body_raw"}`.
+__body_raw"}`. Hooks (`before_*`/`after_*`, subscriptions) and a job's stored
+result read the response as JSON, as they read every v2 envelope, and find
+the body there as a value under `__body_raw`.
 
 ## Error profile
 
