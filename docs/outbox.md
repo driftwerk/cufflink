@@ -85,8 +85,10 @@ the guest's SQL runs as its service's role
 ([database roles](db-roles-and-secrets.md)).
 
 The service's role is granted the function only when the manifest
-declares a table or what the service publishes (`publishes`): a guest that
-enqueues from its SQL lists the subjects it publishes on. Without either,
+declares a served table (`tables`) or what the service publishes
+(`publishes`). `private_tables`, and an adopted schema with no served
+table, do not count: a guest whose rows are all its own lists the subjects
+it publishes on in `publishes`. Without either,
 the role holds nothing of `_cufflink`, and the call is refused with
 `permission denied for schema _cufflink` (SQLSTATE 42501). A deploy that
 adds `publishes` grants the role before the version serves.

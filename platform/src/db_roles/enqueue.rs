@@ -167,7 +167,7 @@ pub fn excess(role: &str, usage: bool, enqueue: Enqueue) -> Vec<Check> {
         Check::excess("outbox_enqueue_unneeded", granted, || {
             (
                 format!(
-                    "the role may execute {function}, and the service declares no table and \
+                    "the role may execute {function}, and the service serves no table and \
                      publishes nothing; a guest that enqueues from its SQL declares \
                      `publishes` rather than have this taken back"
                 ),
@@ -186,7 +186,7 @@ pub fn excess(role: &str, usage: bool, enqueue: Enqueue) -> Vec<Check> {
     std::iter::once(Check::excess("cufflink_schema_unneeded", usage, || {
         (
             format!(
-                "the role has USAGE on schema {CUFFLINK_SCHEMA}, and the service declares no \
+                "the role has USAGE on schema {CUFFLINK_SCHEMA}, and the service serves no \
                  table and publishes nothing; a guest that enqueues from its SQL declares \
                  `publishes` rather than have this taken back"
             ),

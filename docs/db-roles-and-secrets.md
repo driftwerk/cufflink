@@ -252,8 +252,9 @@ comes before the roles are verified:
    works, it may connect to the database, use and create in its schema,
    read and write every served table, switch to its read-only role, and
    use `_cufflink` and the outbox function. The last two are needed only
-   by a service the platform enqueues for, one that declares a table or
-   `publishes` ([outbox](outbox.md#enqueueing-from-a-guest)). The role of
+   by a service the platform enqueues for, one that declares a served
+   table (`tables`; `private_tables` do not count) or `publishes`
+   ([outbox](outbox.md#enqueueing-from-a-guest)). The role of
    any other service is granted nothing of `_cufflink`, so a role bound
    with `--role` reaches no more than it did, and the platform writes the
    service's route audit records in its own session. A role that holds
