@@ -99,6 +99,21 @@ impl PgOptions {
         config
     }
 
+    /// Why the first connection failed; a login as a role the test set up
+    /// names the role.
+    fn not_connected(&self, error: postgres::Error) -> TestHostError {
+        match &self.role {
+            PgRole::Login(role) if !role.made() => TestHostError::Role(format!(
+                "could not log in as role {}: {}",
+                role.name(),
+                server_message(&error)
+            )),
+            PgRole::Connection | PgRole::Set(_) | PgRole::Login(_) => {
+                TestHostError::Database(error)
+            }
+        }
+    }
+
     fn refused(&self, sql: &str) -> Option<&'static str> {
         pooler_refusal(self.pooler, sql).map(|refusal| refusal.message())
     }
@@ -315,7 +330,7 @@ impl PgHost {
     /// The host of the service whose schema is `schema`, in `db`.
     pub fn connect(db: &TestDb, schema: &str, options: PgOptions) -> Result<Self, TestHostError> {
         let config = options.connection(db);
-        let autocommit = apart(|| config.connect(NoTls))?;
+        let autocommit = apart(|| config.connect(NoTls)).map_err(|e| options.not_connected(e))?;
         Ok(Self {
             inner: Rc::new(Inner {
                 config,
