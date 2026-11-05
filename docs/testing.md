@@ -89,6 +89,8 @@ library's loans, tested this way.
 | `services` | `MockServiceCalls` (feature `service-call`) |
 | `ext` | `MockExtensions` (feature `ext-call`): `expect(name).respond(value)`, `.fail(code, message)` (answered as the platform answers it: `Failed`, or the kind of a reserved code `unavailable`, `timeout`, `too_large`) or `.refuse(CallErrorKind::…)`, `.times(n)`; `calls()`. An unscripted call answers `not_found` and is recorded; with `TestHost::builder().extensions([...])` a call to any other extension is refused `not_declared` and never recorded, as the platform refuses one the manifest does not list |
 
+With the features `test-host` and `sql-parse`, `sql::parse` is answered by `PgQueryParser`, which parses in the test's own process with the platform's `pg_query` release, bounds and response cap, so a test gets the platform's tree and refusals. It builds `pg_query`, which needs a C compiler and libclang, and while it parses `pg_query` holds the process's stderr.
+
 None of the fakes panics: what a test did not script is an error the
 handler receives, and `host.verify()` lists the expectations that were not
 met. A transaction a handler leaves open is discarded when `host.call`

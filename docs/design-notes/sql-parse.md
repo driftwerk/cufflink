@@ -121,9 +121,12 @@ talks to each over its stdin and stdout:
   `SQL_PARSE_TIMEOUT_MS` (5000) or the invocation's remaining budget,
   whichever is shorter, is answered `Unavailable`, and the process is killed.
 - **Memory.** On Linux each process caps its own address space at
-  `SQL_PARSE_MEMORY_MB` (1024) with `setrlimit(RLIMIT_AS)`. It also sets its
-  `oom_score_adj` to 1000, so under memory pressure the kernel kills a parser
-  before the platform. The processes share the platform's cgroup and sit
+  `SQL_PARSE_MEMORY_MB` (1024) with `setrlimit(RLIMIT_AS)`. A parse that
+  runs out of it inside PostgreSQL's allocator is reported by the parser as
+  a failed parse, so the guest sees `Syntax` rather than `TooLarge`; one
+  that runs out elsewhere ends the process (`Unavailable`). Where `/proc`
+  allows, it also sets its `oom_score_adj` to 1000, so under memory pressure
+  the kernel kills a parser before the platform. The processes share the platform's cgroup and sit
   outside the guest memory budget's ledger: their worst case,
   `SQL_PARSE_PROCESSES × SQL_PARSE_MEMORY_MB`, has to fit in the memory the
   budget leaves outside itself ([sizing](../deployment.md#guest-memory-budget)).
@@ -230,7 +233,10 @@ guest's tests that enable both `test-host` and `sql-parse` build
 - The new crate `cufflink-sql-parse` (`sql-parse/`) holds the bounds, the
   wire, the corpus and, behind its `parser` feature, the parse itself. It is
   published, since `cufflink-fn`'s test host depends on it. The platform
-  depends on it without `parser`, so it never links `pg_query`.
+  depends on it without `parser` and calls nothing of `pg_query`. A
+  build that compiles the platform and the parser binary in one cargo
+  invocation unifies the crate's features, so the platform's build compiles
+  `pg_query` there too, unused.
 - The binary is its own unpublished crate, `cufflink-sql-parser`
   (`sql-parser/`).
 - `pg_query` builds libpg_query with `cc` and generates its bindings with

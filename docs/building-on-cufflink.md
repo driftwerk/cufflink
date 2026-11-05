@@ -426,6 +426,21 @@ is seen as that kind instead). The extension receives the payload with the tenan
 version, the caller's verified claims (never a token) and the deadline. It works the same
 from the platform and the worker.
 
+### `sql::parse` — PostgreSQL's parse tree
+`sql::parse(sql)` (cargo feature `sql-parse`, which enables `db-v2`; platform feature
+`sql_parse`) answers `Parsed { tree, parser, fingerprint }` for a guest that has to know what
+SQL it did not write does, for instance to allow-list the relations a `SELECT` reads before
+running it. `tree` is `pg_query` 6.2.1's protobuf as serde writes it, the tree PostgreSQL 17
+itself reads; `parser` names that release and `fingerprint` changes whenever a release reads
+the published probe corpus differently, so a guest can refuse trees it was not written for.
+The parse runs in parser processes beside the platform, never in it
+([setup](setup.md#sql-parser)).
+
+It fails with `ParseError::Syntax` (not SQL), `TooLarge` (over 1 MiB, nested past the
+platform's bounds, or a tree past `WASM_MAX_HOST_RESPONSE_MB` or the guest's memory budget)
+or `Unavailable` (no parser answered in time). No message quotes the statement. Details:
+[the design note](design-notes/sql-parse.md).
+
 ### `jobs` — enqueue background work
 `jobs::enqueue(handler, payload)` and `jobs::enqueue_with(handler, payload, opts)`. See *Jobs*.
 

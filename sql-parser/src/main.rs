@@ -59,8 +59,7 @@ fn serve(input: &mut impl Read, out: &mut impl Write) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn confine() -> io::Result<()> {
     if let Some(mb) = memory_limit_mb()? {
-        let bytes =
-            libc::rlim_t::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(libc::RLIM_INFINITY);
+        let bytes: libc::rlim_t = mb.saturating_mul(1024 * 1024);
         let limit = libc::rlimit {
             rlim_cur: bytes,
             rlim_max: bytes,
@@ -70,7 +69,10 @@ fn confine() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    std::fs::write("/proc/self/oom_score_adj", "1000")
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "1000") {
+        eprintln!("cufflink-sql-parser: oom_score_adj not raised: {e}");
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
