@@ -272,8 +272,9 @@ async fn run_on_platform(
             state,
             ctx.identity.tenant_id,
             ctx.identity.service_id,
+            manifest,
         )
-        .await;
+        .await?;
     }
     let eventing = eventing::prepare(state, manifest, &ctx.identity).await?;
     let left = snapshot(
@@ -413,6 +414,10 @@ pub(crate) async fn rollback_locked(
     admit(state, &manifest, service.tenant_id, &user.tenant_slug).await?;
     let identity = service.identity(&user.tenant_slug);
     let new_version = service.current_version + 1;
+    if manifest.mode.runs_on_platform() {
+        crate::db_roles::provision::before_deploy(state, service.tenant_id, service_id, &manifest)
+            .await?;
+    }
 
     let (schema, eventing, deployment) = match manifest.mode {
         ServiceMode::Native => {

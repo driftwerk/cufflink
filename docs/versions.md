@@ -1215,6 +1215,25 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Unreleased changes
+
+No new module-declared feature from these yet.
+
+- **`db_roles` grants the outbox only to a service the platform enqueues
+  for.** A service whose manifest declares no table and nothing it
+  `publishes` has its role granted nothing of `_cufflink`: no `USAGE`, no
+  enqueue function and no `service_roles` row. Its route audit records are
+  written in the platform's own session. `db-role verify` no longer
+  requires those grants of it, and reports a role that holds them as
+  `EXCESS`, with the `REVOKE` that takes each back, without failing it
+  ([database roles](db-roles-and-secrets.md)). Existing grants are kept.
+  A deploy that adds a table or `publishes` grants a verified role before
+  the version serves, whatever the tenant's `db_roles` policy, and fails
+  the deploy when it cannot. A guest that calls
+  `_cufflink.outbox_enqueue_own` from its SQL must now declare `publishes`
+  ([outbox](outbox.md#enqueueing-from-a-guest)); without it, a role bound
+  from now on is refused the call.
+
 ## Changes in v0.35.0
 
 The guest memory budget and route concurrency limits

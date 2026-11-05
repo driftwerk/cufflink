@@ -84,6 +84,13 @@ under `db_roles` (`warn` or `enforce`) with a verified binding, so that
 the guest's SQL runs as its service's role
 ([database roles](db-roles-and-secrets.md)).
 
+The service's role is granted the function only when the manifest
+declares a table or what the service publishes (`publishes`): a guest that
+enqueues from its SQL lists the subjects it publishes on. Without either,
+the role holds nothing of `_cufflink`, and the call is refused with
+`permission denied for schema _cufflink` (SQLSTATE 42501). A deploy that
+adds `publishes` grants the role before the version serves.
+
 - **The service is not an argument.** The function takes it from the role
   that calls it, by the map the platform keeps in `_cufflink.service_roles`.
   A role mapped to no service, the platform's own included (which is what a

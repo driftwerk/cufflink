@@ -84,6 +84,14 @@ impl Provisioning {
         body
     }
 
+    async fn deploy_adopted(&self, tables: &[&str]) -> Value {
+        let mut adopted = manifest(tables);
+        adopted["schema"] = json!("adopted");
+        let (status, body) = self.platform.deploy(&self.tenant, &adopted).await;
+        assert_eq!(status, 200, "deploy: {body}");
+        body
+    }
+
     async fn binding(&self) -> Value {
         let (status, body) = self
             .platform
@@ -765,4 +773,213 @@ async fn db_roles_a_service_enqueues_for_its_own_service_alone() {
         0,
         "nor enqueues"
     );
+}
+
+async fn verify(test: &Provisioning) -> Value {
+    let (status, body) = test
+        .platform
+        .send(
+            Method::POST,
+            &format!(
+                "/api/tenants/{}/services/stock-service/db-role/verify",
+                test.tenant.slug
+            ),
+            &test.admin,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body["report"].clone()
+}
+
+async fn outbox_held(test: &Provisioning, role: &str) -> (bool, bool, i64) {
+    let row = test
+        .tenant_db
+        .query_one(
+            &format!(
+                "SELECT has_schema_privilege('{role}', '_cufflink', 'USAGE'),
+                        has_function_privilege('{role}',
+                            '_cufflink.outbox_enqueue_own(text[], text[], bytea[], jsonb[], uuid[])',
+                            'EXECUTE'),
+                        (SELECT count(*) FROM _cufflink.service_roles WHERE role = '{role}')"
+            ),
+            &[],
+        )
+        .await
+        .expect("held");
+    (row.get(0), row.get(1), row.get(2))
+}
+
+fn excess(report: &Value) -> Vec<(&str, &str)> {
+    report["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|check| check["excess"] == true)
+        .filter_map(|check| Some((check["check"].as_str()?, check["remedy"].as_str()?)))
+        .collect()
+}
+
+#[tokio::test]
+async fn db_roles_a_service_the_platform_never_enqueues_for_is_granted_the_outbox_only_once_it_does(
+) {
+    let Some(test) = Provisioning::start().await else {
+        return;
+    };
+    let (status, body) = test.policy("warn", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    test.sql(
+        "CREATE SCHEMA stock_service;
+         CREATE TABLE stock_service.items (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), body TEXT)",
+    )
+    .await;
+    test.deploy_adopted(&[]).await;
+    let role = test._db.managed_role(&test.tenant, "stock-service").await;
+    let binding = test.binding().await;
+    assert!(binding["verified_at"].is_string(), "{binding}");
+    assert_eq!(
+        outbox_held(&test, &role).await,
+        (false, false, 0),
+        "a service with no table and no event is given nothing of the outbox"
+    );
+    for check in ["cufflink_schema_unneeded", "outbox_enqueue_unneeded"] {
+        assert!(
+            passed(&binding["verify_report"]).contains(&check),
+            "{check}: {binding}"
+        );
+    }
+
+    test.sql(&format!(
+        "GRANT USAGE ON SCHEMA _cufflink TO \"{role}\";
+         GRANT EXECUTE ON FUNCTION _cufflink.outbox_enqueue_own(TEXT[], TEXT[], BYTEA[], JSONB[], UUID[]) TO \"{role}\";
+         INSERT INTO _cufflink.service_roles (role, service) VALUES ('{role}', 'stock-service')"
+    ))
+    .await;
+    let report = verify(&test).await;
+    assert_eq!(
+        report["verified"], true,
+        "what it held before stays verified: {report}"
+    );
+    assert_eq!(report["remediation"], json!([]), "{report}");
+    let narrowing = excess(&report);
+    assert_eq!(
+        narrowing
+            .iter()
+            .map(|(check, _)| *check)
+            .collect::<Vec<_>>(),
+        ["cufflink_schema_unneeded", "outbox_enqueue_unneeded"],
+        "{report}"
+    );
+    assert_eq!(
+        outbox_held(&test, &role).await,
+        (true, true, 1),
+        "and the platform takes nothing back"
+    );
+    let remedies = narrowing
+        .iter()
+        .map(|(_, remedy)| *remedy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    test.sql(&remedies).await;
+    assert_eq!(outbox_held(&test, &role).await, (false, false, 0));
+    let report = verify(&test).await;
+    assert_eq!(report["verified"], true, "{report}");
+    assert!(excess(&report).is_empty(), "{report}");
+
+    test.deploy_adopted(&["items"]).await;
+    assert_eq!(
+        outbox_held(&test, &role).await,
+        (true, true, 1),
+        "the version that enqueues is granted the outbox as it is deployed"
+    );
+    let binding = test.binding().await;
+    assert!(binding["verified_at"].is_string(), "{binding}");
+    for check in [
+        "cufflink_schema",
+        "outbox_enqueue",
+        "outbox_confined",
+        "outbox_service",
+    ] {
+        assert!(
+            passed(&binding["verify_report"]).contains(&check),
+            "{check}: {binding}"
+        );
+    }
+    let msg_id = uuid::Uuid::new_v4();
+    as_login(&test, &role, &enqueue_own(msg_id))
+        .await
+        .expect("the role enqueues for its service");
+}
+
+async fn reach(test: &Provisioning, role: &str) -> Vec<String> {
+    test.tenant_db
+        .query(
+            &format!(
+                "SELECT n.nspname || ':' || a.privilege_type
+                   FROM pg_namespace n, aclexplode(n.nspacl) a
+                  WHERE a.grantee = '{role}'::regrole
+                 UNION ALL
+                 SELECT p.oid::regprocedure::text || ':' || a.privilege_type
+                   FROM pg_proc p, aclexplode(p.proacl) a
+                  WHERE a.grantee = '{role}'::regrole
+                 UNION ALL
+                 SELECT c.oid::regclass::text || ':' || a.privilege_type
+                   FROM pg_class c, aclexplode(c.relacl) a
+                  WHERE a.grantee = '{role}'::regrole
+                 UNION ALL
+                 SELECT 'service_roles:' || service FROM _cufflink.service_roles
+                  WHERE role = '{role}'
+                 ORDER BY 1"
+            ),
+            &[],
+        )
+        .await
+        .expect("reach")
+        .iter()
+        .map(|row| row.get(0))
+        .filter(|reached: &String| {
+            reached.contains("_cufflink") || reached.starts_with("service_roles:")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn db_roles_an_existing_role_bound_to_a_service_without_the_outbox_reaches_no_further() {
+    let Some(test) = Provisioning::start().await else {
+        return;
+    };
+    let (status, body) = test.policy("warn", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    test.sql("CREATE SCHEMA stock_service").await;
+    test.deploy_adopted(&[]).await;
+    let role = test._db.role("stock_reader");
+    test.sql(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'theirs' NOINHERIT;
+         GRANT USAGE, CREATE ON SCHEMA stock_service TO {role}"
+    ))
+    .await;
+    let before = reach(&test, &role).await;
+    assert!(before.is_empty(), "{before:?}");
+    let (status, body) = test.set(json!({"role": role, "password": "theirs"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["binding"]["role"], role.as_str(), "{body}");
+    assert_eq!(
+        reach(&test, &role).await,
+        before,
+        "binding gives it nothing of the platform's schema"
+    );
+    let failed: Vec<&str> = body["report"]["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|check| check["ok"] != true)
+        .filter_map(|check| check["check"].as_str())
+        .collect();
+    assert!(
+        !failed
+            .iter()
+            .any(|check| check.starts_with("cufflink") || check.starts_with("outbox")),
+        "nor does verify ask for it: {body}"
+    );
+    assert_eq!(body["report"]["verified"], true, "{body}");
 }

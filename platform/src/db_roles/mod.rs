@@ -123,6 +123,7 @@ async fn apply(
     change: Change<'_>,
 ) -> PlatformResult<(Binding, VerifyReport)> {
     let policies = state.tenants.policies_or_load(tenant.id).await?;
+    let active = verify::active_manifest(&state.platform_db.get().await?, service.id).await?;
     provision::apply(
         state,
         &Provisioning {
@@ -131,6 +132,7 @@ async fn apply(
             policy: policies.mode(PolicyKey::DbRoles),
             config: policies.config::<DbRolesConfig>(),
             actor,
+            enqueues: provision::enqueues(active.as_ref()),
         },
         change,
     )
