@@ -168,7 +168,10 @@ let host = TestHost::builder()
 Nothing is done to an existing role: it is not created, it is not given
 the schema or what is in it, it is not granted `.read_only_role(name)`, and
 it is not dropped with the database. The test, or the migrations it ran,
-makes every grant, as the operator does in production. The session runs the
+makes every grant, as the operator does in production. Build the schema
+with `execute` or `execute_file`, not `migrate`: `migrate` runs as a role
+it makes, `svc_<uuid>`, and gives that role the schema, so the existing role
+would no longer hold what the operator granted it. The session runs the
 same prelude as any login (`search_path` and `statement_timeout`), so every
 other setting is the role's. A role that does not exist, or a wrong
 password, fails `build()` with `TestHostError::Role`, which names the role
