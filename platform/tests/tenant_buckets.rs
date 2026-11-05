@@ -22,12 +22,14 @@ const PLATFORM_KEY: &str = "AKPLATFORM";
 const HARBOR_KEY: &str = "AKHARBOR";
 const HARBOR_SECRET: &str = "harbor-example-secret";
 const EXACT: &str = "leads/7/Café façade #2 50%+off?.pdf";
-const ROUTES: [(&str, &str); 7] = [
+const ROUTES: [(&str, &str); 9] = [
     ("upload", "/upload"),
     ("head", "/head"),
     ("download", "/download"),
     ("download_many", "/download-many"),
     ("presign", "/presign"),
+    ("presign_upload", "/presign-upload"),
+    ("transform", "/transform"),
     ("delete", "/delete"),
     ("object", "/object"),
 ];
@@ -165,6 +167,33 @@ async fn stand_in() -> (String, Shared) {
     (url, store)
 }
 
+fn seen_count(store: &Shared) -> usize {
+    store.lock().expect("the stand-in's store").seen.len()
+}
+
+fn png() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbImage::new(4, 4)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("a png");
+    png
+}
+
+const DISGUISED: [&str; 12] = [
+    ".",
+    "..",
+    "example-documents\\",
+    "x\\..\\example-documents",
+    "example-platform\\wasm",
+    "example-documents?x",
+    "example-documents#x",
+    "example-documents\t",
+    "example-documents\n",
+    "Example-Documents",
+    "%2e",
+    "example..documents",
+];
+
 fn seen_on(store: &Shared, bucket: &str) -> Vec<Seen> {
     store
         .lock()
@@ -204,6 +233,58 @@ impl Guest<'_> {
             json!({"bucket": bucket, "key": key, "body": "hello", "acl": acl}),
         )
         .await
+    }
+
+    async fn refuses_every_call(&self, bucket: &str, key: &str) {
+        let at = json!({"bucket": bucket, "key": key});
+        let case = format!("{bucket:?}/{key}");
+        assert_eq!(
+            self.upload(bucket, key, None).await["error"],
+            "denied",
+            "{case}"
+        );
+        assert_eq!(
+            self.call("head", at.clone()).await["error"],
+            "denied",
+            "{case}"
+        );
+        assert_eq!(
+            self.call("download", at.clone()).await,
+            json!({"base64": null}),
+            "{case}"
+        );
+        assert_eq!(
+            self.call("download_many", json!({"items": [at.clone()]}))
+                .await,
+            json!({"slots": [{"error": "storage access denied"}]}),
+            "{case}"
+        );
+        for presign in ["presign", "presign_upload"] {
+            assert_eq!(
+                self.call(presign, at.clone()).await,
+                json!({"url": null}),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            self.call("delete", at.clone()).await,
+            json!({"deleted": false}),
+            "{case}"
+        );
+        assert_eq!(
+            self.call(
+                "transform",
+                json!({"bucket": bucket, "key": key, "out_key": format!("{key}.jpg")})
+            )
+            .await,
+            json!({"written": null}),
+            "{case}"
+        );
+        assert_ne!(
+            self.answer("object", at).await.status().as_u16(),
+            200,
+            "{case}"
+        );
     }
 
     async fn refused(&self, bucket: &str, key: &str, acl: Option<&str>) -> String {
@@ -595,6 +676,10 @@ async fn tenant_buckets() {
     let (status, _) = admin
         .send(Method::DELETE, &harbor.slug, Some("example-assets"), None)
         .await;
+    assert_eq!(status, 204, "retiring is idempotent");
+    let (status, _) = admin
+        .send(Method::DELETE, &harbor.slug, Some("example-unknown"), None)
+        .await;
     assert_eq!(status, 404);
     common::until(
         "the replica forgets the deleted bucket",
@@ -608,4 +693,247 @@ async fn tenant_buckets() {
     )
     .await
     .expect("the deletion reaches the replica without a restart");
+
+    let ours = Guest {
+        platform: &platform,
+        tenant: &harbor,
+    };
+    let theirs = Guest {
+        platform: &platform,
+        tenant: &globex,
+    };
+
+    let before = seen_count(&store);
+    for bucket in DISGUISED {
+        for guest in [&ours, &theirs] {
+            guest.refuses_every_call(bucket, "archive/a.pdf").await;
+        }
+    }
+    assert_eq!(
+        seen_count(&store),
+        before,
+        "no disguised bucket name reaches the store"
+    );
+
+    store.lock().expect("the stand-in's store").objects.insert(
+        ("example-documents".into(), "archive/Café logo.png".into()),
+        png(),
+    );
+    let written = ours
+        .call(
+            "transform",
+            json!({"bucket": "example-documents", "key": "archive/Café logo.png", "out_key": "archive/Café logo.jpg"}),
+        )
+        .await;
+    assert!(
+        written["written"].as_u64().is_some_and(|n| n > 0),
+        "{written}"
+    );
+    assert!(
+        seen_on(&store, "example-documents")
+            .iter()
+            .any(|seen| seen.method == "PUT"
+                && seen.key == "archive/Café logo.jpg"
+                && seen.access_key == HARBOR_KEY),
+        "the transform writes the exact key with the bucket's credential"
+    );
+    let upload_url = ours
+        .call(
+            "presign_upload",
+            json!({"bucket": "example-documents", "key": "archive/up load.pdf"}),
+        )
+        .await;
+    let upload_url =
+        reqwest::Url::parse(upload_url["url"].as_str().expect("a presigned url")).expect("a url");
+    assert_eq!(
+        decoded(upload_url.path()),
+        "/example-documents/archive/up load.pdf"
+    );
+    assert!(upload_url
+        .query_pairs()
+        .any(|(name, value)| name == "X-Amz-Credential"
+            && value.starts_with(&format!("{HARBOR_KEY}/"))));
+    let streamed = ours
+        .answer(
+            "object",
+            json!({"bucket": "example-documents", "key": "archive/Café logo.png"}),
+        )
+        .await;
+    assert_eq!(streamed.status().as_u16(), 200);
+    let before = seen_count(&store);
+    theirs
+        .refuses_every_call("example-documents", "archive/Café logo.png")
+        .await;
+    assert_eq!(seen_count(&store), before);
+
+    let (status, revived) = admin
+        .put(
+            &harbor.slug,
+            "example-assets",
+            json!({"acls": ["public-read"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{revived}");
+    assert_eq!(revived["retired_at"], Value::Null);
+    let allowlist =
+        json!({"scope": "legacy", "allowed_buckets": ["example-assets", "example-documents"]});
+    let (status, refused) = platform
+        .send(
+            Method::PUT,
+            &format!("/api/tenants/{}/policies", globex.slug),
+            &admin.key,
+            Some(&json!({"policies": {"storage_scope": {"mode": "enforce", "config": allowlist}}})),
+        )
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    let client = pool.get().await.expect("checkout");
+    client
+        .execute(
+            "INSERT INTO tenant_policies (tenant_id, key, mode, config, updated_by)
+             VALUES ($1, 'storage_scope', 'enforce', $2, 'test')",
+            &[&globex.id, &allowlist],
+        )
+        .await
+        .expect("an allowlist written before the registration");
+    let (status, _) = admin
+        .put(
+            &harbor.slug,
+            "example-assets",
+            json!({"acls": ["public-read"]}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let before = seen_count(&store);
+    theirs
+        .refuses_every_call("example-assets", "logos/a.png")
+        .await;
+    assert!(theirs
+        .refused("example-assets", "logos/a.png", Some("public-read"))
+        .await
+        .contains("foreign_tenant_bucket"));
+    assert_eq!(
+        seen_count(&store),
+        before,
+        "a listed bucket of another tenant stays refused"
+    );
+
+    client
+        .execute(
+            "UPDATE tenant_buckets SET secret_access_key_enc = '\\x00'::bytea WHERE bucket = 'example-documents'",
+            &[],
+        )
+        .await
+        .expect("a secret that cannot be opened");
+    let (status, listed) = admin
+        .put(
+            &harbor.slug,
+            "example-assets",
+            json!({"acls": ["public-read"]}),
+        )
+        .await;
+    assert_eq!(status, 409, "another tenant group lists it: {listed}");
+    let (status, unlisted) = platform
+        .send(
+            Method::PUT,
+            &format!("/api/tenants/{}/policies", globex.slug),
+            &admin.key,
+            Some(&json!({"policies": {"storage_scope": {"mode": "enforce", "config": {"scope": "legacy"}}}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{unlisted}");
+    let (status, _) = admin
+        .put(
+            &harbor.slug,
+            "example-assets",
+            json!({"acls": ["public-read"]}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let unopenable = ours
+        .upload("example-documents", "archive/b.pdf", None)
+        .await;
+    assert_eq!(unopenable["error"], "not_configured", "{unopenable}");
+    assert_eq!(
+        ours.upload("example-assets", "logos/c.png", Some("public-read"))
+            .await,
+        json!({"size": 5}),
+        "the rest of the catalog still loads"
+    );
+
+    let (status, _) = admin
+        .send(
+            Method::DELETE,
+            &harbor.slug,
+            Some("example-documents"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(ours
+        .refused("example-documents", "archive/b.pdf", None)
+        .await
+        .contains("bucket_retired"));
+    let (status, held) = admin
+        .put(&globex.slug, "example-documents", json!({}))
+        .await;
+    assert_eq!(status, 409, "{held}");
+    assert!(held.to_string().contains("release"), "{held}");
+    let release = "/api/buckets/example-documents/release";
+    let (status, early) = platform.send(Method::POST, release, &admin.key, None).await;
+    assert_eq!(
+        status, 409,
+        "released before every replica reloaded: {early}"
+    );
+    client
+        .execute(
+            "UPDATE tenant_buckets SET retired_at = now() - interval '10 minutes' WHERE bucket = 'example-documents'",
+            &[],
+        )
+        .await
+        .expect("backdated");
+    let (status, _) = platform.send(Method::POST, release, &admin.key, None).await;
+    assert_eq!(status, 204);
+    let (status, _) = platform.send(Method::POST, release, &admin.key, None).await;
+    assert_eq!(status, 404);
+    let (status, moved) = admin
+        .put(&globex.slug, "example-documents", json!({}))
+        .await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(
+        theirs.upload("example-documents", "a.pdf", None).await,
+        json!({"size": 5})
+    );
+    assert!(ours
+        .refused("example-documents", "archive/b.pdf", None)
+        .await
+        .contains("foreign_tenant_bucket"));
+
+    let orchard = db.mint_tenant().await;
+    let (status, _) = admin.put(&orchard.slug, "example-orchard", json!({})).await;
+    assert_eq!(status, 200);
+    let (status, deleted) = platform
+        .send(
+            Method::DELETE,
+            &format!("/api/tenants/{}", orchard.slug),
+            &admin.key,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{deleted}");
+    let orphan = client
+        .query_one(
+            "SELECT tenant_id IS NULL AS orphan, retired_at IS NOT NULL AS retired
+             FROM tenant_buckets WHERE bucket = 'example-orchard'",
+            &[],
+        )
+        .await
+        .expect("the deleted tenant's claim");
+    assert!(orphan.get::<_, bool>("orphan") && orphan.get::<_, bool>("retired"));
+    assert!(ours
+        .refused("example-orchard", "a.pdf", None)
+        .await
+        .contains("foreign_tenant_bucket"));
+    let (status, held) = admin.put(&harbor.slug, "example-orchard", json!({})).await;
+    assert_eq!(status, 409, "{held}");
+    assert!(held.to_string().contains("deleted tenant"), "{held}");
 }

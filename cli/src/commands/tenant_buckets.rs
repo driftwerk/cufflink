@@ -39,10 +39,16 @@ pub enum BucketsAction {
         #[arg(long, requires = "access_key_id")]
         secret_access_key_stdin: bool,
     },
-    /// Remove a bucket from the tenant
+    /// Retire the tenant's bucket: refused to every guest, and still
+    /// claimed, until it is released
     Delete {
         /// Tenant slug
         slug: String,
+        /// Bucket name
+        bucket: String,
+    },
+    /// Release a retired bucket, so another tenant may register it
+    Release {
         /// Bucket name
         bucket: String,
     },
@@ -96,8 +102,9 @@ fn joined(value: &Value, none: &str) -> String {
 }
 
 /// One line per bucket: its name, key prefixes, ACLs, the access key id
-/// that reaches it, and when and by whom it was last set.
-fn bucket_rows(listing: &Value) -> Vec<[String; 6]> {
+/// that reaches it, when it was retired, and when and by whom it was last
+/// set.
+fn bucket_rows(listing: &Value) -> Vec<[String; 7]> {
     listing["buckets"]
         .as_array()
         .into_iter()
@@ -112,6 +119,7 @@ fn bucket_rows(listing: &Value) -> Vec<[String; 6]> {
                     .as_str()
                     .unwrap_or("(platform)")
                     .to_string(),
+                text("retired_at"),
                 text("updated_at"),
                 text("updated_by"),
             ]
@@ -119,7 +127,7 @@ fn bucket_rows(listing: &Value) -> Vec<[String; 6]> {
         .collect()
 }
 
-fn print_rows(slug: &str, rows: &[[String; 6]]) {
+fn print_rows(slug: &str, rows: &[[String; 7]]) {
     match rows {
         [] => println!("Tenant '{slug}' has no buckets"),
         rows => {
@@ -128,6 +136,7 @@ fn print_rows(slug: &str, rows: &[[String; 6]]) {
                 "KEY PREFIXES",
                 "ACLS",
                 "ACCESS KEY",
+                "RETIRED",
                 "UPDATED",
                 "BY",
             ]);
@@ -191,7 +200,22 @@ pub async fn run(
                 env,
             )
             .await?;
-            println!("Removed bucket '{bucket}' from tenant '{slug}'");
+            println!(
+                "Retired bucket '{bucket}' of tenant '{slug}': every guest is refused it until \
+                 `cufflink tenants buckets release {bucket}`"
+            );
+        }
+        BucketsAction::Release { bucket } => {
+            admin_request(
+                "Release tenant bucket",
+                Method::POST,
+                &format!("/api/buckets/{bucket}/release"),
+                None,
+                api_url,
+                env,
+            )
+            .await?;
+            println!("Released bucket '{bucket}'");
         }
     }
     Ok(())
@@ -249,6 +273,15 @@ mod tests {
             }
             other => panic!("not a set: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_bucket_is_released_by_its_name_alone() {
+        assert!(matches!(
+            parsed(&["release", "example-documents"]).expect("parses"),
+            BucketsAction::Release { bucket } if bucket == "example-documents"
+        ));
+        assert!(parsed(&["release"]).is_err());
     }
 
     #[test]
@@ -316,10 +349,11 @@ mod tests {
         assert_eq!(
             bucket_rows(&json!({"buckets": [
                 {"bucket": "example-assets", "key_prefixes": null, "acls": ["public-read"],
-                 "credential": {"access_key_id": "AKEXAMPLE"},
+                 "credential": {"access_key_id": "AKEXAMPLE"}, "retired_at": null,
                  "updated_at": "2026-11-05T10:00:00Z", "updated_by": "admin"},
                 {"bucket": "example-documents", "key_prefixes": ["leads/", "archive/"], "acls": [],
-                 "credential": null, "updated_at": "2026-11-04T10:00:00Z", "updated_by": null},
+                 "credential": null, "retired_at": "2026-11-04T11:00:00Z",
+                 "updated_at": "2026-11-04T10:00:00Z", "updated_by": null},
             ]})),
             [
                 [
@@ -327,6 +361,7 @@ mod tests {
                     "(any)",
                     "public-read",
                     "AKEXAMPLE",
+                    "-",
                     "2026-11-05T10:00:00Z",
                     "admin"
                 ]
@@ -336,6 +371,7 @@ mod tests {
                     "leads/,archive/",
                     "-",
                     "(platform)",
+                    "2026-11-04T11:00:00Z",
                     "2026-11-04T10:00:00Z",
                     "-"
                 ]

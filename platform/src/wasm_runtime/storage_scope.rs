@@ -1,7 +1,7 @@
 use crate::policy::config::{StorageScopeConfig, StorageScopeKind};
 use crate::policy::{self, Denied, PolicyKey, PolicySet, Violation};
 use crate::storage::S3Storage;
-use crate::tenant_buckets::{Access, TenantBucket};
+use crate::tenant_buckets::{Access, State, TenantBucket};
 use crate::AppState;
 use cufflink_storage::CannedAcl;
 use uuid::Uuid;
@@ -52,7 +52,7 @@ fn in_platform_prefix(key: &str) -> bool {
 }
 
 pub fn reserved_violation(ctx: &StorageContext, bucket: &str, keys: &[&str]) -> Option<Violation> {
-    if bucket.is_empty() || bucket.contains('/') {
+    if !cufflink_storage::is_bucket_name(bucket) {
         return ctx.denied("invalid_bucket", bucket, keys);
     }
     if ctx.platform_bucket == Some(bucket) && keys.iter().any(|key| in_platform_prefix(key)) {
@@ -88,6 +88,7 @@ pub fn authorize(
 pub enum Route<'a> {
     Scope,
     TenantBucket(&'a Access),
+    Closed(&'static str),
 }
 
 /// How a guest call on `bucket` is served: the reserved checks first, then
@@ -117,12 +118,15 @@ pub fn route<'a>(
         ));
     }
     match owned {
-        Some(owned) if owned.tenant_id != tenant_id => Err(deny("foreign_tenant_bucket")),
-        Some(owned) => owned
-            .rules
-            .admit(keys, acl)
-            .map(|()| Route::TenantBucket(&owned.access))
-            .map_err(|refusal| deny(refusal.code())),
+        Some(owned) if owned.owner != Some(tenant_id) => Err(deny("foreign_tenant_bucket")),
+        Some(owned) => match &owned.state {
+            State::Retired => Err(deny("bucket_retired")),
+            State::Unreadable => Ok(Route::Closed("the bucket's registration cannot be read")),
+            State::Active { rules, access } => rules
+                .admit(keys, acl)
+                .map(|()| Route::TenantBucket(access))
+                .map_err(|refusal| deny(refusal.code())),
+        },
         None if acl.is_some() => Err(deny("acl_not_admitted")),
         None => policies
             .apply(
@@ -203,6 +207,7 @@ fn store(platform: Option<&S3Storage>, bucket: &str, routed: Route) -> Result<S3
         Route::TenantBucket(Access::Unopenable) => Err(Unserved::NotConfigured(
             "the bucket's credential cannot be opened",
         )),
+        Route::Closed(why) => Err(Unserved::NotConfigured(why)),
     }
 }
 
@@ -272,6 +277,23 @@ mod tests {
         }
     }
 
+    const DISGUISED: [&str; 14] = [
+        "",
+        ".",
+        "..",
+        "a\\b",
+        "cufflink-platform\\wasm",
+        "a?b",
+        "a#b",
+        "a\tb",
+        "a\nb",
+        "Example-Documents",
+        "%2e",
+        "example-documents.",
+        "example..documents",
+        "example documents",
+    ];
+
     #[test]
     fn platform_prefix_denied_in_platform_bucket_only() {
         let legacy = config(StorageScopeKind::Legacy, &[]);
@@ -302,8 +324,16 @@ mod tests {
     fn bucket_names_that_could_alias_a_path_are_refused() {
         let legacy = config(StorageScopeKind::Legacy, &[]);
         let c = ctx(&legacy, false);
-        for bucket in ["", "cufflink-platform/wasm", "../x", "/"] {
-            assert_eq!(code(&c, bucket, &["a"]), Some("invalid_bucket"), "{bucket}");
+        for bucket in DISGUISED
+            .iter()
+            .copied()
+            .chain(["cufflink-platform/wasm", "../x", "/"])
+        {
+            assert_eq!(
+                code(&c, bucket, &["a"]),
+                Some("invalid_bucket"),
+                "{bucket:?}"
+            );
         }
         assert_eq!(code(&c, "app.data-1", &["a"]), None);
     }
@@ -522,13 +552,15 @@ mod tests {
         acls: &[CannedAcl],
     ) -> TenantBucket {
         TenantBucket {
-            tenant_id,
+            owner: Some(tenant_id),
             bucket: bucket.to_string(),
-            rules: Rules {
-                key_prefixes: Some(prefixes.iter().map(|p| p.to_string()).collect()),
-                acls: acls.iter().copied().collect(),
+            state: State::Active {
+                rules: Rules {
+                    key_prefixes: Some(prefixes.iter().map(|p| p.to_string()).collect()),
+                    acls: acls.iter().copied().collect(),
+                },
+                access: Access::Platform,
             },
-            access: Access::Platform,
         }
     }
 
@@ -667,10 +699,7 @@ mod tests {
             Err(Unserved::NotConfigured(why)) => why.to_string(),
             Err(Unserved::Backend(_)) => "backend".to_string(),
         };
-        let credential = Access::Own(Credential {
-            access_key_id: "AKEXAMPLE".into(),
-            secret_access_key: "example-secret".into(),
-        });
+        let credential = Access::Own(Credential::new("AKEXAMPLE", "example-secret"));
         let memory = S3Storage::from_inner(cufflink_storage::in_memory("cufflink-platform"));
         let s3 = S3Storage::from_inner(
             cufflink_storage::from_vars(|name| {
@@ -730,5 +759,110 @@ mod tests {
             "backend",
             "only s3 signs with a bucket's own credential"
         );
+    }
+
+    #[test]
+    fn a_bucket_name_that_is_not_one_is_refused_in_every_mode_before_any_rule() {
+        let documents = registered(HARBOR, "example-documents", &["leads/"], &[]);
+        for scope in [StorageScopeKind::Legacy, StorageScopeKind::Strict] {
+            for mode in PolicyMode::ALL {
+                let config = config(scope, &["example-documents"]);
+                let policies = policies(mode, &config);
+                let context = ctx(policies.config::<StorageScopeConfig>(), false);
+                for bucket in DISGUISED {
+                    for owned in [None, Some(&documents)] {
+                        for acl in [None, Some(CannedAcl::PublicRead)] {
+                            assert_eq!(
+                                routed_code(route(
+                                    &context,
+                                    &policies,
+                                    GLOBEX,
+                                    owned,
+                                    bucket,
+                                    &["leads/a.pdf"],
+                                    acl
+                                )),
+                                Err("invalid_bucket"),
+                                "{scope:?} {mode:?} {bucket:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_retired_or_unreadable_registration_refuses_every_tenant() {
+        let config = config(StorageScopeKind::Legacy, &[]);
+        for mode in PolicyMode::ALL {
+            let policies = policies(mode, &config);
+            let context = ctx(policies.config::<StorageScopeConfig>(), false);
+            let call = |owned: &TenantBucket, tenant| {
+                routed_code(route(
+                    &context,
+                    &policies,
+                    tenant,
+                    Some(owned),
+                    "example-documents",
+                    &["a.pdf"],
+                    None,
+                ))
+                .map(|routed| match routed {
+                    Route::Closed(why) => why,
+                    Route::Scope | Route::TenantBucket(_) => "served",
+                })
+            };
+            let retired = TenantBucket {
+                state: State::Retired,
+                ..registered(HARBOR, "example-documents", &["leads/"], &[])
+            };
+            let orphan = TenantBucket {
+                owner: None,
+                ..retired.clone()
+            };
+            let unreadable = TenantBucket {
+                state: State::Unreadable,
+                ..retired.clone()
+            };
+            assert_eq!(call(&retired, HARBOR), Err("bucket_retired"), "{mode:?}");
+            assert_eq!(
+                call(&retired, GLOBEX),
+                Err("foreign_tenant_bucket"),
+                "{mode:?}"
+            );
+            assert_eq!(
+                call(&orphan, HARBOR),
+                Err("foreign_tenant_bucket"),
+                "{mode:?}"
+            );
+            assert_eq!(
+                call(&orphan, GLOBEX),
+                Err("foreign_tenant_bucket"),
+                "{mode:?}"
+            );
+            assert_eq!(
+                call(&unreadable, HARBOR),
+                Ok("the bucket's registration cannot be read"),
+                "{mode:?}"
+            );
+            assert_eq!(
+                call(&unreadable, GLOBEX),
+                Err("foreign_tenant_bucket"),
+                "{mode:?}"
+            );
+        }
+        assert!(matches!(
+            store(
+                Some(&S3Storage::from_inner(cufflink_storage::in_memory(
+                    "cufflink-platform"
+                ))),
+                "example-documents",
+                Route::Closed("the bucket's registration cannot be read")
+            ),
+            Err(Unserved::NotConfigured(
+                "the bucket's registration cannot be read"
+            ))
+        ));
     }
 }

@@ -29,6 +29,24 @@ impl Keys {
     }
 }
 
+/// Whether a store whose own bucket is `own` may serve `bucket`: a store
+/// built for a tenant's bucket serves that bucket alone, and any other is a
+/// valid bucket name ([`crate::is_bucket_name`]).
+pub(crate) fn admit_bucket(own: &str, keys: Keys, bucket: &str) -> Result<()> {
+    if bucket == own {
+        return Ok(());
+    }
+    eyre::ensure!(
+        keys == Keys::Encoded,
+        "this store serves bucket {own} alone, not {bucket:?}"
+    );
+    eyre::ensure!(
+        crate::is_bucket_name(bucket),
+        "{bucket:?} is not a bucket name"
+    );
+    Ok(())
+}
+
 pub(crate) fn no_acl(backend: &'static str, options: &UploadOptions) -> Result<()> {
     match options.acl {
         Some(acl) => Err(eyre::eyre!(

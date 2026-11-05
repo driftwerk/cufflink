@@ -1,12 +1,14 @@
 use crate::common::{self, Keys};
 use crate::{
-    CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded,
+    is_bucket_name, CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions,
+    Uploaded,
 };
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::ClientOptions;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 const BACKEND: &str = "s3";
 
@@ -23,7 +25,7 @@ struct Connection {
     endpoint: String,
     region: String,
     access_key: String,
-    secret_key: String,
+    secret_key: Zeroizing<String>,
     allow_http: bool,
 }
 
@@ -41,7 +43,7 @@ impl Connection {
             .with_endpoint(&self.endpoint)
             .with_region(&self.region)
             .with_access_key_id(&self.access_key)
-            .with_secret_access_key(&self.secret_key)
+            .with_secret_access_key(self.secret_key.as_str())
             .with_bucket_name(bucket)
             .with_client_options(options)
             .with_retry(common::retry_config())
@@ -77,7 +79,7 @@ impl S3Backend {
         let connection = Connection {
             region: vars(ENV_REGION).unwrap_or_else(|| "us-east-1".to_string()),
             access_key: env_required(&vars, ENV_ACCESS_KEY)?,
-            secret_key: env_required(&vars, ENV_SECRET_KEY)?,
+            secret_key: Zeroizing::new(env_required(&vars, ENV_SECRET_KEY)?),
             allow_http: endpoint.starts_with("http://"),
             endpoint,
         };
@@ -105,11 +107,12 @@ impl S3Backend {
         })
     }
 
-    fn store_for(&self, bucket: &str) -> Result<Arc<AmazonS3>> {
-        if bucket == self.bucket {
-            return Ok(Arc::clone(&self.primary));
+    fn store_for(&self, bucket: &str, acl: Option<CannedAcl>) -> Result<Arc<AmazonS3>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
+        match acl {
+            None if bucket == self.bucket => Ok(Arc::clone(&self.primary)),
+            acl => self.connection.store(bucket, acl),
         }
-        self.connection.store(bucket, None)
     }
 }
 
@@ -143,10 +146,7 @@ impl ObjectStorage for S3Backend {
         data: Vec<u8>,
         options: &UploadOptions,
     ) -> Result<Uploaded> {
-        let store = match options.acl {
-            Some(acl) => self.connection.store(bucket, Some(acl))?,
-            None => self.store_for(bucket)?,
-        };
+        let store = self.store_for(bucket, options.acl)?;
         common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
     }
 
@@ -155,12 +155,12 @@ impl ObjectStorage for S3Backend {
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
-        let store = self.store_for(bucket)?;
+        let store = self.store_for(bucket, None)?;
         common::get_bytes(store.as_ref(), BACKEND, self.keys, Some(bucket), key).await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
-        let store = self.store_for(bucket)?;
+        let store = self.store_for(bucket, None)?;
         common::open_read(store.as_ref(), BACKEND, self.keys, bucket, key).await
     }
 
@@ -169,7 +169,7 @@ impl ObjectStorage for S3Backend {
     }
 
     async fn head_in_bucket(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
-        let store = self.store_for(bucket)?;
+        let store = self.store_for(bucket, None)?;
         common::head_meta(store.as_ref(), BACKEND, self.keys, bucket, key).await
     }
 
@@ -182,7 +182,7 @@ impl ObjectStorage for S3Backend {
     }
 
     async fn delete_from_bucket(&self, bucket: &str, key: &str) -> Result<()> {
-        let store = self.store_for(bucket)?;
+        let store = self.store_for(bucket, None)?;
         common::delete_object_idempotent(store.as_ref(), BACKEND, self.keys, key).await
     }
 
@@ -207,7 +207,7 @@ impl ObjectStorage for S3Backend {
         _content_type: &str,
         expires_in_secs: u64,
     ) -> Result<String> {
-        let store = self.store_for(bucket)?;
+        let store = self.store_for(bucket, None)?;
         common::presign_url(
             store.as_ref(),
             BACKEND,
@@ -230,7 +230,7 @@ impl ObjectStorage for S3Backend {
         key: &str,
         expires_in_secs: u64,
     ) -> Result<String> {
-        let store = self.store_for(bucket)?;
+        let store = self.store_for(bucket, None)?;
         common::presign_url(
             store.as_ref(),
             BACKEND,
@@ -255,6 +255,7 @@ impl ObjectStorage for S3Backend {
         bucket: &str,
         credential: Option<&Credential>,
     ) -> Result<Arc<dyn ObjectStorage>> {
+        eyre::ensure!(is_bucket_name(bucket), "{bucket:?} is not a bucket name");
         let connection = match credential {
             Some(credential) => Connection {
                 access_key: credential.access_key_id.clone(),
@@ -373,13 +374,15 @@ mod tests {
             ],
             || {
                 let backend = S3Backend::from_vars(var).expect("should build");
-                let same = backend.store_for("cufflink").expect("store_for primary");
+                let same = backend
+                    .store_for("cufflink", None)
+                    .expect("store_for primary");
                 assert!(
                     Arc::ptr_eq(&same, &backend.primary),
                     "same bucket must short-circuit to shared Arc"
                 );
                 let other = backend
-                    .store_for("other-bucket")
+                    .store_for("other-bucket", None)
                     .expect("store_for other bucket");
                 assert!(
                     !Arc::ptr_eq(&other, &backend.primary),
@@ -597,10 +600,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let credential = Credential {
-            access_key_id: "AKDOCUMENTS".into(),
-            secret_access_key: "documents-secret".into(),
-        };
+        let credential = Credential::new("AKDOCUMENTS", "documents-secret");
         let bucket = tenant_bucket(&server.uri(), Some(&credential));
         bucket
             .upload_to_bucket_with(
@@ -776,10 +776,7 @@ mod tests {
 
     #[test]
     fn a_credential_never_shows_its_secret() {
-        let credential = Credential {
-            access_key_id: "AKDOCUMENTS".into(),
-            secret_access_key: "documents-secret".into(),
-        };
+        let credential = Credential::new("AKDOCUMENTS", "documents-secret");
         let shown = format!("{credential:?}");
         assert!(shown.contains("AKDOCUMENTS"), "{shown}");
         assert!(!shown.contains("documents-secret"), "{shown}");

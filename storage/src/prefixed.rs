@@ -54,15 +54,17 @@ impl PrefixedBackend {
         }
     }
 
-    fn store_for(&self, bucket: &str) -> PrefixStore<Arc<dyn object_store::ObjectStore>> {
-        PrefixStore::new(Arc::clone(&self.store), bucket)
+    fn store_for(&self, bucket: &str) -> Result<PrefixStore<Arc<dyn object_store::ObjectStore>>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
+        Ok(PrefixStore::new(Arc::clone(&self.store), bucket))
     }
 
     fn primary(&self) -> PrefixStore<Arc<dyn object_store::ObjectStore>> {
-        self.store_for(&self.bucket)
+        PrefixStore::new(Arc::clone(&self.store), self.bucket.as_str())
     }
 
     fn placeholder_url(&self, bucket: &str, key: &str, expires_in_secs: u64) -> Result<String> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
         self.keys.path(key)?;
         Ok(format!(
             "{}://{bucket}/{key}?expires={expires_in_secs}",
@@ -100,7 +102,7 @@ impl ObjectStorage for PrefixedBackend {
     ) -> Result<Uploaded> {
         common::no_acl(self.kind, options)?;
         common::put_with(
-            &self.store_for(bucket),
+            &self.store_for(bucket)?,
             self.kind,
             self.keys,
             key,
@@ -116,7 +118,7 @@ impl ObjectStorage for PrefixedBackend {
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         common::get_bytes(
-            &self.store_for(bucket),
+            &self.store_for(bucket)?,
             self.kind,
             self.keys,
             Some(bucket),
@@ -126,7 +128,7 @@ impl ObjectStorage for PrefixedBackend {
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
-        common::open_read(&self.store_for(bucket), self.kind, self.keys, bucket, key).await
+        common::open_read(&self.store_for(bucket)?, self.kind, self.keys, bucket, key).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
@@ -134,7 +136,7 @@ impl ObjectStorage for PrefixedBackend {
     }
 
     async fn head_in_bucket(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
-        common::head_meta(&self.store_for(bucket), self.kind, self.keys, bucket, key).await
+        common::head_meta(&self.store_for(bucket)?, self.kind, self.keys, bucket, key).await
     }
 
     async fn copy(&self, src_key: &str, dst_key: &str) -> Result<()> {
@@ -146,7 +148,7 @@ impl ObjectStorage for PrefixedBackend {
     }
 
     async fn delete_from_bucket(&self, bucket: &str, key: &str) -> Result<()> {
-        common::delete_object_idempotent(&self.store_for(bucket), self.kind, self.keys, key).await
+        common::delete_object_idempotent(&self.store_for(bucket)?, self.kind, self.keys, key).await
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
@@ -202,6 +204,10 @@ impl ObjectStorage for PrefixedBackend {
             credential.is_none(),
             "the {} backend takes no bucket credential",
             self.kind
+        );
+        eyre::ensure!(
+            crate::is_bucket_name(bucket),
+            "{bucket:?} is not a bucket name"
         );
         Ok(Arc::new(Self {
             bucket: bucket.to_string(),
@@ -427,14 +433,60 @@ mod tests {
             .await
             .is_err());
         assert!(memory
-            .tenant_bucket(
-                "example-documents",
-                Some(&Credential {
-                    access_key_id: "a".into(),
-                    secret_access_key: "s".into(),
-                }),
-            )
+            .tenant_bucket("example-documents", Some(&Credential::new("a", "s")),)
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_store_serves_valid_bucket_names_and_a_tenant_store_its_own_alone() {
+        let backend = PrefixedBackend::memory("example-platform".to_string());
+        for disguised in [
+            ".", "..", "a\\b", "a?b", "a#b", "a\tb", "a\nb", "Example", "%2e", "a..b",
+        ] {
+            assert!(
+                backend.download_from_bucket(disguised, "k").await.is_err(),
+                "{disguised:?}"
+            );
+            assert!(
+                backend.tenant_bucket(disguised, None).is_err(),
+                "{disguised:?}"
+            );
+        }
+        let documents = backend
+            .tenant_bucket("example-documents", None)
+            .expect("a tenant store");
+        documents
+            .upload_to_bucket(
+                "example-documents",
+                "a.pdf",
+                b"x".to_vec(),
+                "application/pdf",
+            )
+            .await
+            .expect("its own bucket");
+        for other in ["example-assets", "example-platform"] {
+            assert!(
+                documents
+                    .upload_to_bucket(other, "a.pdf", b"x".to_vec(), "application/pdf")
+                    .await
+                    .is_err(),
+                "{other}"
+            );
+            assert!(
+                documents
+                    .download_from_bucket(other, "a.pdf")
+                    .await
+                    .is_err(),
+                "{other}"
+            );
+            assert!(
+                documents
+                    .presign_download_to_bucket(other, "a.pdf", 60)
+                    .await
+                    .is_err(),
+                "{other}"
+            );
+        }
     }
 
     #[tokio::test]

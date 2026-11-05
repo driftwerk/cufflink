@@ -327,11 +327,14 @@ before they are published.
   every other tenant's guests and holds its own guests to its key prefixes
   and canned ACLs, whatever the `storage_scope` mode (recorded as
   `foreign_tenant_bucket`, `key_not_exact`, `key_outside_prefix` and
-  `acl_not_admitted`). An upload naming an ACL is refused in every other
+  `acl_not_admitted`). A retired registration is refused to every tenant
+  (`bucket_retired`). An upload naming an ACL is refused in every other
   bucket (`acl_not_admitted`).
 - **Platform storage prefixes**: no guest may touch `wasm/`, `backups/`,
   `files/` or `web/` in the platform bucket, use `..` key segments, or name
-  a bucket that is empty or contains `/`, whatever the `storage_scope` mode
+  a bucket that breaks the bucket naming rules (3 to 63 lowercase letters,
+  digits, `.`, `-` or `_`, beginning and ending with a letter or digit, no
+  `..`), whatever the `storage_scope` mode
   (recorded as `platform_prefix`, `path_traversal` and `invalid_bucket`). The web-runner verifies every artifact it extracts
   against its deployment's SHA-256.
 - **Metadata endpoints**: cloud metadata hosts and addresses are never

@@ -71,6 +71,24 @@ cufflink_fn::handler!(presign, |req: Request| {
     }))
 });
 
+cufflink_fn::handler!(presign_upload, |req: Request| {
+    Response::json(&json!({
+        "url": storage::presign_upload(text(&req, "bucket"), text(&req, "key"), "application/pdf", 60),
+    }))
+});
+
+cufflink_fn::handler!(transform, |req: Request| {
+    Response::json(&json!({
+        "written": image::transform_jpeg(
+            text(&req, "bucket"),
+            text(&req, "key"),
+            text(&req, "out_key"),
+            0,
+            80,
+        ),
+    }))
+});
+
 cufflink_fn::handler!(delete, |req: Request| {
     Response::json(&json!({
         "deleted": storage::delete(text(&req, "bucket"), text(&req, "key")),

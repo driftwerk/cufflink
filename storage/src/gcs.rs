@@ -51,6 +51,7 @@ impl GcsBackend {
     }
 
     fn store_for(&self, bucket: &str) -> Result<Arc<GoogleCloudStorage>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
         if bucket == self.bucket {
             return Ok(Arc::clone(&self.primary));
         }
@@ -78,6 +79,7 @@ impl GcsBackend {
                 .await
             }
             Some(signer) => {
+                common::admit_bucket(&self.bucket, self.keys, bucket)?;
                 self.keys.path(key)?;
                 let signer: &dyn BlobSigner = signer;
                 sign_url(signer, Utc::now(), &method, bucket, key, expires_in_secs).await
@@ -223,6 +225,10 @@ impl ObjectStorage for GcsBackend {
         eyre::ensure!(
             credential.is_none(),
             "the {BACKEND} backend takes no bucket credential"
+        );
+        eyre::ensure!(
+            crate::is_bucket_name(bucket),
+            "{bucket:?} is not a bucket name"
         );
         Ok(Arc::new(Self {
             primary: build_store(bucket, self.sa_key_path.as_deref())?,

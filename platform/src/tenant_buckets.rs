@@ -1,4 +1,4 @@
-use cufflink_storage::{is_exact_key, is_exact_prefix, CannedAcl, Credential};
+use cufflink_storage::{is_bucket_name, is_exact_key, is_exact_prefix, CannedAcl, Credential};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -21,12 +21,25 @@ pub enum Access {
     Unopenable,
 }
 
+/// What a registration lets its own tenant do. Every other tenant is
+/// refused whatever the state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    Active {
+        rules: Rules,
+        access: Access,
+    },
+    /// Its row cannot be read as rules: refused until it is set again.
+    Unreadable,
+    /// Deleted, or its tenant deleted: refused until an admin releases it.
+    Retired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantBucket {
-    pub tenant_id: Uuid,
+    pub owner: Option<Uuid>,
     pub bucket: String,
-    pub rules: Rules,
-    pub access: Access,
+    pub state: State,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +67,7 @@ impl Rules {
         let within = |key: &str| {
             self.key_prefixes
                 .as_ref()
-                .is_none_or(|prefixes| prefixes.iter().any(|prefix| key.starts_with(prefix)))
+                .is_none_or(|prefixes| prefixes.iter().any(|prefix| under(prefix, key)))
         };
         if !keys.iter().all(|key| within(key)) {
             return Err(Refusal::KeyOutsidePrefix);
@@ -85,19 +98,29 @@ impl Rules {
     }
 }
 
+/// Whether `key` is `prefix` or lies under it, on a segment boundary: the
+/// prefix `docs` holds `docs` and `docs/a`, never `docs-old/a`.
+fn under(prefix: &str, key: &str) -> bool {
+    key.strip_prefix(prefix)
+        .is_some_and(|rest| prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The rules a stored row holds, or `None` when it holds an ACL the
+/// platform does not know or rules it would refuse to store.
+pub fn stored_rules(key_prefixes: Option<Vec<String>>, acls: &[String]) -> Option<Rules> {
+    acls.iter()
+        .map(|name| CannedAcl::parse(name))
+        .collect::<Option<BTreeSet<_>>>()
+        .map(|acls| Rules { key_prefixes, acls })
+        .filter(|rules| rules.validate().is_ok())
+}
+
 pub fn validate_bucket_name(bucket: &str) -> Result<(), String> {
-    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    let named = (3..=63).contains(&bucket.len())
-        && bucket
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
-        && edge(bucket.chars().next())
-        && edge(bucket.chars().last());
-    match named {
+    match is_bucket_name(bucket) {
         true => Ok(()),
         false => Err(format!(
             "bucket {bucket:?} must be 3 to 63 lowercase letters, digits, '.', '-' or '_', \
-             beginning and ending with a letter or digit"
+             beginning and ending with a letter or digit, without '..'"
         )),
     }
 }
@@ -119,14 +142,23 @@ mod tests {
         for admitted in [
             "leads/7/Café façade #2 50%+off?.pdf",
             "leads/a b",
-            "archive/2026-01/x",
+            "archive/2026/x",
+            "archive/2026",
         ] {
             assert_eq!(documents.admit(&[admitted], None), Ok(()), "{admitted}");
         }
-        assert_eq!(
-            documents.admit(&["other/a.pdf"], None),
-            Err(Refusal::KeyOutsidePrefix)
-        );
+        for outside in [
+            "other/a.pdf",
+            "archive/2026-01/x",
+            "archive/20261",
+            "leadsx/a",
+        ] {
+            assert_eq!(
+                documents.admit(&[outside], None),
+                Err(Refusal::KeyOutsidePrefix),
+                "{outside}"
+            );
+        }
         assert_eq!(
             documents.admit(&["leads/a.pdf", "other/a.pdf"], None),
             Err(Refusal::KeyOutsidePrefix),
@@ -201,10 +233,24 @@ mod tests {
             "abc-",
             "a/b",
             "a b",
+            "a..b",
             &"a".repeat(64),
             "",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_stored_row_is_read_as_rules_only_when_the_platform_would_store_them() {
+        let names = |acls: &[&str]| acls.iter().map(|acl| acl.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            stored_rules(Some(vec!["leads/".into()]), &names(&["public-read"])),
+            Some(rules(Some(&["leads/"]), &[CannedAcl::PublicRead]))
+        );
+        assert_eq!(stored_rules(None, &[]), Some(rules(None, &[])));
+        assert_eq!(stored_rules(None, &names(&["public-read-write"])), None);
+        assert_eq!(stored_rules(Some(vec![]), &[]), None);
+        assert_eq!(stored_rules(Some(vec!["/leads".into()]), &[]), None);
     }
 }

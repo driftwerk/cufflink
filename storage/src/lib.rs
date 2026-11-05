@@ -5,6 +5,7 @@ use eyre::{Result, WrapErr};
 use futures_util::stream::BoxStream;
 use std::fmt;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 pub use cufflink_types::host::storage::CannedAcl;
 
@@ -112,7 +113,16 @@ pub struct UploadOptions {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub access_key_id: String,
-    pub secret_access_key: String,
+    pub secret_access_key: Zeroizing<String>,
+}
+
+impl Credential {
+    pub fn new(access_key_id: impl Into<String>, secret_access_key: impl Into<String>) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: Zeroizing::new(secret_access_key.into()),
+        }
+    }
 }
 
 impl fmt::Debug for Credential {
@@ -125,6 +135,20 @@ impl fmt::Debug for Credential {
 }
 
 pub const MAX_KEY_BYTES: usize = 1024;
+
+/// A bucket name every backend accepts as it is: 3 to 63 lowercase letters,
+/// digits, `.`, `-` or `_`, beginning and ending with a letter or digit,
+/// with no `..`. Nothing in such a name can change the request's path.
+pub fn is_bucket_name(bucket: &str) -> bool {
+    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+        && edge(bucket.chars().next())
+        && edge(bucket.chars().last())
+        && !bucket.contains("..")
+}
 
 /// A key the stores can address without changing it: 1 to 1024 bytes, no
 /// leading, trailing or doubled `/`, no `.` or `..` segment and no ASCII
@@ -265,6 +289,35 @@ fn unknown_backend(got: &str) -> eyre::Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bucket_name_cannot_change_the_request_path() {
+        for name in ["example-documents", "a.b_c", "abc", "1st-bucket"] {
+            assert!(is_bucket_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "ab",
+            ".",
+            "..",
+            "a..b",
+            "a\\b",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "Example",
+            "%2e",
+            "-ab",
+            "ab-",
+            ".ab",
+            &"a".repeat(64),
+        ] {
+            assert!(!is_bucket_name(name), "{name:?}");
+        }
+    }
     use crate::common::test_env::with as with_env;
     use cufflink_settings::process_var as var;
 

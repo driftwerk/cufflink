@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 const MAX_ACCESS_KEY_ID_BYTES: usize = 128;
 const MAX_SECRET_BYTES: usize = 1024;
@@ -35,6 +36,12 @@ pub struct PutBucketRequest {
 pub struct CredentialRequest {
     pub access_key_id: String,
     pub secret_access_key: String,
+}
+
+impl Drop for CredentialRequest {
+    fn drop(&mut self) {
+        self.secret_access_key.zeroize();
+    }
 }
 
 impl fmt::Debug for CredentialRequest {
@@ -65,6 +72,15 @@ fn validate_credential(credential: &CredentialRequest) -> Result<(), String> {
     Ok(())
 }
 
+/// What a registration holds that only the s3 backend can serve.
+fn needs_s3(rules: &Rules, credential: Option<&CredentialRequest>) -> Option<&'static str> {
+    match (credential.is_some(), rules.acls.is_empty()) {
+        (true, _) => Some("a credential"),
+        (false, false) => Some("a canned ACL"),
+        (false, true) => None,
+    }
+}
+
 fn validate(
     state: &AppState,
     bucket: &str,
@@ -72,6 +88,7 @@ fn validate(
     credential: Option<&CredentialRequest>,
 ) -> PlatformResult<()> {
     let platform = state.storage.as_ref();
+    let kind = platform.map(|storage| storage.backend_kind());
     validate_bucket_name(bucket)
         .and_then(|()| rules.validate())
         .and_then(|()| credential.map_or(Ok(()), validate_credential))
@@ -83,15 +100,13 @@ fn validate(
                 _ => Ok(()),
             },
         )
-        .and_then(
-            |()| match (credential, platform.map(|s| s.backend_kind())) {
-                (Some(_), kind) if kind != Some("s3") => Err(format!(
-                    "a credential needs the s3 storage backend; this platform's is {}",
-                    kind.unwrap_or("not configured")
-                )),
-                _ => Ok(()),
-            },
-        )
+        .and_then(|()| match needs_s3(rules, credential) {
+            Some(what) if kind != Some("s3") => Err(format!(
+                "{what} needs the s3 storage backend; this platform's is {}",
+                kind.unwrap_or("not configured")
+            )),
+            _ => Ok(()),
+        })
         .map_err(PlatformError::Validation)
 }
 
@@ -100,6 +115,19 @@ fn owner_slug(state: &AppState, tenant_id: Uuid) -> String {
         .tenants
         .get(tenant_id)
         .map_or_else(|| tenant_id.to_string(), |entry| entry.tenant.slug.clone())
+}
+
+fn held(state: &AppState, bucket: &str, row: &BucketRow) -> PlatformError {
+    let owner = row
+        .tenant_id
+        .map(|id| format!("tenant {}", owner_slug(state, id)));
+    PlatformError::Conflict(match (row.retired_at, owner) {
+        (None, Some(owner)) => format!("bucket {bucket} is registered to {owner}"),
+        (_, owner) => format!(
+            "bucket {bucket} was retired from {}; release it before registering it to another tenant",
+            owner.as_deref().unwrap_or("a deleted tenant")
+        ),
+    })
 }
 
 fn buckets_body(slug: &str, rows: &[BucketRow]) -> Value {
@@ -146,11 +174,11 @@ pub async fn put_bucket(
     let mut client = state.platform_db.get().await?;
     let txn = client.transaction().await?;
     let existing = tenant_buckets::find_for_update(&txn, &bucket).await?;
-    if let Some(other) = existing.as_ref().filter(|row| row.tenant_id != tenant.id) {
-        return Err(PlatformError::Conflict(format!(
-            "bucket {bucket} is registered to tenant {}",
-            owner_slug(&state, other.tenant_id)
-        )));
+    if let Some(other) = existing
+        .as_ref()
+        .filter(|row| row.tenant_id != Some(tenant.id))
+    {
+        return Err(held(&state, &bucket, other));
     }
     let id = existing.map_or_else(Uuid::new_v4, |row| row.id);
     let secret = match &credential {
@@ -208,7 +236,7 @@ pub async fn delete_bucket(
 ) -> PlatformResult<StatusCode> {
     let tenant = tenants::require_by_slug(&state.platform_db, &slug).await?;
     let client = state.platform_db.get().await?;
-    if tenant_buckets::delete(&client, tenant.id, &bucket)
+    if tenant_buckets::retire(&client, tenant.id, &bucket, &admin.subject)
         .await?
         .is_none()
     {
@@ -217,7 +245,7 @@ pub async fn delete_bucket(
         )));
     }
     drop(client);
-    info!(tenant = %slug, bucket = %bucket, actor = %admin.subject, "Tenant bucket deleted");
+    info!(tenant = %slug, bucket = %bucket, actor = %admin.subject, "Tenant bucket retired");
     audit::record(
         &state.platform_db,
         audit::Change {
@@ -225,6 +253,49 @@ pub async fn delete_bucket(
             actor: &admin.subject,
             credential: admin.credential(),
             action: "tenant.bucket.delete",
+            resource_type: "tenant_bucket",
+            resource_id: Some(&bucket),
+            details: None,
+        },
+    )
+    .await;
+    state.tenants.refresh().await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn release_bucket(
+    State(state): State<Arc<AppState>>,
+    admin: PlatformAdmin,
+    Path(bucket): Path<String>,
+) -> PlatformResult<StatusCode> {
+    let grace = crate::tenant_catalog::RETIREMENT_GRACE;
+    let client = state.platform_db.get().await?;
+    let Some(released) = tenant_buckets::release(&client, &bucket, grace).await? else {
+        return Err(
+            match tenant_buckets::find_for_update(&client, &bucket).await? {
+                None => PlatformError::NotFound(format!("No tenant holds bucket '{bucket}'")),
+                Some(row) if row.retired_at.is_none() => PlatformError::Conflict(format!(
+                    "bucket {bucket} is registered to tenant {}; delete it first",
+                    row.tenant_id
+                        .map_or_else(String::new, |id| owner_slug(&state, id))
+                )),
+                Some(_) => PlatformError::Conflict(format!(
+                    "bucket {bucket} was retired less than {} s ago, when a replica may still \
+                     serve it to its tenant; release it later",
+                    grace.as_secs()
+                )),
+            },
+        );
+    };
+    drop(client);
+    info!(bucket = %bucket, actor = %admin.subject, "Tenant bucket released");
+    audit::record(
+        &state.platform_db,
+        audit::Change {
+            tenant_id: released.tenant_id,
+            actor: &admin.subject,
+            credential: admin.credential(),
+            action: "tenant.bucket.release",
             resource_type: "tenant_bucket",
             resource_id: Some(&bucket),
             details: None,
@@ -289,6 +360,31 @@ mod tests {
         ] {
             assert!(validate_credential(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_credential_or_an_acl_needs_the_s3_backend() {
+        let rules = |acls: BTreeSet<CannedAcl>| Rules {
+            key_prefixes: Some(vec!["leads/".into()]),
+            acls,
+        };
+        let credential = CredentialRequest {
+            access_key_id: "AKEXAMPLE".into(),
+            secret_access_key: "s".into(),
+        };
+        assert_eq!(needs_s3(&rules(BTreeSet::new()), None), None);
+        assert_eq!(
+            needs_s3(&rules(BTreeSet::new()), Some(&credential)),
+            Some("a credential")
+        );
+        assert_eq!(
+            needs_s3(&rules(BTreeSet::from([CannedAcl::PublicRead])), None),
+            Some("a canned ACL")
+        );
+        assert_eq!(
+            needs_s3(&rules(BTreeSet::from([CannedAcl::Private])), None),
+            Some("a canned ACL")
+        );
     }
 
     #[test]

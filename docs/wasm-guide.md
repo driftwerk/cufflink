@@ -2174,6 +2174,8 @@ way, and differs in three things:
   (`key_not_exact`), as is one outside the bucket's key prefixes
   (`key_outside_prefix`). In any other bucket a non-ASCII byte or one of
   `% # ? * [ ] ~ " < > |` is stored percent-encoded, as in earlier releases;
+- a key prefix holds keys on a segment boundary: `docs` holds `docs/a`,
+  never `docs-old/a`;
 - the call is signed with the bucket's own credential when it has one;
 - feature `storage-acl` adds `UploadOptions::acl(CannedAcl::PublicRead)`
   (or `Private`), admitted only where the bucket lists that ACL
@@ -2181,7 +2183,10 @@ way, and differs in three things:
   tenant).
 
 A bucket registered to another tenant is refused for every call, whatever
-the guest's `storage_scope`.
+the guest's `storage_scope`, and so is a retired one (`bucket_retired`). In
+every bucket, a name outside the bucket naming rules (3 to 63 lowercase
+letters, digits, `.`, `-` or `_`, beginning and ending with a letter or
+digit, no `..`) is refused (`invalid_bucket`).
 
 ```rust,ignore
 let stored = storage::upload_with(

@@ -281,6 +281,11 @@ guests may use and, optionally, a credential that reaches it at the
 platform's `S3_ENDPOINT`. The design is
 [`design-notes/storage-tenant-buckets.md`](design-notes/storage-tenant-buckets.md).
 
+- Every bucket name a guest gives is checked against the bucket naming
+  rules (3 to 63 lowercase letters, digits, `.`, `-` or `_`, beginning and
+  ending with a letter or digit, no `..`) on every call, in every mode, and
+  any other name is refused (`invalid_bucket`). Earlier releases refused
+  only an empty name or one containing `/`.
 - Every guest storage call on a registered bucket, in every
   `storage_scope` mode:
   - a bucket registered to another tenant is refused
@@ -290,8 +295,14 @@ platform's `S3_ENDPOINT`. The design is
   - in the tenant's own bucket, a key must be exact (`key_not_exact`)
     and within the bucket's prefixes when it has any
     (`key_outside_prefix`), and `storage_scope` is not consulted;
+  - a key prefix holds keys on a segment boundary;
   - the call is signed with the bucket's credential, or the platform's
     when it has none.
+- Deleting a registration, or its tenant, retires the bucket: it stays
+  claimed and refused to every guest (`bucket_retired`) until
+  `POST /api/buckets/{bucket}/release` (`cufflink tenants buckets release`)
+  frees it, at least two minutes after the retirement. A registered bucket
+  cannot be listed in another tenant group's `allowed_buckets` (409).
 - In a registered bucket a key is stored exactly as given: spaces,
   non-ASCII letters, `%`, `#`, `?` and `+` included. A key that begins or
   ends with `/`, has an empty, `.` or `..` segment, has a control
@@ -309,7 +320,8 @@ platform's `S3_ENDPOINT`. The design is
   (`tenant_buckets.secret_access_key`, covered by
   `cufflink admin secrets reseal` and `verify`). It is never answered,
   audited or logged. A secret that cannot be opened leaves its bucket's
-  calls refused (`not_configured`) and the rest of the catalog loaded.
+  calls refused (`not_configured`) and the rest of the catalog loaded, as
+  does a row that cannot be read.
 - The SDK's `InMemoryStorage` stores the ACL on `StoredObject`, refuses an
   ACL that `admit_acl` has not admitted, and records every call in
   `calls()`.
@@ -424,7 +436,8 @@ Rolling a platform back from the release that adds tenant buckets:
 | Services that enable `cufflink-fn/storage-acl` (`cufflink services list --features` names them, as `storage_acl`) | **Roll each back first, to a version without it.** The older platform cannot read an upload that names an ACL, and refuses it rather than store it without one. Such a service cannot be deployed there (422, naming the feature) |
 | Tenant buckets | Set each tenant that has some to `storage_scope` `strict` with an allowlist that leaves them out, unless its guests may reach them with the platform's credentials and today's rules. The older platform does not read `tenant_buckets`: their calls fall back to `storage_scope` and the platform's credentials, and under `legacy` with no allowlist they are admitted |
 | Exact keys | Nothing to undo, but objects stored under a key the older encoding changes (non-ASCII, `% # ? * [ ] ~ " < > |`) cannot be read there until the platform is back |
-| The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read |
+| Sealed secrets | Run `cufflink admin secrets reseal` and `verify` from this release: the older binary does not know `tenant_buckets` and skips its secrets |
+| The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read. Retired claims stay in it, and the older platform does not refuse them either |
 
 Rolling a platform back from v0.35.0 to an earlier release:
 

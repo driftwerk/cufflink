@@ -1375,6 +1375,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "zenwebp",
+ "zeroize",
 ]
 
 [[package]]
@@ -1448,6 +1449,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

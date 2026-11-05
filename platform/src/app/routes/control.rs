@@ -65,6 +65,10 @@ pub(in crate::app) fn routes() -> Router<Arc<AppState>> {
             put(api::tenant_buckets::put_bucket).delete(api::tenant_buckets::delete_bucket),
         )
         .route(
+            "/api/buckets/{bucket}/release",
+            post(api::tenant_buckets::release_bucket),
+        )
+        .route(
             "/api/tenants/{slug}/services/{service}/db-role",
             get(api::db_roles::get_db_role).put(api::db_roles::set_db_role),
         )

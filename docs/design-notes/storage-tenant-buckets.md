@@ -119,17 +119,48 @@ Refused at write (422, naming the field), so a bad row never reaches a
 guest:
 
 - a bucket name that is not 3 to 63 lowercase letters, digits, `.`, `-` or
-  `_`, beginning and ending with a letter or digit;
+  `_`, beginning and ending with a letter or digit, without `..`;
 - the platform's own bucket (`S3_BUCKET`);
 - a prefix that is empty, longer than 1024 bytes, or not an exact key
   (section 2.4), apart from a trailing `/`;
 - an empty `key_prefixes` list (`null` already means any key);
 - an ACL that is not `private` or `public-read`;
-- a credential on a platform whose backend is not `s3`.
+- a credential, or a canned ACL, on a platform whose backend is not `s3`.
 
-Refused with `409`: a bucket another tenant has registered (naming that
-tenant), and one another tenant group lists in its `storage_scope`
-`allowed_buckets`.
+Refused with `409`, in both directions:
+
+- registering a bucket another tenant holds (naming that tenant), retired
+  claims included, or one another tenant group lists in its
+  `storage_scope` `allowed_buckets`;
+- a `storage_scope` `allowed_buckets` that names a bucket registered to
+  another tenant (`PUT /api/tenants/{slug}/policies`).
+
+The database holds the same rules (a `CHECK` on `acls`). A row that cannot
+be read as rules all the same, written by hand, is loaded as its tenant's
+bucket in an unreadable state: every other tenant is refused it
+(`foreign_tenant_bucket`) and its own tenant's calls are `not_configured`
+until it is set again. It never fails the catalog's load and is never
+dropped from it.
+
+**Retiring and releasing.** A registration is never simply deleted, because
+a bucket nobody holds is an ordinary bucket, which a `legacy` tenant with no
+allowlist may use with the platform's credentials.
+
+- `DELETE` retires it: the credential is dropped and the bucket stays
+  claimed by its tenant, refused to every guest, its own tenant's included
+  (`bucket_retired`). Setting it again by the same tenant revives it.
+- Deleting the tenant retires its buckets in the same transaction. The
+  claim is kept, with no tenant, and refused to every guest.
+- An admin frees a retired bucket with `POST /api/buckets/{bucket}/release`.
+  It is refused (`409`) until the bucket has been retired for twice the
+  catalog's reload interval (two minutes), so every replica has loaded the
+  retirement first. Only then may another tenant register it.
+
+**Staleness.** A change reaches a replica on the change notification, or at
+the latest at its next one-minute reload. Until then the replica serves the
+rules it holds, which is why a retired bucket cannot change hands sooner.
+A replica whose reload keeps failing keeps its last catalog, as it does for
+policies, and logs every failure.
 
 A tenant bucket is outside `storage_scope`. Its rules are its own, and
 they hold in every policy mode: no tenant relies on them yet, which is how
@@ -165,16 +196,29 @@ the platform makes every control unconditional ([policies](../policies.md)).
 
 In order, for the bucket and every key of the call:
 
-1. **Reserved checks**, unchanged (section 1.1).
+1. **Reserved checks** (section 1.1), now with every bucket name validated
+   by the rule of section 2.1 for every call, whatever the mode: a name
+   that is not one is refused `invalid_bucket` before any lookup, since a
+   name such as `example-documents\`, `a?b` or one in capitals would miss
+   the registration and could still be rewritten into another bucket's
+   path by the HTTP client. Each store also refuses an invalid name, and a
+   store built for a tenant bucket serves that bucket alone.
 2. **Another tenant's bucket.** The bucket is a tenant bucket whose tenant
    is not the guest's: refused, `foreign_tenant_bucket`, in every mode,
    whatever the guest's `storage_scope` says. A preview tenant is a tenant
    of its own here (section 12, question 2).
 3. **The tenant's own bucket.**
+   - a retired registration is refused `bucket_retired`, and an unreadable
+     one `not_configured`;
    - every key must be exact (section 2.4): refused `key_not_exact`;
-   - and start with one of `key_prefixes` when that is set: refused
+   - and lie under one of `key_prefixes` when that is set, on a segment
+     boundary: the prefix `docs` holds `docs` and `docs/a`, never
+     `docs-old/a`, and `docs/` holds what is under it. Refused
      `key_outside_prefix`;
-   - and `storage_scope` is not consulted.
+   - and `storage_scope` is not consulted. That includes `strict`'s
+     `tenants/{tenant}/{service}/` prefix: a registered bucket keeps its
+     own layout, and the registration's prefixes are the limit (section
+     12, question 8).
 
    The call then uses the bucket's credential, or the platform's, with keys
    stored exactly.
@@ -236,6 +280,12 @@ The platform's buckets and `storage_scope` buckets keep today's encoding
     stores no canned ACL"), never stored without it.
 - **No free-form value.** The closed enum keeps every header the guest can
   influence a header value the host builds itself.
+- **Presigned uploads.** A presigned `PUT` names no ACL. AWS S3 refuses a
+  request whose `x-amz-*` headers are not all signed, so the holder of the
+  URL cannot add `x-amz-acl`. An S3-compatible store that accepts unsigned
+  `x-amz-*` headers on a presigned request would let it: on such a store,
+  block public ACLs in the bucket's policy for every principal but the
+  platform's uploads.
 
 ### 2.6 Every path that reaches storage for a guest
 
@@ -266,12 +316,14 @@ Platform admin only, like every tenant policy route.
 
 | Method | Path | Body / result |
 |--------|------|---------------|
-| GET | `/api/tenants/{slug}/buckets` | `{"tenant", "buckets": [{"bucket", "key_prefixes", "acls", "credential": null \| {"access_key_id"}, "updated_at", "updated_by"}]}` |
+| GET | `/api/tenants/{slug}/buckets` | `{"tenant", "buckets": [{"bucket", "key_prefixes", "acls", "credential": null \| {"access_key_id"}, "retired_at", "updated_at", "updated_by"}]}`, retired buckets included |
 | PUT | `/api/tenants/{slug}/buckets/{bucket}` | `{"key_prefixes"?, "acls"?, "credential"?: {"access_key_id", "secret_access_key"}}`. It replaces the row: what is left out takes its default, and a left-out `credential` means the platform's. `200` with the row as GET answers it; `409` and `422` as section 2.1 |
-| DELETE | `/api/tenants/{slug}/buckets/{bucket}` | `204`; `404` when the tenant has no such bucket |
+| DELETE | `/api/tenants/{slug}/buckets/{bucket}` | Retires it (section 2.1): `204`, again for a retired one; `404` when the tenant has no such bucket |
+| POST | `/api/buckets/{bucket}/release` | Frees a retired bucket: `204`; `409` while it is registered, or retired for less than two minutes; `404` when nobody holds it |
 
-Each change is audited (`tenant.bucket.set`, `tenant.bucket.delete`) and
-announces a tenant change, so every replica reloads.
+Each change is audited (`tenant.bucket.set`, `tenant.bucket.delete`,
+`tenant.bucket.release`) and announces a tenant change, so every replica
+reloads.
 
 ```sh
 cufflink tenants buckets list harbor
@@ -279,6 +331,7 @@ cufflink tenants buckets set harbor example-documents --key-prefix leads/
 printf '%s' "$SECRET" | cufflink tenants buckets set harbor example-assets \
   --acl public-read --access-key-id AKEXAMPLE --secret-access-key-stdin
 cufflink tenants buckets delete harbor example-documents
+cufflink tenants buckets release example-documents
 ```
 
 The CLI reads a secret from stdin only, never from an argument, which would
@@ -340,6 +393,9 @@ let stored = storage::upload_with(
   - ACL uploads are refused, since `acl` is an unknown field there.
   - The older platform logs the missing migration at each start, as for
     earlier migrations.
+  - `reseal` and `verify` on the older binary do not know
+    `tenant_buckets`, so they skip its secrets: run them from this release
+    before rolling back, and again after returning to it.
 
   So before rolling back: roll back the services that enable `storage-acl`,
   and set the tenant's `storage_scope` to `strict` with an allowlist if its
@@ -390,7 +446,11 @@ These are what the tests of section 9 prove:
    prefix. The platform's own bucket cannot be registered.
 7. Registration is exclusive. A bucket belongs to one tenant, and a bucket
    another tenant group lists in its `allowed_buckets` cannot be registered
-   until that listing is removed.
+   until that listing is removed, nor listed while it is registered.
+8. A registration never lapses into an ordinary bucket by itself: deleting
+   it, or its tenant, leaves a retired claim refused to every guest until an
+   admin releases it, and only after every replica has loaded the
+   retirement.
 
 ## 8. Alternatives considered
 
@@ -454,8 +514,11 @@ credential.
 - `storage_scope` buckets unchanged (the existing tests stay as they are);
 - ACL admission for each case of section 2.5;
 - validation of a row (section 2.1), and the `409`s;
-- a snapshot with an unopenable secret loads, and that bucket is
-  `not_configured`;
+- a snapshot with an unopenable secret, or an unreadable row, loads, and
+  that bucket is `not_configured` to its tenant and refused to every other;
+- every disguised bucket name is `invalid_bucket` on every call, in every
+  mode;
+- a retired or orphaned claim is refused to every tenant;
 - `TENANT_BUCKET_SECRET` is in `columns::ALL`, so `reseal` and `verify`
   cover it;
 - under `enforce` caps, a 25 MiB object passes `fetch_object` and
@@ -476,8 +539,14 @@ credential.
   - a key outside `leads/` is refused, and so is an unlisted ACL;
 - `globex`, with `storage_scope` `legacy` and its allowlist naming
   `example-documents`, is refused on every call;
+- `globex`, with its allowlist naming `example-assets` (written before
+  the registration, as the API refuses it after), is refused on every call
+  there too, presigned uploads, image transforms and `s3_object` included;
 - the API never answers the secret, `409` and `422` as specified, and a
   change reaches the guest without a restart;
+- a delete retires the bucket; another tenant cannot register it until it
+  is released, nor release it before the grace; a deleted tenant's bucket
+  stays claimed;
 - the guest's SDK tests (`test-guests`) exercise `storage-acl` against the
   test host.
 
@@ -522,3 +591,4 @@ credential.
 | 5 | Should tenant-bucket rules hold in every policy mode, rather than follow `storage_scope`'s mode? | Yes |
 | 6 | Should an ACL upload on a backend that cannot apply it be refused rather than stored without it? | Refused |
 | 7 | Should the API answer a credential's access key id? | Yes, never its secret |
+| 8 | Should a registered bucket also hold `strict`'s `tenants/{tenant}/{service}/` prefix? | No, on purpose: a registered bucket keeps the layout it already has, and its `key_prefixes` are its limit. A tenant that wants a prefix per service registers one per service's prefix |

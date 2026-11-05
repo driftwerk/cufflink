@@ -41,6 +41,7 @@ jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 
 uuid = { workspace = true }
+zeroize = { workspace = true }
 chrono = { workspace = true }
 
 eyre = { workspace = true }

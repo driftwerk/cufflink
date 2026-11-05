@@ -20,6 +20,9 @@ use uuid::Uuid;
 
 pub const TENANTS_CHANGED_SUBJECT: &str = "cufflink.tenants.changed";
 const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a retired tenant bucket stays claimed before it may be
+/// released: long enough for every replica to have reloaded its retirement.
+pub const RETIREMENT_GRACE: Duration = Duration::from_secs(2 * RELOAD_INTERVAL.as_secs());
 
 #[derive(Debug)]
 pub struct TenantEntry {
