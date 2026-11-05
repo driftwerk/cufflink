@@ -1,10 +1,10 @@
 //! `cufflink services db-role` — the database role a service runs as
 //! (platform admin only).
 
+use crate::commands::secret_from;
 use crate::commands::tenants::admin_request;
 use clap::Subcommand;
 use serde_json::{json, Value};
-use std::io::Read;
 
 #[derive(Subcommand)]
 pub enum DbRoleAction {
@@ -49,18 +49,6 @@ pub enum DbRoleAction {
 
 fn path(tenant: &str, service: &str) -> String {
     format!("/api/tenants/{tenant}/services/{service}/db-role")
-}
-
-/// The password `input` holds, without the line ending a shell or a file
-/// leaves after it; nothing at all is refused.
-fn password_from(mut input: impl Read) -> eyre::Result<String> {
-    let mut password = String::new();
-    input.read_to_string(&mut password)?;
-    let password = password.trim_end_matches(['\r', '\n']);
-    if password.is_empty() {
-        eyre::bail!("--password-stdin: nothing was read from stdin");
-    }
-    Ok(password.to_string())
 }
 
 fn set_body(role: Option<&str>, password: Option<&str>, read_only_role: Option<&str>) -> Value {
@@ -116,25 +104,41 @@ fn print_binding(body: &Value) {
 }
 
 fn print_report(report: &Value) {
-    for check in report["checks"].as_array().into_iter().flatten() {
+    let checks: Vec<&Value> = report["checks"].as_array().into_iter().flatten().collect();
+    let detail = |check: &Value| check["detail"].as_str().unwrap_or_default().to_string();
+    for check in &checks {
         let name = check["check"].as_str().unwrap_or_default();
-        match check["ok"].as_bool().unwrap_or(false) {
-            true => println!("  ok      {name}"),
-            false => println!(
-                "  FAILED  {name}: {}",
-                check["detail"].as_str().unwrap_or_default()
-            ),
+        match (
+            check["ok"].as_bool().unwrap_or(false),
+            check["excess"].as_bool().unwrap_or(false),
+        ) {
+            (true, false) => println!("  ok      {name}"),
+            (true, true) => println!("  EXCESS  {name}: {}", detail(check)),
+            (false, _) => println!("  FAILED  {name}: {}", detail(check)),
         }
     }
-    let remediation: Vec<&str> = report["remediation"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    if !remediation.is_empty() {
-        println!("To mend, run on the tenant database:");
-        remediation
+    print_statements(
+        "To mend, run on the tenant database:",
+        report["remediation"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    );
+    print_statements(
+        "To take back what the role holds beyond its need, run on the tenant database:",
+        checks
+            .iter()
+            .filter(|check| check["excess"].as_bool().unwrap_or(false))
+            .filter_map(|check| check["remedy"].as_str()),
+    );
+}
+
+fn print_statements<'a>(heading: &str, statements: impl Iterator<Item = &'a str>) {
+    let statements: Vec<&str> = statements.collect();
+    if !statements.is_empty() {
+        println!("{heading}");
+        statements
             .iter()
             .for_each(|statement| println!("  {statement}"));
     }
@@ -179,7 +183,7 @@ pub async fn run(
             read_only_role,
         } => {
             let password = password_stdin
-                .then(|| password_from(std::io::stdin()))
+                .then(|| secret_from(std::io::stdin(), "--password-stdin"))
                 .transpose()?;
             let body = admin_request(
                 "Database role",
@@ -252,14 +256,17 @@ mod tests {
             (" spaced out \n", " spaced out "),
             ("two\nlines\n", "two\nlines"),
         ] {
-            assert_eq!(password_from(input.as_bytes()).expect(input), password);
+            assert_eq!(
+                secret_from(input.as_bytes(), "--password-stdin").expect(input),
+                password
+            );
         }
     }
 
     #[test]
     fn an_empty_password_is_refused() {
         for input in ["", "\n", "\r\n\n"] {
-            let refused = password_from(input.as_bytes()).expect_err(input);
+            let refused = secret_from(input.as_bytes(), "--password-stdin").expect_err(input);
             assert!(
                 refused.to_string().contains("nothing was read"),
                 "{refused}"

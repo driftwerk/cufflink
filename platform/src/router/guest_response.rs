@@ -12,9 +12,11 @@ use base64::{engine::general_purpose, Engine};
 use cufflink_storage::ObjectReader;
 use cufflink_types::delivery::{DeliveryControl, DELIVERY_KEY};
 use futures_util::StreamExt;
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::future::Future;
+use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,16 @@ const MAX_OBJECT_NAME: usize = 1024;
 const MAX_TREE_DEPTH: usize = 127;
 const MAX_DELIVERY_BLOCK: usize = 64 * 1024;
 const MAX_ESCAPED_KEY: usize = 64 * 1024;
+const BODY_RAW: &str = "__body_raw";
+const BODY_RAW_KEY: &str = "\"__body_raw\"";
+const OTHER_BODIES: [&str; 4] = ["__body", "__body_b64", "__stream", "__sse"];
+const HEAD: [&str; 5] = [
+    "__v",
+    "__status",
+    "__headers",
+    "__content_type",
+    DELIVERY_KEY,
+];
 
 const DENIED_HEADERS: [&str; 4] = [
     "content-length",
@@ -143,13 +155,40 @@ pub(crate) fn parse_output(output: GuestOutput) -> Result<(Value, Hold), Refused
 }
 
 pub(crate) fn decode(output: GuestOutput) -> Result<(GuestResponse, Hold), DecodeError> {
-    let (value, mut hold) = parse_output(output).map_err(DecodeError::Refused)?;
-    decode_value(value, &mut hold).map(|response| (response, hold))
+    let GuestOutput { text, mut hold } = output;
+    match raw_envelope(&text, &mut hold)? {
+        Some(RawEnvelope { head, body }) => {
+            let body = Bytes::from(text.into_bytes()).slice(body);
+            decode_v2(head, &mut hold, Some(body)).map(|v2| (GuestResponse::V2(v2), hold))
+        }
+        None => {
+            let (value, mut hold) =
+                parse_output(GuestOutput { text, hold }).map_err(DecodeError::Refused)?;
+            decode_value(value, &mut hold).map(|response| (response, hold))
+        }
+    }
+}
+
+fn v2_answer(v2: V2Response) -> Answer {
+    Answer {
+        status: v2.status,
+        delivery: v2.delivery.map(|delivery| *delivery),
+    }
 }
 
 pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError> {
     let text = output.text.as_bytes();
     let mut hold = output.hold.beside();
+    let raw = raw_envelope(&output.text, &mut hold).and_then(|raw| {
+        raw.map(|raw| decode_v2(raw.head, &mut hold, Some(Bytes::new())))
+            .transpose()
+    });
+    match raw {
+        Ok(Some(v2)) => return Ok(v2_answer(v2)),
+        Ok(None) => {}
+        Err(DecodeError::Invalid(error)) => return Err(error),
+        Err(DecodeError::Refused(_)) => return outline(text),
+    }
     let response = match ChargedJson::parse(text, &mut hold) {
         Ok(parsed) => match decode_value(parsed.value, &mut hold) {
             Ok(response) => response,
@@ -167,11 +206,108 @@ pub(crate) fn answer(output: &GuestOutput) -> Result<Answer, GuestResponseError>
             status,
             delivery: None,
         },
-        GuestResponse::V2(v2) => Answer {
-            status: v2.status,
-            delivery: v2.delivery.map(|delivery| *delivery),
-        },
+        GuestResponse::V2(v2) => v2_answer(v2),
     })
+}
+
+/// A v2 envelope whose body is raw JSON: the keys that are not the body,
+/// as trees, and where the body lies in the envelope's text.
+struct RawEnvelope {
+    head: Map<String, Value>,
+    body: Range<usize>,
+}
+
+/// What a scan of an envelope's top level found, holding each value as the
+/// text it is: no tree is built, and nothing is copied.
+#[derive(Default)]
+struct RawScan<'a> {
+    v2: bool,
+    in_body: bool,
+    body: Option<&'a RawValue>,
+    other_body: bool,
+    head: [Option<&'a RawValue>; HEAD.len()],
+}
+
+impl<'de> DeserializeSeed<'de> for &mut RawScan<'de> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for &mut RawScan<'de> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a response envelope")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<(), A::Error> {
+        while let Some(key) = entries.next_key::<String>()? {
+            if key == BODY_RAW {
+                self.in_body = true;
+                self.body = Some(entries.next_value()?);
+                self.in_body = false;
+                continue;
+            }
+            let value: &'de RawValue = entries.next_value()?;
+            if key == "__v" {
+                self.v2 = value.get() == "2";
+            }
+            self.other_body |= OTHER_BODIES.contains(&key.as_str());
+            if let Some(at) = HEAD.iter().position(|head| *head == key) {
+                self.head[at] = Some(value);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The envelope in `text` when it is a v2 envelope with a raw JSON body.
+/// Only then is the body not parsed: its text is checked to be one JSON
+/// value, its place noted, and the rest of the envelope read as before. An
+/// envelope that said it is v2 and then failed to parse in or after its
+/// raw body is invalid; any other text is left to the reading every other
+/// response has.
+fn raw_envelope(text: &str, hold: &mut Hold) -> Result<Option<RawEnvelope>, DecodeError> {
+    if !text.contains(BODY_RAW_KEY) {
+        return Ok(None);
+    }
+    let mut scan = RawScan::default();
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let scanned = (&mut scan)
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end());
+    let body = match (scanned, scan.v2, scan.body) {
+        (Err(_), true, body) if scan.in_body || body.is_some() => {
+            return Err(invalid(BODY_RAW).into())
+        }
+        (Err(_), _, _) | (Ok(()), false, _) | (Ok(()), true, None) => return Ok(None),
+        (Ok(()), true, Some(_)) if scan.other_body => return Err(more_than_one_body().into()),
+        (Ok(()), true, Some(body)) => body,
+    };
+    let start = (body.get().as_ptr() as usize)
+        .checked_sub(text.as_ptr() as usize)
+        .filter(|start| text.get(*start..start + body.get().len()) == Some(body.get()))
+        .ok_or_else(|| invalid(BODY_RAW))?;
+    let head = HEAD
+        .iter()
+        .zip(scan.head)
+        .filter_map(|(key, value)| value.map(|value| (key.to_string(), value)))
+        .map(|(key, value)| {
+            ChargedJson::parse(value.get().as_bytes(), hold)
+                .map(|parsed| (key, parsed.value))
+                .map_err(|error| match error {
+                    ChargedJsonError::Capacity(refused) => DecodeError::Refused(refused),
+                    ChargedJsonError::Syntax(_) => invalid(BODY_RAW).into(),
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some(RawEnvelope {
+        head,
+        body: start..start + body.get().len(),
+    }))
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -273,7 +409,7 @@ fn v2_status(status: Option<u64>) -> Result<StatusCode, GuestResponseError> {
 fn decode_value(value: Value, hold: &mut Hold) -> Result<GuestResponse, DecodeError> {
     match value {
         Value::Object(envelope) if envelope.get("__v") == Some(&Value::from(2)) => {
-            decode_v2(envelope, hold).map(GuestResponse::V2)
+            decode_v2(envelope, hold, None).map(GuestResponse::V2)
         }
         legacy => Ok(decode_legacy(legacy)),
     }
@@ -293,7 +429,11 @@ fn decode_legacy(value: Value) -> GuestResponse {
     GuestResponse::Legacy { status, body }
 }
 
-fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Response, DecodeError> {
+fn decode_v2(
+    mut envelope: Map<String, Value>,
+    hold: &mut Hold,
+    raw: Option<Bytes>,
+) -> Result<V2Response, DecodeError> {
     let status = v2_status(envelope.get("__status").and_then(Value::as_u64))?;
     let (headers, dropped) = headers(envelope.get("__headers"))?;
     let delivery = envelope
@@ -306,7 +446,13 @@ fn decode_v2(mut envelope: Map<String, Value>, hold: &mut Hold) -> Result<V2Resp
                 .map_err(|_| invalid(DELIVERY_KEY))
         })
         .transpose()?;
-    let body = body(&mut envelope, hold)?;
+    let body = match raw {
+        Some(bytes) => V2Body::Bytes {
+            content_type: content_type(&envelope, "application/json")?,
+            bytes,
+        },
+        None => body(&mut envelope, hold)?,
+    };
     let bodiless = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
     Ok(V2Response {
         status,
@@ -360,9 +506,31 @@ fn headers(value: Option<&Value>) -> Result<(HeaderMap, Vec<&'static str>), Gues
     )
 }
 
+fn more_than_one_body() -> GuestResponseError {
+    invalid("body: more than one of __body, __body_b64, __body_raw, __stream, __sse")
+}
+
+fn content_type(
+    envelope: &Map<String, Value>,
+    otherwise: &'static str,
+) -> Result<HeaderValue, GuestResponseError> {
+    match envelope.get("__content_type") {
+        None => Ok(HeaderValue::from_static(otherwise)),
+        Some(content_type) => content_type
+            .as_str()
+            .and_then(header_value)
+            .ok_or_else(|| invalid("__content_type")),
+    }
+}
+
 fn body(envelope: &mut Map<String, Value>, hold: &mut Hold) -> Result<V2Body, DecodeError> {
+    let json = match (envelope.remove("__body"), envelope.remove(BODY_RAW)) {
+        (None, None) => None,
+        (Some(json), None) | (None, Some(json)) => Some(json),
+        (Some(_), Some(_)) => return Err(more_than_one_body().into()),
+    };
     match (
-        envelope.remove("__body"),
+        json,
         envelope.remove("__body_b64"),
         envelope.remove("__stream"),
         envelope.remove("__sse"),
@@ -384,19 +552,12 @@ fn body(envelope: &mut Map<String, Value>, hold: &mut Hold) -> Result<V2Body, De
             let bytes = general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|_| invalid("__body_b64"))?;
-            let content_type = match envelope.get("__content_type") {
-                None => HeaderValue::from_static("application/octet-stream"),
-                Some(content_type) => content_type
-                    .as_str()
-                    .and_then(header_value)
-                    .ok_or_else(|| invalid("__content_type"))?,
-            };
             Ok(V2Body::Bytes {
-                content_type,
+                content_type: content_type(envelope, "application/octet-stream")?,
                 bytes: Bytes::from(bytes),
             })
         }
-        _ => Err(invalid("body: more than one of __body, __body_b64, __stream, __sse").into()),
+        _ => Err(more_than_one_body().into()),
     }
 }
 
@@ -1350,7 +1511,10 @@ mod tests {
         };
         let (ledger, mut hold) = testing::hold(2 * MIB);
         assert!(
-            matches!(decode_v2(envelope, &mut hold), Err(DecodeError::Refused(_))),
+            matches!(
+                decode_v2(envelope, &mut hold, None),
+                Err(DecodeError::Refused(_))
+            ),
             "the decoded bytes are charged before decoding"
         );
         drop(hold);
@@ -1411,6 +1575,180 @@ mod tests {
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
             "application/problem+json"
+        );
+    }
+
+    fn raw(body: &str) -> String {
+        format!(r#"{{"__headers":{{"x-total":"2"}},"__status":201,"__v":2,"__body_raw":{body}}}"#)
+    }
+
+    const RAW_BODY: &str = "{\"b\": 1,  \"a\":[\"\\u00e9\\n\\\"q\\\"\", 2.50, 1e3, {\"__body_raw\": null}],\n \"\": {}}";
+
+    #[tokio::test]
+    async fn a_raw_json_body_is_sent_as_the_guest_wrote_it_and_is_not_copied() {
+        let text = raw(RAW_BODY);
+        let at = text.as_ptr() as usize + text.find(RAW_BODY).expect("the body");
+        let (response, hold) = decode(GuestOutput {
+            text,
+            hold: Hold::none(),
+        })
+        .expect("decodes");
+        let GuestResponse::V2(sent) = response else {
+            panic!("{response:?}");
+        };
+        assert_eq!(sent.status, StatusCode::CREATED);
+        assert_eq!(sent.headers["x-total"], "2");
+        let V2Body::Bytes {
+            content_type,
+            bytes,
+        } = &sent.body
+        else {
+            panic!("{:?}", sent.body);
+        };
+        assert_eq!(content_type, "application/json");
+        assert_eq!(bytes, RAW_BODY.as_bytes());
+        assert_eq!(bytes.as_ptr() as usize, at, "a slice of the guest's text");
+        let response = GuestResponse::V2(sent)
+            .render("svc", &mut Objects, hold)
+            .await
+            .expect("rendered");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body"),
+            RAW_BODY.as_bytes()
+        );
+        let typed = v2(&json!({"__v": 2, "__status": 200, "__content_type": "application/geo+json", "__body_raw": [1]}))
+            .expect("v2");
+        assert!(
+            matches!(&typed.body, V2Body::Bytes { content_type, bytes } if content_type == "application/geo+json" && bytes == "[1]")
+        );
+        let bodiless = v2(&json!({"__v": 2, "__status": 204, "__body_raw": [1]})).expect("v2");
+        assert_eq!(bodiless.body, V2Body::Empty);
+    }
+
+    #[tokio::test]
+    async fn a_raw_json_body_is_charged_as_its_text_and_nothing_more() {
+        let rows = format!("[{}]", vec![r#"{"id":1,"memo":"x"}"#; 200_000].join(","));
+        let (ledger, response) = charged(&raw(&rows), 64 * MIB).await;
+        let response = response.expect("rendered");
+        assert!(ledger.in_use() >= rows.len());
+        assert!(
+            ledger.in_use() <= rows.len() + 2 * MIB,
+            "{} bytes held for {} bytes of body",
+            ledger.in_use(),
+            rows.len()
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * MIB)
+            .await
+            .expect("body");
+        assert_eq!(body, rows.as_bytes());
+        assert_eq!(ledger.in_use(), 0);
+    }
+
+    #[test]
+    fn a_raw_json_body_that_is_not_json_is_an_invalid_response() {
+        for text in [
+            raw(r#"{"a":}"#),
+            raw("[1, 2"),
+            format!("{}x", raw("1")),
+            raw("NaN"),
+            format!("{}]", raw(&"[".repeat(200))),
+        ] {
+            assert_eq!(
+                decode(output(&text)).map(drop).map_err(|e| e.to_string()),
+                Err("invalid response __body_raw".to_string()),
+                "{text}"
+            );
+            assert_eq!(
+                answer(&output(&text)).map(drop),
+                Err(invalid(BODY_RAW)),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            legacy(r#"{"__body_raw":{,"__v":2}"#),
+            (200, json!(r#"{"__body_raw":{,"__v":2}"#)),
+            "before __v says 2, it is a legacy response's text"
+        );
+    }
+
+    #[test]
+    fn a_raw_json_body_is_the_only_body_and_only_a_v2_envelope_has_one() {
+        for envelope in [
+            json!({"__v": 2, "__status": 200, "__body": {}, "__body_raw": {}}),
+            json!({"__v": 2, "__status": 200, "__body_b64": "", "__body_raw": {}}),
+            json!({"__v": 2, "__status": 200, "__sse": {}, "__body_raw": {}}),
+        ] {
+            assert_eq!(
+                v2(&envelope).map(drop),
+                Err(more_than_one_body()),
+                "{envelope}"
+            );
+        }
+        assert_eq!(
+            legacy(r#"{"__body_raw":{"a":1},"ok":true}"#),
+            (200, json!({"__body_raw": {"a": 1}, "ok": true}))
+        );
+        assert_eq!(
+            legacy(r#"{"__v":1,"__status":201,"__body_raw":{"a":1}}"#),
+            (
+                201,
+                json!({"__v": 1, "__status": 201, "__body_raw": {"a": 1}})
+            )
+        );
+        let Ok((GuestResponse::V2(escaped), _)) = decode(output(
+            r#"{"__v":2,"__status":200,"\u005f_body_raw":{"a":1}}"#,
+        )) else {
+            panic!("an escaped key is read from the tree");
+        };
+        assert_eq!(escaped.body, V2Body::Json(json!({"a": 1})));
+        let nested =
+            v2(&json!({"__v": 2, "__status": 200, "__body": {"__body_raw": 1}})).expect("v2");
+        assert_eq!(nested.body, V2Body::Json(json!({"__body_raw": 1})));
+    }
+
+    #[tokio::test]
+    async fn a_raw_envelope_reads_each_head_key_once_and_its_headers_win() {
+        let text = r#"{"__v":2,"__status":500,"__status":200,"__headers":{"content-type":"application/geo+json"},"__body_raw":{"type":"Point"}}"#;
+        let (response, hold) = decode(output(text)).expect("decodes");
+        let response = response
+            .render("svc", &mut Objects, hold)
+            .await
+            .expect("rendered");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the last of a key is read"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/geo+json"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body"),
+            r#"{"type":"Point"}"#.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_raw_envelope_answers_its_status_and_delivery_as_a_route_would() {
+        let read = |text: &str| {
+            answer(&output(text))
+                .map(|answer| (answer.status.as_u16(), format!("{:?}", answer.delivery)))
+        };
+        assert_eq!(read(&raw(RAW_BODY)), Ok((201, "None".to_string())));
+        assert_eq!(
+            read(r#"{"__delivery":{"retry_after_ms":50},"__status":503,"__v":2,"__body_raw":[]}"#),
+            Ok((503, "Some(RetryAfter { retry_after_ms: 50 })".to_string()))
+        );
+        assert_eq!(
+            read(r#"{"__status":99,"__v":2,"__body_raw":[]}"#),
+            Err(invalid("status"))
         );
     }
 }

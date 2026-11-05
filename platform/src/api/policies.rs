@@ -87,6 +87,40 @@ fn require_role_bindings(unbound: &[String]) -> PlatformResult<()> {
     }
 }
 
+/// A `storage_scope` allowlist may not name a bucket registered to another
+/// tenant, as a bucket another tenant group lists cannot be registered.
+async fn require_own_buckets(
+    state: &AppState,
+    tenant: &tenants::Tenant,
+    updates: &[(PolicyKey, PolicyMode, Value)],
+) -> PlatformResult<()> {
+    let listed: Vec<String> = updates
+        .iter()
+        .filter(|(key, ..)| *key == PolicyKey::StorageScope)
+        .flat_map(|(.., config)| {
+            config["allowed_buckets"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|bucket| bucket.as_str().map(str::to_string))
+        .collect();
+    if listed.is_empty() {
+        return Ok(());
+    }
+    let client = state.platform_db.get().await?;
+    match crate::repo::tenant_buckets::held_by_others(&client, tenant.id, &listed)
+        .await?
+        .as_slice()
+    {
+        [] => Ok(()),
+        held => Err(PlatformError::Conflict(format!(
+            "storage_scope allowed_buckets names buckets registered to another tenant: {}",
+            held.join(", ")
+        ))),
+    }
+}
+
 async fn require_tenant_rules(
     state: &AppState,
     tenant: &tenants::Tenant,
@@ -148,6 +182,7 @@ pub async fn put_policies(
     for (key, mode, _) in &updates {
         require_tenant_rules(&state, &tenant, &current, *key, *mode).await?;
     }
+    require_own_buckets(&state, &tenant, &updates).await?;
     let mut client = state.platform_db.get().await?;
     let txn = client.transaction().await?;
     for (key, mode, config) in &updates {

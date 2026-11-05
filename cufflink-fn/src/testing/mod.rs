@@ -61,4 +61,4 @@ pub use request::{request, AuthBuilder, RequestBuilder, SubscriptionBuilder};
 pub use service_call::{MockServiceCalls, ServiceCall};
 #[cfg(feature = "sql-parse")]
 pub use sql_parse::PgQueryParser;
-pub use storage::{InMemoryStorage, StoredObject};
+pub use storage::{InMemoryStorage, StorageCall, StoredObject};

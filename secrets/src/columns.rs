@@ -55,6 +55,16 @@ pub const DB_ROLE_PASSWORD: SealedColumn = SealedColumn {
     row: "ARRAY[r.service_id::text]",
 };
 
+pub const TENANT_BUCKET_SECRET: SealedColumn = SealedColumn {
+    table: "tenant_buckets",
+    name: "secret_access_key",
+    plain: Some("secret_access_key"),
+    sealed: "secret_access_key_enc",
+    id: "id",
+    tenant: "r.tenant_id",
+    row: "ARRAY[r.id::text]",
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lock {
     ForRewrite,
@@ -70,11 +80,12 @@ impl Lock {
     }
 }
 
-pub const ALL: [&SealedColumn; 4] = [
+pub const ALL: [&SealedColumn; 5] = [
     &SERVICE_CONFIG_VALUE,
     &TENANT_OPS_SECRET,
     &WEBHOOK_SECRET,
     &DB_ROLE_PASSWORD,
+    &TENANT_BUCKET_SECRET,
 ];
 
 impl SealedColumn {

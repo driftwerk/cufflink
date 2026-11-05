@@ -1,4 +1,5 @@
-use crate::{common, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
+use crate::common::{self, Keys};
+use crate::{Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use object_store::local::LocalFileSystem;
@@ -14,6 +15,7 @@ pub(crate) struct PrefixedBackend {
     bucket: String,
     kind: &'static str,
     attributes: bool,
+    keys: Keys,
 }
 
 impl PrefixedBackend {
@@ -23,6 +25,7 @@ impl PrefixedBackend {
             bucket,
             kind: "memory",
             attributes: true,
+            keys: Keys::Encoded,
         }
     }
 
@@ -36,6 +39,7 @@ impl PrefixedBackend {
             bucket,
             kind: "local",
             attributes: false,
+            keys: Keys::Encoded,
         })
     }
 
@@ -50,16 +54,22 @@ impl PrefixedBackend {
         }
     }
 
-    fn store_for(&self, bucket: &str) -> PrefixStore<Arc<dyn object_store::ObjectStore>> {
-        PrefixStore::new(Arc::clone(&self.store), bucket)
+    fn store_for(&self, bucket: &str) -> Result<PrefixStore<Arc<dyn object_store::ObjectStore>>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
+        Ok(PrefixStore::new(Arc::clone(&self.store), bucket))
     }
 
     fn primary(&self) -> PrefixStore<Arc<dyn object_store::ObjectStore>> {
-        self.store_for(&self.bucket)
+        PrefixStore::new(Arc::clone(&self.store), self.bucket.as_str())
     }
 
-    fn placeholder_url(&self, bucket: &str, key: &str, expires_in_secs: u64) -> String {
-        format!("{}://{bucket}/{key}?expires={expires_in_secs}", self.kind)
+    fn placeholder_url(&self, bucket: &str, key: &str, expires_in_secs: u64) -> Result<String> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
+        self.keys.path(key)?;
+        Ok(format!(
+            "{}://{bucket}/{key}?expires={expires_in_secs}",
+            self.kind
+        ))
     }
 }
 
@@ -90,9 +100,11 @@ impl ObjectStorage for PrefixedBackend {
         data: Vec<u8>,
         options: &UploadOptions,
     ) -> Result<Uploaded> {
+        common::no_acl(self.kind, options)?;
         common::put_with(
-            &self.store_for(bucket),
+            &self.store_for(bucket)?,
             self.kind,
+            self.keys,
             key,
             data,
             self.put_options(options),
@@ -101,35 +113,42 @@ impl ObjectStorage for PrefixedBackend {
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(&self.primary(), self.kind, None, key).await
+        common::get_bytes(&self.primary(), self.kind, self.keys, None, key).await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(&self.store_for(bucket), self.kind, Some(bucket), key).await
+        common::get_bytes(
+            &self.store_for(bucket)?,
+            self.kind,
+            self.keys,
+            Some(bucket),
+            key,
+        )
+        .await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
-        common::open_read(&self.store_for(bucket), self.kind, bucket, key).await
+        common::open_read(&self.store_for(bucket)?, self.kind, self.keys, bucket, key).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
-        common::head_size(&self.primary(), self.kind, key).await
+        common::head_size(&self.primary(), self.kind, self.keys, key).await
     }
 
     async fn head_in_bucket(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
-        common::head_meta(&self.store_for(bucket), self.kind, bucket, key).await
+        common::head_meta(&self.store_for(bucket)?, self.kind, self.keys, bucket, key).await
     }
 
     async fn copy(&self, src_key: &str, dst_key: &str) -> Result<()> {
-        common::copy_object(&self.primary(), self.kind, src_key, dst_key).await
+        common::copy_object(&self.primary(), self.kind, self.keys, src_key, dst_key).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        common::delete_object(&self.primary(), self.kind, key).await
+        common::delete_object(&self.primary(), self.kind, self.keys, key).await
     }
 
     async fn delete_from_bucket(&self, bucket: &str, key: &str) -> Result<()> {
-        common::delete_object_idempotent(&self.store_for(bucket), self.kind, key).await
+        common::delete_object_idempotent(&self.store_for(bucket)?, self.kind, self.keys, key).await
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
@@ -142,7 +161,7 @@ impl ObjectStorage for PrefixedBackend {
         _content_type: &str,
         expires_in_secs: u64,
     ) -> Result<String> {
-        Ok(self.placeholder_url(&self.bucket, key, expires_in_secs))
+        self.placeholder_url(&self.bucket, key, expires_in_secs)
     }
 
     async fn presign_upload_to_bucket(
@@ -152,11 +171,11 @@ impl ObjectStorage for PrefixedBackend {
         _content_type: &str,
         expires_in_secs: u64,
     ) -> Result<String> {
-        Ok(self.placeholder_url(bucket, key, expires_in_secs))
+        self.placeholder_url(bucket, key, expires_in_secs)
     }
 
     async fn presign_download(&self, key: &str, expires_in_secs: u64) -> Result<String> {
-        Ok(self.placeholder_url(&self.bucket, key, expires_in_secs))
+        self.placeholder_url(&self.bucket, key, expires_in_secs)
     }
 
     async fn presign_download_to_bucket(
@@ -165,7 +184,7 @@ impl ObjectStorage for PrefixedBackend {
         key: &str,
         expires_in_secs: u64,
     ) -> Result<String> {
-        Ok(self.placeholder_url(bucket, key, expires_in_secs))
+        self.placeholder_url(bucket, key, expires_in_secs)
     }
 
     fn primary_bucket(&self) -> &str {
@@ -174,6 +193,27 @@ impl ObjectStorage for PrefixedBackend {
 
     fn backend_kind(&self) -> &'static str {
         self.kind
+    }
+
+    fn tenant_bucket(
+        &self,
+        bucket: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Arc<dyn ObjectStorage>> {
+        eyre::ensure!(
+            credential.is_none(),
+            "the {} backend takes no bucket credential",
+            self.kind
+        );
+        eyre::ensure!(
+            crate::is_bucket_name(bucket),
+            "{bucket:?} is not a bucket name"
+        );
+        Ok(Arc::new(Self {
+            bucket: bucket.to_string(),
+            keys: Keys::Exact,
+            ..self.clone()
+        }))
     }
 }
 
@@ -276,6 +316,7 @@ mod tests {
             content_type: "application/pdf".into(),
             content_disposition: Some("attachment; filename=\"receipt.pdf\"".into()),
             cache_control: Some("no-store".into()),
+            acl: None,
         };
         let before = chrono::Utc::now() - chrono::Duration::seconds(1);
         let uploaded = memory
@@ -333,6 +374,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tenant_bucket_keeps_its_keys_exactly_beside_the_encoded_ones() {
+        let memory = PrefixedBackend::memory("primary".into());
+        let tenant = memory
+            .tenant_bucket("example-documents", None)
+            .expect("tenant bucket");
+        let key = "leads/7/Café façade #2 50%.pdf";
+        tenant
+            .upload_to_bucket(
+                "example-documents",
+                key,
+                b"%PDF".to_vec(),
+                "application/pdf",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tenant
+                .download_from_bucket("example-documents", key)
+                .await
+                .unwrap(),
+            b"%PDF"
+        );
+        assert!(
+            memory
+                .download_from_bucket("example-documents", key)
+                .await
+                .is_err(),
+            "the encoded name is another object"
+        );
+        memory
+            .upload_to_bucket(
+                "example-documents",
+                "Café.pdf",
+                b"old".to_vec(),
+                "application/pdf",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tenant
+                .download_from_bucket("example-documents", "Caf%C3%A9.pdf")
+                .await
+                .unwrap(),
+            b"old",
+            "the platform's buckets keep today's encoded names"
+        );
+        assert!(tenant
+            .download_from_bucket("example-documents", "Café.pdf")
+            .await
+            .is_err());
+        assert!(tenant
+            .upload_to_bucket("example-documents", "leads//a", b"x".to_vec(), "text/plain")
+            .await
+            .is_err());
+        assert!(tenant
+            .presign_download_to_bucket("example-documents", "a/../b", 60)
+            .await
+            .is_err());
+        assert!(memory
+            .tenant_bucket("example-documents", Some(&Credential::new("a", "s")),)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_store_serves_valid_bucket_names_and_a_tenant_store_its_own_alone() {
+        let backend = PrefixedBackend::memory("example-platform".to_string());
+        for invalid in [
+            ".", "..", "a\\b", "a?b", "a#b", "a\tb", "a\nb", "Example", "%2e", "a..b",
+        ] {
+            assert!(
+                backend.download_from_bucket(invalid, "k").await.is_err(),
+                "{invalid:?}"
+            );
+            assert!(backend.tenant_bucket(invalid, None).is_err(), "{invalid:?}");
+        }
+        let documents = backend
+            .tenant_bucket("example-documents", None)
+            .expect("a tenant store");
+        documents
+            .upload_to_bucket(
+                "example-documents",
+                "a.pdf",
+                b"x".to_vec(),
+                "application/pdf",
+            )
+            .await
+            .expect("its own bucket");
+        for other in ["example-assets", "example-platform"] {
+            assert!(
+                documents
+                    .upload_to_bucket(other, "a.pdf", b"x".to_vec(), "application/pdf")
+                    .await
+                    .is_err(),
+                "{other}"
+            );
+            assert!(
+                documents
+                    .download_from_bucket(other, "a.pdf")
+                    .await
+                    .is_err(),
+                "{other}"
+            );
+            assert!(
+                documents
+                    .presign_download_to_bucket(other, "a.pdf", 60)
+                    .await
+                    .is_err(),
+                "{other}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_acls_refuses_an_upload_that_names_one() {
+        let memory = PrefixedBackend::memory("primary".into());
+        let public = UploadOptions {
+            acl: Some(crate::CannedAcl::PublicRead),
+            ..UploadOptions::content_type("image/png")
+        };
+        let refused = memory
+            .upload_to_bucket_with("example-assets", "a.png", b"png".to_vec(), &public)
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            refused.to_string(),
+            "the memory backend stores no canned ACL (public-read)"
+        );
+        assert_eq!(
+            memory
+                .head_in_bucket("example-assets", "a.png")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn a_directory_keeps_the_bytes_and_no_attributes() {
         let dir = std::env::temp_dir().join(format!("cufflink-storage-head-{}", uuid()));
         let local = PrefixedBackend::local(&dir, "primary".into()).expect("local backend");
@@ -340,6 +518,7 @@ mod tests {
             content_type: "application/pdf".into(),
             content_disposition: Some("inline".into()),
             cache_control: None,
+            acl: None,
         };
         let uploaded = local
             .upload_to_bucket_with("receipts", "a/b.pdf", b"%PDF".to_vec(), &options)

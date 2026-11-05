@@ -14,6 +14,31 @@ pub struct UploadRequest {
     pub content_disposition: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl: Option<CannedAcl>,
+}
+
+/// A canned ACL an upload asks the store to set, admitted per tenant bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CannedAcl {
+    Private,
+    PublicRead,
+}
+
+impl CannedAcl {
+    pub const ALL: [CannedAcl; 2] = [CannedAcl::Private, CannedAcl::PublicRead];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CannedAcl::Private => "private",
+            CannedAcl::PublicRead => "public-read",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|acl| acl.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +137,7 @@ mod tests {
                 body: Vec::new(),
                 content_disposition: Some("attachment; filename=\"q.pdf\"".into()),
                 cache_control: Some("no-store".into()),
+                acl: Some(CannedAcl::PublicRead),
             },
             json!({
                 "bucket": "receipts",
@@ -119,7 +145,8 @@ mod tests {
                 "content_type": "text/plain",
                 "body_b64": "",
                 "content_disposition": "attachment; filename=\"q.pdf\"",
-                "cache_control": "no-store"
+                "cache_control": "no-store",
+                "acl": "public-read"
             }),
         );
         round_trip(
@@ -136,6 +163,27 @@ mod tests {
             },
             json!({"result": "ok", "etag": null, "size": 0}),
         );
+    }
+
+    #[test]
+    fn a_canned_acl_is_one_of_a_closed_set() {
+        for acl in CannedAcl::ALL {
+            assert_eq!(CannedAcl::parse(acl.as_str()), Some(acl));
+            assert_eq!(
+                serde_json::to_value(acl).expect("json"),
+                json!(acl.as_str())
+            );
+        }
+        for unknown in ["public-read-write", "authenticated-read", "PUBLIC-READ", ""] {
+            assert_eq!(CannedAcl::parse(unknown), None, "{unknown}");
+        }
+        refused::<UploadRequest>(json!({
+            "bucket": "b",
+            "key": "k",
+            "content_type": "t",
+            "body_b64": "",
+            "acl": "public-read-write"
+        }));
     }
 
     #[test]

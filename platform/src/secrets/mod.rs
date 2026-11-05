@@ -1,5 +1,5 @@
 pub use cufflink_secrets::columns::{
-    DB_ROLE_PASSWORD, SERVICE_CONFIG_VALUE, TENANT_OPS_SECRET, WEBHOOK_SECRET,
+    DB_ROLE_PASSWORD, SERVICE_CONFIG_VALUE, TENANT_BUCKET_SECRET, TENANT_OPS_SECRET, WEBHOOK_SECRET,
 };
 pub use cufflink_secrets::{
     configs, random_bytes, reseal, KeyRing, MacKeys, SealedColumn, SecretAad, SecretBox,

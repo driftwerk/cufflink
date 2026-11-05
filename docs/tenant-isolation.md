@@ -100,6 +100,67 @@ prefixes, both keep tenants apart. Move a tenant's existing objects under
 `tenants/{tenant}/{service}/` before `strict`, and give its previews the
 same row.
 
+#### Tenant buckets
+
+A bucket a tenant keeps with keys of its own choosing (a bucket it brings
+with it, or one its objects are served from publicly) is registered to it
+instead:
+
+```sh
+cufflink tenants buckets set harbor example-documents --key-prefix leads/
+printf '%s' "$SECRET" | cufflink tenants buckets set harbor example-assets \
+  --acl public-read --access-key-id AKEXAMPLE --secret-access-key-stdin
+cufflink tenants buckets list harbor
+cufflink tenants buckets delete harbor example-documents
+cufflink tenants buckets release example-documents
+```
+
+(`GET /api/tenants/{slug}/buckets`, `PUT` and `DELETE
+/api/tenants/{slug}/buckets/{bucket}`, `POST /api/buckets/{bucket}/release`,
+platform admin only.) A `set` replaces the bucket's rules and credential:
+what it leaves out takes its default, so any key, no ACL and the platform's
+credentials.
+
+- A bucket is registered to one tenant at most, and never the platform's
+  own. A bucket another tenant holds, or another tenant group lists in
+  `allowed_buckets`, cannot be registered, and a registered bucket cannot be
+  listed in another tenant group's `allowed_buckets` (409). A credential or
+  an ACL needs the `s3` backend (422).
+- Every bucket name a guest gives is checked against the bucket naming
+  rules (3 to 63 lowercase letters, digits, `.`, `-` or `_`, beginning and
+  ending with a letter or digit, no `..`) before anything else, in every
+  mode: any other name is refused (`invalid_bucket`).
+- Every guest call on it, in every `storage_scope` mode, is refused unless
+  it comes from that tenant (`foreign_tenant_bucket`), uses exact keys
+  (`key_not_exact`) within its prefixes (`key_outside_prefix`) and an ACL
+  it lists (`acl_not_admitted`). Its own tenant's `storage_scope` is not
+  consulted for it, and no other bucket admits an ACL.
+- A credential reaches the bucket at the platform's `S3_ENDPOINT`, on the
+  `s3` backend only. Its secret is sealed like every stored secret, and is
+  never answered, audited or logged; a secret that cannot be opened leaves
+  the bucket's calls refused (`not_configured`).
+- A key prefix holds keys on a segment boundary: `docs` holds `docs` and
+  `docs/a`, never `docs-old/a`.
+- `delete` retires the bucket rather than freeing it: its credential is
+  dropped and every guest is refused it (`bucket_retired`), its own
+  tenant's included, until a `set` by that tenant revives it. Deleting a
+  tenant retires its buckets the same way. Only `release` frees a retired
+  bucket, and only once it has been retired for two minutes, so every
+  replica holds the retirement before another tenant may register it. A
+  released bucket goes back to `storage_scope`, where the default policy
+  admits it with the platform's credentials.
+- A row the platform cannot read leaves its bucket refused to every other
+  tenant and `not_configured` to its own, and the rest of the catalog
+  loaded.
+- A presigned upload names no ACL. AWS S3 refuses unsigned `x-amz-*`
+  headers on a presigned request; on an S3-compatible store that accepts
+  them, block public ACLs in the bucket's policy.
+- Each change is audited (`tenant.bucket.set`, `tenant.bucket.delete`,
+  `tenant.bucket.release`) and reaches every replica on the change
+  notification, or at the latest at its next one-minute reload. A replica
+  that has not loaded the tenant buckets for two minutes refuses every guest
+  storage call (`not_configured`) until a reload succeeds.
+
 ### Egress, memory, binding and Redis
 
 - `CUFFLINK_POLICY_EGRESS=enforce`: first run `warn` and add the internal

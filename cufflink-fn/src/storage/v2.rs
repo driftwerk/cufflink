@@ -13,6 +13,7 @@ use std::fmt;
 pub struct UploadOptions {
     content_disposition: Option<String>,
     cache_control: Option<String>,
+    acl: Option<cufflink_types::host::storage::CannedAcl>,
 }
 
 impl UploadOptions {
@@ -27,6 +28,15 @@ impl UploadOptions {
 
     pub fn cache_control(mut self, value: &str) -> Self {
         self.cache_control = Some(value.to_string());
+        self
+    }
+
+    /// A canned ACL for the stored object. The platform admits it only in
+    /// a bucket registered to the tenant that lists it, and refuses the
+    /// upload otherwise rather than storing it without the ACL.
+    #[cfg(feature = "storage-acl")]
+    pub fn acl(mut self, acl: super::CannedAcl) -> Self {
+        self.acl = Some(acl);
         self
     }
 }
@@ -118,6 +128,7 @@ pub fn upload_with(
         body: body.to_vec(),
         content_disposition: options.content_disposition.clone(),
         cache_control: options.cache_control.clone(),
+        acl: options.acl,
     };
     match transport::upload(&request)? {
         UploadResponse::Ok { etag, size } => Ok(Uploaded { size, etag }),
@@ -265,6 +276,51 @@ mod tests {
                     Some("attachment; filename=\"receipt.pdf\""),
                     Some("no-store")
                 )
+            );
+        }
+
+        #[cfg(feature = "storage-acl")]
+        #[test]
+        fn an_acl_is_stored_only_where_it_is_admitted() {
+            use crate::storage::CannedAcl;
+            use crate::testing::StorageCall;
+            let storage = InMemoryStorage::new().admit_acl("example-assets", CannedAcl::PublicRead);
+            let public = UploadOptions::new().acl(CannedAcl::PublicRead);
+            let (stored, refused) = hosted(&storage, || {
+                (
+                    upload_with(
+                        "example-assets",
+                        "logos/Café.png",
+                        "image/png",
+                        b"png",
+                        &public,
+                    ),
+                    upload_with(
+                        "example-documents",
+                        "a.pdf",
+                        "application/pdf",
+                        b"%PDF",
+                        &public,
+                    ),
+                )
+            });
+            assert!(stored.is_ok());
+            assert_eq!(refused.expect_err("refused").kind, StorageErrorKind::Denied);
+            assert_eq!(
+                storage
+                    .object("example-assets", "logos/Café.png")
+                    .and_then(|o| o.acl),
+                Some(CannedAcl::PublicRead)
+            );
+            assert_eq!(storage.object("example-documents", "a.pdf"), None);
+            assert_eq!(
+                storage.calls()[0],
+                StorageCall::Upload {
+                    bucket: "example-assets".into(),
+                    key: "logos/Café.png".into(),
+                    content_type: "image/png".into(),
+                    acl: Some(CannedAcl::PublicRead),
+                }
             );
         }
 
