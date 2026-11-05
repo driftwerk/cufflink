@@ -83,6 +83,17 @@ platform or worker past its container's limit.
   `cufflink_wasm_admission_refused_total{mode="warn"}` and
   `cufflink_wasm_memory_denied_total{mode="warn"}` before setting `enforce`.
 
+### SQL parser processes
+
+The `cufflink-sql-parser` processes behind `sql_parse` share the platform's
+container but sit outside the budget's ledger. Their worst case is
+`SQL_PARSE_PROCESSES × SQL_PARSE_MEMORY_MB` (2 GiB at the defaults), and an
+idle one holds a few MiB. A 1 MiB statement of `AND`ed comparisons, the
+worst flat input, takes about 900 MiB while it parses. Size the container
+for the budget, its reserve and that worst case, or lower
+`SQL_PARSE_MEMORY_MB`: a parse past it costs only that call. The processes
+ask the kernel to kill them first (`oom_score_adj` 1000).
+
 ## HTTP request layers
 
 `CUFFLINK_HTTP_PROFILE` picks the defaults; each value can be overridden on

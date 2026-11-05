@@ -24,6 +24,7 @@ pub mod router;
 pub mod schedules;
 pub mod schema_manager;
 pub mod secrets;
+pub mod sql_parser;
 pub mod storage;
 pub mod telemetry;
 pub mod tenant_catalog;
@@ -68,6 +69,7 @@ pub struct AppState {
     pub webhooks: webhooks::Webhooks,
     pub outbox_seal: Option<outbox::OutboxSeal>,
     pub audit_reads: audit::ReadAudit,
+    pub sql_parser: std::sync::Arc<sql_parser::SqlParser>,
 }
 
 pub struct Assembly {
@@ -127,6 +129,7 @@ impl AppState {
             audit_reads: audit::ReadAudit::new(&config.audit),
             webhooks: webhooks::Webhooks::new(&config.webhook_delivery),
             sse_limiter: router::sse::SseLimiter::new(config.sse_max_streams_per_principal),
+            sql_parser: std::sync::Arc::new(sql_parser::SqlParser::new(config.sql_parse.clone())),
             secrets,
             egress: egress::EgressGuard::new(
                 config.egress_max_response_bytes,

@@ -52,6 +52,7 @@ mod nats;
 mod redis;
 mod rows;
 mod service_call;
+mod sql_parse;
 mod storage;
 mod util;
 
@@ -510,6 +511,7 @@ pub const HOST_FEATURES: &[(&str, &[&str])] = &[
     ("storage_v2", &["s3_upload", "s3_head"]),
     ("util_v2", &["util_sleep_ms", "util_now_millis"]),
     ("ext_call", &["ext_call"]),
+    ("sql_parse", &["sql_parse"]),
 ];
 
 pub fn supported_features(host_fns: &HashSet<&'static str>) -> Vec<&'static str> {
@@ -542,6 +544,7 @@ pub fn register_host_functions(
         storage::register_v2,
         util::register_v2,
         ext::register,
+        sql_parse::register,
     ]
     .into_iter()
     .try_for_each(|register| register(linker, &mut names))?;

@@ -69,6 +69,7 @@ pub struct PlatformConfig {
     pub dev_bootstrap: Option<crate::app::dev_bootstrap::DevBootstrap>,
     pub service_identity_keys: Option<String>,
     pub extensions: crate::extensions::ExtensionsConfig,
+    pub sql_parse: crate::sql_parser::SqlParseSettings,
 }
 
 const MIN_CACHE_SIGNING_KEY_BYTES: usize = 16;
@@ -266,6 +267,7 @@ impl PlatformConfig {
             dev_bootstrap,
             service_identity_keys: vars(crate::auth::service_identity::KEYS_ENV),
             extensions: crate::extensions::ExtensionsConfig::from_env()?,
+            sql_parse: crate::sql_parser::SqlParseSettings::from_vars(&vars)?,
         })
     }
 
@@ -334,6 +336,7 @@ impl PlatformConfig {
             dev_bootstrap: None,
             service_identity_keys: None,
             extensions: Default::default(),
+            sql_parse: Default::default(),
         }
     }
 

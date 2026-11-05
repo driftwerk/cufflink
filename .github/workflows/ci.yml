@@ -467,7 +467,7 @@ jobs:
       - name: Build release binaries
         env:
           CUFFLINK_VERSION: sha-${{ github.sha }}
-        run: cargo build --release -p cufflink-platform -p cufflink-web-runner -p cufflink-worker -p cufflink-ext-runner
+        run: cargo build --release -p cufflink-platform -p cufflink-web-runner -p cufflink-worker -p cufflink-ext-runner -p cufflink-sql-parser
 
       - name: Upload platform binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -497,6 +497,13 @@ jobs:
           path: target/release/cufflink-ext-runner
           retention-days: 1
 
+      - name: Upload SQL parser binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: cufflink-sql-parser
+          path: target/release/cufflink-sql-parser
+          retention-days: 1
+
   push_platform:
     name: Push Platform Image
     needs: [fmt, clippy, test, test-pgbouncer, memory-limit, observability, sdk-features, publish-script, audit, build]
@@ -510,8 +517,13 @@ jobs:
         with:
           name: cufflink-platform
 
-      - name: Make binary executable
-        run: chmod +x cufflink-platform
+      - name: Download SQL parser binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: cufflink-sql-parser
+
+      - name: Make binaries executable
+        run: chmod +x cufflink-platform cufflink-sql-parser
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -628,8 +640,13 @@ jobs:
         with:
           name: cufflink-worker
 
-      - name: Make binary executable
-        run: chmod +x cufflink-worker
+      - name: Download SQL parser binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: cufflink-sql-parser
+
+      - name: Make binaries executable
+        run: chmod +x cufflink-worker cufflink-sql-parser
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4

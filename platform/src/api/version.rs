@@ -1,5 +1,6 @@
 use crate::AppState;
 use axum::{extract::State, Json};
+use cufflink_types::features;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -33,6 +34,11 @@ pub fn platform_version() -> &'static str {
 }
 
 pub fn supports(state: &AppState) -> Vec<&'static str> {
+    advertised(state, state.sql_parser.is_ready())
+}
+
+/// `sql_parse` only while a parser process of this release has answered.
+fn advertised(state: &AppState, parser_ready: bool) -> Vec<&'static str> {
     let host = state
         .wasm_engine
         .as_ref()
@@ -44,6 +50,7 @@ pub fn supports(state: &AppState) -> Vec<&'static str> {
         .chain(SUBSYSTEM_FEATURES.into_iter().flatten())
         .copied()
         .chain(host)
+        .filter(|feature| parser_ready || *feature != features::SQL_PARSE)
         .collect()
 }
 
@@ -184,11 +191,21 @@ mod tests {
         let engine = WasmEngine::new(WasmLimits::default(), Shutdown::new(Duration::from_secs(1)))
             .expect("engine");
         let state = AppState::minimal(engine).await;
-        let mut advertised = supports(&state);
+        let mut advertised = advertised(&state, true);
         advertised.sort_unstable();
         let mut listed = documented(include_str!("../../../docs/versions.md"));
         listed.sort_unstable();
         assert_eq!(listed, advertised, "docs/versions.md and supports differ");
+    }
+
+    #[tokio::test]
+    async fn sql_parse_is_advertised_only_once_a_parser_has_answered() {
+        let engine = WasmEngine::new(WasmLimits::default(), Shutdown::new(Duration::from_secs(1)))
+            .expect("engine");
+        let state = AppState::minimal(engine).await;
+        assert!(!state.sql_parser.is_ready());
+        assert!(!supports(&state).contains(&features::SQL_PARSE));
+        assert!(advertised(&state, true).contains(&features::SQL_PARSE));
     }
 
     #[test]

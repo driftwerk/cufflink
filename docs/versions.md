@@ -44,6 +44,7 @@ declares.
 | `storage-v2` | `storage_v2` |
 | `util-v2` | `util_v2` |
 | `ext-call` | `ext_call` |
+| `sql-parse` | `sql_parse` (and `db_v2`, which it enables) |
 | `test-host` | none: it runs handlers natively in `cargo test` ([testing](testing.md)) |
 | `stripe` | none |
 
@@ -265,6 +266,14 @@ Migration `V7__capacity_deferrals.sql` adds a column to `wasm_jobs`.
 
 `cufflink services list --features` prints what each deployed service
 requires.
+
+## Features added in v0.36.0
+
+Unreleased.
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `sql_parse` | the guest enables `cufflink-fn/sql-parse` | PostgreSQL's parse tree of a statement, from parser processes beside the platform; advertised only once one has answered ([design](design-notes/sql-parse.md)) |
 
 ## Changes in v0.33.0
 
@@ -1214,6 +1223,24 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.36.0
+
+Unreleased.
+
+- The platform and the worker serve `sql_parse` (feature `sql_parse`), and
+  `cufflink-fn` gains the `sql-parse` feature: `sql::parse` answers
+  `pg_query` 6.2.1's tree of a statement, with the parser's identity and the
+  fingerprint of its probe corpus
+  ([design](design-notes/sql-parse.md)). The parse runs in
+  `cufflink-sql-parser` processes, which the platform and worker images
+  ship beside their binaries; `SQL_PARSER_BIN`, `SQL_PARSE_PROCESSES`,
+  `SQL_PARSE_MEMORY_MB` and `SQL_PARSE_TIMEOUT_MS` configure them
+  ([setup](setup.md#sql-parser)). The probe corpus's fingerprint is
+  `PROBE_FINGERPRINT` in `cufflink-sql-parse`.
+- The new crate `cufflink-sql-parse` 0.1.0 is published before
+  `cufflink-fn`. With `test-host` and `sql-parse` both on, `cufflink-fn`
+  builds `pg_query`, which needs a C compiler and libclang.
 
 ## Changes in v0.35.0
 

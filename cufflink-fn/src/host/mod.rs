@@ -13,6 +13,7 @@ pub mod image;
 pub mod jobs;
 pub mod nats;
 pub mod service_call;
+pub mod sql_parse;
 pub mod storage;
 
 use std::rc::Rc;
@@ -34,6 +35,8 @@ pub struct HostSet {
     pub service_call: Option<Rc<dyn service_call::ServiceCallHost>>,
     #[cfg_attr(not(feature = "ext-call"), allow(dead_code))]
     pub ext: Option<Rc<dyn ext::ExtHost>>,
+    #[cfg_attr(not(feature = "sql-parse"), allow(dead_code))]
+    pub sql_parse: Option<Rc<dyn sql_parse::SqlParseHost>>,
     /// What `context::tenant()` answers.
     pub tenant: String,
 }
@@ -96,6 +99,11 @@ pub(crate) fn service_call() -> Option<Rc<dyn service_call::ServiceCallHost>> {
 #[cfg(feature = "ext-call")]
 pub(crate) fn ext() -> Option<Rc<dyn ext::ExtHost>> {
     current().and_then(|hosts| hosts.ext.clone())
+}
+
+#[cfg(feature = "sql-parse")]
+pub(crate) fn sql_parse() -> Option<Rc<dyn sql_parse::SqlParseHost>> {
+    current().and_then(|hosts| hosts.sql_parse.clone())
 }
 
 pub(crate) fn tenant() -> Option<String> {

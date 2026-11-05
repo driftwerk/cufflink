@@ -1,0 +1,20 @@
+[package]
+name = "cufflink-sql-parser"
+version = "0.1.0"
+edition = "2021"
+description = "The process that parses SQL for a Cufflink platform, so that a fault in the parser costs one call"
+license = "Elastic-2.0"
+repository = "https://github.com/driftwerk/cufflink"
+publish = false
+
+[[bin]]
+name = "cufflink-sql-parser"
+path = "src/main.rs"
+
+[dependencies]
+cufflink-sql-parse = { workspace = true, features = ["parser"] }
+cufflink-types = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

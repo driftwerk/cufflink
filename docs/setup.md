@@ -501,6 +501,24 @@ The platform and the worker read this table. Zero or unparseable values fall bac
 
 Every host call is bounded by the handler's remaining execution budget. Guest `db::query`/`db::execute` statements run in their own transaction with the service schema on the search path and `statement_timeout` set to the remaining budget (minus a 500 ms margin, floor 1 s), so both settings revert whether the statement commits or fails; `db::execute_all` and `db::query_read_only` carry the same timeout. Statements Postgres refuses inside a transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`, …) run on the bare connection between a `SET` and `RESET` pair. NATS requests, HTTP fetches and everything that waits on object storage, image transforms, job enqueue or config reads are clamped to the budget as well, so no host call can outlive the execution it belongs to.
 
+### SQL parser
+
+`sql_parse` ([design](design-notes/sql-parse.md)) runs PostgreSQL's parser in
+`cufflink-sql-parser` processes, never in the platform's own. The platform
+and the worker each start a pool at startup and advertise `sql_parse` only
+once a process has answered with this release's parser and fingerprint;
+without one, startup logs a warning, and deploys that need the feature are
+refused until the process restarts with one.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SQL_PARSER_BIN` | `cufflink-sql-parser` beside the platform's binary | The parser binary; the images ship it at `/usr/local/bin/cufflink-sql-parser` |
+| `SQL_PARSE_PROCESSES` | `2` | Parser processes, and so parses at once; more calls wait their turn within their budget |
+| `SQL_PARSE_MEMORY_MB` | `1024` | Each process's address space, on Linux (`RLIMIT_AS`); a parse past it costs that call `Unavailable` |
+| `SQL_PARSE_TIMEOUT_MS` | `5000` | Longest one parse lasts, and never past the handler's remaining budget; the process is then killed and the call is `Unavailable` |
+
+Zero or unparseable values are refused at startup, naming the variable.
+
 ---
 
 ## Worker Configuration

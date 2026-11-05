@@ -3,6 +3,7 @@ FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab0
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini && rm -rf /var/lib/apt/lists/*
 
 COPY cufflink-worker /usr/local/bin/cufflink-worker
+COPY cufflink-sql-parser /usr/local/bin/cufflink-sql-parser
 
 USER 10001:10001
 
