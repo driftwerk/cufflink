@@ -211,7 +211,8 @@ mod tests {
                 (4, "r3"),
                 (5, "extensions"),
                 (6, "runner_keys"),
-                (7, "capacity_deferrals")
+                (7, "capacity_deferrals"),
+                (8, "tenant_buckets")
             ]
         );
     }

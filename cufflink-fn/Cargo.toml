@@ -20,6 +20,7 @@ response-raw-json = ["response-v2"]
 nats-publish-v2 = []
 http-v2 = []
 storage-v2 = []
+storage-acl = ["storage-v2"]
 util-v2 = []
 ext-call = []
 test-host = [

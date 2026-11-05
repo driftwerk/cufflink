@@ -22,6 +22,7 @@ pub mod runner;
 pub mod runner_keys;
 pub mod seed;
 pub mod services;
+pub mod tenant_buckets;
 pub mod tenants;
 pub mod version;
 pub mod wasm;

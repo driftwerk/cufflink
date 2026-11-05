@@ -308,10 +308,20 @@ pub async fn sharing_realm(
     Ok(row.map(|row| row.get(0)))
 }
 
-pub async fn delete_by_slug(pool: &deadpool_postgres::Pool, slug: &str) -> PlatformResult<bool> {
-    let client = pool.get().await?;
-    let count = client
-        .execute("DELETE FROM tenants WHERE slug = $1", &[&slug])
+/// Deletes the tenant, retiring its buckets in the same transaction so each
+/// stays claimed until it is released. Answers the buckets it retired, or
+/// `None` when there is no such tenant.
+pub async fn delete_retiring_buckets(
+    pool: &deadpool_postgres::Pool,
+    tenant: &Tenant,
+    actor: &str,
+) -> PlatformResult<Option<Vec<String>>> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let retired = crate::repo::tenant_buckets::retire_all(&txn, tenant.id, actor).await?;
+    let count = txn
+        .execute("DELETE FROM tenants WHERE id = $1", &[&tenant.id])
         .await?;
-    Ok(count > 0)
+    txn.commit().await?;
+    Ok((count > 0).then_some(retired))
 }

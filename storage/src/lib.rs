@@ -3,7 +3,11 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use futures_util::stream::BoxStream;
+use std::fmt;
 use std::sync::Arc;
+use zeroize::Zeroizing;
+
+pub use cufflink_types::host::storage::CannedAcl;
 
 mod common;
 mod gcs;
@@ -86,6 +90,15 @@ pub trait ObjectStorage: Send + Sync {
     fn primary_bucket(&self) -> &str;
 
     fn backend_kind(&self) -> &'static str;
+
+    /// A backend for one bucket a tenant owns: its keys stored exactly as
+    /// given ([`is_exact_key`]), signed with `credential` when one is given
+    /// and with this backend's own credentials otherwise.
+    fn tenant_bucket(
+        &self,
+        bucket: &str,
+        credential: Option<&Credential>,
+    ) -> Result<Arc<dyn ObjectStorage>>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -93,6 +106,67 @@ pub struct UploadOptions {
     pub content_type: String,
     pub content_disposition: Option<String>,
     pub cache_control: Option<String>,
+    pub acl: Option<CannedAcl>,
+}
+
+/// An access key that reaches a bucket at the platform's endpoint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    pub access_key_id: String,
+    pub secret_access_key: Zeroizing<String>,
+}
+
+impl Credential {
+    pub fn new(access_key_id: impl Into<String>, secret_access_key: impl Into<String>) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: Zeroizing::new(secret_access_key.into()),
+        }
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credential")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
+pub const MAX_KEY_BYTES: usize = 1024;
+
+/// A bucket name every backend accepts as it is: 3 to 63 lowercase letters,
+/// digits, `.`, `-` or `_`, beginning and ending with a letter or digit,
+/// with no `..`.
+pub fn is_bucket_name(bucket: &str) -> bool {
+    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+        && edge(bucket.chars().next())
+        && edge(bucket.chars().last())
+        && !bucket.contains("..")
+}
+
+/// A key the stores can address without changing it: 1 to 1024 bytes, no
+/// leading, trailing or doubled `/`, no `.` or `..` segment and no ASCII
+/// control character.
+pub fn is_exact_key(key: &str) -> bool {
+    key.len() <= MAX_KEY_BYTES && exact_segments(key)
+}
+
+/// A prefix of exact keys: an exact key, or one followed by `/`.
+pub fn is_exact_prefix(prefix: &str) -> bool {
+    prefix.len() <= MAX_KEY_BYTES && exact_segments(prefix.strip_suffix('/').unwrap_or(prefix))
+}
+
+fn exact_segments(key: &str) -> bool {
+    !key.chars().any(|c| c.is_ascii_control())
+        && key
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
 impl UploadOptions {
@@ -215,6 +289,35 @@ fn unknown_backend(got: &str) -> eyre::Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_names_follow_the_s3_naming_rules() {
+        for name in ["example-documents", "a.b_c", "abc", "1st-bucket"] {
+            assert!(is_bucket_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "ab",
+            ".",
+            "..",
+            "a..b",
+            "a\\b",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "Example",
+            "%2e",
+            "-ab",
+            "ab-",
+            ".ab",
+            &"a".repeat(64),
+        ] {
+            assert!(!is_bucket_name(name), "{name:?}");
+        }
+    }
     use crate::common::test_env::with as with_env;
     use cufflink_settings::process_var as var;
 

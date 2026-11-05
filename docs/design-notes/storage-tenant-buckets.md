@@ -159,8 +159,10 @@ allowlist may use with the platform's credentials.
 **Staleness.** A change reaches a replica on the change notification, or at
 the latest at its next one-minute reload. Until then the replica serves the
 rules it holds, which is why a retired bucket cannot change hands sooner.
-A replica whose reload keeps failing keeps its last catalog, as it does for
-policies, and logs every failure.
+A replica whose reload keeps failing keeps its last policies, and logs
+every failure, but refuses every guest storage call (`not_configured`)
+once its tenant buckets were loaded more than two minutes ago: a bucket
+released since may already belong to another tenant.
 
 A tenant bucket is outside `storage_scope`. Its rules are its own, and
 they hold in every policy mode: no tenant relies on them yet, which is how

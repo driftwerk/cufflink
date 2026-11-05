@@ -12,10 +12,11 @@ variables in [setup](setup.md#core) and the metrics in
 
 ## Stored secrets
 
-Service configs, webhook secrets, tenants' Keycloak ops secrets and
-database-role passwords can be sealed (AES-256-GCM) under a data key per
-tenant, itself wrapped under a key-encryption key (KEK) the platform is
-given. Service roles the platform makes need it, so turn this on first.
+Service configs, webhook secrets, tenants' Keycloak ops secrets, tenant
+buckets' secret access keys and database-role passwords can be sealed
+(AES-256-GCM) under a data key per tenant, itself wrapped under a
+key-encryption key (KEK) the platform is given. Service roles the
+platform makes need it, so turn this on first.
 
 1. Make a KEK and give it the same value on every platform, worker,
    web-runner and ext-runner replica:

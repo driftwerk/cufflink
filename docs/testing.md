@@ -80,7 +80,7 @@ library's loans, tested this way.
 | `db` | `db::*` and `sql::*` (`db-v2`) on the `TestDb`, with the platform's rules: the schema on the search path, a transaction per legacy call, at most two interactive transactions, the same errors and row JSON |
 | `http` | `MockHttp`: `expect(method, UrlMatch::exact/prefix/matching).respond(...)` or `.fail(...)`, `.times(n)`; an unmatched request is refused and recorded; `requests()` |
 | `nats` | `NatsRecorder`: `published()`, `published_to(subject)`, `requests()`; `captures(stream, pattern)` declares streams, `reply(pattern, bytes)` scripts `nats::request` |
-| `storage` | `InMemoryStorage`: `put`, `object`, `keys`, `deny` |
+| `storage` | `InMemoryStorage`: `put`, `object` (with the ACL it was stored with), `keys`, `deny`; `admit_acl(bucket, acl)` admits a canned ACL as a tenant bucket would, and an upload naming any other is refused `denied`; `calls()` lists every call in order |
 | `cache` | `InMemoryCache`, with the platform's key and size limits; `set_unavailable` |
 | `config` | `ConfigMap`: `set`, `remove` |
 | `clock` | `FakeClock`: `at`, `set`, `advance`; `util::sleep_ms` advances it (`slept_ms`) |

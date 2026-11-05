@@ -288,7 +288,7 @@ pub async fn update_tenant(
 
 pub async fn delete_tenant(
     State(state): State<Arc<AppState>>,
-    _admin: PlatformAdmin,
+    admin: PlatformAdmin,
     Path(slug): Path<String>,
 ) -> PlatformResult<Json<serde_json::Value>> {
     let tenant = crate::repo::tenants::require_by_slug(&state.platform_db, &slug).await?;
@@ -313,12 +313,17 @@ pub async fn delete_tenant(
         }
     }
 
-    let deleted = crate::repo::tenants::delete_by_slug(&state.platform_db, &slug).await?;
-    if !deleted {
+    let Some(retired) =
+        crate::repo::tenants::delete_retiring_buckets(&state.platform_db, &tenant, &admin.subject)
+            .await?
+    else {
         return Err(PlatformError::NotFound(format!(
             "Tenant '{}' not found",
             slug
         )));
+    };
+    for bucket in &retired {
+        tracing::info!(tenant = %slug, bucket = %bucket, actor = %admin.subject, "Tenant bucket retired with its tenant");
     }
     for service in state.registry.get_by_tenant(tenant.id).await {
         state.registry.remove(tenant.id, &service.name).await;

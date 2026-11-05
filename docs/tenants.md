@@ -42,3 +42,30 @@ Users are then granted Cufflink roles by subject (`POST
 external realm's own claims, e.g. `books:view@field(branch_id=branch_id)`
 with an `branch_id` mapper on the realm ([scoped
 permissions](scoped-permissions.md)).
+
+## Tenant buckets
+
+A bucket a tenant brings with it, with keys of its own choosing, is
+registered to that tenant by a platform admin:
+
+```bash
+cufflink tenants buckets set harbor example-documents --key-prefix leads/
+printf '%s' "$SECRET" | cufflink tenants buckets set harbor example-assets \
+  --acl public-read --access-key-id AKEXAMPLE --secret-access-key-stdin
+cufflink tenants buckets list harbor
+cufflink tenants buckets delete harbor example-documents
+cufflink tenants buckets release example-documents
+```
+
+| Method | Path | |
+|--------|------|-|
+| GET | `/api/tenants/{slug}/buckets` | The tenant's buckets, retired ones included, with each credential's access key id and never its secret |
+| PUT | `/api/tenants/{slug}/buckets/{bucket}` | Registers the bucket, or replaces its rules and credential (`key_prefixes`, `acls`, `credential`) |
+| DELETE | `/api/tenants/{slug}/buckets/{bucket}` | Retires it: refused to every guest, still claimed |
+| POST | `/api/buckets/{bucket}/release` | Frees a bucket retired for at least two minutes |
+
+Only the tenant's own guests reach the bucket, with exact keys under its
+prefixes and the canned ACLs it lists, whatever the tenant's
+`storage_scope`. Deleting the tenant retires its buckets. The rules, and
+what each refusal means, are in
+[tenant buckets](tenant-isolation.md#tenant-buckets).

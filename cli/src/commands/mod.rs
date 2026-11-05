@@ -31,6 +31,7 @@ pub mod sql;
 pub mod status;
 #[cfg(test)]
 pub(crate) mod stub;
+pub mod tenant_buckets;
 pub mod tenants;
 pub mod test;
 pub mod version;
@@ -46,6 +47,19 @@ pub(crate) async fn json_answer(
         eyre::bail!("Failed to {what} ({status}): {body}");
     }
     Ok(resp.json().await?)
+}
+
+/// The secret `input` holds, without the line ending a shell or a file
+/// leaves after it; nothing at all is refused, naming the `flag` it was
+/// read for.
+pub(crate) fn secret_from(mut input: impl std::io::Read, flag: &str) -> eyre::Result<String> {
+    let mut secret = String::new();
+    input.read_to_string(&mut secret)?;
+    let secret = secret.trim_end_matches(['\r', '\n']);
+    if secret.is_empty() {
+        eyre::bail!("{flag}: nothing was read from stdin");
+    }
+    Ok(secret.to_string())
 }
 
 pub(crate) fn listing(header: &[&str]) -> comfy_table::Table {
