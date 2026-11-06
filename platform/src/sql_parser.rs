@@ -187,6 +187,8 @@ struct Health {
     failures: u32,
     /// Starts failed in a row.
     failed_starts: u32,
+    /// When a start last failed.
+    failed_start_at: Option<Instant>,
 }
 
 /// One tenant's standing: the processes its parses lost within its
@@ -353,6 +355,9 @@ impl SqlParser {
             .await
             .flatten()
             .ok_or_else(ParseError::unavailable)?;
+        if self.pool.refuses(tenant) {
+            return Err(ParseError::unavailable().into());
+        }
         let process = before(deadline, self.pool.take(tenant))
             .await
             .flatten()
@@ -412,7 +417,9 @@ impl Pool {
     /// for one to come back or be started. When only other tenants'
     /// processes are idle, the one idle longest is replaced, and the
     /// process started in its place is the caller's: it keeps its turn
-    /// rather than queueing again.
+    /// rather than queueing again. While starts are failing, within their
+    /// backoff, or when the replacement does not start, the caller gets
+    /// none and the process stays as it was.
     async fn take(self: &Arc<Self>, tenant: Uuid) -> Option<Process> {
         loop {
             self.available.acquire().await.ok()?.forget();
@@ -424,14 +431,22 @@ impl Pool {
                 continue;
             }
             if process.tenant.is_some_and(|served| served != tenant) {
-                let Ok(fresh) = self.recycle(process).await else {
-                    continue;
-                };
-                process = fresh;
+                if self.starts_failing() {
+                    self.idle_again(process);
+                    return None;
+                }
+                process = self.recycle(process, tenant).await.ok()?;
             }
             process.tenant = Some(tenant);
             return Some(process);
         }
+    }
+
+    fn starts_failing(&self) -> bool {
+        let health = lock(&self.health);
+        health
+            .failed_start_at
+            .is_some_and(|at| at.elapsed() < health.backoff())
     }
 
     /// `tenant`'s own idle process, else one that has served no tenant,
@@ -446,33 +461,31 @@ impl Pool {
         Some(idle.remove(at))
     }
 
-    /// A process that served another tenant is dropped, which kills it, and
-    /// a fresh one is started in its place, at once and beside the
-    /// supervisor's own starts: replacing a process is no failure, so it
-    /// waits for no backoff. The fresh process is handed to the caller, or,
-    /// if the caller stopped waiting, joins the idle processes. A start that
-    /// fails is the supervisor's to retry.
-    fn recycle(self: &Arc<Self>, process: Process) -> oneshot::Receiver<Process> {
-        drop(process);
-        metrics::counter!("cufflink_sql_parser_recycled_total").increment(1);
-        {
-            let mut health = lock(&self.health);
-            health.live = health.live.saturating_sub(1);
-            metrics::gauge!("cufflink_sql_parser_processes").set(health.live as f64);
-        }
+    /// A fresh process is started for `tenant` in place of `old`, which
+    /// served another tenant, at once and beside the supervisor's own
+    /// starts. Only once the fresh one has greeted is `old` dropped, which
+    /// kills it; if it does not start, `old` is idle again. The start's
+    /// time is charged to `tenant`. The fresh process is handed to the
+    /// caller, or, if the caller stopped waiting, joins the idle processes.
+    fn recycle(self: &Arc<Self>, old: Process, tenant: Uuid) -> oneshot::Receiver<Process> {
         let (hand, fresh) = oneshot::channel();
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            match Process::spawn(&pool.settings).await {
+            let started = Instant::now();
+            let spawned = Process::spawn(&pool.settings).await;
+            pool.spent(tenant, started.elapsed());
+            match spawned {
                 Ok(process) => {
-                    pool.counted();
+                    drop(old);
+                    metrics::counter!("cufflink_sql_parser_recycled_total").increment(1);
+                    lock(&pool.health).failed_starts = 0;
                     if let Err(process) = hand.send(process) {
                         pool.idle_again(process);
                     }
                 }
                 Err(error) => {
                     pool.failed_to_start(&error);
-                    pool.want();
+                    pool.idle_again(old);
                 }
             }
         });
@@ -599,6 +612,7 @@ impl Pool {
         let mut health = lock(&self.health);
         health.failures = health.failures.saturating_add(1);
         health.failed_starts = health.failed_starts.saturating_add(1);
+        health.failed_start_at = Some(Instant::now());
         let delay = health.backoff();
         tracing::warn!(%error, ?delay, "a SQL parser process did not start");
         if health.live == 0

@@ -710,6 +710,58 @@ async fn readiness_follows_whether_a_process_can_start() {
     assert_eq!(tree(&parser, "SELECT 1").await, own("SELECT 1"));
 }
 
+/// Another tenant's call replaces a process only once the replacement has
+/// greeted: while starts fail, that call is refused, and every process
+/// keeps serving its own tenant.
+#[tokio::test]
+async fn a_replacement_that_does_not_start_leaves_every_process_serving() {
+    let Some(built) = infra::require_binary("cufflink-sql-parser") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("cufflink-sql-parser");
+    let point = |target: &std::path::Path| {
+        let staged = dir.path().join("staged");
+        std::os::unix::fs::symlink(target, &staged).expect("a link");
+        std::fs::rename(&staged, &path).expect("the link replaced");
+    };
+    point(&built);
+    let binary = Binary {
+        path: path.clone(),
+        _dir: tempfile::tempdir().expect("a directory"),
+    };
+    let parser = SqlParser::new(settings(path.clone(), 2));
+    assert!(parser.start().await);
+    wait_for(|| binary.processes().len() == 2).await;
+    let (acme, globex, harbor) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+    let sql = "SELECT 1";
+    for tenant in [acme, globex] {
+        assert_eq!(tree_within(&parser, tenant, sql, WITHIN).await, own(sql));
+    }
+    let mut serving = binary.processes();
+    serving.sort_unstable();
+    point(std::path::Path::new("/usr/bin/false"));
+    for _ in 0..3 {
+        assert!(matches!(
+            tree_within(&parser, harbor, sql, WITHIN).await,
+            Err(ParseError::Unavailable(_))
+        ));
+    }
+    let mut still = binary.processes();
+    still.sort_unstable();
+    assert_eq!(
+        still, serving,
+        "no process was killed for a start that failed"
+    );
+    assert!(parser.is_ready());
+    for tenant in [acme, globex] {
+        assert_eq!(tree_within(&parser, tenant, sql, WITHIN).await, own(sql));
+    }
+    point(&built);
+    assert_eq!(tree_within(&parser, harbor, sql, WITHIN).await, own(sql));
+    wait_for(|| binary.processes().len() == 2).await;
+}
+
 #[tokio::test]
 async fn parses_run_at_once_across_processes() {
     let Some((binary, parser)) = started(4).await else {

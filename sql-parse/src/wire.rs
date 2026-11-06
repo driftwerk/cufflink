@@ -24,7 +24,8 @@ pub const PROTOCOL: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol: u32,
-    /// The `cufflink-sql-parse` release the process was built with.
+    /// The `cufflink-sql-parse` release the process was built with, and
+    /// every bound it applies.
     pub build: String,
     pub parser: String,
     pub fingerprint: String,
@@ -36,11 +37,24 @@ impl Hello {
     pub fn of_this_build(fingerprint: impl Into<String>) -> Self {
         Self {
             protocol: PROTOCOL,
-            build: env!("CARGO_PKG_VERSION").to_string(),
+            build: build(),
             parser: crate::PARSER.to_string(),
             fingerprint: fingerprint.into(),
         }
     }
+}
+
+/// This crate's release and its bounds, so that two builds that differ in
+/// either never take each other's processes.
+fn build() -> String {
+    use crate::bounds::*;
+    format!(
+        "{} input={MAX_INPUT_BYTES} brackets={MAX_BRACKET_DEPTH} chain={MAX_CHAIN_DEPTH} \
+         warned={MAX_WARNED_FORMS} operators={MAX_OPERATOR_RUN} comments={MAX_COMMENT_DEPTH} \
+         tree={}",
+        env!("CARGO_PKG_VERSION"),
+        crate::MAX_TREE_NESTING
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +155,11 @@ mod tests {
             serde_json::to_value(&hello).expect("encode"),
             serde_json::json!({
                 "protocol": PROTOCOL,
-                "build": env!("CARGO_PKG_VERSION"),
+                "build": format!(
+                    "{} input=131072 brackets=1000 chain=10000 warned=100 operators=256 \
+                     comments=1000 tree=120",
+                    env!("CARGO_PKG_VERSION")
+                ),
                 "parser": crate::PARSER,
                 "fingerprint": "f",
             })

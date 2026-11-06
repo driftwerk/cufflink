@@ -53,7 +53,8 @@ fn one_arena() -> io::Result<()> {
 
 /// Closes every descriptor but stdin, stdout and stderr, so nothing the
 /// process was started with outlives its confinement. Before Linux 5.9,
-/// which has no `close_range`, it closes what `/proc/self/fd` lists.
+/// which has no `close_range`, or where a container's own filter refuses
+/// it, it closes what `/proc/self/fd` lists.
 #[cfg(target_os = "linux")]
 fn close_inherited() -> io::Result<()> {
     const FIRST: libc::c_uint = 3;
@@ -62,7 +63,7 @@ fn close_inherited() -> io::Result<()> {
     match unsafe { libc::syscall(libc::SYS_close_range, FIRST, libc::c_uint::MAX, 0) } {
         0 => Ok(()),
         _ => match io::Error::last_os_error() {
-            e if e.raw_os_error() == Some(libc::ENOSYS) => {
+            e if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
                 let open: Vec<libc::c_int> = std::fs::read_dir("/proc/self/fd")?
                     .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
                     .filter(|fd| *fd >= FIRST as libc::c_int)
