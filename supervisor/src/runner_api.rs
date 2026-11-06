@@ -286,7 +286,7 @@ pub fn forbid_inspection() -> eyre::Result<()> {
     match unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } {
         0 => Ok(()),
         _ => Err(eyre::Report::new(std::io::Error::last_os_error())
-            .wrap_err("cannot make the runner undumpable")),
+            .wrap_err("cannot make this process undumpable")),
     }
 }
 

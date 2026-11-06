@@ -310,6 +310,10 @@ impl TestHost {
             ext: Some(Rc::new(self.ext.clone())),
             #[cfg(not(feature = "ext-call"))]
             ext: None,
+            #[cfg(feature = "sql-parse")]
+            sql_parse: Some(Rc::new(super::sql_parse::PgQueryParser)),
+            #[cfg(not(feature = "sql-parse"))]
+            sql_parse: None,
             tenant: self.tenant.clone(),
         }
     }

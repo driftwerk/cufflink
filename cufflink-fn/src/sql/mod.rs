@@ -18,14 +18,23 @@
 //!
 //! Outside the platform every call is `Err` with kind `Unavailable`, unless
 //! a test host answers it.
+//!
+//! With the `sql-parse` feature, [`parse`] reads SQL with PostgreSQL's own
+//! parser.
 
 mod param;
+#[cfg(feature = "sql-parse")]
+mod parse;
 mod row;
 mod transport;
 mod tx;
 
 pub use cufflink_types::db::{Column, DbError, DbErrorKind, Isolation, Param};
+#[cfg(feature = "sql-parse")]
+pub use cufflink_types::sql_parse::{ParseError, Parsed};
 pub use param::IntoParam;
+#[cfg(feature = "sql-parse")]
+pub use parse::parse;
 pub use row::Row;
 pub use tx::{retry_transaction, transaction, transaction_with, Tx, TxOptions};
 

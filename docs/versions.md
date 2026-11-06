@@ -47,6 +47,7 @@ declares.
 | `util-v2` | `util_v2` |
 | `ext-call` | `ext_call` |
 | `guest-statement-timeout` | `guest_statement_timeout` (and `db_v2`, which it enables) |
+| `sql-parse` | `sql_parse` (and `db_v2`, which it enables) |
 | `test-host` | none: it runs handlers natively in `cargo test` ([testing](testing.md)) |
 | `stripe` | none |
 
@@ -342,6 +343,7 @@ Unreleased.
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
 | `guest_statement_timeout` | the guest enables `cufflink-fn/guest-statement-timeout` | a transaction's own `statement_timeout`, bounded by the invocation's remaining budget ([db_v2](db-v2.md#a-statement-timeout-of-the-guests-own)) |
+| `sql_parse` | the guest enables `cufflink-fn/sql-parse` | PostgreSQL's parse tree of a statement, from parser processes beside the platform; advertised while one answers ([design](design-notes/sql-parse.md)) |
 
 ## Changes in v0.33.0
 
@@ -497,8 +499,9 @@ additive and the older binary does not abort on a newer schema. It serves `_fn`,
    with the rest on every release. Then `cufflink init`'s scaffold (a unit
    test pins it to the workspace versions).
 2. `cargo publish --dry-run -p cufflink-types -p cufflink-migrate -p cufflink-pgcodec
-   -p cufflink-fn -p cufflink-sdk-macros -p cufflink -p cufflink-cli -p cufflink-nats
-   -p cufflink-native` on a clean tree.
+   -p cufflink-sql-parse -p cufflink-fn -p cufflink-sdk-macros -p cufflink -p cufflink-cli
+   -p cufflink-nats -p cufflink-native` on a clean tree. `cufflink-sql-parse`'s first
+   release is a new crate on crates.io, so step 3 applies to it.
 3. A crate crates.io has never had is published only by a token with the
    `publish-new` scope whose crate pattern covers its name: check
    `CARGO_REGISTRY_TOKEN` before tagging a release that adds one, and add
@@ -1317,6 +1320,24 @@ Unreleased.
   only a method, so turning it on changes no other code in the build.
 - The native test host now sets its `statement_timeout` before each
   statement of a transaction, as the platform does.
+- The platform and the worker serve `sql_parse` (feature `sql_parse`), and
+  `cufflink-fn` gains the `sql-parse` feature: `sql::parse` answers
+  `pg_query` 6.2.1's tree of a statement, with the parser's identity and the
+  fingerprint of its probe corpus
+  ([design](design-notes/sql-parse.md)). The parse runs in
+  `cufflink-sql-parser` processes, which the platform and worker images
+  ship beside their binaries and which confine themselves with a seccomp
+  allowlist before they serve; `SQL_PARSER_BIN`, `SQL_PARSE_PROCESSES`,
+  `SQL_PARSE_PER_TENANT`, `SQL_PARSE_TENANT_COOLDOWN_MS`,
+  `SQL_PARSE_TENANT_BUSY_MS`, `SQL_PARSE_MEMORY_MB` and
+  `SQL_PARSE_TIMEOUT_MS` configure them ([setup](setup.md#sql-parser)). A
+  statement is at most 96 KiB, and a process serves one tenant. The probe
+  corpus's fingerprint is `PROBE_FINGERPRINT` in `cufflink-sql-parse`.
+- The platform and the worker make themselves undumpable on Linux at
+  start, as the runners do, so they no longer write core dumps.
+- The new crate `cufflink-sql-parse` 0.1.0 is published before
+  `cufflink-fn`. With `test-host` and `sql-parse` both on, `cufflink-fn`
+  builds `pg_query`, which needs a C compiler and libclang.
 
 ## Changes in v0.36.0
 

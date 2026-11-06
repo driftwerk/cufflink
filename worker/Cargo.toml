@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 cufflink-platform = { path = "../platform" }
+cufflink-supervisor = { workspace = true }
 cufflink-settings = { workspace = true }
 cufflink-storage = { workspace = true }
 cufflink-telemetry = { workspace = true }

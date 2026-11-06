@@ -91,6 +91,7 @@ fn subscribe_pattern(configured: Option<String>) -> eyre::Result<String> {
 }
 
 fn main() -> eyre::Result<()> {
+    cufflink_supervisor::runner_api::forbid_inspection()?;
     cufflink_platform::wasm_runtime::budget::runtime()?.block_on(run())
 }
 
@@ -169,6 +170,7 @@ async fn run() -> eyre::Result<()> {
         shutdown: shutdown.clone(),
         service_identity,
     }));
+    app_state.sql_parser.start().await;
     let readiness = Arc::new(WorkerReadiness::default());
     for kind in jobs::KINDS {
         metrics::gauge!("cufflink_worker_inflight", "kind" => kind).set(0.0);

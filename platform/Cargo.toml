@@ -29,6 +29,7 @@ cufflink-settings = { workspace = true }
 async-trait = { workspace = true }
 cufflink-migrate = { workspace = true }
 cufflink-pgcodec = { workspace = true }
+cufflink-sql-parse = { workspace = true }
 cufflink-secrets = { workspace = true }
 postgres-protocol = { workspace = true }
 
@@ -76,6 +77,7 @@ ring = { workspace = true }
 cufflink-storage = { workspace = true }
 cufflink-telemetry = { workspace = true }
 cufflink-shutdown = { workspace = true }
+cufflink-supervisor = { workspace = true }
 cufflink-nats = { workspace = true }
 redis = { workspace = true }
 regex = { workspace = true }
@@ -95,5 +97,6 @@ schemars = { version = "1", default-features = false, features = ["derive", "std
 cufflink-test-guests = { workspace = true }
 cufflink-testkit = { workspace = true }
 cufflink-native = { workspace = true }
+cufflink-sql-parse = { workspace = true, features = ["parser"] }
 wat = { workspace = true }
 tempfile = { workspace = true }

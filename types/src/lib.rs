@@ -16,6 +16,7 @@ pub mod runner;
 pub mod schedule;
 mod serde_util;
 pub mod slug;
+pub mod sql_parse;
 #[cfg(feature = "wasm-inspect")]
 pub mod wasm_features;
 
