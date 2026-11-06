@@ -436,7 +436,7 @@ the published probe corpus differently, so a guest can refuse trees it was not w
 The parse runs in parser processes beside the platform, never in it
 ([setup](setup.md#sql-parser)).
 
-It fails with `ParseError::Syntax` (not SQL), `TooLarge` (over 1 MiB, nested past the
+It fails with `ParseError::Syntax` (not SQL), `TooLarge` (over 128 KiB, nested past the
 platform's bounds, or a tree past `WASM_MAX_HOST_RESPONSE_MB` or the guest's memory budget)
 or `Unavailable` (no parser answered in time). No message quotes the statement. Details:
 [the design note](design-notes/sql-parse.md).

@@ -1,11 +1,14 @@
 use common::{infra, PlatformProcess, Tenant};
-use cufflink_platform::sql_parser::{ParseFailure, SqlParseSettings, SqlParser, MIN_PARSE_BUDGET};
-use cufflink_sql_parse::{bounds, PROBE};
+use cufflink_platform::sql_parser::{
+    Charge, ParseFailure, SqlParseSettings, SqlParser, MIN_PARSE_BUDGET,
+};
+use cufflink_sql_parse::{bounds, golden, PROBE, PROBE_FINGERPRINT};
 use cufflink_test_guests::Profile;
 use cufflink_testkit as common;
 use cufflink_types::sql_parse::{ParseError, ParseResponse};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -22,13 +25,14 @@ fn settings(binary: PathBuf, processes: usize) -> SqlParseSettings {
         memory_mb: 1024,
         timeout: WITHIN,
         tenant_cooldown: WITHIN,
+        tenant_busy: WITHIN * 30,
     }
 }
 
 /// A statement whose parse takes well over [`MIN_PARSE_BUDGET`] and well
-/// under [`WITHIN`].
+/// under [`WITHIN`]: the costliest shape at the input bound.
 fn slow() -> String {
-    format!("SELECT 1 WHERE {}", vec!["x = 1"; 50_000].join(" AND "))
+    format!("SELECT a{}", ",a".repeat(bounds::MAX_INPUT_BYTES / 2 - 5))
 }
 
 /// The parser binary behind a path of the test's own, so that the test
@@ -95,7 +99,7 @@ async fn tree_within(
     parser
         .parse(tenant, sql, usize::MAX, within, |_| Ok::<_, ()>(Vec::new()))
         .await
-        .map(|bytes| String::from_utf8(bytes).expect("text"))
+        .map(|(bytes, _)| String::from_utf8(bytes).expect("text"))
         .map_err(|failure| match failure {
             ParseFailure::Refused(error) => error,
             ParseFailure::Unheld(()) => unreachable!("every tree is held"),
@@ -113,6 +117,21 @@ async fn the_parser_process_answers_pg_querys_own_tree() {
     };
     for sql in PROBE.lines().filter(|line| !line.trim().is_empty()) {
         assert_eq!(tree(&parser, sql).await, own(sql), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn the_parser_process_answers_the_golden_corpus() {
+    let Some((_binary, parser)) = started(2).await else {
+        return;
+    };
+    for (sql, expected) in golden::cases() {
+        assert_eq!(
+            golden::answer(&tree(&parser, sql).await),
+            expected,
+            "{}",
+            &sql[..sql.len().min(60)]
+        );
     }
 }
 
@@ -183,7 +202,8 @@ async fn a_tree_past_the_callers_limit_or_hold_costs_no_process() {
             Ok::<_, ()>(answer)
         })
         .await
-        .expect("held");
+        .expect("held")
+        .0;
     assert_eq!(held, [b"<<".as_slice(), text.as_bytes()].concat());
     assert_eq!(binary.processes().len(), 1);
 }
@@ -334,7 +354,7 @@ async fn one_tenant_waits_for_its_own_share_of_the_processes() {
     let own_slow = own(&slow);
     let took = started.elapsed();
     assert!(
-        took > MIN_PARSE_BUDGET * 5,
+        took > MIN_PARSE_BUDGET * 2,
         "the slow statement takes {took:?}"
     );
     assert!(matches!(
@@ -365,6 +385,216 @@ async fn one_tenant_waits_for_its_own_share_of_the_processes() {
         "the tenant's next call waits for its turn"
     );
     assert!(own_slow.is_ok());
+}
+
+#[tokio::test]
+async fn a_process_serves_one_tenant_and_is_replaced_before_it_serves_another() {
+    let Some((binary, parser)) = started(1).await else {
+        return;
+    };
+    let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let fresh = binary.processes();
+    assert_eq!(
+        tree_within(&parser, first, "SELECT 1", WITHIN).await,
+        own("SELECT 1")
+    );
+    assert_eq!(
+        tree_within(&parser, first, "SELECT 2", WITHIN).await,
+        own("SELECT 2")
+    );
+    assert_eq!(binary.processes(), fresh, "a tenant keeps its own process");
+    assert_eq!(
+        tree_within(&parser, second, "SELECT 3", WITHIN).await,
+        own("SELECT 3")
+    );
+    wait_for(|| {
+        let now = binary.processes();
+        now.len() == 1 && now != fresh
+    })
+    .await;
+    let replaced = binary.processes();
+    assert_eq!(
+        tree_within(&parser, second, "SELECT 4", WITHIN).await,
+        own("SELECT 4")
+    );
+    assert_eq!(binary.processes(), replaced);
+}
+
+#[tokio::test]
+async fn a_tenant_whose_parses_spent_their_process_time_is_refused_until_it_refills() {
+    let Some((binary, parser)) = started_with(2, |settings| SqlParseSettings {
+        tenant_busy: Duration::from_millis(50),
+        tenant_cooldown: Duration::from_millis(200),
+        ..settings
+    })
+    .await
+    else {
+        return;
+    };
+    let busy = Uuid::from_u128(1);
+    let slow = slow();
+    assert_eq!(tree_within(&parser, busy, &slow, WITHIN).await, own(&slow));
+    let before = binary.processes();
+    assert!(
+        matches!(
+            tree_within(&parser, busy, "SELECT 1", WITHIN).await,
+            Err(ParseError::Unavailable(_))
+        ),
+        "the tenant has taken more process time than it has"
+    );
+    assert_eq!(
+        tree_within(&parser, Uuid::from_u128(2), "SELECT 1", WITHIN).await,
+        own("SELECT 1"),
+        "another tenant is served meanwhile"
+    );
+    let refilling = Instant::now();
+    while tree_within(&parser, busy, "SELECT 1", WITHIN)
+        .await
+        .is_err()
+    {
+        assert!(
+            refilling.elapsed() < Duration::from_secs(10),
+            "never refilled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(binary.processes().len() <= 2 && before.len() == 2);
+}
+
+/// Counts what a parse charges, and whether the charge is still held.
+#[derive(Clone, Default)]
+struct Ledger {
+    requested: Arc<AtomicUsize>,
+    trees: Arc<AtomicUsize>,
+    held: Arc<AtomicUsize>,
+}
+
+struct Counted(Ledger);
+
+impl Counted {
+    fn new(ledger: &Ledger) -> Self {
+        ledger.held.fetch_add(1, Ordering::SeqCst);
+        Self(ledger.clone())
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Charge for Counted {
+    type Refused = ();
+
+    fn request(&mut self, bytes: usize) -> Result<(), ()> {
+        self.0.requested.fetch_add(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn tree(&mut self, len: usize) -> Result<Vec<u8>, ()> {
+        self.0.trees.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::with_capacity(len))
+    }
+}
+
+#[tokio::test]
+async fn a_charge_lasts_as_long_as_the_exchange_that_holds_its_bytes() {
+    let Some((_binary, parser)) = started(1).await else {
+        return;
+    };
+    let ledger = Ledger::default();
+    let slow = slow();
+    let gave_up = parser
+        .parse(
+            Uuid::nil(),
+            &slow,
+            usize::MAX,
+            MIN_PARSE_BUDGET,
+            Counted::new(&ledger),
+        )
+        .await;
+    assert!(matches!(
+        gave_up,
+        Err(ParseFailure::Refused(ParseError::Unavailable(_)))
+    ));
+    assert!(ledger.requested.load(Ordering::SeqCst) > slow.len());
+    assert_eq!(
+        ledger.held.load(Ordering::SeqCst),
+        1,
+        "the exchange still holds the request's charge"
+    );
+    wait_for(|| ledger.held.load(Ordering::SeqCst) == 0).await;
+    assert_eq!(
+        ledger.trees.load(Ordering::SeqCst),
+        0,
+        "no tree is charged to a caller that stopped waiting"
+    );
+    let (text, charge) = parser
+        .parse(
+            Uuid::nil(),
+            "SELECT 1",
+            usize::MAX,
+            WITHIN,
+            Counted::new(&ledger),
+        )
+        .await
+        .expect("parsed");
+    assert_eq!(Ok(String::from_utf8(text).expect("text")), own("SELECT 1"));
+    assert_eq!(ledger.trees.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger.held.load(Ordering::SeqCst), 1, "the caller holds it");
+    drop(charge);
+    assert_eq!(ledger.held.load(Ordering::SeqCst), 0);
+}
+
+/// A shell script that greets as this build's parser does, then answers
+/// whatever it is asked with `tree` as the tree's text.
+fn answering(dir: &std::path::Path, tree: &[u8]) -> PathBuf {
+    let octal = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|b| format!("\\{b:03o}"))
+            .collect::<String>()
+    };
+    let frame = |bytes: &[u8]| {
+        let len = u32::try_from(bytes.len()).expect("small");
+        octal(&[len.to_be_bytes().as_slice(), bytes].concat())
+    };
+    let hello = serde_json::to_vec(&cufflink_sql_parse::wire::Hello::of_this_build(
+        PROBE_FINGERPRINT,
+    ))
+    .expect("hello");
+    let script = format!(
+        "#!/bin/sh\nprintf '{}'\nprintf '{}{}'\nexec /bin/sleep 30\n",
+        frame(&hello),
+        frame(br#""tree""#),
+        frame(tree)
+    );
+    let path = dir.join("cufflink-sql-parser");
+    std::fs::write(&path, script).expect("script");
+    let mut permissions = std::fs::metadata(&path).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&path, permissions).expect("executable");
+    path
+}
+
+#[tokio::test]
+async fn a_tree_that_is_not_one_json_object_costs_the_process_and_never_reaches_the_caller() {
+    let dir = tempfile::tempdir().expect("a directory");
+    let forged = answering(dir.path(), br#"{}},"injected":{"#);
+    let parser = SqlParser::new(settings(forged, 1));
+    assert!(parser.start().await, "the script greets as the parser does");
+    assert!(matches!(
+        tree(&parser, "SELECT 1").await,
+        Err(ParseError::Unavailable(_))
+    ));
+    let honest = answering(dir.path(), br#"{"stmts":[],"version":170007}"#);
+    let parser = SqlParser::new(settings(honest, 1));
+    assert!(parser.start().await);
+    assert_eq!(
+        tree(&parser, "SELECT 1").await.as_deref(),
+        Ok(r#"{"stmts":[],"version":170007}"#)
+    );
 }
 
 #[tokio::test]

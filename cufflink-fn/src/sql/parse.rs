@@ -10,7 +10,7 @@ use cufflink_types::sql_parse::{ParseError, ParseResponse, Parsed};
 /// changes whenever a release reads its probe corpus differently, so a
 /// guest that matches trees can pin what it was written against.
 ///
-/// No error quotes `sql`. A statement past the platform's bounds (1 MiB,
+/// No error quotes `sql`. A statement past the platform's bounds (128 KiB,
 /// nested deeper than the parser is allowed to go, or a tree nested
 /// deeper than 120 levels, which a guest's JSON reader cannot take) is
 /// [`ParseError::TooLarge`]; outside the platform, without a test host,

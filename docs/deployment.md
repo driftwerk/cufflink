@@ -90,13 +90,16 @@ container but sit outside the budget's ledger. The platform and every
 worker each run a pool of their own, so each of their containers holds up
 to `SQL_PARSE_PROCESSES × SQL_PARSE_MEMORY_MB` (2 GiB at the defaults), and
 an idle process holds a few MiB, as it hands back what a parse freed. A
-1 MiB statement of `AND`ed comparisons, the worst flat input, takes about
-900 MiB while it parses. Size each container for the budget, its reserve
-and that worst case, or lower `SQL_PARSE_MEMORY_MB`: a parse past it costs
-only that call. The processes ask the kernel to kill them first
-(`oom_score_adj` 1000). `SQL_PARSE_PER_TENANT` keeps one tenant from
-holding every process, and `SQL_PARSE_TENANT_COOLDOWN_MS` refuses a tenant
-whose parses keep losing them.
+statement is at most 128 KiB, and the costliest one of that size, a flat
+list of column references, takes about 360 MB and half a second while it
+parses. Size each container for the budget, its reserve and that worst
+case, or lower `SQL_PARSE_MEMORY_MB`: a parse past it costs only that
+call. The processes ask the kernel to kill them first (`oom_score_adj`
+1000). `SQL_PARSE_PER_TENANT` keeps one tenant from holding every process,
+`SQL_PARSE_TENANT_BUSY_MS` from keeping them busy, and
+`SQL_PARSE_TENANT_COOLDOWN_MS` refuses a tenant whose parses keep losing
+them. A process serves one tenant, so every change of tenant on a process
+costs a process start, a few tens of milliseconds.
 
 ## HTTP request layers
 

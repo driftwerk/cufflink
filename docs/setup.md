@@ -507,7 +507,9 @@ Every host call is bounded by the handler's remaining execution budget. Guest `d
 `cufflink-sql-parser` processes, never in the platform's own. The platform
 and the worker each start a pool at startup, waiting at most 5 s for the
 first process, and advertise `sql_parse` while a process has answered with
-this release's parser and fingerprint. Without one, startup logs a warning
+this release's protocol, build, parser and fingerprint. A process serves
+one tenant: another tenant's call gets a fresh process. Without one,
+startup logs a warning
 and deploys that need the feature are refused; processes keep being
 started in the background, and the first that answers advertises it. The
 platform and the worker make themselves undumpable on Linux, so they write
@@ -521,6 +523,7 @@ no core dumps.
 | `SQL_PARSE_MEMORY_MB` | `1024` | Each process's address space, on Linux (`RLIMIT_AS`); a parse that runs out of it is `TooLarge`, or `Unavailable` where it ends the process |
 | `SQL_PARSE_TIMEOUT_MS` | `5000` | Longest one parse lasts; the process is then killed and replaced. A caller whose budget runs out first is answered `Unavailable` and the parse finishes without it |
 | `SQL_PARSE_TENANT_COOLDOWN_MS` | `60000` | A tenant whose parses lose three processes within this long, by timing out or ending them, has its parses answered `Unavailable` for this long |
+| `SQL_PARSE_TENANT_BUSY_MS` | `10000` | The process time one tenant's parses may take at once, refilled at this much every `SQL_PARSE_TENANT_COOLDOWN_MS`; a tenant that has none left has its parses answered `Unavailable` until it refills |
 
 Zero or unparseable values are refused at startup, naming the variable.
 

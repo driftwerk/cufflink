@@ -47,7 +47,10 @@ pub enum ParseError { Syntax(String), TooLarge(String), Unavailable(String) }
   `docs/versions.md`.
 - **The canonical form** is `serde_json::to_string` of the tree as a
   `serde_json::Value`, with `preserve_order` off. Keys are sorted, there is
-  no whitespace, and strings use serde_json's escapes.
+  no whitespace, and strings use serde_json's escapes. The platform writes
+  that text straight from `pg_query`'s protobuf, sorting each object's
+  keys itself, so it never builds the `Value` (about thirty times the
+  text) and its output does not depend on `preserve_order` (section 4).
 
 The function is advertised as the platform feature `sql_parse`. The SDK's
 `sql-parse` cargo feature records it in the module, so a platform that does
@@ -55,14 +58,14 @@ not advertise it refuses the deploy. `parse` lives in the `sql` module, so
 the feature enables `db-v2` too.
 
 The guest hands the host function the statement's bytes as they are, not
-inside a JSON request, so a 1 MiB statement costs 1 MiB.
+inside a JSON request, so a 128 KiB statement costs 128 KiB.
 
 ## 2. Errors
 
 | Kind | When | Message |
 |---|---|---|
 | `Syntax` | the statement does not parse, or holds a NUL byte | fixed: `the statement is not valid SQL` |
-| `TooLarge` | the input is over 1 MiB, its nesting is over the bound (section 4), the tree is too deep for the parser's own decoder or nests deeper than a guest can read (section 4), the tree's text is over the host response cap, or the parse ran out of the parser process's memory | which bound was passed, with no part of the input |
+| `TooLarge` | the input is over 128 KiB, its nesting is over the bound, it has more than 100 forms the grammar warns about (section 4), the tree is too deep for the parser's own decoder or nests deeper than a guest can read (section 4), the tree's text is over the host response cap, or the parse ran out of the parser process's memory | which bound was passed, with no part of the input |
 | `Unavailable` | the parser could not run, faulted, or took too long for this call | fixed |
 
 PostgreSQL's messages quote the input (`syntax error at or near "…"`,
@@ -93,6 +96,8 @@ can a segfault. Measured on `pg_query` 6.2.1:
 | `ARRAY[[…]]` | 9 000 | stack overflow on 2 MiB |
 | 100 000 `(` | | `memory exhausted` error: bison's own stack limit |
 | `x = 1 AND …`, 1 MiB | flat | 1.0 s, 875 MB resident, a 27 MB tree |
+| `SELECT a, a, …`, 1 MiB | flat | 5.2 s, 5.5 GB resident, an 85 MB tree |
+| `CREATE GLOBAL TEMP TABLE t();` × 35 000 | flat | 17 s: quadratic, see section 4 |
 
 Bison bounds the right-nesting forms with its own stack (`YYMAXDEPTH`), but
 not before they overflow a small thread stack. The left-deep forms are not
@@ -105,6 +110,10 @@ separately built binary, `cufflink-sql-parser`, does the parsing. The
 platform keeps a pool of them, `SQL_PARSE_PROCESSES` (2 by default), and
 talks to each over its stdin and stdout:
 
+- **The process inherits only stdin, stdout and stderr.** Before anything
+  else it closes every descriptor past 2 (`close_range`, or what
+  `/proc/self/fd` lists before Linux 5.9), so nothing the platform holds
+  outlives its confinement.
 - **One parse at a time per process**, all on one thread with a 64 MiB
   stack that the process starts before it confines itself. Each parse
   redirects the process's file descriptor 2, so one parse at a time also
@@ -150,6 +159,20 @@ talks to each over its stdin and stdout:
   call adds to a backoff before the next start, from 100 ms to 5 s, so a
   statement that crashes its process again and again cannot keep the
   platform starting processes.
+- **A process serves one tenant.** A process that has served a tenant is
+  given back marked with it, and is used again only for that tenant. A
+  call of another tenant takes a fresh process, or, when only other
+  tenants' processes are idle, has the one idle longest replaced and waits
+  for the next process. Replacing a process this way is no failure: it adds
+  nothing to the backoff. A statement that took control of its process
+  can therefore read, and answer falsely, only its own tenant's later
+  statements. The cost is a process start, 10 to 60 ms measured, most of
+  it parsing the probe corpus, whenever a process changes tenants.
+- **The platform checks what a process answers.** A tree's text must be
+  one well-formed JSON object and nothing after it, or the call is
+  `Unavailable` and the process is replaced, so no answer can reach past
+  the tree in the answer the platform writes around it. A greeting must
+  match the platform's own exactly (section 5).
 - **A share for each tenant.** One tenant's parses at once are at most
   `SQL_PARSE_PER_TENANT` (half the processes, at least one); its further
   calls wait for one of its own turns, within their budget. A turn is held
@@ -160,6 +183,25 @@ talks to each over its stdin and stdout:
   `Unavailable` for that long, without asking a process, so its statements
   cannot keep the other tenants waiting on replacements. The count is the
   tenant's own: other tenants' answers do not reset it.
+- **Process time for each tenant.** Each tenant has a bucket of
+  `SQL_PARSE_TENANT_BUSY_MS` (10 000) of process time that refills at that
+  much every `SQL_PARSE_TENANT_COOLDOWN_MS` (60 s), a sixth of one process
+  on average. Each exchange is charged the time it held its process once
+  it ends, a timeout the whole timeout. A tenant whose bucket is empty has
+  its parses answered `Unavailable`, without a process being asked, until
+  it refills. Ordinary statements parse in a millisecond or two, so this
+  touches only a tenant that keeps processes busy with the costliest
+  statements, and keeps processes free for the others: with two such
+  tenants on the default pool of two, the others still have about two
+  thirds of it. Within the share, waiting callers are served in the order
+  they came, and each tenant waits at most once in that queue for each of
+  its turns, so no tenant can push ahead of another.
+- **Memory charged to the guest.** The caller's charge goes with the
+  exchange: the request's copy of the statement is charged before it is
+  made, and the tree's buffer before it is read, and both charges last
+  until the bytes they pay for are freed. A caller that stops waiting
+  leaves its charge with the exchange until it ends, and a tree that no
+  caller waits for is read and discarded without being charged.
 - **Memory.** On Linux each process caps its own address space at
   `SQL_PARSE_MEMORY_MB` (1024) with `setrlimit(RLIMIT_AS)`. A parse that
   runs out of it inside PostgreSQL's allocator is `TooLarge`; one that runs
@@ -179,14 +221,11 @@ talks to each over its stdin and stdout:
   a row have failed, the feature is no longer advertised, deploys that need
   it are refused, and the host function answers `Unavailable`; the starts
   go on, and the first that succeeds advertises it again.
-- **Shared processes.** A process serves the calls of every tenant on the
-  platform, one after another, and is not restarted between them. Its
-  memory holds nothing of a call once the call is answered. A parser bug
-  that let a statement take control of the process would let it read the
-  statements that follow and answer them falsely, but, confined, not reach
-  anything outside the process. A guest should treat a tree as the parser's
-  reading of the statement, and still run the statement with the least
-  privilege it needs.
+- **What a compromised process reaches.** A parser bug that let a
+  statement take control of its process would reach the statements of the
+  same tenant that follow, and nothing outside the process. A guest should
+  treat a tree as the parser's reading of the statement, and still run the
+  statement with the least privilege it needs.
 
 The alternative of a wasm store was considered. libpg_query would have to be
 built for `wasm32-wasip1` with setjmp/longjmp lowered to wasm exceptions,
@@ -201,7 +240,39 @@ that a refusal costs no round trip, and by the parser process before it
 parses. The parser process applies them because it is the side that must
 not overflow.
 
-- **Input:** at most 1 MiB (`MAX_INPUT_BYTES`), refused `TooLarge`.
+- **Input:** at most 128 KiB (`MAX_INPUT_BYTES`), refused `TooLarge` by
+  its length alone. A parse's time and memory grow with its input, by up
+  to about 4 µs and 2.8 KB a byte, most of it the parse and `pg_query`'s
+  decoding of the protobuf into Rust structs, so the bound is what keeps
+  every parse short. Measured on a release build (Apple silicon), over 52
+  shapes of flat statement, each filled to the bound:
+
+  | Statement, 128 KiB | Time | Peak resident | Tree text |
+  |---|---|---|---|
+  | `SELECT 1 ORDER BY a, a, …` | 0.37 s | 362 MB | 11.3 MB |
+  | `SELECT a, a, …` | 0.36 to 0.52 s | 346 MB | 10.6 MB |
+  | `SELECT *, *, …` | 0.34 s | 331 MB | 9.9 MB |
+  | `SELECT a[1], a[1], …` | 0.31 s | 283 MB | 9.2 MB |
+  | `SELECT f(a, a, …)` | 0.24 s | 274 MB | 5.6 MB |
+  | `SELECT 1+1, 1+1, …` | 0.32 s | 245 MB | 11.2 MB |
+  | `x = 1 AND …` | 0.16 s | 161 MB | 4.4 MB |
+  | `IN (1, 1, …)` | 0.12 s | 99 MB | 5.3 MB |
+  | 100 `GLOBAL TEMP` tables after a comment | 0.01 s | 5 MB | 39 KB |
+
+  The worst is about a third of `SQL_PARSE_MEMORY_MB` and a tenth of
+  `SQL_PARSE_TIMEOUT_MS`. Before, the same shapes at 1 MiB took up to
+  5.2 s and 5.5 GB with the `Value`, and 2.0 s and 2.5 GB without it, so
+  no output bound could have kept them inside the process. A guest that
+  allow-lists ad-hoc report SQL, capped at 64 KiB of text, fits with room
+  to spare.
+- **Forms the grammar warns about:** at most `MAX_WARNED_FORMS` (100). The
+  grammar parses `GLOBAL TEMP` and `GLOBAL TEMPORARY` with a `WARNING`,
+  and every warning computes its cursor position by counting the
+  characters before it, so 35 000 of them in 1 MiB took 17 s. The scan
+  counts every `GLOBAL` followed by `TEMP` or `TEMPORARY`, outside quotes
+  and comments. No other form warns while parsing: the lexer's escape
+  warnings need `standard_conforming_strings` off, and notices are not
+  emitted at all.
 - **Nesting:** a lexical scan, refused `TooLarge`. It reads the input as
   PostgreSQL's lexer does, with quoted strings (`'…'`, `E'…'` with its
   backslash escapes, `U&'…'`, `B'…'`, `X'…'`, `N'…'`), quoted identifiers,
@@ -246,7 +317,10 @@ not overflow.
 - **Output:** the parser process refuses a tree whose text is over the
   request's `max_output`, which the platform sets to its host response cap
   (`WASM_MAX_HOST_RESPONSE_MB`, 64) less the answer around the tree. It
-  sends `TooLarge` rather than the bytes.
+  sends `TooLarge` rather than the bytes. The text is written as the tree
+  is serialised, and the writer stops at the first byte past `max_output`
+  and the first object or array past `MAX_TREE_NESTING`, so neither bound
+  waits for the whole text.
 - **Guest memory:** the input is charged when the platform reads it from
   the guest, as every host call's input is. The answer's length arrives
   first, in its frame header. The platform reserves that many bytes, and
@@ -262,8 +336,13 @@ A frame is a 4-byte big-endian length and that many bytes
 64 KiB; a frame past its limit ends the process or, on the platform's side,
 costs the process.
 
-- At start the parser process sends `{"parser": "6.2.1", "fingerprint":
-  "…"}`, computing the fingerprint by parsing the probe corpus.
+- At start the parser process sends `{"protocol": 1, "build": "0.1.0",
+  "parser": "6.2.1", "fingerprint": "…"}`, computing the fingerprint by
+  parsing the probe corpus. `protocol` changes whenever the frames, the
+  bounds or the canonical text do, and `build` is the `cufflink-sql-parse`
+  release the process was built with. The platform uses a process only if
+  its greeting equals the one its own build would send; a greeting
+  without either field is not read at all.
 - A request is `{"max_output": n}`, then a frame of the statement's bytes,
   at most 1 MiB.
 - An answer is `"tree"` followed by a frame of the tree's canonical text,
@@ -277,7 +356,12 @@ The platform answers the guest `{"ok": {"fingerprint": …, "parser": …,
 ## 6. The native test host
 
 `TestHost` parses in its own process, with the same crate, bounds,
-canonical form and error mapping, on a thread with the same 64 MiB stack. One
+canonical form and error mapping, on a thread with the same 64 MiB stack.
+It is built with the guest's dependency graph, so before it parses it
+checks that its parser reads the probe corpus as the release does, and
+panics otherwise, rather than name the release's fingerprint for trees the
+platform would not give. Its canonical text sorts keys itself, so a guest
+that enables `serde_json/preserve_order` gets the same trees. One
 parse runs at a time, behind a process-wide lock, because of the stderr
 redirection. A test therefore gets the same `Parsed` that the platform
 gives, and the same refusals. The test host does not contain faults. That is
@@ -305,18 +389,29 @@ guest's tests that enable both `test-host` and `sql-parse` build
 
 ## 8. Tests
 
-- **Golden:** for a corpus of accepted and refused statements, the probe
-  corpus among them, the host's answer equals `pg_query`'s own tree in
-  canonical form. The fingerprint is recomputed and compared with the
-  published constant.
+- **Golden:** a committed corpus (`sql-parse/golden/`): the probe corpus
+  and 35 more statements, accepted and refused, each with the answer this
+  release gives it, the tree's canonical text or the refusal's kind. The
+  library, the confined parser process, the platform and the test host
+  are each checked against those bytes, and the library against
+  `pg_query`'s own tree through a `Value`. The fingerprint is recomputed
+  and compared with the published constant. An ignored test rewrites the
+  answers for a release that changes the parser on purpose.
 - **Adversarial:** 100 000 nested parentheses; nested subqueries,
   `ARRAY[[[…]]]`, `CASE`, `NOT` and unary-minus chains; left-deep `+`,
   `UNION`, `JOIN` and cast chains; a long `IN` list; unterminated quotes,
   dollar quotes and comments; 1 MiB + 1 byte. Each answers `Syntax` or
   `TooLarge`, or parses, and the parser process then serves the next call.
+- **Cost:** in the confined process, the costliest shapes filled to the
+  input bound (columns, stars, `ORDER BY`, function arguments, subscripts,
+  `IN`, `AND`, `VALUES`, statements, column definitions, and the most
+  `GLOBAL TEMP`s after a comment) each answer the library's tree within
+  half the parse timeout. On Linux, the largest any parser process grew to
+  in that test binary is under half its address space limit.
 - **Confinement:** on Linux, the running parser process reports
   `Seccomp: 2` and `NoNewPrivs: 1`, and answers the corpus, every refusal
-  and the deepest inputs as the library does.
+  and the deepest inputs as the library does. A pipe whose write end it
+  inherited ends as soon as the test closes its own copy.
 - **Faults:** a process past `SQL_PARSE_TIMEOUT_MS` is killed and replaced
   in the background. A caller that stops waiting costs no process: the
   same process serves the next call. A call with less than 100 ms left
@@ -324,7 +419,17 @@ guest's tests that enable both `test-host` and `sql-parse` build
   that does not greet is never used, and readiness goes when no process
   can start and comes back when one can.
 - **Shares:** a tenant at its share waits for its own turn while another
-  tenant is served.
+  tenant is served. A tenant whose parses spent their process time is
+  refused, without a process, while another is served, and served again
+  once it refills. A turn waited for and given up leaves nothing behind.
+- **Tenants:** a process serves one tenant, and another tenant's call gets
+  a different process.
+- **Charges:** a caller that stops waiting leaves its charge held until
+  the exchange ends, and is charged nothing for the tree; a caller that
+  waits gets the charge back with the tree.
+- **Answers:** a process that answers a tree that is not one JSON object,
+  here a forged one that closes the tree early, costs the call
+  (`Unavailable`), and never reaches the caller.
 - **Concurrency:** many parses at once from many tasks. fd 2 still works
   afterwards, and the platform has leaked no descriptors.
 - **Privacy:** a `Syntax` or `TooLarge` answer carries no fragment of the

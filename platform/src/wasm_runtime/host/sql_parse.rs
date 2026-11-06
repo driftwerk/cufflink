@@ -1,5 +1,5 @@
 use super::{block_on_within, read_guest_bytes, wrap, HostIoError, HostState};
-use crate::sql_parser::ParseFailure;
+use crate::sql_parser::{Charge, ParseFailure};
 use crate::wasm_runtime::budget::{Hold, HostCaps, Refused};
 use cufflink_types::sql_parse::{ParseError, ParseResponse};
 use std::collections::HashSet;
@@ -28,6 +28,27 @@ fn charged(caps: &HostCaps, hold: &mut Hold, len: usize) -> Result<Vec<u8>, Refu
     Ok(answer)
 }
 
+/// What a parse charges to the guest: the request's copy of the statement,
+/// for as long as the exchange holds it, and the answer, which stays
+/// charged as the guest's response.
+struct ParseCharge {
+    caps: HostCaps,
+    request: Hold,
+    answer: Hold,
+}
+
+impl Charge for ParseCharge {
+    type Refused = Refused;
+
+    fn request(&mut self, bytes: usize) -> Result<(), Refused> {
+        self.request.grow(bytes).map_err(Refused::Budget)
+    }
+
+    fn tree(&mut self, len: usize) -> Result<Vec<u8>, Refused> {
+        charged(&self.caps, &mut self.answer, len)
+    }
+}
+
 fn parse(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
     caller.data_mut().clear_host_response();
     let (bytes, _input) = host_try!(read_guest_bytes(caller, HOST_FN, ptr, len)).into_parts();
@@ -41,13 +62,16 @@ fn parse(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
     let tenant = state.identity.tenant_id;
     let caps = state.caps().clone();
     let bounds = state.bounds();
-    let mut hold = state.hold();
+    let charge = ParseCharge {
+        caps,
+        request: state.hold(),
+        answer: state.hold(),
+    };
+    let max = max_tree(&charge.caps);
     let parsed = block_on_within(
         bounds.remaining,
         &bounds.cancel,
-        parser.parse(tenant, sql, max_tree(&caps), bounds.remaining, |len| {
-            charged(&caps, &mut hold, len)
-        }),
+        parser.parse(tenant, sql, max, bounds.remaining, charge),
     );
     let state = caller.data_mut();
     match parsed.map_err(|ended| match ended {
@@ -56,7 +80,7 @@ fn parse(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
             ParseFailure::Refused(ParseError::unavailable())
         }
     }) {
-        Ok(mut answer) => {
+        Ok((mut answer, ParseCharge { answer: hold, .. })) => {
             answer.extend_from_slice(AROUND.1.as_bytes());
             match String::from_utf8(answer) {
                 Ok(text) => {
@@ -72,7 +96,6 @@ fn parse(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
             }
         }
         Err(ParseFailure::Refused(error)) => {
-            drop(hold);
             state.respond_json(HOST_FN, &ParseResponse::Error(error))
         }
         Err(ParseFailure::Unheld(refused)) => state.refused(refused),
