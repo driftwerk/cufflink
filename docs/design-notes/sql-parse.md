@@ -112,7 +112,8 @@ talks to each over its stdin and stdout:
 
 - **The process inherits only stdin, stdout and stderr.** Before anything
   else it closes every descriptor past 2 (`close_range`, or what
-  `/proc/self/fd` lists before Linux 5.9), so nothing the platform holds
+  `/proc/self/fd` lists before Linux 5.9 or where a container's filter
+  refuses `close_range`), so nothing the platform holds
   outlives its confinement.
 - **One parse at a time per process**, all on one thread with a 64 MiB
   stack that the process starts before it confines itself. Each parse
@@ -171,10 +172,14 @@ talks to each over its stdin and stdout:
   given back marked with it, and is used again only for that tenant. A
   call of another tenant takes a fresh process, or, when only other
   tenants' processes are idle, has the one idle longest replaced. The
-  process started in its place is that call's own: it does not queue
-  again, and the start waits for no backoff, since replacing a process this
-  way is no failure. A start that fails leaves the call to queue again
-  within its budget. A statement that took control of its process
+  replacement starts first, and the old process is killed only once the
+  replacement has greeted; the replacement is that call's own, so it does
+  not queue again, and its start, which is no failure, waits for no
+  backoff. Its time is charged to that call's tenant. A start that fails
+  leaves the old process idle and serving its tenant, and the call
+  `Unavailable`; until the backoff that failure set has passed, calls that
+  would replace a process are `Unavailable` without trying, so failing
+  starts never drain the pool. A statement that took control of its process
   can therefore read, and answer falsely, only its own tenant's later
   statements. The cost is a process start, 10 to 60 ms measured, most of
   it parsing the probe corpus, whenever a process changes tenants.
@@ -197,9 +202,10 @@ talks to each over its stdin and stdout:
   `SQL_PARSE_TENANT_BUSY_MS` (10 000) of process time that refills at that
   much every `SQL_PARSE_TENANT_COOLDOWN_MS` (60 s), a sixth of one process
   on average. Each exchange is charged the time it held its process once
-  it ends, a timeout the whole timeout. A tenant whose bucket is empty has
-  its parses answered `Unavailable`, without a process being asked, until
-  it refills. Ordinary statements parse in a millisecond or two, so this
+  it ends, a timeout the whole timeout, and so is a process start its call
+  forced. A tenant whose bucket is empty has its parses answered
+  `Unavailable`, without a process being asked, until it refills; the
+  bucket is checked again once a call has waited for its tenant's turn. Ordinary statements parse in a millisecond or two, so this
   touches only a tenant that keeps processes busy with the costliest
   statements, and keeps processes free for the others: over time two such
   tenants take a third of one process between them, and leave five sixths
@@ -270,7 +276,10 @@ not overflow.
   | 100 `GLOBAL TEMP` tables after a comment | 0.01 s | 5 MB | 39 KB |
 
   The worst is about a third of `SQL_PARSE_MEMORY_MB` and a tenth of
-  `SQL_PARSE_TIMEOUT_MS`. Before, the same shapes at 1 MiB took up to
+  `SQL_PARSE_TIMEOUT_MS`. The lexer's rescanned runs at their own bound
+  (below), filled to the input bound, are cheaper still: 256 signs
+  (`1+-+-…1`) at a time take 0.33 s and 74 MB, and runs of 128 nested
+  comment openings 0.01 s. Before, the same shapes at 1 MiB took up to
   5.2 s and 5.5 GB with the `Value`, and 2.0 s and 2.5 GB without it, so
   no output bound could have kept them inside the process. A guest that
   allow-lists ad-hoc report SQL, capped at 64 KiB of text, fits with room
@@ -283,6 +292,19 @@ not overflow.
   and comments. No other form warns while parsing: the lexer's escape
   warnings need `standard_conforming_strings` off, and notices are not
   emitted at all.
+- **Operator runs and comment nesting:** at most `MAX_OPERATOR_RUN` (256)
+  operator characters (`~!@#^&|`?+-*/%<>=`) in a row, in or out of block
+  comments, and block comments nested at most `MAX_COMMENT_DEPTH` (1000)
+  deep. The lexer reads a run of operator characters again from each
+  point where it puts text back: the operator rule gives back a trailing
+  `+` or `-`, and each `/*` that opens a comment or a nested one first
+  matches the whole run after it. A run therefore costs up to its length
+  squared: `SELECT 1` followed by 32 000 `/*` and as many `*/` took 15.9 s
+  in 128 KiB, and fourteen runs of 9 000 signs 3.9 s. With the cap a
+  statement's lexing is linear in its length, and those statements are
+  `TooLarge` at once. Runs inside quoted text and line comments are read
+  once and are not counted. A run past 256 is rare in SQL; a banner
+  comment wider than that is refused.
 - **Nesting:** a lexical scan, refused `TooLarge`. It reads the input as
   PostgreSQL's lexer does, with quoted strings (`'…'`, `E'…'` with its
   backslash escapes, `U&'…'`, `B'…'`, `X'…'`, `N'…'`), quoted identifiers,
@@ -346,11 +368,13 @@ A frame is a 4-byte big-endian length and that many bytes
 64 KiB; a frame past its limit ends the process or, on the platform's side,
 costs the process.
 
-- At start the parser process sends `{"protocol": 1, "build": "0.1.0",
-  "parser": "6.2.1", "fingerprint": "…"}`, computing the fingerprint by
-  parsing the probe corpus. `protocol` changes whenever the frames, the
-  bounds or the canonical text do, and `build` is the `cufflink-sql-parse`
-  release the process was built with. The platform uses a process only if
+- At start the parser process sends `{"protocol": 1, "build": "0.1.0
+  input=131072 brackets=1000 …", "parser": "6.2.1", "fingerprint": "…"}`,
+  computing the fingerprint by parsing the probe corpus. `protocol`
+  changes whenever the frames, the bounds or the canonical text do, and
+  `build` is the `cufflink-sql-parse` release the process was built with
+  followed by every bound it applies, so builds whose bounds differ never
+  take each other's processes, even when no one changed `protocol`. The platform uses a process only if
   its greeting equals the one its own build would send; a greeting
   without either field is not read at all.
 - A request is `{"max_output": n}`, then a frame of the statement's bytes,
@@ -414,9 +438,10 @@ guest's tests that enable both `test-host` and `sql-parse` build
   `TooLarge`, or parses, and the parser process then serves the next call.
 - **Cost:** in the confined process, the costliest shapes filled to the
   input bound (columns, stars, `ORDER BY`, function arguments, subscripts,
-  `IN`, `AND`, `VALUES`, statements, column definitions, and the most
-  `GLOBAL TEMP`s after a comment) each answer the library's tree within
-  half the parse timeout. On Linux, the process's resident peak (`VmHWM`)
+  `IN`, `AND`, `VALUES`, statements, column definitions, the most
+  `GLOBAL TEMP`s after a comment, sign runs and nested comment runs at
+  their bound) each pass the bounds and are answered as the library
+  answers them within half the parse timeout. On Linux, the process's resident peak (`VmHWM`)
   is then under half its address space limit. Through the platform, the
   1 MiB statements that cost seconds before the bound came down are
   `TooLarge` at once, and ask no process.

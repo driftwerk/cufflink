@@ -1,5 +1,5 @@
 use cufflink_sql_parse::bounds::{
-    MAX_BRACKET_DEPTH, MAX_CHAIN_DEPTH, MAX_INPUT_BYTES, MAX_WARNED_FORMS,
+    self, MAX_BRACKET_DEPTH, MAX_CHAIN_DEPTH, MAX_INPUT_BYTES, MAX_OPERATOR_RUN, MAX_WARNED_FORMS,
 };
 use cufflink_sql_parse::wire::{read_frame, read_message, write_frame, write_message};
 use cufflink_sql_parse::wire::{Answer, Hello, Request};
@@ -204,9 +204,12 @@ fn filled(prefix: &str, unit: &str, suffix: &str) -> String {
 }
 
 /// The shapes whose parse costs most for their length, each at the input
-/// bound.
+/// bound, and the lexer's rescanned runs at their own bound.
 fn costliest() -> Vec<(&'static str, String)> {
     let warned = "CREATE GLOBAL TEMP TABLE t();".repeat(MAX_WARNED_FORMS as usize);
+    let half_run = MAX_OPERATOR_RUN / 2;
+    let comment_run = format!("{} {} ", "/*".repeat(half_run), "*/".repeat(half_run));
+    let comment_runs = comment_run.repeat((MAX_INPUT_BYTES - 64) / comment_run.len());
     vec![
         ("columns", filled("SELECT a", ",a", "")),
         ("stars", filled("SELECT *", ",*", "")),
@@ -225,6 +228,14 @@ fn costliest() -> Vec<(&'static str, String)> {
             "warnings at the end",
             filled("-- ", "x", &format!("\n{warned}")),
         ),
+        (
+            "sign runs",
+            filled("SELECT 1", &format!(", 1{}1", "+-".repeat(half_run)), ""),
+        ),
+        (
+            "nested comment runs",
+            filled(&format!("SELECT 1 /* {}", comment_runs), " ", "*/"),
+        ),
     ]
 }
 
@@ -233,7 +244,8 @@ fn costliest() -> Vec<(&'static str, String)> {
 const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The costliest statements the bounds let through, in the confined
-/// process: each answers its tree, as the library does, within half the
+/// process: each passes the bounds and is answered as the library answers
+/// it (its tree, or `TooLarge` for a tree past the decoder's nesting) within half the
 /// platform's parse timeout, and on Linux the process's resident peak stays
 /// under half its address space; a parse past that space would end it.
 #[test]
@@ -248,10 +260,17 @@ fn the_costliest_statements_within_the_bounds_answer_in_time_and_memory() {
             "{name}: {}",
             sql.len()
         );
+        assert!(bounds::check(&sql).is_ok(), "{name}");
         let started = Instant::now();
         let answer = parser.answer(&sql);
         let took = started.elapsed();
-        assert!(answer.is_ok(), "{name}: {answer:?}");
+        assert!(
+            matches!(
+                answer,
+                Ok(_) | Err(cufflink_types::sql_parse::ParseError::TooLarge(_))
+            ),
+            "{name}: {answer:?}"
+        );
         assert!(took < PARSE_TIMEOUT / 2, "{name}: {took:?}");
         assert!(answer == parse(&sql, usize::MAX), "{name}");
     }

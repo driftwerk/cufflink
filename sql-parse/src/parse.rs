@@ -286,7 +286,7 @@ mod tests {
                 &sql[..30]
             );
             assert!(
-                started.elapsed() < Duration::from_secs(30),
+                started.elapsed() < Duration::from_millis(2_500),
                 "{}: {:?}",
                 &sql[..30],
                 started.elapsed()

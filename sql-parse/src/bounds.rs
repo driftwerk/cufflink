@@ -11,10 +11,11 @@
 
 use cufflink_types::sql_parse::ParseError;
 
-/// The longest statement parsed. A parse's time and memory grow with its
-/// input, by up to about 4 µs and 2.8 KB a byte for a flat list of column
-/// references; at this size the worst measured parse takes 0.6 s and
-/// 360 MB, well inside a parser process's time and memory.
+/// The longest statement parsed. Within the other bounds a parse's time and
+/// memory grow linearly with its input, by up to about 4 µs and 2.8 KB a
+/// byte; at this size the costliest measured shape, a flat list of column
+/// references, takes 0.5 s and 362 MB (release, Apple silicon), a tenth of
+/// the default parse timeout and a third of a process's address space.
 pub const MAX_INPUT_BYTES: usize = 128 * 1024;
 
 /// `(`, `[` and `CASE … END` levels open at once.
@@ -27,6 +28,16 @@ pub const MAX_CHAIN_DEPTH: u32 = 10_000;
 /// warning. Each warning counts the characters before it, so their cost
 /// grows with their number times the input's length.
 pub const MAX_WARNED_FORMS: u32 = 100;
+
+/// Operator characters (`~!@#^&|`?+-*/%<>=`) in a row, in or out of block
+/// comments. The lexer reads such a run again from each point where it
+/// puts text back: after a trailing `+` or `-`, and after each `/*` that
+/// opens a comment or a nested one. So a run costs up to its length
+/// squared, and capping it keeps a statement's lexing linear in its length.
+pub const MAX_OPERATOR_RUN: usize = 256;
+
+/// Block comments open at once.
+pub const MAX_COMMENT_DEPTH: u32 = 1_000;
 
 /// Refuses, as `TooLarge`, input past one of the bounds.
 ///
@@ -42,7 +53,9 @@ pub const MAX_WARNED_FORMS: u32 = 100;
 /// the first count past [`MAX_CHAIN_DEPTH`], since a depth is at least any
 /// of its counts. A `GLOBAL` followed by `TEMP` or `TEMPORARY` counts as a
 /// form the grammar warns about, wherever it is, at most
-/// [`MAX_WARNED_FORMS`].
+/// [`MAX_WARNED_FORMS`]. Outside quoted text and line comments, at most
+/// [`MAX_OPERATOR_RUN`] operator characters stand in a row, and block
+/// comments nest at most [`MAX_COMMENT_DEPTH`] deep.
 pub fn check(sql: &str) -> Result<(), ParseError> {
     if sql.len() > MAX_INPUT_BYTES {
         return Err(too_large(format!(
@@ -168,6 +181,8 @@ struct Scan<'a> {
     open: [u32; 4],
     after_global: bool,
     warned: u32,
+    /// Operator characters in a row up to here.
+    run: usize,
 }
 
 impl<'a> Scan<'a> {
@@ -179,11 +194,12 @@ impl<'a> Scan<'a> {
             open: [1, 0, 0, 0],
             after_global: false,
             warned: 0,
+            run: 0,
         }
     }
 
     fn depth(mut self) -> Result<u32, ParseError> {
-        while let Some(token) = self.next_token() {
+        while let Some(token) = self.next_token()? {
             self.take(token)?;
         }
         while self.close_top().is_some() {}
@@ -290,15 +306,41 @@ impl<'a> Scan<'a> {
         self.sql.get(self.at + ahead).copied()
     }
 
-    fn next_token(&mut self) -> Option<Token> {
+    fn next_token(&mut self) -> Result<Option<Token>, ParseError> {
         loop {
-            let byte = self.peek(0)?;
+            let Some(byte) = self.peek(0) else {
+                return Ok(None);
+            };
             match byte {
-                b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => self.at += 1,
-                b'-' if self.peek(1) == Some(b'-') => self.line_comment(),
-                b'/' if self.peek(1) == Some(b'*') => self.block_comment(),
-                _ => return Some(self.token(byte)),
+                b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => {
+                    self.run = 0;
+                    self.at += 1;
+                }
+                b'-' if self.peek(1) == Some(b'-') => {
+                    self.run = 0;
+                    self.line_comment();
+                }
+                b'/' if self.peek(1) == Some(b'*') => self.block_comment()?,
+                _ => {
+                    self.lexed(byte)?;
+                    return Ok(Some(self.token(byte)));
+                }
             }
+        }
+    }
+
+    /// Counts `byte` into the run of operator characters it ends or
+    /// extends.
+    fn lexed(&mut self, byte: u8) -> Result<(), ParseError> {
+        self.run = match is_operator_char(byte) {
+            true => self.run + 1,
+            false => 0,
+        };
+        match self.run > MAX_OPERATOR_RUN {
+            true => Err(too_large(format!(
+                "the statement has more than {MAX_OPERATOR_RUN} operator characters in a row"
+            ))),
+            false => Ok(()),
         }
     }
 
@@ -340,24 +382,37 @@ impl<'a> Scan<'a> {
             .map_or(self.sql.len(), |end| self.at + end);
     }
 
-    fn block_comment(&mut self) {
-        let mut open = 0usize;
-        while self.at < self.sql.len() {
-            match (self.peek(0), self.peek(1)) {
-                (Some(b'/'), Some(b'*')) => {
+    fn block_comment(&mut self) -> Result<(), ParseError> {
+        let mut open = 0u32;
+        while let Some(byte) = self.peek(0) {
+            match (byte, self.peek(1)) {
+                (b'/', Some(b'*')) => {
                     open += 1;
+                    if open > MAX_COMMENT_DEPTH {
+                        return Err(too_large(format!(
+                            "the statement nests more than {MAX_COMMENT_DEPTH} comments"
+                        )));
+                    }
+                    self.lexed(b'/')?;
+                    self.lexed(b'*')?;
                     self.at += 2;
                 }
-                (Some(b'*'), Some(b'/')) => {
-                    open -= 1;
+                (b'*', Some(b'/')) => {
+                    self.lexed(b'*')?;
+                    self.lexed(b'/')?;
                     self.at += 2;
+                    open -= 1;
                     if open == 0 {
-                        return;
+                        return Ok(());
                     }
                 }
-                _ => self.at += 1,
+                _ => {
+                    self.lexed(byte)?;
+                    self.at += 1;
+                }
             }
         }
+        Ok(())
     }
 
     /// The rest of a literal or identifier quoted by `quote`, whose opening
@@ -470,6 +525,10 @@ fn keyword(word: &[u8]) -> Token {
     } else {
         Token::Other
     }
+}
+
+fn is_operator_char(byte: u8) -> bool {
+    b"~!@#^&|`?+-*/%<>=".contains(&byte)
 }
 
 fn is_ident_start(byte: u8) -> bool {
@@ -676,6 +735,41 @@ mod tests {
         assert!(check(&hidden).is_ok());
         let local = "CREATE LOCAL TEMP TABLE t(); CREATE TEMP TABLE t();".repeat(500);
         assert!(check(&local).is_ok());
+    }
+
+    #[test]
+    fn operator_runs_are_bounded_in_and_out_of_comments() {
+        let signs = |n: usize| format!("SELECT 1{}1", "+-".repeat(n / 2));
+        assert!(check(&signs(MAX_OPERATOR_RUN)).is_ok());
+        assert!(refused(&signs(MAX_OPERATOR_RUN + 2)).contains("in a row"));
+        let opens = |n: usize| format!("SELECT 1 {} x", "/*".repeat(n / 2));
+        assert!(check(&opens(MAX_OPERATOR_RUN)).is_ok());
+        assert!(refused(&opens(MAX_OPERATOR_RUN + 2)).contains("in a row"));
+        let inside = format!("SELECT 1 /* {} */", "+".repeat(MAX_OPERATOR_RUN + 1));
+        assert!(refused(&inside).contains("in a row"));
+        let glued = format!("SELECT 1 {}/* x */", "@".repeat(MAX_OPERATOR_RUN - 1));
+        assert!(refused(&glued).contains("in a row"));
+        let apart = format!("SELECT 1{}", ", 1 +-+- 1".repeat(10_000));
+        assert!(check(&apart).is_ok());
+        let ruled = "=".repeat(MAX_OPERATOR_RUN * 4);
+        for quoted in [
+            format!("SELECT '{ruled}'"),
+            format!("SELECT \"{ruled}\""),
+            format!("SELECT $${ruled}$$"),
+            format!("SELECT 1 -- {ruled}\n"),
+            format!("{}\nSELECT 1", "-".repeat(MAX_OPERATOR_RUN * 4)),
+        ] {
+            assert!(check(&quoted).is_ok(), "{}", &quoted[..20]);
+        }
+    }
+
+    #[test]
+    fn block_comments_nest_at_most_their_bound() {
+        let nested = |n: usize| format!("SELECT 1 {}{}", "/* ".repeat(n), "*/ ".repeat(n));
+        assert!(check(&nested(MAX_COMMENT_DEPTH as usize)).is_ok());
+        assert!(refused(&nested(MAX_COMMENT_DEPTH as usize + 1)).contains("comments"));
+        let apart = "/* a /* b */ c */ SELECT 1;".repeat(2_000);
+        assert!(check(&apart).is_ok());
     }
 
     #[test]
