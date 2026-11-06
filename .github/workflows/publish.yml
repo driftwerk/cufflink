@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: verify
     env:
-      CRATES: cufflink-types cufflink-model cufflink-migrate cufflink-pgcodec cufflink-fn cufflink-sdk-macros cufflink cufflink-cli cufflink-nats cufflink-native
+      CRATES: cufflink-types cufflink-model cufflink-migrate cufflink-pgcodec cufflink-sql-parse cufflink-fn cufflink-sdk-macros cufflink cufflink-cli cufflink-nats cufflink-native
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 

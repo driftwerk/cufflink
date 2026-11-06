@@ -8,6 +8,8 @@ COPY Cargo.toml Cargo.lock* ./
 COPY types/ types/
 COPY migrate/ migrate/
 COPY pgcodec/ pgcodec/
+COPY sql-parse/ sql-parse/
+COPY sql-parser/ sql-parser/
 COPY secrets/ secrets/
 COPY storage/ storage/
 COPY db/ db/

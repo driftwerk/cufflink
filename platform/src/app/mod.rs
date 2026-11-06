@@ -145,6 +145,7 @@ pub async fn assemble(
         shutdown,
         service_identity,
     }));
+    state.sql_parser.start().await;
     state
         .svc_service
         .install(routes::svc_service(state.clone()))?;

@@ -35,6 +35,8 @@ mod posture;
 pub mod request;
 #[cfg(feature = "service-call")]
 pub mod service_call;
+#[cfg(feature = "sql-parse")]
+pub mod sql_parse;
 pub mod storage;
 
 pub use cache::InMemoryCache;
@@ -57,4 +59,6 @@ pub use nats::NatsRecorder;
 pub use request::{request, AuthBuilder, RequestBuilder, SubscriptionBuilder};
 #[cfg(feature = "service-call")]
 pub use service_call::{MockServiceCalls, ServiceCall};
+#[cfg(feature = "sql-parse")]
+pub use sql_parse::PgQueryParser;
 pub use storage::{InMemoryStorage, StorageCall, StoredObject};

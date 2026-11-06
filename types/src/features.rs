@@ -54,6 +54,7 @@ pub const INACTIVE_DEPLOY: &str = "inactive_deploy";
 pub const CONFIG_APPLY: &str = "config_apply";
 pub const COLUMN_PERMISSIONS: &str = "column_permissions";
 pub const GUEST_MEMORY_BUDGET: &str = "guest_memory_budget";
+pub const SQL_PARSE: &str = "sql_parse";
 
 impl ServiceManifest {
     /// Features this manifest's declared shape requires, sorted and

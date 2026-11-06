@@ -114,6 +114,11 @@ const GUESTS: &[Guest] = &[
         features: &["ext-call"],
     },
     Guest {
+        name: "sql-parse",
+        source: "sql_parse",
+        features: &["sql-parse"],
+    },
+    Guest {
         name: "db-roles",
         source: "db_roles",
         features: &["db-v2"],

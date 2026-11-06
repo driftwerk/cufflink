@@ -501,6 +501,32 @@ The platform and the worker read this table. Zero or unparseable values fall bac
 
 Every host call is bounded by the handler's remaining execution budget. Guest `db::query`/`db::execute` statements run in their own transaction with the service schema on the search path and `statement_timeout` set to the remaining budget (minus a 500 ms margin, floor 1 s), so both settings revert whether the statement commits or fails; `db::execute_all` and `db::query_read_only` carry the same timeout. Statements Postgres refuses inside a transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`, …) run on the bare connection between a `SET` and `RESET` pair. NATS requests, HTTP fetches and everything that waits on object storage, image transforms, job enqueue or config reads are clamped to the budget as well, so no host call can outlive the execution it belongs to.
 
+### SQL parser
+
+`sql_parse` ([design](design-notes/sql-parse.md)) runs PostgreSQL's parser in
+`cufflink-sql-parser` processes, never in the platform's own. The platform
+and the worker each start a pool at startup, waiting at most 5 s for the
+first process, and advertise `sql_parse` while a process has answered with
+this release's protocol, build, parser and fingerprint. A process serves
+one tenant: another tenant's call gets a fresh process. Without one,
+startup logs a warning
+and deploys that need the feature are refused; processes keep being
+started in the background, and the first that answers advertises it. The
+platform and the worker make themselves undumpable on Linux, so they write
+no core dumps.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SQL_PARSER_BIN` | `cufflink-sql-parser` beside the platform's binary | The parser binary; the images ship it at `/usr/local/bin/cufflink-sql-parser` |
+| `SQL_PARSE_PROCESSES` | `2` | Parser processes, and so parses at once; more calls wait their turn within their budget |
+| `SQL_PARSE_PER_TENANT` | half of `SQL_PARSE_PROCESSES`, at least `1` | One tenant's parses at once; its further calls wait for one of its own turns |
+| `SQL_PARSE_MEMORY_MB` | `1024` | Each process's address space, on Linux (`RLIMIT_AS`); a parse that runs out of it is `TooLarge`, or `Unavailable` where it ends the process |
+| `SQL_PARSE_TIMEOUT_MS` | `5000` | Longest one parse lasts; the process is then killed and replaced. A caller whose budget runs out first is answered `Unavailable` and the parse finishes without it |
+| `SQL_PARSE_TENANT_COOLDOWN_MS` | `60000` | A tenant whose parses lose three processes within this long, by timing out or ending them, has its parses answered `Unavailable` for this long |
+| `SQL_PARSE_TENANT_BUSY_MS` | `10000` | The process time one tenant's parses may take at once, refilled at this much every `SQL_PARSE_TENANT_COOLDOWN_MS`; a tenant that has none left has its parses answered `Unavailable` until it refills |
+
+Zero or unparseable values are refused at startup, naming the variable.
+
 ---
 
 ## Worker Configuration

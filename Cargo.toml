@@ -19,6 +19,8 @@ members = [
     "cli",
     "cufflink-fn",
     "model",
+    "sql-parse",
+    "sql-parser",
     "supervisor",
     "web-runner",
     "ext-runner",
@@ -86,6 +88,7 @@ cufflink-types = { version = "0.20.0", path = "types" }
 cufflink-sdk-macros = { version = "0.20.0", path = "sdk-macros" }
 cufflink-migrate = { version = "0.20.0", path = "migrate" }
 cufflink-pgcodec = { version = "0.20.0", path = "pgcodec" }
+cufflink-sql-parse = { version = "0.1.0", path = "sql-parse" }
 cufflink-secrets = { path = "secrets" }
 hex = "0.4.3"
 base64 = "0.22.1"
@@ -154,4 +157,16 @@ opt-level = 3
 [profile.dev.package.imgref]
 opt-level = 3
 [profile.dev.package.bitstream-io]
+opt-level = 3
+
+# The SQL parser and what writes its trees run in the tests that bound a
+# parse's time; unoptimised, a parse of the largest statement takes several
+# times as long as it does in a release build.
+[profile.dev.package.pg_query]
+opt-level = 3
+[profile.dev.package.prost]
+opt-level = 3
+[profile.dev.package.cufflink-sql-parse]
+opt-level = 3
+[profile.dev.package.cufflink-sql-parser]
 opt-level = 3
