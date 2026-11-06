@@ -1338,6 +1338,9 @@ Unreleased.
 - The new crate `cufflink-sql-parse` 0.1.0 is published before
   `cufflink-fn`. With `test-host` and `sql-parse` both on, `cufflink-fn`
   builds `pg_query`, which needs a C compiler and libclang.
+- The test host's embedded Postgres gives each `initdb` and `pg_ctl`
+  command the seconds `CUFFLINK_TEST_POSTGRES_COMMAND_TIMEOUT_SECS` names,
+  60 when it is unset ([testing](testing.md#the-database)).
 
 ## Changes in v0.36.0
 

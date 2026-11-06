@@ -135,7 +135,11 @@ compares the token's `sub`, so a test of a handler that compares a
 `TestDb::start()` creates a database on the server
 `CUFFLINK_TEST_DATABASE_URL` names, else on an embedded Postgres the
 process starts once and stops at exit (installed where `postgresql_embedded`
-installs it, or under `CUFFLINK_TEST_POSTGRES_DIR`). The database is dropped
+installs it, or under `CUFFLINK_TEST_POSTGRES_DIR`). Each command that
+initialises, starts or stops it (`initdb`, `pg_ctl`) may take 60 s, or as
+many whole seconds as `CUFFLINK_TEST_POSTGRES_COMMAND_TIMEOUT_SECS` names,
+for a slow or busy machine; a value that is not a whole number of at least
+1 fails the test with a message naming the variable. The database is dropped
 with the `TestDb`. `migrate(schema, dir, history)` applies SQL migrations as
 a deploy does, under the history's table and lock, so a service that keeps
 a refinery history is migrated the way it is in production; `execute`,
