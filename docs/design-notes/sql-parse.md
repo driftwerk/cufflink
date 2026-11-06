@@ -301,7 +301,7 @@ not overflow.
   - Both measures over-count: every keyword, identifier and literal in a
     segment counts. They are sized so that nothing that `pg_query` can turn
     into a decodable tree comes near them. Such a tree is at most about 50
-    nodes deep, and a flat statement of 1 MiB passes as long as no single
+    nodes deep, and a flat statement of 128 KiB passes as long as no single
     comma-, `AND`- and `OR`-free run in it has more than 10 000 tokens.
 - **Tree nesting:** after the parse, a tree whose text nests deeper than
   `MAX_TREE_NESTING` (120) objects and arrays is refused `TooLarge`. The
@@ -346,7 +346,7 @@ costs the process.
   its greeting equals the one its own build would send; a greeting
   without either field is not read at all.
 - A request is `{"max_output": n}`, then a frame of the statement's bytes,
-  at most 1 MiB.
+  at most 128 KiB.
 - An answer is `"tree"` followed by a frame of the tree's canonical text,
   so the tree is never parsed or copied again on the platform's side, or
   `{"error": {"kind": "syntax"|"too_large"|"unavailable", "message": "…"}}`.
@@ -402,7 +402,7 @@ guest's tests that enable both `test-host` and `sql-parse` build
 - **Adversarial:** 100 000 nested parentheses; nested subqueries,
   `ARRAY[[[…]]]`, `CASE`, `NOT` and unary-minus chains; left-deep `+`,
   `UNION`, `JOIN` and cast chains; a long `IN` list; unterminated quotes,
-  dollar quotes and comments; 1 MiB + 1 byte. Each answers `Syntax` or
+  dollar quotes and comments; the input bound plus one byte. Each answers `Syntax` or
   `TooLarge`, or parses, and the parser process then serves the next call.
 - **Cost:** in the confined process, the costliest shapes filled to the
   input bound (columns, stars, `ORDER BY`, function arguments, subscripts,

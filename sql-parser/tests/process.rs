@@ -12,20 +12,18 @@ struct Parser {
     child: Child,
     input: ChildStdin,
     output: ChildStdout,
+    answered: usize,
+    last: String,
 }
 
 impl Parser {
     fn start() -> Self {
-        Self::start_with(Stdio::null())
-    }
-
-    fn start_with(stderr: Stdio) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_cufflink-sql-parser"))
             .env_clear()
             .env("SQL_PARSE_MEMORY_MB", "1024")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawned");
         let input = child.stdin.take().expect("stdin");
@@ -34,37 +32,58 @@ impl Parser {
             child,
             input,
             output,
+            answered: 0,
+            last: String::new(),
         }
     }
 
     fn hello(&mut self) -> Hello {
-        read_message(&mut self.output)
-            .expect("read")
-            .expect("hello")
+        match read_message(&mut self.output) {
+            Ok(Some(hello)) => hello,
+            failed => self.ended("the greeting", &failed.map(drop)),
+        }
     }
 
     fn answer(&mut self, sql: &str) -> Result<String, cufflink_types::sql_parse::ParseError> {
-        write_message(
+        let sent = write_message(
             &mut self.input,
             &Request {
                 max_output: u64::MAX,
             },
         )
-        .expect("request");
-        write_frame(&mut self.input, sql.as_bytes()).expect("statement");
-        self.input.flush().expect("flushed");
-        match read_message(&mut self.output)
-            .expect("read")
-            .expect("answer")
-        {
-            Answer::Tree => Ok(String::from_utf8(
-                read_frame(&mut self.output, usize::MAX)
-                    .expect("read")
-                    .expect("tree"),
-            )
-            .expect("text")),
-            Answer::Error(error) => Err(error),
+        .and_then(|()| write_frame(&mut self.input, sql.as_bytes()))
+        .and_then(|()| self.input.flush());
+        if let Err(error) = sent {
+            self.ended(&format!("sending {}", head(sql)), &error);
         }
+        let answer = match read_message(&mut self.output) {
+            Ok(Some(Answer::Tree)) => match read_frame(&mut self.output, usize::MAX) {
+                Ok(Some(tree)) => Ok(String::from_utf8(tree).expect("text")),
+                failed => self.ended(&format!("the tree of {}", head(sql)), &failed.map(drop)),
+            },
+            Ok(Some(Answer::Error(error))) => Err(error),
+            failed => self.ended(&format!("the answer to {}", head(sql)), &failed.map(drop)),
+        };
+        self.answered += 1;
+        self.last = head(sql);
+        answer
+    }
+
+    /// Panics with how the process ended, what it wrote to stderr and the
+    /// last statement it answered, once a step of the wire failed. A
+    /// process still running is killed first.
+    fn ended(&mut self, step: &str, failed: &impl std::fmt::Debug) -> ! {
+        let _ = self.child.kill();
+        let status = self.child.wait().map(|status| status.to_string());
+        let mut report = String::new();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut report);
+        }
+        panic!(
+            "{step}: {failed:?}; the process ended {status:?} after answering {} \
+             statements, the last {:?}; its stderr: {report:?}",
+            self.answered, self.last
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -155,7 +174,7 @@ fn the_confined_process_answers_as_the_library_does() {
 /// read ends it with its own failure, not with the allowlist's kill.
 #[test]
 fn the_confined_process_reports_a_broken_request_on_stderr_and_fails() {
-    let mut parser = Parser::start_with(Stdio::piped());
+    let mut parser = Parser::start();
     let mut stderr = parser.child.stderr.take().expect("stderr");
     parser.hello();
     #[cfg(target_os = "linux")]
@@ -170,6 +189,11 @@ fn the_confined_process_reports_a_broken_request_on_stderr_and_fails() {
     std::io::Read::read_to_string(&mut stderr, &mut report).expect("stderr");
     assert_eq!(status.code(), Some(1), "{status}");
     assert!(report.starts_with("cufflink-sql-parser: "), "{report}");
+}
+
+/// The first bytes of `sql`, enough to name it in a failure.
+fn head(sql: &str) -> String {
+    sql.chars().take(40).collect()
 }
 
 /// `prefix`, as many `unit`s as fit, and `suffix`: a statement of
