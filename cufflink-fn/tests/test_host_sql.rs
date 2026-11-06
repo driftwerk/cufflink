@@ -71,7 +71,7 @@ fn move_loans(request: Request) -> Response {
     let moved = sql::transaction_with(
         TxOptions {
             isolation: Isolation::Serializable,
-            read_only: false,
+            ..TxOptions::default()
         },
         |tx| {
             tx.advisory_xact_lock(7)?;
@@ -232,7 +232,7 @@ fn a_conflict_between_transactions_is_retried() {
             3,
             TxOptions {
                 isolation: Isolation::RepeatableRead,
-                read_only: false,
+                ..TxOptions::default()
             },
             |tx| {
                 attempts.set(attempts.get() + 1);

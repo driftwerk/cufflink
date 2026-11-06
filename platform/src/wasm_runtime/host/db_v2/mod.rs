@@ -14,13 +14,13 @@ use crate::tenant_sessions::{
 use crate::wasm_runtime::budget::{Hold, HostCaps};
 use cufflink_pgcodec::bind;
 use cufflink_pgcodec::tx::{
-    admit, in_failed_transaction, invalid_savepoint, isolation_sql, next,
-    parameters_outside_transaction, rolled_back_by_commit, savepoint_sql, savepoints_after,
-    transaction_control_refused, unknown_savepoint, valid_savepoint, Next, Outcome, Phase,
-    SavepointOp, SlotOp,
+    admit, effective_statement_timeout, guest_statement_timeout, in_failed_transaction,
+    invalid_savepoint, isolation_sql, next, parameters_outside_transaction, rolled_back_by_commit,
+    savepoint_sql, savepoints_after, transaction_control_refused, unknown_savepoint,
+    valid_savepoint, Next, Outcome, Phase, SavepointOp, SlotOp,
 };
 use cufflink_types::db::{DbError, DbErrorKind, DbRequest, DbResponse, Isolation, Param};
-use session::TxEnd;
+use session::{TxEnd, TxSlot};
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -69,6 +69,7 @@ fn handle(state: &mut HostState, request: DbRequest) -> i32 {
     let target = DbTarget {
         sessions: &app_state.tenant_sessions,
         identity: &state.identity,
+        budget: state.budget,
         deadline: state.deadline,
         cancel: &state.cancel,
     };
@@ -95,6 +96,7 @@ fn handle(state: &mut HostState, request: DbRequest) -> i32 {
 pub struct DbTarget<'a> {
     pub sessions: &'a TenantSessions,
     pub identity: &'a ServiceIdentity,
+    pub budget: Duration,
     pub deadline: Instant,
     pub cancel: &'a CancellationToken,
 }
@@ -214,6 +216,7 @@ async fn dispatch(
         DbRequest::RollbackTo { tx, name } => {
             savepoint(session, target, tx, SavepointOp::RollbackTo, &name).await
         }
+        DbRequest::StatementTimeout { tx, ms } => set_statement_timeout(session, target, tx, ms),
     };
     response.map(Reply::Response)
 }
@@ -384,15 +387,12 @@ async fn in_transaction(
 ) -> Result<Reply, DbError> {
     let slot = session.slot(tx)?;
     admit(slot.phase, SlotOp::Statement).map_err(in_failed_transaction)?;
-    let timeout_ms = statement_timeout_for(remaining(target.deadline))
-        .as_millis()
-        .to_string();
+    let timeout_ms = timeout_ms(slot, target);
     let client = slot.client()?;
     let outcome = target
         .run(client.stop(), async {
-            let timeout_arg: [&(dyn ToSql + Sync); 1] = [&timeout_ms];
             let (_, statement) = tokio::try_join!(
-                client.execute(&slot.set_timeout, &timeout_arg),
+                apply_timeout(slot, client, &timeout_ms),
                 client.prepare(bound.sql),
             )
             .map_err(StatementFailure::server)?;
@@ -468,8 +468,18 @@ async fn end(
         _ => ("ROLLBACK", TxEnd::Rollback),
     };
     let aborted_earlier = slot.phase == Phase::Failed;
+    let timeout_ms = (!aborted_earlier).then(|| timeout_ms(&slot, target));
     let client = slot.client()?;
-    let result = target.run(client.stop(), client.end_by_hand(sql)).await;
+    let result = target
+        .run(client.stop(), async {
+            if let Some(timeout_ms) = &timeout_ms {
+                apply_timeout(&slot, client, timeout_ms)
+                    .await
+                    .map_err(|e| (e, false))?;
+            }
+            client.end_by_hand(sql).await.map_err(|e| (e, true))
+        })
+        .await;
     match result {
         Err(elapsed) => {
             slot.abandon(AbandonReason::Deadline);
@@ -483,12 +493,45 @@ async fn end(
             slot.finish(ended, target.reusable());
             Ok(DbResponse::Done)
         }
-        Ok(Err(e)) => {
-            let server_ended_it = op == SlotOp::Commit && e.as_db_error().is_some();
+        Ok(Err((e, reached_end))) => {
+            let server_ended_it = reached_end && op == SlotOp::Commit && e.as_db_error().is_some();
             slot.finish(TxEnd::Rollback, server_ended_it && target.reusable());
             Err(from_pg(&e))
         }
     }
+}
+
+/// What the transaction's next command runs under, in the text
+/// `SET_STATEMENT_TIMEOUT` takes.
+fn timeout_ms(slot: &TxSlot, target: &DbTarget<'_>) -> String {
+    effective_statement_timeout(
+        slot.statement_timeout,
+        statement_timeout_for(remaining(target.deadline)),
+    )
+    .as_millis()
+    .to_string()
+}
+
+async fn apply_timeout(
+    slot: &TxSlot,
+    client: &Session,
+    timeout_ms: &str,
+) -> Result<u64, tokio_postgres::Error> {
+    let timeout_arg: [&(dyn ToSql + Sync); 1] = [&timeout_ms];
+    client.execute(&slot.set_timeout, &timeout_arg).await
+}
+
+fn set_statement_timeout(
+    session: &mut DbSession,
+    target: &DbTarget<'_>,
+    tx: u32,
+    ms: Option<u64>,
+) -> Result<DbResponse, DbError> {
+    let timeout = ms
+        .map(|ms| guest_statement_timeout(ms, target.budget))
+        .transpose()?;
+    session.slot(tx)?.statement_timeout = timeout;
+    Ok(DbResponse::Done)
 }
 
 async fn savepoint(
@@ -505,8 +548,16 @@ async fn savepoint(
     admit(slot.phase, op.slot_op()).map_err(in_failed_transaction)?;
     let known = slot.savepoints.iter().rposition(|s| s == name);
     let sql = savepoint_sql(op, name, known).ok_or_else(|| unknown_savepoint(name, tx))?;
+    let timeout_ms = (slot.phase == Phase::Open).then(|| timeout_ms(slot, target));
     let client = slot.client()?;
-    let result = target.run(client.stop(), client.batch_execute(&sql)).await;
+    let result = target
+        .run(client.stop(), async {
+            if let Some(timeout_ms) = &timeout_ms {
+                apply_timeout(slot, client, timeout_ms).await?;
+            }
+            client.batch_execute(&sql).await
+        })
+        .await;
     match result {
         Ok(result) => {
             let outcome = match result {

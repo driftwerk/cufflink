@@ -46,6 +46,7 @@ declares.
 | `storage-acl` | `storage_acl` (and `storage_v2`, which it enables) |
 | `util-v2` | `util_v2` |
 | `ext-call` | `ext_call` |
+| `guest-statement-timeout` | `guest_statement_timeout` (and `db_v2`, which it enables) |
 | `sql-parse` | `sql_parse` (and `db_v2`, which it enables) |
 | `test-host` | none: it runs handlers natively in `cargo test` ([testing](testing.md)) |
 | `stripe` | none |
@@ -341,6 +342,7 @@ Unreleased.
 
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
+| `guest_statement_timeout` | the guest enables `cufflink-fn/guest-statement-timeout` | a transaction's own `statement_timeout`, bounded by the invocation's remaining budget ([db_v2](db-v2.md#a-statement-timeout-of-the-guests-own)) |
 | `sql_parse` | the guest enables `cufflink-fn/sql-parse` | PostgreSQL's parse tree of a statement, from parser processes beside the platform; advertised while one answers ([design](design-notes/sql-parse.md)) |
 
 ## Changes in v0.33.0
@@ -1309,6 +1311,15 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 Unreleased.
 
+- `db_call` takes a new operation, `statement_timeout`, and `cufflink-fn`
+  a new feature, `guest-statement-timeout`: `Tx::statement_timeout` sets
+  a transaction's own timeout, and each of its statements, savepoints and
+  its commit run under the shorter of that and the platform's
+  ([features](#features-added-in-v0370)). With no value set, a
+  transaction's statements are timed exactly as before. The feature adds
+  only a method, so turning it on changes no other code in the build.
+- The native test host now sets its `statement_timeout` before each
+  statement of a transaction, as the platform does.
 - The platform and the worker serve `sql_parse` (feature `sql_parse`), and
   `cufflink-fn` gains the `sql-parse` feature: `sql::parse` answers
   `pg_query` 6.2.1's tree of a statement, with the parser's identity and the

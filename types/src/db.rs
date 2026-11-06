@@ -174,6 +174,13 @@ pub enum DbRequest {
         tx: u32,
         name: String,
     },
+    /// The guest's own `statement_timeout` for the statements of `tx` that
+    /// follow, in milliseconds; `None` hands it back to the platform.
+    StatementTimeout {
+        tx: u32,
+        #[serde(default)]
+        ms: Option<u64>,
+    },
 }
 
 impl DbRequest {
@@ -188,6 +195,7 @@ impl DbRequest {
             DbRequest::Savepoint { .. } => "savepoint",
             DbRequest::Release { .. } => "release",
             DbRequest::RollbackTo { .. } => "rollback_to",
+            DbRequest::StatementTimeout { .. } => "statement_timeout",
         }
     }
 }
@@ -766,6 +774,17 @@ mod tests {
                     name: "sp_0".into(),
                 },
                 json!({"op": "rollback_to", "tx": 1, "name": "sp_0"}),
+            ),
+            (
+                DbRequest::StatementTimeout {
+                    tx: 1,
+                    ms: Some(200),
+                },
+                json!({"op": "statement_timeout", "tx": 1, "ms": 200}),
+            ),
+            (
+                DbRequest::StatementTimeout { tx: 1, ms: None },
+                json!({"op": "statement_timeout", "tx": 1, "ms": null}),
             ),
         ] {
             assert_eq!(wire["op"], request.op());

@@ -185,7 +185,7 @@ mod tests {
             transaction_with(
                 TxOptions {
                     isolation: Isolation::Serializable,
-                    read_only: false,
+                    ..TxOptions::default()
                 },
                 |tx| {
                     tx.set_local("app.scope", "a")?;
@@ -217,6 +217,53 @@ mod tests {
             }
         );
         assert_eq!(seen[5], DbRequest::Commit { tx: 4 });
+    }
+
+    #[cfg(feature = "guest-statement-timeout")]
+    #[test]
+    fn a_statement_timeout_is_sent_in_whole_milliseconds_and_a_refusal_rolls_back() {
+        use std::time::Duration;
+        let (result, seen) = mock::with(platform, || {
+            transaction(|tx| {
+                tx.statement_timeout(Some(Duration::from_micros(200_001)))?;
+                tx.query("SELECT 1", &[])?;
+                tx.statement_timeout(Some(Duration::from_nanos(1)))?;
+                tx.statement_timeout(Some(Duration::ZERO))?;
+                tx.statement_timeout(Some(Duration::MAX))?;
+                tx.statement_timeout(None)
+            })
+        });
+        assert!(result.is_ok());
+        let sent: Vec<_> = seen
+            .iter()
+            .filter_map(|request| match request {
+                DbRequest::StatementTimeout { tx, ms } => Some((*tx, *ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (4, Some(201)),
+                (4, Some(1)),
+                (4, Some(0)),
+                (4, Some(u64::MAX)),
+                (4, None)
+            ]
+        );
+        assert_eq!(&ops(&seen)[..3], ["begin", "statement_timeout", "query"]);
+        let (refused, seen) = mock::with(
+            |request| match request {
+                DbRequest::StatementTimeout { .. } => failure(DbErrorKind::InvalidParameter),
+                other => platform(other),
+            },
+            || transaction(|tx| tx.statement_timeout(Some(Duration::from_secs(1)))),
+        );
+        assert_eq!(
+            refused.err().map(|e| e.kind),
+            Some(DbErrorKind::InvalidParameter)
+        );
+        assert_eq!(ops(&seen), ["begin", "statement_timeout", "rollback"]);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::wasm_runtime::ExecutionError;
 use cufflink_pgcodec::tx::{transaction_limit, transaction_not_found, Phase};
 use cufflink_types::db::{DbError, DbErrorKind};
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_postgres::Statement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,9 @@ pub(crate) struct TxSlot {
     pub(crate) set_timeout: Statement,
     pub(crate) phase: Phase,
     pub(crate) savepoints: Vec<String>,
+    /// The guest's own timeout for the statements that follow; a rollback
+    /// to a savepoint leaves it as it is.
+    pub(crate) statement_timeout: Option<Duration>,
     opened: Instant,
 }
 
@@ -69,6 +72,7 @@ impl TxSlot {
             set_timeout,
             phase: Phase::Open,
             savepoints: Vec::new(),
+            statement_timeout: None,
             opened: Instant::now(),
         }
     }

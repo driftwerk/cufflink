@@ -42,6 +42,7 @@ declare_features! {
     "storage-acl" => STORAGE_ACL = b"storage_acl\n",
     "util-v2" => UTIL_V2 = b"util_v2\n",
     "ext-call" => EXT_CALL = b"ext_call\n",
+    "guest-statement-timeout" => GUEST_STATEMENT_TIMEOUT = b"guest_statement_timeout\n",
     "sql-parse" => SQL_PARSE = b"sql_parse\n",
 }
 
@@ -126,6 +127,7 @@ mod tests {
             features::STORAGE_ACL,
             features::UTIL_V2,
             features::EXT_CALL,
+            features::GUEST_STATEMENT_TIMEOUT,
             features::SQL_PARSE,
         ];
         assert_eq!(MARKERS.len(), expected.len());
