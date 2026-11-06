@@ -6,11 +6,12 @@ use super::apart;
 use postgresql_embedded::blocking::PostgreSQL;
 use postgresql_embedded::Settings;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const ADMIN_DATABASE: &str = "postgres";
 /// A test's data is dropped with its database, so nothing waits for a disk.
 const CONFIGURATION: [(&str, &str); 3] = [
@@ -25,6 +26,11 @@ static RUNNING: Mutex<Option<PostgreSQL>> = Mutex::new(None);
 /// Where Postgres is installed, when not where `postgresql_embedded`
 /// installs it by default.
 const INSTALLATION_DIR: &str = "CUFFLINK_TEST_POSTGRES_DIR";
+
+/// How long, in whole seconds, each command that initialises, starts or
+/// stops the server (`initdb`, `pg_ctl`) may take, when not
+/// [`DEFAULT_COMMAND_TIMEOUT`].
+const COMMAND_TIMEOUT_SECS: &str = "CUFFLINK_TEST_POSTGRES_COMMAND_TIMEOUT_SECS";
 
 /// The URL of the server's `postgres` database; the first call starts the
 /// server, [`apart`], since the blocking installer drives a runtime of its
@@ -42,7 +48,7 @@ fn start() -> Result<String, String> {
         installation_dir: std::env::var_os(INSTALLATION_DIR)
             .filter(|dir| !dir.is_empty())
             .map_or(defaults.installation_dir.clone(), PathBuf::from),
-        timeout: Some(COMMAND_TIMEOUT),
+        timeout: Some(command_timeout(std::env::var_os(COMMAND_TIMEOUT_SECS))?),
         configuration: CONFIGURATION
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -68,9 +74,69 @@ fn start() -> Result<String, String> {
     Ok(url)
 }
 
+/// The command timeout `value` of [`COMMAND_TIMEOUT_SECS`] names: the
+/// default when it is unset or empty, else a whole number of seconds, at
+/// least one.
+fn command_timeout(value: Option<OsString>) -> Result<Duration, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_COMMAND_TIMEOUT);
+    };
+    value
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            format!("{COMMAND_TIMEOUT_SECS} is {value:?}: it must be a whole number of seconds, at least 1")
+        })
+}
+
 /// Dropping the server stops it and removes its data directory.
 extern "C" fn stop() {
     if let Ok(mut running) = RUNNING.lock() {
         drop(running.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_timeout_is_a_minute_unless_set() {
+        assert_eq!(command_timeout(None), Ok(DEFAULT_COMMAND_TIMEOUT));
+        assert_eq!(
+            command_timeout(Some("".into())),
+            Ok(DEFAULT_COMMAND_TIMEOUT)
+        );
+        assert_eq!(DEFAULT_COMMAND_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_set_command_timeout_is_whole_seconds() {
+        for (value, secs) in [("1", 1), ("300", 300), ("007", 7)] {
+            assert_eq!(
+                command_timeout(Some(value.into())),
+                Ok(Duration::from_secs(secs)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_timeout_that_is_not_a_positive_whole_number_is_refused() {
+        for value in ["0", "-5", "1.5", "abc", " 5", "5s", "18446744073709551616"] {
+            let refused = command_timeout(Some(value.into())).expect_err(value);
+            assert!(refused.starts_with(COMMAND_TIMEOUT_SECS), "{refused}");
+            assert!(refused.contains("at least 1"), "{refused}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_timeout_that_is_not_text_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let refused = command_timeout(Some(OsString::from_vec(vec![0x35, 0xff])));
+        assert!(refused.is_err());
     }
 }
