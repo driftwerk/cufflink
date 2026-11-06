@@ -597,12 +597,11 @@ impl Process {
                 eyre!("the parser process did not greet within {HANDSHAKE_TIMEOUT:?}")
             })??;
         metrics::counter!("cufflink_sql_parser_spawns_total").increment(1);
-        match hello.parser == PARSER && hello.fingerprint == PROBE_FINGERPRINT {
+        let wanted = Hello::of_this_build(PROBE_FINGERPRINT);
+        match hello == wanted {
             true => Ok(process),
             false => Err(eyre!(
-                "the parser process is pg_query {} with fingerprint {}; this platform needs {PARSER} with {PROBE_FINGERPRINT}",
-                hello.parser,
-                hello.fingerprint
+                "the parser process greeted with {hello:?}; this platform needs {wanted:?}"
             )),
         }
     }

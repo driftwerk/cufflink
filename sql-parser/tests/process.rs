@@ -1,9 +1,12 @@
-use cufflink_sql_parse::bounds::{MAX_BRACKET_DEPTH, MAX_CHAIN_DEPTH};
+use cufflink_sql_parse::bounds::{
+    MAX_BRACKET_DEPTH, MAX_CHAIN_DEPTH, MAX_INPUT_BYTES, MAX_WARNED_FORMS,
+};
 use cufflink_sql_parse::wire::{read_frame, read_message, write_frame, write_message};
 use cufflink_sql_parse::wire::{Answer, Hello, Request};
-use cufflink_sql_parse::{parse, PARSER, PROBE, PROBE_FINGERPRINT};
+use cufflink_sql_parse::{golden, parse, PROBE, PROBE_FINGERPRINT};
 use std::io::Write;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 struct Parser {
     child: Child,
@@ -95,19 +98,14 @@ impl Parser {
 #[test]
 fn the_built_process_greets_answers_and_ends_with_its_input() {
     let mut parser = Parser::start();
-    assert_eq!(
-        parser.hello(),
-        Hello {
-            parser: PARSER.to_string(),
-            fingerprint: PROBE_FINGERPRINT.to_string(),
-        }
-    );
+    assert_eq!(parser.hello(), Hello::of_this_build(PROBE_FINGERPRINT));
     assert_eq!(parser.answer("SELECT 1"), parse("SELECT 1", usize::MAX));
     parser.end();
 }
 
 /// Everything a parse can do, in the confined process: the corpus, every
-/// refusal, and the deepest inputs the bounds let through. A system call
+/// refusal, the deepest inputs the bounds let through, and the golden
+/// corpus's committed answers. A system call
 /// missing from the allowlist ends the process, and the test with it.
 #[test]
 fn the_confined_process_answers_as_the_library_does() {
@@ -132,12 +130,20 @@ fn the_confined_process_answers_as_the_library_does() {
                 "f(".repeat(brackets - 1),
                 ")".repeat(brackets - 1)
             ),
-            format!("SELECT 1 WHERE x IN (1{})", ",1".repeat(100_000)),
+            filled("SELECT 1 WHERE x IN (1", ",1", ")"),
         ]);
     for sql in statements {
         assert_eq!(
             parser.answer(&sql),
             parse(&sql, usize::MAX),
+            "{}",
+            &sql[..20.min(sql.len())]
+        );
+    }
+    for (sql, expected) in golden::cases() {
+        assert_eq!(
+            golden::answer(&parser.answer(sql)),
+            expected,
             "{}",
             &sql[..20.min(sql.len())]
         );
@@ -164,4 +170,122 @@ fn the_confined_process_reports_a_broken_request_on_stderr_and_fails() {
     std::io::Read::read_to_string(&mut stderr, &mut report).expect("stderr");
     assert_eq!(status.code(), Some(1), "{status}");
     assert!(report.starts_with("cufflink-sql-parser: "), "{report}");
+}
+
+/// `prefix`, as many `unit`s as fit, and `suffix`: a statement of
+/// [`MAX_INPUT_BYTES`], less at most one unit.
+fn filled(prefix: &str, unit: &str, suffix: &str) -> String {
+    let units = (MAX_INPUT_BYTES - prefix.len() - suffix.len()) / unit.len();
+    format!("{prefix}{}{suffix}", unit.repeat(units))
+}
+
+/// The shapes whose parse costs most for their length, each at the input
+/// bound.
+fn costliest() -> Vec<(&'static str, String)> {
+    let warned = "CREATE GLOBAL TEMP TABLE t();".repeat(MAX_WARNED_FORMS as usize);
+    vec![
+        ("columns", filled("SELECT a", ",a", "")),
+        ("stars", filled("SELECT *", ",*", "")),
+        ("ordering", filled("SELECT 1 ORDER BY a", ",a", "")),
+        ("arguments", filled("SELECT f(a", ",a", ")")),
+        ("subscripts", filled("SELECT a[1]", ",a[1]", "")),
+        ("in list", filled("SELECT 1 WHERE x IN (1", ",1", ")")),
+        ("conjunction", filled("SELECT 1 WHERE x=1", " AND x=1", "")),
+        ("rows", filled("VALUES (1)", ",(1)", "")),
+        ("statements", filled("", "SELECT 1;", "")),
+        (
+            "column definitions",
+            filled("CREATE TABLE t (a int", ",a int", ")"),
+        ),
+        (
+            "warnings at the end",
+            filled("-- ", "x", &format!("\n{warned}")),
+        ),
+    ]
+}
+
+/// What a platform allows one parse by default; the costliest statements
+/// must answer well within it.
+const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The costliest statements the bounds let through, in the confined
+/// process: each answers its tree, as the library does, within half the
+/// platform's parse timeout, and on Linux within half the process's address
+/// space; a parse past that space would end the process.
+#[test]
+fn the_costliest_statements_within_the_bounds_answer_in_time_and_memory() {
+    let mut parser = Parser::start();
+    parser.hello();
+    #[cfg(target_os = "linux")]
+    parser.assert_confined();
+    for (name, sql) in costliest() {
+        assert!(
+            (MAX_INPUT_BYTES - 64..=MAX_INPUT_BYTES).contains(&sql.len()),
+            "{name}: {}",
+            sql.len()
+        );
+        let started = Instant::now();
+        let answer = parser.answer(&sql);
+        let took = started.elapsed();
+        assert!(answer.is_ok(), "{name}: {answer:?}");
+        assert!(took < PARSE_TIMEOUT / 2, "{name}: {took:?}");
+        assert!(answer == parse(&sql, usize::MAX), "{name}");
+    }
+    let past = "CREATE GLOBAL TEMP TABLE t();".repeat(MAX_WARNED_FORMS as usize + 1);
+    assert!(matches!(
+        parser.answer(&past),
+        Err(cufflink_types::sql_parse::ParseError::TooLarge(_))
+    ));
+    parser.end();
+    #[cfg(target_os = "linux")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage writes one rusage into the buffer it is given.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: getrusage succeeded, so it wrote the whole struct.
+        let peak_kib = unsafe { usage.assume_init() }.ru_maxrss;
+        assert!(
+            peak_kib < 512 * 1024,
+            "a parser process reached {peak_kib} KiB, over half of SQL_PARSE_MEMORY_MB"
+        );
+    }
+}
+
+/// A descriptor the process is started with, here the write end of a pipe
+/// the test holds the read end of, is closed before the process greets: the
+/// pipe ends as soon as the test closes its own copy.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_process_closes_every_descriptor_it_inherits() {
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 writes two descriptors into the array it is given.
+    assert_eq!(
+        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let [read, write] = ends;
+    // SAFETY: F_SETFD on a descriptor this test owns.
+    assert_eq!(unsafe { libc::fcntl(write, libc::F_SETFD, 0) }, 0);
+    let mut parser = Parser::start();
+    parser.hello();
+    // SAFETY: closing the test's own copy of the write end.
+    assert_eq!(unsafe { libc::close(write) }, 0);
+    let mut ready = libc::pollfd {
+        fd: read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll reads and writes the one pollfd it is given.
+    let polled = unsafe { libc::poll(&mut ready, 1, 5_000) };
+    let mut byte = 0u8;
+    // SAFETY: read writes at most one byte into `byte`.
+    let read_len = unsafe { libc::read(read, (&mut byte as *mut u8).cast(), 1) };
+    // SAFETY: closing the test's own read end.
+    unsafe { libc::close(read) };
+    assert_eq!(polled, 1, "the pipe is still open in the parser process");
+    assert_eq!(read_len, 0);
+    parser.end();
 }

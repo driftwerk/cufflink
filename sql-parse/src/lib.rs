@@ -3,10 +3,14 @@
 //!
 //! - [`bounds`]: what is refused before the parser runs.
 //! - [`wire`]: how the platform talks to a parser process.
+//! - [`golden`]: statements and the answers this release gives them.
 //! - With the `parser` feature, the parse itself (`pg_query`), which the
 //!   parser process and the native test host run.
 
 pub mod bounds;
+#[cfg(feature = "parser")]
+mod canonical;
+pub mod golden;
 #[cfg(feature = "parser")]
 mod parse;
 pub mod wire;

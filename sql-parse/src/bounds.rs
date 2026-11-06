@@ -11,13 +11,22 @@
 
 use cufflink_types::sql_parse::ParseError;
 
-pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// The longest statement parsed. A parse's time and memory grow with its
+/// input, by up to about 4 µs and 2.8 KB a byte for a flat list of column
+/// references; at this size the worst measured parse takes 0.6 s and
+/// 360 MB, well inside a parser process's time and memory.
+pub const MAX_INPUT_BYTES: usize = 128 * 1024;
 
 /// `(`, `[` and `CASE … END` levels open at once.
 pub const MAX_BRACKET_DEPTH: u32 = 1_000;
 
 /// An upper bound on the tree's depth along any path (see [`check`]).
 pub const MAX_CHAIN_DEPTH: u32 = 10_000;
+
+/// `GLOBAL TEMP` and `GLOBAL TEMPORARY`, which the grammar parses with a
+/// warning. Each warning counts the characters before it, so their cost
+/// grows with their number times the input's length.
+pub const MAX_WARNED_FORMS: u32 = 100;
 
 /// Refuses, as `TooLarge`, input past one of the bounds.
 ///
@@ -31,7 +40,9 @@ pub const MAX_CHAIN_DEPTH: u32 = 10_000;
 /// plus its whole-level count, plus its deepest segment, where a segment is
 /// its own count plus the deepest level nested inside it. The scan stops at
 /// the first count past [`MAX_CHAIN_DEPTH`], since a depth is at least any
-/// of its counts.
+/// of its counts. A `GLOBAL` followed by `TEMP` or `TEMPORARY` counts as a
+/// form the grammar warns about, wherever it is, at most
+/// [`MAX_WARNED_FORMS`].
 pub fn check(sql: &str) -> Result<(), ParseError> {
     if sql.len() > MAX_INPUT_BYTES {
         return Err(too_large(format!(
@@ -83,6 +94,8 @@ enum Token {
     Chain,
     Case,
     End,
+    Global,
+    Temp,
     Other,
 }
 
@@ -153,6 +166,8 @@ struct Scan<'a> {
     levels: Vec<Level>,
     /// The levels of each kind open, so a close finds its own in O(1).
     open: [u32; 4],
+    after_global: bool,
+    warned: u32,
 }
 
 impl<'a> Scan<'a> {
@@ -162,6 +177,8 @@ impl<'a> Scan<'a> {
             at: 0,
             levels: vec![Level::new(Opened::Root)],
             open: [1, 0, 0, 0],
+            after_global: false,
+            warned: 0,
         }
     }
 
@@ -179,6 +196,15 @@ impl<'a> Scan<'a> {
     }
 
     fn take(&mut self, token: Token) -> Result<(), ParseError> {
+        if token == Token::Temp && self.after_global {
+            self.warned += 1;
+            if self.warned > MAX_WARNED_FORMS {
+                return Err(too_large(format!(
+                    "the statement has more than {MAX_WARNED_FORMS} forms the parser warns about"
+                )));
+            }
+        }
+        self.after_global = token == Token::Global;
         match token {
             Token::Open(opened) => self.open(opened)?,
             Token::Case => {
@@ -212,7 +238,7 @@ impl<'a> Scan<'a> {
                 level.whole = level.whole.saturating_add(1);
                 level.count();
             }
-            Token::End | Token::Other => self.top().count(),
+            Token::End | Token::Global | Token::Temp | Token::Other => self.top().count(),
         }
         match self.top().reached() > MAX_CHAIN_DEPTH {
             true => Err(too_deep()),
@@ -437,6 +463,10 @@ fn keyword(word: &[u8]) -> Token {
         Token::Case
     } else if is("end") {
         Token::End
+    } else if is("global") {
+        Token::Global
+    } else if is("temp") || is("temporary") {
+        Token::Temp
     } else {
         Token::Other
     }
@@ -478,7 +508,7 @@ mod tests {
     fn flat_lists_and_boolean_chains_stay_shallow() {
         let in_list = format!("SELECT 1 WHERE x IN (1{})", ",1".repeat(100_000));
         assert!(depth(&in_list) < 10, "{}", depth(&in_list));
-        let conjunction = format!("SELECT 1 WHERE {}true", "x = 1 AND ".repeat(80_000));
+        let conjunction = format!("SELECT 1 WHERE {}true", "x = 1 AND ".repeat(12_000));
         assert!(depth(&conjunction) < 10);
         assert!(check(&conjunction).is_ok());
         let columns = format!("SELECT a{} FROM t", ", a AS b".repeat(50_000));
@@ -632,7 +662,24 @@ mod tests {
     }
 
     #[test]
-    fn input_past_a_mebibyte_is_refused_before_it_is_read() {
+    fn global_temp_is_counted_wherever_it_is_and_bounded() {
+        let tables = |n: usize| "CREATE GLOBAL TEMP TABLE t();".repeat(n);
+        assert!(check(&tables(MAX_WARNED_FORMS as usize)).is_ok());
+        assert!(refused(&tables(MAX_WARNED_FORMS as usize + 1)).contains("warns"));
+        let spelled = |n: usize| "create global /* c */ temporary table t();".repeat(n);
+        assert!(refused(&spelled(MAX_WARNED_FORMS as usize + 1)).contains("warns"));
+        let hidden = format!(
+            "SELECT '{}', $q${}$q$, global, temp",
+            tables(200),
+            tables(200)
+        );
+        assert!(check(&hidden).is_ok());
+        let local = "CREATE LOCAL TEMP TABLE t(); CREATE TEMP TABLE t();".repeat(500);
+        assert!(check(&local).is_ok());
+    }
+
+    #[test]
+    fn input_past_the_byte_bound_is_refused_before_it_is_read() {
         let largest = format!("SELECT '{}'", "x".repeat(MAX_INPUT_BYTES - 9));
         assert_eq!(largest.len(), MAX_INPUT_BYTES);
         assert!(check(&largest).is_ok());

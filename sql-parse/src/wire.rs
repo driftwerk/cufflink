@@ -1,7 +1,8 @@
 //! Between the platform and a parser process, over the process's stdin and
 //! stdout: frames of a 4-byte big-endian length and that many bytes.
 //!
-//! - The process starts by sending a [`Hello`].
+//! - The process starts by sending a [`Hello`], which the platform takes
+//!   only if it is [`Hello::of_this_build`] with the published fingerprint.
 //! - Each request is a [`Request`] frame, then a frame of the statement.
 //! - Each answer is an [`Answer`] frame, and after [`Answer::Tree`] a frame
 //!   of the tree's canonical text.
@@ -13,10 +14,33 @@ use std::io::{self, Read, Write};
 /// The most a [`Hello`], [`Request`] or [`Answer`] frame holds.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 
+/// The version of this exchange: its frames and messages, the bounds both
+/// sides apply and the tree's canonical text. It changes whenever any of
+/// them does, so a platform never uses a process built to other terms.
+pub const PROTOCOL: u32 = 1;
+
+/// What a process greets with: the terms it was built to, and its parser's
+/// identity, which it computes by parsing the probe corpus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
+    pub protocol: u32,
+    /// The `cufflink-sql-parse` release the process was built with.
+    pub build: String,
     pub parser: String,
     pub fingerprint: String,
+}
+
+impl Hello {
+    /// The greeting of a process built with this crate whose parser reads
+    /// the probe corpus as `fingerprint`.
+    pub fn of_this_build(fingerprint: impl Into<String>) -> Self {
+        Self {
+            protocol: PROTOCOL,
+            build: env!("CARGO_PKG_VERSION").to_string(),
+            parser: crate::PARSER.to_string(),
+            fingerprint: fingerprint.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +132,24 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
         let cut = read_frame(&mut &long[..6], 16).expect_err("cut short");
         assert_eq!(cut.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_greeting_names_its_terms_and_one_without_them_is_not_read() {
+        let hello = Hello::of_this_build("f");
+        assert_eq!(
+            serde_json::to_value(&hello).expect("encode"),
+            serde_json::json!({
+                "protocol": PROTOCOL,
+                "build": env!("CARGO_PKG_VERSION"),
+                "parser": crate::PARSER,
+                "fingerprint": "f",
+            })
+        );
+        let earlier = br#"{"parser":"6.2.1","fingerprint":"f"}"#;
+        let mut wire = Vec::new();
+        write_frame(&mut wire, earlier).expect("hello");
+        assert!(read_message::<Hello>(&mut wire.as_slice()).is_err());
     }
 
     #[test]

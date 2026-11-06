@@ -158,3 +158,15 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.bitstream-io]
 opt-level = 3
+
+# The SQL parser and what writes its trees run in the tests that bound a
+# parse's time; unoptimised, a parse of the largest statement takes several
+# times as long as it does in a release build.
+[profile.dev.package.pg_query]
+opt-level = 3
+[profile.dev.package.prost]
+opt-level = 3
+[profile.dev.package.cufflink-sql-parse]
+opt-level = 3
+[profile.dev.package.cufflink-sql-parser]
+opt-level = 3

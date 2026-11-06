@@ -10,7 +10,7 @@ mod sandbox;
 use cufflink_sql_parse::bounds::MAX_INPUT_BYTES;
 use cufflink_sql_parse::wire::{read_frame, read_message, write_frame, write_message};
 use cufflink_sql_parse::wire::{Answer, Hello, Request};
-use cufflink_sql_parse::{fingerprint_with, parse_on_this_thread, PARSER, STACK_BYTES};
+use cufflink_sql_parse::{fingerprint_with, parse_on_this_thread, STACK_BYTES};
 use cufflink_types::sql_parse::ParseError;
 use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
@@ -29,10 +29,7 @@ fn main() -> ExitCode {
 fn run() -> io::Result<()> {
     sandbox::confine()?;
     let thread = ParseThread::spawn()?;
-    let hello = Hello {
-        parser: PARSER.to_string(),
-        fingerprint: thread.warm_up()?,
-    };
+    let hello = Hello::of_this_build(thread.warm_up()?);
     sandbox::enter()?;
     serve(
         &hello,
@@ -141,12 +138,7 @@ mod tests {
     }
 
     fn hello() -> Hello {
-        Hello {
-            parser: PARSER.to_string(),
-            fingerprint: cufflink_sql_parse::fingerprint()
-                .expect("fingerprint")
-                .to_string(),
-        }
+        Hello::of_this_build(cufflink_sql_parse::fingerprint().expect("fingerprint"))
     }
 
     fn served(input: &[u8]) -> io::Result<Vec<u8>> {

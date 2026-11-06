@@ -1,7 +1,7 @@
 //! The parse itself: `pg_query` over a statement that passed the bounds, on
 //! a thread with a stack sized for them, one at a time in the process.
 
-use crate::{bounds, MAX_TREE_NESTING, PARSER, PROBE};
+use crate::{bounds, canonical, MAX_TREE_NESTING, PARSER, PROBE, PROBE_FINGERPRINT};
 use cufflink_types::sql_parse::{ParseError, Parsed};
 use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -15,10 +15,10 @@ pub const STACK_BYTES: usize = 64 * 1024 * 1024;
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// The tree of `sql` as canonical text: `serde_json::to_value` of
-/// `pg_query`'s protobuf, written with sorted keys and no whitespace.
-/// Refuses input past the bounds, a text past `max_output` bytes, and one
-/// nesting deeper than [`MAX_TREE_NESTING`]. Runs on a thread of its own
-/// with [`STACK_BYTES`] of stack.
+/// `pg_query`'s protobuf, written with sorted keys and no whitespace
+/// ([`canonical`]). Refuses input past the bounds, a text past
+/// `max_output` bytes, and one nesting deeper than [`MAX_TREE_NESTING`].
+/// Runs on a thread of its own with [`STACK_BYTES`] of stack.
 pub fn parse(sql: &str, max_output: usize) -> Result<String, ParseError> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -32,64 +32,43 @@ pub fn parse(sql: &str, max_output: usize) -> Result<String, ParseError> {
 }
 
 /// [`parse`] on the calling thread, which must have [`STACK_BYTES`] of
-/// stack, for a process that keeps one such thread for every parse.
+/// stack, for a process that keeps one such thread for every parse. The
+/// text is written as the tree is serialised, and stops at the first byte
+/// or level past either limit.
 pub fn parse_on_this_thread(sql: &str, max_output: usize) -> Result<String, ParseError> {
     bounds::check(sql)?;
-    let text = {
+    let parsed = {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-        canonical(sql)?
+        pg_query::parse(sql).map_err(refusal)?
     };
-    if text.len() > max_output {
-        return Err(ParseError::TooLarge(format!(
-            "the parse tree is over {max_output} bytes"
-        )));
-    }
-    match nesting(&text) > MAX_TREE_NESTING {
-        true => Err(ParseError::TooLarge(format!(
-            "the parse tree nests deeper than {MAX_TREE_NESTING} levels"
-        ))),
-        false => Ok(text),
-    }
-}
-
-/// The deepest the objects and arrays of JSON `text` nest.
-fn nesting(text: &str) -> usize {
-    let mut depth = 0usize;
-    let mut deepest = 0usize;
-    let mut bytes = text.bytes();
-    while let Some(byte) = bytes.next() {
-        match byte {
-            b'"' => {
-                while let Some(inner) = bytes.next() {
-                    match inner {
-                        b'\\' => {
-                            bytes.next();
-                        }
-                        b'"' => break,
-                        _ => {}
-                    }
-                }
+    canonical::to_text(&parsed.protobuf, max_output, MAX_TREE_NESTING).map_err(|refused| {
+        match refused {
+            canonical::Refusal::TooLong => {
+                ParseError::TooLarge(format!("the parse tree is over {max_output} bytes"))
             }
-            b'{' | b'[' => {
-                depth += 1;
-                deepest = deepest.max(depth);
-            }
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            _ => {}
+            canonical::Refusal::TooDeep => ParseError::TooLarge(format!(
+                "the parse tree nests deeper than {MAX_TREE_NESTING} levels"
+            )),
+            canonical::Refusal::Unsupported => ParseError::unavailable(),
         }
-    }
-    deepest
+    })
 }
 
-/// [`parse`], read back as the tree a guest is given, with this parser's
-/// identity.
+/// [`parse`], read back as the tree a guest is given, with the release's
+/// identity. A build whose parser reads the probe corpus differently from
+/// the release is `Unavailable`, never answered with the release's name.
 pub fn parsed(sql: &str, max_output: usize) -> Result<Parsed, ParseError> {
+    if fingerprint()? != PROBE_FINGERPRINT {
+        return Err(ParseError::Unavailable(
+            "this build's parser reads the probe corpus differently from the release".into(),
+        ));
+    }
     let text = parse(sql, max_output)?;
     let tree = serde_json::from_str(&text).map_err(|_| ParseError::unavailable())?;
     Ok(Parsed {
         tree,
         parser: PARSER.to_string(),
-        fingerprint: fingerprint()?.to_string(),
+        fingerprint: PROBE_FINGERPRINT.to_string(),
     })
 }
 
@@ -115,12 +94,6 @@ pub fn fingerprint_with(
         .map(|hash| hex::encode(hash.finalize()))
 }
 
-fn canonical(sql: &str) -> Result<String, ParseError> {
-    let parsed = pg_query::parse(sql).map_err(refusal)?;
-    let tree = serde_json::to_value(&parsed.protobuf).map_err(|_| ParseError::unavailable())?;
-    serde_json::to_string(&tree).map_err(|_| ParseError::unavailable())
-}
-
 /// No message of the parser's reaches the guest: they quote the input. A
 /// parse that ran out of memory, which PostgreSQL reports as an error of
 /// its own, is too large rather than wrong.
@@ -140,8 +113,36 @@ fn refusal(error: pg_query::Error) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PROBE_FINGERPRINT;
     use std::time::{Duration, Instant};
+
+    /// The deepest the objects and arrays of JSON `text` nest.
+    fn nesting(text: &str) -> usize {
+        let mut depth = 0usize;
+        let mut deepest = 0usize;
+        let mut bytes = text.bytes();
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'"' => {
+                    while let Some(inner) = bytes.next() {
+                        match inner {
+                            b'\\' => {
+                                bytes.next();
+                            }
+                            b'"' => break,
+                            _ => {}
+                        }
+                    }
+                }
+                b'{' | b'[' => {
+                    depth += 1;
+                    deepest = deepest.max(depth);
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        deepest
+    }
 
     fn own(sql: &str) -> Option<String> {
         pg_query::parse(sql).ok().map(|parsed| {
@@ -164,6 +165,30 @@ mod tests {
         let tree: serde_json::Value =
             serde_json::from_str(&parse("SELECT 1", usize::MAX).expect("parses")).expect("json");
         assert_eq!(tree["version"], 170_007);
+    }
+
+    #[test]
+    fn every_golden_statement_answers_its_committed_tree_or_refusal() {
+        let differing: Vec<_> = crate::golden::cases()
+            .filter(|(sql, expected)| crate::golden::answer(&parse(sql, usize::MAX)) != *expected)
+            .map(|(sql, _)| &sql[..sql.len().min(60)])
+            .collect();
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// Rewrites `golden/answers.txt` from this build's parser, for a release
+    /// that changes the parser on purpose.
+    #[test]
+    #[ignore = "rewrites the committed golden answers"]
+    fn bless_golden_answers() {
+        let answers: String = crate::golden::statements()
+            .map(|sql| crate::golden::answer(&parse(sql, usize::MAX)) + "\n")
+            .collect();
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/golden/answers.txt"),
+            answers,
+        )
+        .expect("written");
     }
 
     #[test]

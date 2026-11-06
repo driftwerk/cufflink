@@ -1,12 +1,14 @@
-//! What confines a parser process on Linux: its address space, its place
-//! in the out-of-memory killer's order, no inspection by other processes,
-//! and, once it has greeted, a system call allowlist with no files,
-//! sockets or programs in it. Elsewhere only the memory setting is read.
+//! What confines a parser process on Linux: no descriptor but stdin,
+//! stdout and stderr, its address space, its place in the out-of-memory
+//! killer's order, no inspection by other processes, and, once it has
+//! greeted, a system call allowlist with no files, sockets or programs in
+//! it. Elsewhere only the memory setting is read.
 
 use std::io;
 
 #[cfg(target_os = "linux")]
 pub fn confine() -> io::Result<()> {
+    close_inherited()?;
     if let Some(mb) = memory_limit_mb()? {
         let bytes: libc::rlim_t = mb.saturating_mul(1024 * 1024);
         let limit = libc::rlimit {
@@ -27,6 +29,34 @@ pub fn confine() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Closes every descriptor but stdin, stdout and stderr, so nothing the
+/// process was started with outlives its confinement. Before Linux 5.9,
+/// which has no `close_range`, it closes what `/proc/self/fd` lists.
+#[cfg(target_os = "linux")]
+fn close_inherited() -> io::Result<()> {
+    const FIRST: libc::c_uint = 3;
+    // SAFETY: close_range takes plain integers and only closes descriptors,
+    // and nothing in this process holds one past stderr yet.
+    match unsafe { libc::syscall(libc::SYS_close_range, FIRST, libc::c_uint::MAX, 0) } {
+        0 => Ok(()),
+        _ => match io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(libc::ENOSYS) => {
+                let open: Vec<libc::c_int> = std::fs::read_dir("/proc/self/fd")?
+                    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .filter(|fd| *fd >= FIRST as libc::c_int)
+                    .collect();
+                // SAFETY: closing a descriptor touches no memory; the one
+                // the listing used is already closed, and is ignored.
+                open.into_iter().for_each(|fd| unsafe {
+                    libc::close(fd);
+                });
+                Ok(())
+            }
+            e => Err(e),
+        },
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
