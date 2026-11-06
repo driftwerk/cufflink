@@ -135,7 +135,11 @@ compares the token's `sub`, so a test of a handler that compares a
 `TestDb::start()` creates a database on the server
 `CUFFLINK_TEST_DATABASE_URL` names, else on an embedded Postgres the
 process starts once and stops at exit (installed where `postgresql_embedded`
-installs it, or under `CUFFLINK_TEST_POSTGRES_DIR`). The database is dropped
+installs it, or under `CUFFLINK_TEST_POSTGRES_DIR`). Each command that
+initialises, starts or stops it (`initdb`, `pg_ctl`) may take 60 s, or as
+many whole seconds as `CUFFLINK_TEST_POSTGRES_COMMAND_TIMEOUT_SECS` names,
+for a slow or busy machine; a value that is not a whole number of at least
+1 fails the test with a message naming the variable. The database is dropped
 with the `TestDb`. `migrate(schema, dir, history)` applies SQL migrations as
 a deploy does, under the history's table and lock, so a service that keeps
 a refinery history is migrated the way it is in production; `execute`,
@@ -149,6 +153,7 @@ what fails there fails in the test:
 | Role | a login as the service's own role, as under `db_roles: enforce`: made by `TestDb::service_role(schema)` as the platform makes it (no superuser, owns its schema and what the server's user made in it, no `CREATE` in `public`, nothing of another schema). `migrate` runs the migrations as it. | `.role(PgRole::Login(ServiceRole::existing(name, password)))` logs in as a role the test set up; `.role(PgRole::Set(name))` sets a role on each transaction; `.role(PgRole::Connection)` runs as the server's user, as under `db_roles: off` |
 | Pooler | `pgbouncer_transaction`: a statement that must run outside a transaction, and `SET`/`RESET`, are refused with the platform's messages | `.pooler(Pooler::Direct)` |
 | `db::query_read_only` | the service's role; with `.read_only_role(name)`, that role, which the service's role is granted | |
+| Statement timeout | 30 s, set again before each statement, savepoint and commit of a transaction as the platform does; a guest's own shorter value (`guest-statement-timeout`) wins, and one past the timeout plus 0.5 s is refused, as the platform refuses one past the route's budget | `.statement_timeout(d)` |
 
 `TestDb::service_role` needs a server user that may create roles (a
 superuser, or `CREATEROLE`); the roles are dropped with the database.

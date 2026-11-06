@@ -3,6 +3,49 @@
 //! which savepoints it holds. Whatever holds the connection applies them.
 
 use cufflink_types::db::{DbError, DbErrorKind, Isolation};
+use std::time::Duration;
+
+const STATEMENT_DEADLINE_MARGIN: Duration = Duration::from_millis(500);
+const STATEMENT_TIMEOUT_FLOOR: Duration = Duration::from_secs(1);
+
+/// The platform's `statement_timeout` with `remaining` of the invocation
+/// left: half a second short of the deadline, and never under a second, so
+/// a nearly spent budget can still run a statement.
+pub fn statement_timeout_for(remaining: Duration) -> Duration {
+    remaining
+        .saturating_sub(STATEMENT_DEADLINE_MARGIN)
+        .max(STATEMENT_TIMEOUT_FLOOR)
+}
+
+/// The route budget the native test host stands for: the one whose
+/// platform timeout at the start is `statement_timeout`.
+pub fn budget_of(statement_timeout: Duration) -> Duration {
+    statement_timeout + STATEMENT_DEADLINE_MARGIN
+}
+
+/// A guest's own `statement_timeout` in milliseconds, as `StatementTimeout`
+/// carries it. Zero, which Postgres reads as no timeout, and anything past
+/// the invocation's whole `budget` are refused.
+pub fn guest_statement_timeout(ms: u64, budget: Duration) -> Result<Duration, DbError> {
+    let timeout = Duration::from_millis(ms);
+    match ms > 0 && timeout <= budget {
+        true => Ok(timeout),
+        false => Err(DbError::new(
+            DbErrorKind::InvalidParameter,
+            format!(
+                "a statement timeout is at least 1 ms and at most the invocation's budget of {} ms",
+                budget.as_millis()
+            ),
+        )),
+    }
+}
+
+/// What a statement runs under: the platform's timeout, or the guest's
+/// where it is shorter. A guest's value below the platform's floor stands,
+/// since the floor only keeps a nearly spent budget usable.
+pub fn effective_statement_timeout(guest: Option<Duration>, platform: Duration) -> Duration {
+    guest.map_or(platform, |guest| guest.min(platform))
+}
 
 /// Where an open transaction stands. After a statement error Postgres has
 /// aborted the transaction and only a rollback (to a savepoint or whole)
@@ -188,6 +231,69 @@ pub fn unknown_savepoint(name: &str, tx: u32) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_platform_timeout_keeps_a_margin_and_a_floor() {
+        assert_eq!(
+            statement_timeout_for(Duration::from_secs(30)),
+            Duration::from_millis(29_500)
+        );
+        assert_eq!(
+            statement_timeout_for(Duration::from_millis(1_200)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            statement_timeout_for(Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            statement_timeout_for(budget_of(Duration::from_secs(30))),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn a_guest_timeout_is_positive_and_within_the_budget() {
+        let budget = Duration::from_secs(30);
+        assert_eq!(
+            guest_statement_timeout(200, budget).ok(),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(guest_statement_timeout(30_000, budget).ok(), Some(budget));
+        for refused in [0, 30_001, u64::MAX] {
+            assert_eq!(
+                guest_statement_timeout(refused, budget)
+                    .err()
+                    .map(|e| e.kind),
+                Some(DbErrorKind::InvalidParameter),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shorter_timeout_wins_and_a_guest_one_may_pass_the_floor() {
+        let platform = statement_timeout_for(Duration::from_secs(30));
+        assert_eq!(effective_statement_timeout(None, platform), platform);
+        assert_eq!(
+            effective_statement_timeout(Some(Duration::from_millis(200)), platform),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            effective_statement_timeout(Some(Duration::from_secs(60)), platform),
+            platform
+        );
+        let spent = statement_timeout_for(Duration::from_millis(300));
+        assert_eq!(spent, Duration::from_secs(1));
+        assert_eq!(
+            effective_statement_timeout(Some(Duration::from_millis(200)), spent),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            effective_statement_timeout(Some(Duration::from_secs(2)), spent),
+            spent
+        );
+    }
 
     #[test]
     fn refusals_name_their_kind() {

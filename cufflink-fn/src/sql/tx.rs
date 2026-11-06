@@ -6,6 +6,8 @@ use super::{query_request, Row};
 use cufflink_types::db::{DbError, DbErrorKind, DbRequest, Isolation, Param};
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
+#[cfg(feature = "guest-statement-timeout")]
+use std::time::Duration;
 
 /// How a transaction runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,6 +111,24 @@ impl Tx {
         .affected()
     }
 
+    /// The `statement_timeout` of every statement of this transaction from
+    /// the next one on: the shorter of `timeout` and what the platform
+    /// allows from the invocation's remaining budget. `None` gives the
+    /// choice back to the platform. A rollback to a savepoint keeps it.
+    ///
+    /// A timeout under a second stands, though the platform's own never
+    /// goes below one; one of zero, or past the invocation's whole budget,
+    /// is refused as `InvalidParameter`. It is sent in whole milliseconds,
+    /// rounded up.
+    #[cfg(feature = "guest-statement-timeout")]
+    pub fn statement_timeout(&mut self, timeout: Option<Duration>) -> Result<(), DbError> {
+        call(&DbRequest::StatementTimeout {
+            tx: self.id,
+            ms: timeout.map(whole_millis),
+        })?
+        .done()
+    }
+
     /// `SET LOCAL setting = value`, reverted when the transaction ends.
     pub fn set_local(&mut self, setting: &str, value: &str) -> Result<(), DbError> {
         self.query(
@@ -166,4 +186,9 @@ impl Tx {
             }
         }
     }
+}
+
+#[cfg(feature = "guest-statement-timeout")]
+fn whole_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
