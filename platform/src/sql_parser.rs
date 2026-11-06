@@ -435,7 +435,11 @@ impl Pool {
                     self.idle_again(process);
                     return None;
                 }
-                process = self.recycle(process, tenant).await.ok()?;
+                let pool = Arc::clone(self);
+                let fresh = Handover::new(self.recycle(process, tenant), move |process| {
+                    pool.idle_again(process)
+                });
+                process = fresh.claim().await?;
             }
             process.tenant = Some(tenant);
             return Some(process);
@@ -667,6 +671,45 @@ async fn reap_idle(pool: Weak<Pool>) {
         match pool.upgrade() {
             Some(pool) => pool.reap(),
             None => return,
+        }
+    }
+}
+
+/// A value another task is starting for a caller. If the caller stops
+/// waiting, whether before the value is sent or after it is sent and
+/// before it is claimed, the value goes to `unclaimed` rather than being
+/// dropped with the channel.
+struct Handover<T> {
+    fresh: Option<oneshot::Receiver<T>>,
+    unclaimed: Option<Box<dyn FnOnce(T) + Send>>,
+}
+
+impl<T> Handover<T> {
+    fn new(fresh: oneshot::Receiver<T>, unclaimed: impl FnOnce(T) + Send + 'static) -> Self {
+        Self {
+            fresh: Some(fresh),
+            unclaimed: Some(Box::new(unclaimed)),
+        }
+    }
+
+    /// The value, or none if its sender gave up.
+    async fn claim(mut self) -> Option<T> {
+        let claimed = self.fresh.as_mut()?.await.ok();
+        self.fresh = None;
+        claimed
+    }
+}
+
+impl<T> Drop for Handover<T> {
+    /// Closing the channel first means a value is either sent before it,
+    /// and taken here, or refused to its sender, which keeps it.
+    fn drop(&mut self) {
+        let Some(mut fresh) = self.fresh.take() else {
+            return;
+        };
+        fresh.close();
+        if let (Ok(value), Some(unclaimed)) = (fresh.try_recv(), self.unclaimed.take()) {
+            unclaimed(value);
         }
     }
 }
@@ -968,6 +1011,47 @@ mod tests {
             delays,
             [0, 100, 200, 400, 5_000, 5_000].map(Duration::from_millis)
         );
+    }
+
+    fn handover() -> (oneshot::Sender<u32>, Handover<u32>, Arc<Mutex<Vec<u32>>>) {
+        let (hand, fresh) = oneshot::channel();
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let back = Arc::clone(&returned);
+        let handover = Handover::new(fresh, move |value| lock(&back).push(value));
+        (hand, handover, returned)
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_value_is_claimed_once() {
+        let (hand, handover, returned) = handover();
+        hand.send(7).expect("sent");
+        assert_eq!(handover.claim().await, Some(7));
+        assert!(lock(&returned).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_value_sent_to_a_caller_that_then_stopped_waiting_is_returned() {
+        let (hand, handover, returned) = handover();
+        hand.send(7).expect("sent");
+        drop(handover);
+        assert_eq!(*lock(&returned), [7]);
+    }
+
+    #[tokio::test]
+    async fn a_value_sent_after_the_caller_stopped_waiting_stays_with_its_sender() {
+        let (hand, handover, returned) = handover();
+        drop(handover);
+        assert_eq!(hand.send(7), Err(7));
+        assert!(lock(&returned).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_claim_cancelled_while_it_waits_returns_what_arrives_later_to_its_sender() {
+        let (hand, handover, returned) = handover();
+        let waiting = tokio::time::timeout(Duration::from_millis(10), handover.claim()).await;
+        assert!(waiting.is_err());
+        assert_eq!(hand.send(7), Err(7));
+        assert!(lock(&returned).is_empty());
     }
 
     #[test]
