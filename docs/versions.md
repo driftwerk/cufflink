@@ -467,6 +467,7 @@ Rolling a platform back from v0.37.0 to an earlier release:
 | What v0.37.0 added | Before rolling the platform back |
 |--------------------|----------------------------------|
 | Services that enable `cufflink-fn/sql-parse` (`cufflink services list --features` names them, as `sql_parse`) | **Roll each back first, to a version without it.** The older platform has no `sql_parse` host function, so it cannot instantiate such a module. Such a service cannot be deployed there (422, naming the feature) |
+| Services that enable `cufflink-fn/guest-statement-timeout` (`cufflink services list --features` names them, as `guest_statement_timeout`) | **Roll each back first, to a version without it.** The older platform does not know the `statement_timeout` operation of `db_call` and answers it as a malformed request, so such a service's transactions that set one fail. Such a service cannot be deployed there (422, naming the feature) |
 | The parser processes | Nothing: the older images do not ship `cufflink-sql-parser`, and the older binaries ignore the `SQL_PARSER_BIN` and `SQL_PARSE_*` variables |
 | The database | Nothing: v0.37.0 has no migration |
 
