@@ -156,7 +156,7 @@ mod tests {
             serde_json::json!({
                 "protocol": PROTOCOL,
                 "build": format!(
-                    "{} input=131072 brackets=1000 chain=10000 warned=100 operators=256 \
+                    "{} input=98304 brackets=1000 chain=10000 warned=100 operators=256 \
                      comments=1000 tree=120",
                     env!("CARGO_PKG_VERSION")
                 ),

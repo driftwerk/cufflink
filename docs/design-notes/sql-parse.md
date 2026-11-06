@@ -58,14 +58,14 @@ not advertise it refuses the deploy. `parse` lives in the `sql` module, so
 the feature enables `db-v2` too.
 
 The guest hands the host function the statement's bytes as they are, not
-inside a JSON request, so a 128 KiB statement costs 128 KiB.
+inside a JSON request, so a 96 KiB statement costs 96 KiB.
 
 ## 2. Errors
 
 | Kind | When | Message |
 |---|---|---|
 | `Syntax` | the statement does not parse, or holds a NUL byte | fixed: `the statement is not valid SQL` |
-| `TooLarge` | the input is over 128 KiB, its nesting is over the bound, it has more than 100 forms the grammar warns about (section 4), the tree is too deep for the parser's own decoder or nests deeper than a guest can read (section 4), the tree's text is over the host response cap, or the parse ran out of the parser process's memory | which bound was passed, with no part of the input |
+| `TooLarge` | the input is over 96 KiB, its nesting is over the bound, it has more than 100 forms the grammar warns about (section 4), the tree is too deep for the parser's own decoder or nests deeper than a guest can read (section 4), the tree's text is over the host response cap, or the parse ran out of the parser process's memory | which bound was passed, with no part of the input |
 | `Unavailable` | the parser could not run, faulted, or took too long for this call | fixed |
 
 PostgreSQL's messages quote the input (`syntax error at or near "…"`,
@@ -256,30 +256,38 @@ that a refusal costs no round trip, and by the parser process before it
 parses. The parser process applies them because it is the side that must
 not overflow.
 
-- **Input:** at most 128 KiB (`MAX_INPUT_BYTES`), refused `TooLarge` by
+- **Input:** at most 96 KiB (`MAX_INPUT_BYTES`), refused `TooLarge` by
   its length alone. A parse's time and memory grow with its input, by up
-  to about 4 µs and 2.8 KB a byte, most of it the parse and `pg_query`'s
+  to about 6 µs and 4.3 KB a byte, most of it the parse and `pg_query`'s
   decoding of the protobuf into Rust structs, so the bound is what keeps
-  every parse short. Measured on a release build (Apple silicon), over 52
+  every parse short. Measured on a release build (Apple silicon), over 61
   shapes of flat statement, each filled to the bound:
 
-  | Statement, 128 KiB | Time | Peak resident | Tree text |
+  | Statement, 96 KiB | Time | Peak resident | Tree text |
   |---|---|---|---|
-  | `SELECT 1 ORDER BY a, a, …` | 0.37 s | 362 MB | 11.3 MB |
-  | `SELECT a, a, …` | 0.36 to 0.52 s | 346 MB | 10.6 MB |
-  | `SELECT *, *, …` | 0.34 s | 331 MB | 9.9 MB |
-  | `SELECT a[1], a[1], …` | 0.31 s | 283 MB | 9.2 MB |
-  | `SELECT f(a, a, …)` | 0.24 s | 274 MB | 5.6 MB |
-  | `SELECT 1+1, 1+1, …` | 0.32 s | 245 MB | 11.2 MB |
-  | `x = 1 AND …` | 0.16 s | 161 MB | 4.4 MB |
-  | `IN (1, 1, …)` | 0.12 s | 99 MB | 5.3 MB |
+  | `SELECT 1 ORDER BY a, a&a&…&a, …` (31 operands) | 0.43 s | 417 MB | 9.3 MB |
+  | `SELECT 1, a&a&…&a, …` (31 operands) | 0.43 s | 417 MB | 9.3 MB |
+  | `SELECT 1, a&a&a&a&a&a, …` | 0.42 s | 392 MB | 9.1 MB |
+  | `SELECT 1, a&a&a, …` | 0.39 s | 371 MB | 8.9 MB |
+  | `SELECT 1, U&x, …` | 0.36 s | 342 MB | 8.6 MB |
+  | `SELECT a, a, …` | 0.29 to 0.35 s | 268 MB | 7.9 MB |
+  | `SELECT 1 ORDER BY a, a, …` | 0.31 s | 264 MB | 8.5 MB |
+  | `SELECT f(a ORDER BY a, a, …)` | 0.32 s | 261 MB | 8.5 MB |
+  | `SELECT *, *, …` | 0.29 s | 260 MB | 7.4 MB |
+  | `SELECT a[1], a[1], …` | 0.27 s | 215 MB | 6.9 MB |
+  | `x = 1 AND …` | 0.14 s | 121 MB | 3.3 MB |
+  | `IN (1, 1, …)` | 0.11 s | 56 MB | 3.9 MB |
   | 100 `GLOBAL TEMP` tables after a comment | 0.01 s | 5 MB | 39 KB |
 
-  The worst is about a third of `SQL_PARSE_MEMORY_MB` and a tenth of
-  `SQL_PARSE_TIMEOUT_MS`. The lexer's rescanned runs at their own bound
-  (below), filled to the input bound, are cheaper still: 256 signs
-  (`1+-+-…1`) at a time take 0.33 s and 74 MB, and runs of 128 nested
-  comment openings 0.01 s. Before, the same shapes at 1 MiB took up to
+  The worst is two fifths of `SQL_PARSE_MEMORY_MB` and a tenth of
+  `SQL_PARSE_TIMEOUT_MS`. At 128 KiB the short operator chains reached
+  568 MB, past half the address space the confined process is held to,
+  so the bound came down to 96 KiB rather than the check going up. The
+  lexer's rescanned runs at their own bound (below), filled to the input
+  bound, are cheaper still: 256 signs (`1+-+-…1`) at a time take 0.25 s
+  and 56 MB, runs of 128 nested comment openings 0.01 s, and a run of
+  256 signs going on into a comment the length of the input 0.03 s.
+  Before, the same shapes at 1 MiB took up to
   5.2 s and 5.5 GB with the `Value`, and 2.0 s and 2.5 GB without it, so
   no output bound could have kept them inside the process. A guest that
   allow-lists ad-hoc report SQL, capped at 64 KiB of text, fits with room
@@ -293,18 +301,24 @@ not overflow.
   warnings need `standard_conforming_strings` off, and notices are not
   emitted at all.
 - **Operator runs and comment nesting:** at most `MAX_OPERATOR_RUN` (256)
-  operator characters (`~!@#^&|`?+-*/%<>=`) in a row, in or out of block
-  comments, and block comments nested at most `MAX_COMMENT_DEPTH` (1000)
-  deep. The lexer reads a run of operator characters again from each
-  point where it puts text back: the operator rule gives back a trailing
-  `+` or `-`, and each `/*` that opens a comment or a nested one first
-  matches the whole run after it. A run therefore costs up to its length
-  squared: `SELECT 1` followed by 32 000 `/*` and as many `*/` took 15.9 s
-  in 128 KiB, and fourteen runs of 9 000 signs 3.9 s. With the cap a
-  statement's lexing is linear in its length, and those statements are
-  `TooLarge` at once. Runs inside quoted text and line comments are read
-  once and are not counted. A run past 256 is rare in SQL; a banner
-  comment wider than that is refused.
+  operator characters (`~!@#^&|`?+-*/%<>=`) in a row where the lexer
+  rescans them, and block comments nested at most `MAX_COMMENT_DEPTH`
+  (1000) deep. The lexer reads a run of operator characters again from
+  each point where it puts text back, each time to the run's end. Outside
+  comments, the operator rule matches the whole run, then gives back a
+  trailing `+` or `-` one at a time. Inside a comment, the only rule that
+  takes more than one character of a run is a nested `/*`, which matches
+  the rest of the run and gives it back. A run therefore cost up to its
+  length squared: `SELECT 1` followed by 32 000 `/*` and as many `*/` took
+  15.9 s in 128 KiB, and fourteen runs of 9 000 signs 3.9 s. So the scan
+  counts runs outside comments and quoted text, and, inside a comment, a
+  run from its first nested `/*` to its end. Each byte is then read at most
+  about 400 times: up to 256 restarts of the operator rule before a
+  comment, which read on into it, once by the comment's own `/*`, and by up
+  to 128 nested `/*` in the 256 bytes before it. Lexing
+  stays linear in the input, and those statements are `TooLarge` at once.
+  Runs in quoted text and line comments are read once, as are a comment's
+  runs with no nested `/*`, so `/* ===…=== */` banners of any width pass.
 - **Nesting:** a lexical scan, refused `TooLarge`. It reads the input as
   PostgreSQL's lexer does, with quoted strings (`'…'`, `E'…'` with its
   backslash escapes, `U&'…'`, `B'…'`, `X'…'`, `N'…'`), quoted identifiers,
@@ -331,7 +345,7 @@ not overflow.
   - Both measures over-count: every keyword, identifier and literal in a
     segment counts. They are sized so that nothing that `pg_query` can turn
     into a decodable tree comes near them. Such a tree is at most about 50
-    nodes deep, and a flat statement of 128 KiB passes as long as no single
+    nodes deep, and a flat statement of 96 KiB passes as long as no single
     comma-, `AND`- and `OR`-free run in it has more than 10 000 tokens.
 - **Tree nesting:** after the parse, a tree whose text nests deeper than
   `MAX_TREE_NESTING` (120) objects and arrays is refused `TooLarge`. The
@@ -369,7 +383,7 @@ A frame is a 4-byte big-endian length and that many bytes
 costs the process.
 
 - At start the parser process sends `{"protocol": 1, "build": "0.1.0
-  input=131072 brackets=1000 …", "parser": "6.2.1", "fingerprint": "…"}`,
+  input=98304 brackets=1000 …", "parser": "6.2.1", "fingerprint": "…"}`,
   computing the fingerprint by parsing the probe corpus. `protocol`
   changes whenever the frames, the bounds or the canonical text do, and
   `build` is the `cufflink-sql-parse` release the process was built with
@@ -378,7 +392,7 @@ costs the process.
   its greeting equals the one its own build would send; a greeting
   without either field is not read at all.
 - A request is `{"max_output": n}`, then a frame of the statement's bytes,
-  at most 128 KiB.
+  at most 96 KiB.
 - An answer is `"tree"` followed by a frame of the tree's canonical text,
   so the tree is never parsed or copied again on the platform's side, or
   `{"error": {"kind": "syntax"|"too_large"|"unavailable", "message": "…"}}`.
@@ -441,7 +455,8 @@ guest's tests that enable both `test-host` and `sql-parse` build
   `IN`, `AND`, `VALUES`, statements, column definitions, the most
   `GLOBAL TEMP`s after a comment, sign runs and nested comment runs at
   their bound) each pass the bounds and are answered as the library
-  answers them within half the parse timeout. On Linux, the process's resident peak (`VmHWM`)
+  answers them within half the parse timeout, the short operator chains
+  that use the most memory among them. On Linux, the process's resident peak (`VmHWM`)
   is then under half its address space limit. Through the platform, the
   1 MiB statements that cost seconds before the bound came down are
   `TooLarge` at once, and ask no process.

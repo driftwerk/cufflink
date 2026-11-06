@@ -1320,7 +1320,7 @@ Unreleased.
   `SQL_PARSE_PER_TENANT`, `SQL_PARSE_TENANT_COOLDOWN_MS`,
   `SQL_PARSE_TENANT_BUSY_MS`, `SQL_PARSE_MEMORY_MB` and
   `SQL_PARSE_TIMEOUT_MS` configure them ([setup](setup.md#sql-parser)). A
-  statement is at most 128 KiB, and a process serves one tenant. The probe
+  statement is at most 96 KiB, and a process serves one tenant. The probe
   corpus's fingerprint is `PROBE_FINGERPRINT` in `cufflink-sql-parse`.
 - The platform and the worker make themselves undumpable on Linux at
   start, as the runners do, so they no longer write core dumps.

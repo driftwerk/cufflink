@@ -208,6 +208,7 @@ fn filled(prefix: &str, unit: &str, suffix: &str) -> String {
 fn costliest() -> Vec<(&'static str, String)> {
     let warned = "CREATE GLOBAL TEMP TABLE t();".repeat(MAX_WARNED_FORMS as usize);
     let half_run = MAX_OPERATOR_RUN / 2;
+    let chain = format!(",a{}", "&a".repeat(30));
     let comment_run = format!("{} {} ", "/*".repeat(half_run), "*/".repeat(half_run));
     let comment_runs = comment_run.repeat((MAX_INPUT_BYTES - 64) / comment_run.len());
     vec![
@@ -228,6 +229,14 @@ fn costliest() -> Vec<(&'static str, String)> {
             "warnings at the end",
             filled("-- ", "x", &format!("\n{warned}")),
         ),
+        ("operator chains", filled("SELECT 1", &chain, "")),
+        ("ordered chains", filled("SELECT 1 ORDER BY a", &chain, "")),
+        ("short chains", filled("SELECT 1", ",a&a&a&a&a&a", "")),
+        (
+            "aggregate ordering",
+            filled("SELECT f(a ORDER BY a", ",a&a", ")"),
+        ),
+        ("failed escapes", filled("SELECT 1", ",U&x", "")),
         (
             "sign runs",
             filled("SELECT 1", &format!(", 1{}1", "+-".repeat(half_run)), ""),

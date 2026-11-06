@@ -90,8 +90,8 @@ container but sit outside the budget's ledger. The platform and every
 worker each run a pool of their own, so each of their containers holds up
 to `SQL_PARSE_PROCESSES × SQL_PARSE_MEMORY_MB` (2 GiB at the defaults), and
 an idle process holds a few MiB, as it hands back what a parse freed. A
-statement is at most 128 KiB, and the costliest one of that size, a flat
-list of column references, takes about 360 MB and half a second while it
+statement is at most 96 KiB, and the costliest one of that size, a list
+of short operator chains, takes about 420 MB and half a second while it
 parses. Size each container for the budget, its reserve and that worst
 case, or lower `SQL_PARSE_MEMORY_MB`: a parse past it costs only that
 call. The processes ask the kernel to kill them first (`oom_score_adj`
