@@ -1,5 +1,5 @@
 //! What confines a parser process on Linux: no descriptor but stdin,
-//! stdout and stderr, its address space, its place in the out-of-memory
+//! stdout and stderr, one allocator arena, its address space, its place in the out-of-memory
 //! killer's order, no inspection by other processes, and, once it has
 //! greeted, a system call allowlist with no files, sockets or programs in
 //! it. Elsewhere only the memory setting is read.
@@ -9,6 +9,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 pub fn confine() -> io::Result<()> {
     close_inherited()?;
+    one_arena()?;
     if let Some(mb) = memory_limit_mb()? {
         let bytes: libc::rlim_t = mb.saturating_mul(1024 * 1024);
         let limit = libc::rlimit {
@@ -28,6 +29,25 @@ pub fn confine() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(())
+}
+
+/// Keeps every thread's allocations in glibc's main arena. Any other
+/// arena, once it shrinks, opens `/proc/sys/vm/overcommit_memory`, which
+/// the allowlist answers by ending the process; the main arena shrinks
+/// through `brk` alone. One parse runs at a time, so one arena costs no
+/// contention. It must be set before the parse thread first allocates.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn one_arena() -> io::Result<()> {
+    // SAFETY: mallopt only sets an allocator parameter.
+    match unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) } {
+        1 => Ok(()),
+        _ => Err(io::Error::other("the allocator refused M_ARENA_MAX 1")),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+fn one_arena() -> io::Result<()> {
     Ok(())
 }
 

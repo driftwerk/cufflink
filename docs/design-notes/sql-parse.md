@@ -121,6 +121,14 @@ talks to each over its stdin and stdout:
   `/dev/null`, and nothing else in it writes there. After each answer it
   hands the memory the parse freed back to the system (`malloc_trim`, on
   glibc).
+- **One allocator arena.** On glibc the process keeps every thread's
+  allocations in the main arena (`M_ARENA_MAX` 1), set before the parse
+  thread starts. A thread's own arena, the first time it shrinks, opens
+  `/proc/sys/vm/overcommit_memory`, which the seccomp filter answers by
+  ending the process: the main thread freeing a large tree the parse
+  thread built did exactly that in CI, after the answer had been sent.
+  The main arena shrinks through `brk` alone, and with one parse at a time
+  one arena costs no contention.
 - **Confinement.** Before it greets, the process sets its address space
   limit and `oom_score_adj` (below), makes itself undumpable, starts its
   parse thread and computes the fingerprint and one refusal through it, so
