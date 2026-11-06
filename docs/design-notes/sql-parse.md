@@ -162,9 +162,11 @@ talks to each over its stdin and stdout:
 - **A process serves one tenant.** A process that has served a tenant is
   given back marked with it, and is used again only for that tenant. A
   call of another tenant takes a fresh process, or, when only other
-  tenants' processes are idle, has the one idle longest replaced and waits
-  for the next process. Replacing a process this way is no failure: it adds
-  nothing to the backoff. A statement that took control of its process
+  tenants' processes are idle, has the one idle longest replaced. The
+  process started in its place is that call's own: it does not queue
+  again, and the start waits for no backoff, since replacing a process this
+  way is no failure. A start that fails leaves the call to queue again
+  within its budget. A statement that took control of its process
   can therefore read, and answer falsely, only its own tenant's later
   statements. The cost is a process start, 10 to 60 ms measured, most of
   it parsing the probe corpus, whenever a process changes tenants.
@@ -191,9 +193,9 @@ talks to each over its stdin and stdout:
   its parses answered `Unavailable`, without a process being asked, until
   it refills. Ordinary statements parse in a millisecond or two, so this
   touches only a tenant that keeps processes busy with the costliest
-  statements, and keeps processes free for the others: with two such
-  tenants on the default pool of two, the others still have about two
-  thirds of it. Within the share, waiting callers are served in the order
+  statements, and keeps processes free for the others: over time two such
+  tenants take a third of one process between them, and leave five sixths
+  of the default pool of two to the rest. Within the share, waiting callers are served in the order
   they came, and each tenant waits at most once in that queue for each of
   its turns, so no tenant can push ahead of another.
 - **Memory charged to the guest.** The caller's charge goes with the
@@ -406,8 +408,10 @@ guest's tests that enable both `test-host` and `sql-parse` build
   input bound (columns, stars, `ORDER BY`, function arguments, subscripts,
   `IN`, `AND`, `VALUES`, statements, column definitions, and the most
   `GLOBAL TEMP`s after a comment) each answer the library's tree within
-  half the parse timeout. On Linux, the largest any parser process grew to
-  in that test binary is under half its address space limit.
+  half the parse timeout. On Linux, the process's resident peak (`VmHWM`)
+  is then under half its address space limit. Through the platform, the
+  1 MiB statements that cost seconds before the bound came down are
+  `TooLarge` at once, and ask no process.
 - **Confinement:** on Linux, the running parser process reports
   `Seccomp: 2` and `NoNewPrivs: 1`, and answers the corpus, every refusal
   and the deepest inputs as the library does. A pipe whose write end it
@@ -423,7 +427,8 @@ guest's tests that enable both `test-host` and `sql-parse` build
   refused, without a process, while another is served, and served again
   once it refills. A turn waited for and given up leaves nothing behind.
 - **Tenants:** a process serves one tenant, and another tenant's call gets
-  a different process.
+  a different process. Three tenants taking turns on two processes, one
+  turn each, are each answered every call within its budget.
 - **Charges:** a caller that stops waiting leaves its charge held until
   the exchange ends, and is charged nothing for the tree; a caller that
   waits gets the charge back with the tree.

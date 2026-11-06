@@ -421,6 +421,77 @@ async fn a_process_serves_one_tenant_and_is_replaced_before_it_serves_another() 
 }
 
 #[tokio::test]
+async fn tenants_taking_turns_on_fewer_processes_are_each_served_in_time() {
+    let Some((_binary, parser)) = started_with(2, |settings| SqlParseSettings {
+        per_tenant: 1,
+        ..settings
+    })
+    .await
+    else {
+        return;
+    };
+    let parser = Arc::new(parser);
+    let budget = Duration::from_secs(5);
+    let tenants: Vec<_> = (1..=3)
+        .map(|tenant| {
+            let parser = Arc::clone(&parser);
+            tokio::spawn(async move {
+                let mut answers = Vec::new();
+                for call in 0..8 {
+                    let sql = format!("SELECT {tenant} AS tenant, {call} AS call");
+                    let started = Instant::now();
+                    let answer = tree_within(&parser, Uuid::from_u128(tenant), &sql, budget).await;
+                    answers.push((answer == own(&sql), started.elapsed()));
+                }
+                answers
+            })
+        })
+        .collect();
+    for tenant in tenants {
+        for (same, took) in tenant.await.expect("joined") {
+            assert!(same, "every call is answered its tree");
+            assert!(took < budget, "{took:?}");
+        }
+    }
+}
+
+/// The reviewer's inputs from before the input bound came down: each is
+/// refused by its length alone, at once, and asks no process.
+#[tokio::test]
+async fn statements_past_the_input_bound_are_refused_at_once_without_a_process() {
+    let Some((binary, parser)) = started(1).await else {
+        return;
+    };
+    let before = binary.processes();
+    let mebibyte = 1024 * 1024;
+    let fill = |prefix: &str, unit: &str, suffix: &str| {
+        let units = (mebibyte - prefix.len() - suffix.len()) / unit.len();
+        format!("{prefix}{}{suffix}", unit.repeat(units))
+    };
+    for sql in [
+        fill("SELECT a", ",a", ""),
+        fill("SELECT *", ",*", ""),
+        fill("SELECT 1 WHERE x IN (1", ",1", ")"),
+        fill("SELECT 1 WHERE x = 1", " AND x = 1", ""),
+        "CREATE GLOBAL TEMP TABLE t();".repeat(35_000),
+        format!("SELECT '{}'", "x".repeat(bounds::MAX_INPUT_BYTES - 9)) + " ",
+    ] {
+        let started = Instant::now();
+        let refused = tree(&parser, &sql).await;
+        assert!(
+            matches!(&refused, Err(ParseError::TooLarge(message)) if message.contains("bytes")),
+            "{refused:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+    assert_eq!(binary.processes(), before);
+}
+
+#[tokio::test]
 async fn a_tenant_whose_parses_spent_their_process_time_is_refused_until_it_refills() {
     let Some((binary, parser)) = started_with(2, |settings| SqlParseSettings {
         tenant_busy: Duration::from_millis(50),
@@ -580,15 +651,21 @@ fn answering(dir: &std::path::Path, tree: &[u8]) -> PathBuf {
 
 #[tokio::test]
 async fn a_tree_that_is_not_one_json_object_costs_the_process_and_never_reaches_the_caller() {
-    let dir = tempfile::tempdir().expect("a directory");
-    let forged = answering(dir.path(), br#"{}},"injected":{"#);
+    let (forging, answering_honestly) = (
+        tempfile::tempdir().expect("a directory"),
+        tempfile::tempdir().expect("a directory"),
+    );
+    let forged = answering(forging.path(), br#"{}},"injected":{"#);
+    let honest = answering(
+        answering_honestly.path(),
+        br#"{"stmts":[],"version":170007}"#,
+    );
     let parser = SqlParser::new(settings(forged, 1));
     assert!(parser.start().await, "the script greets as the parser does");
     assert!(matches!(
         tree(&parser, "SELECT 1").await,
         Err(ParseError::Unavailable(_))
     ));
-    let honest = answering(dir.path(), br#"{"stmts":[],"version":170007}"#);
     let parser = SqlParser::new(settings(honest, 1));
     assert!(parser.start().await);
     assert_eq!(

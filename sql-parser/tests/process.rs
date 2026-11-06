@@ -210,8 +210,8 @@ const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The costliest statements the bounds let through, in the confined
 /// process: each answers its tree, as the library does, within half the
-/// platform's parse timeout, and on Linux within half the process's address
-/// space; a parse past that space would end the process.
+/// platform's parse timeout, and on Linux the process's resident peak stays
+/// under half its address space; a parse past that space would end it.
 #[test]
 fn the_costliest_statements_within_the_bounds_answer_in_time_and_memory() {
     let mut parser = Parser::start();
@@ -236,22 +236,20 @@ fn the_costliest_statements_within_the_bounds_answer_in_time_and_memory() {
         parser.answer(&past),
         Err(cufflink_types::sql_parse::ParseError::TooLarge(_))
     ));
-    parser.end();
     #[cfg(target_os = "linux")]
     {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-        // SAFETY: getrusage writes one rusage into the buffer it is given.
-        assert_eq!(
-            unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) },
-            0
-        );
-        // SAFETY: getrusage succeeded, so it wrote the whole struct.
-        let peak_kib = unsafe { usage.assume_init() }.ru_maxrss;
+        let peak = parser.proc_field("status", "VmHWM:").expect("VmHWM");
+        let peak_kib: u64 = peak
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .expect("a size in kB");
         assert!(
             peak_kib < 512 * 1024,
-            "a parser process reached {peak_kib} KiB, over half of SQL_PARSE_MEMORY_MB"
+            "the parser process reached {peak_kib} KiB, over half of SQL_PARSE_MEMORY_MB"
         );
     }
+    parser.end();
 }
 
 /// A descriptor the process is started with, here the write end of a pipe

@@ -410,9 +410,10 @@ impl Pool {
 
     /// A live idle process that has served no tenant but `tenant`, waiting
     /// for one to come back or be started. When only other tenants'
-    /// processes are idle, the one idle longest is replaced, and the call
-    /// waits for the next process.
-    async fn take(&self, tenant: Uuid) -> Option<Process> {
+    /// processes are idle, the one idle longest is replaced, and the
+    /// process started in its place is the caller's: it keeps its turn
+    /// rather than queueing again.
+    async fn take(self: &Arc<Self>, tenant: Uuid) -> Option<Process> {
         loop {
             self.available.acquire().await.ok()?.forget();
             let Some(mut process) = self.pick(tenant) else {
@@ -422,13 +423,14 @@ impl Pool {
                 self.lost("an idle parser process ended", &"exited", "idle");
                 continue;
             }
-            match process.tenant {
-                Some(served) if served != tenant => self.recycle(process),
-                _ => {
-                    process.tenant = Some(tenant);
-                    return Some(process);
-                }
+            if process.tenant.is_some_and(|served| served != tenant) {
+                let Ok(fresh) = self.recycle(process).await else {
+                    continue;
+                };
+                process = fresh;
             }
+            process.tenant = Some(tenant);
+            return Some(process);
         }
     }
 
@@ -445,9 +447,12 @@ impl Pool {
     }
 
     /// A process that served another tenant is dropped, which kills it, and
-    /// a fresh one is started in its place. It is no failure, so it adds
-    /// nothing to the backoff.
-    fn recycle(&self, process: Process) {
+    /// a fresh one is started in its place, at once and beside the
+    /// supervisor's own starts: replacing a process is no failure, so it
+    /// waits for no backoff. The fresh process is handed to the caller, or,
+    /// if the caller stopped waiting, joins the idle processes. A start that
+    /// fails is the supervisor's to retry.
+    fn recycle(self: &Arc<Self>, process: Process) -> oneshot::Receiver<Process> {
         drop(process);
         metrics::counter!("cufflink_sql_parser_recycled_total").increment(1);
         {
@@ -455,7 +460,23 @@ impl Pool {
             health.live = health.live.saturating_sub(1);
             metrics::gauge!("cufflink_sql_parser_processes").set(health.live as f64);
         }
-        self.want();
+        let (hand, fresh) = oneshot::channel();
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            match Process::spawn(&pool.settings).await {
+                Ok(process) => {
+                    pool.counted();
+                    if let Err(process) = hand.send(process) {
+                        pool.idle_again(process);
+                    }
+                }
+                Err(error) => {
+                    pool.failed_to_start(&error);
+                    pool.want();
+                }
+            }
+        });
+        fresh
     }
 
     /// Idle processes that ended, killed by the kernel for instance, are
@@ -548,6 +569,12 @@ impl Pool {
     }
 
     fn started(&self, process: Process) {
+        self.counted();
+        self.idle_again(process);
+    }
+
+    /// A process that started and greeted is live, and the parser ready.
+    fn counted(&self) {
         {
             let mut health = lock(&self.health);
             health.live += 1;
@@ -560,6 +587,9 @@ impl Pool {
                 "a SQL parser process answered; sql_parse is advertised"
             );
         }
+    }
+
+    fn idle_again(&self, process: Process) {
         lock(&self.idle).push(process);
         self.available.add_permits(1);
     }
