@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-const SDK_VERSION: &str = "0.20";
-const FN_VERSION: &str = "0.36";
+const SDK_VERSION: &str = "0.21";
+const FN_VERSION: &str = "0.37";
 
 pub async fn run(
     name: &str,

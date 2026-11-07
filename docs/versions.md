@@ -338,8 +338,6 @@ Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 
 ## Features added in v0.37.0
 
-Unreleased.
-
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
 | `guest_statement_timeout` | the guest enables `cufflink-fn/guest-statement-timeout` | a transaction's own `statement_timeout`, bounded by the invocation's remaining budget ([db_v2](db-v2.md#a-statement-timeout-of-the-guests-own)) |
@@ -464,6 +462,15 @@ Rolling a platform back from v0.36.0 to an earlier release:
 | Database roles of services the platform does not enqueue for (no served table and no `publishes`), provisioned or bound by this release | A tenant under `db_roles: enforce` goes to `warn` first. The older platform expects every bound role to hold `USAGE` on `_cufflink` and the outbox function, which this release no longer grants such a role, and writes those services' route audit records in their own sessions. Once it runs, apply the statements its `cufflink services db-role verify` prints for each such role, then set `enforce` again, which it refuses while a role is not verified |
 | The database | Nothing: `V8__tenant_buckets` only adds a table the older binary does not read. Retired claims stay in it, and the older platform does not refuse them either |
 
+Rolling a platform back from v0.37.0 to an earlier release:
+
+| What v0.37.0 added | Before rolling the platform back |
+|--------------------|----------------------------------|
+| Services that enable `cufflink-fn/sql-parse` (`cufflink services list --features` names them, as `sql_parse`) | **Roll each back first, to a version without it.** The older platform has no `sql_parse` host function, so it cannot instantiate such a module. Such a service cannot be deployed there (422, naming the feature) |
+| Services that enable `cufflink-fn/guest-statement-timeout` (`cufflink services list --features` names them, as `guest_statement_timeout`) | **Roll each back first, to a version without it.** The older platform does not know the `statement_timeout` operation of `db_call` and answers it as a malformed request, so such a service's transactions that set one fail. Such a service cannot be deployed there (422, naming the feature) |
+| The parser processes | Nothing: the older images do not ship `cufflink-sql-parser`, and the older binaries ignore the `SQL_PARSER_BIN` and `SQL_PARSE_*` variables |
+| The database | Nothing: v0.37.0 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -498,7 +505,7 @@ additive and the older binary does not abort on a newer schema. It serves `_fn`,
    `cufflink-nats` and `cufflink-native` are published too and are bumped
    with the rest on every release. Then `cufflink init`'s scaffold (a unit
    test pins it to the workspace versions).
-2. `cargo publish --dry-run -p cufflink-types -p cufflink-migrate -p cufflink-pgcodec
+2. `cargo publish --dry-run -p cufflink-types -p cufflink-model -p cufflink-migrate -p cufflink-pgcodec
    -p cufflink-sql-parse -p cufflink-fn -p cufflink-sdk-macros -p cufflink -p cufflink-cli
    -p cufflink-nats -p cufflink-native` on a clean tree. `cufflink-sql-parse`'s first
    release is a new crate on crates.io, so step 3 applies to it.
@@ -1309,7 +1316,9 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.37.0
 
-Unreleased.
+PostgreSQL's parse tree of a statement for guests, from confined parser
+processes beside the platform ([features](#features-added-in-v0370)). There
+is no migration. Also:
 
 - `db_call` takes a new operation, `statement_timeout`, and `cufflink-fn`
   a new feature, `guest-statement-timeout`: `Tx::statement_timeout` sets
