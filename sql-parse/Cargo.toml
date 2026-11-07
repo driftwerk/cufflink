@@ -14,8 +14,8 @@ parser = ["dep:pg_query", "dep:sha2", "dep:hex"]
 
 [dependencies]
 cufflink-types = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 pg_query = { version = "=6.2.1", optional = true }
-sha2 = { version = "0.10", optional = true }
-hex = { version = "0.4", optional = true }
+sha2 = { version = "0.11.1", optional = true }
+hex = { version = "0.4.3", optional = true }
