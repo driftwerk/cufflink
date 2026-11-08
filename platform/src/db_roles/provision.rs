@@ -720,11 +720,9 @@ async fn apply_locked(
         deploying,
     } = *provisioning;
     let existing = service_db_roles::get(platform, service.id).await?;
-    let enqueues = verify::active_manifest(platform, service.id)
-        .await?
-        .iter()
-        .chain(deploying)
-        .any(enqueue::in_session);
+    let active = verify::active_manifest(platform, service.id).await?;
+    let enqueues = active.iter().chain(deploying).any(enqueue::in_session);
+    let creates = verify::creates_any(active.iter().chain(deploying));
     let schema = service.schema();
     let target = target(existing.as_ref(), &change, policy, || {
         names::managed_role(&tenant.slug, &schema, tenant.id, service.id)
@@ -819,6 +817,7 @@ async fn apply_locked(
             role: &target.role,
             managed: target.managed,
             enqueues,
+            creates,
             read_only_role: target.read_only_role.as_deref(),
             password: opened.as_ref(),
         },
@@ -941,13 +940,17 @@ async fn refresh(
     })
 }
 
-/// Whether the version the service runs is one the platform enqueues for;
-/// a version that cannot be read is taken as one that is not, so the
-/// caller provisions for the coming version rather than skip it.
-async fn running_enqueues(state: &AppState, service_id: Uuid) -> bool {
+/// Whether the version the service runs, `None` before its first deploy,
+/// is `judged` so; a version that cannot be read is taken as one that is
+/// not, so the caller provisions for the coming version rather than skip it.
+async fn running_is(
+    state: &AppState,
+    service_id: Uuid,
+    judged: impl FnOnce(Option<&ServiceManifest>) -> bool,
+) -> bool {
     let read = async { verify::active_manifest(&state.platform_db.get().await?, service_id).await };
     match read.await {
-        Ok(active) => active.as_ref().is_some_and(enqueue::in_session),
+        Ok(active) => judged(active.as_ref()),
         Err(e) => {
             warn!(service_id = %service_id, error = %e, "The running version could not be read; its database role is provisioned for the coming one");
             false
@@ -966,8 +969,12 @@ async fn verified_or_not(state: &AppState, service_id: Uuid) -> bool {
 /// platform comes to enqueue for, and did not, is granted the outbox first,
 /// whatever the tenant's policy, and the deploy fails when it cannot be: a
 /// verified role is one sessions use, now or once the policy asks.
-/// Otherwise a binding not yet verified is provisioned, when the policy
-/// asks, as before, and a failure is logged.
+/// A verified binding of a service whose coming version runs DDL as the
+/// role ([`verify::creates`]), and whose running one did not, is verified
+/// again for the coming version when the policy asks, so a role that may
+/// not create in the schema loses its verification before the deploy runs
+/// any statement as it. Otherwise a binding not yet verified is
+/// provisioned, when the policy asks, as before, and a failure is logged.
 pub async fn before_deploy(
     state: &AppState,
     tenant_id: Uuid,
@@ -986,7 +993,18 @@ pub async fn before_deploy(
         verified_or_not(state, service_id).await,
         asks(&entry),
     ) {
-        (true, true, _) if !running_enqueues(state, service_id).await => {
+        (true, true, _)
+            if !running_is(state, service_id, |active| {
+                active.is_some_and(enqueue::in_session)
+            })
+            .await =>
+        {
+            refresh(state, &entry, service_id, Some(deploying)).await
+        }
+        (_, true, true)
+            if verify::creates(deploying)
+                && !running_is(state, service_id, |active| verify::creates_any(active)).await =>
+        {
             refresh(state, &entry, service_id, Some(deploying)).await
         }
         (_, false, true) => {

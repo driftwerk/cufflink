@@ -11,6 +11,7 @@ use crate::AppState;
 use chrono::{DateTime, Utc};
 use cufflink_db::quote_ident;
 use cufflink_types::manifest::validate::{folded, folded_ident};
+use cufflink_types::HistoryMode;
 use deadpool_postgres::GenericClient;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -207,6 +208,9 @@ pub struct Expected<'a> {
     pub role: &'a str,
     pub managed: bool,
     pub enqueues: bool,
+    /// Whether the platform may run DDL in the service's schema as the
+    /// role ([`creates`]); when it never does, USAGE is all the role needs.
+    pub creates: bool,
     pub service: &'a str,
     pub schema: &'a str,
     pub tables: &'a [(String, Holds)],
@@ -365,6 +369,43 @@ fn cufflink_checks(expected: &Expected<'_>, (usage, enqueue): (bool, Enqueue)) -
     .collect()
 }
 
+fn schema_checks(expected: &Expected<'_>, held: Option<(bool, bool)>) -> Vec<Check> {
+    let role = quote_ident(expected.role);
+    let schema = folded_ident(expected.schema);
+    match (held, expected.creates) {
+        (None, _) => vec![Check::failed(
+            "schema",
+            format!("schema {schema} does not exist"),
+            Some(format!("CREATE SCHEMA {schema} AUTHORIZATION {role};")),
+        )],
+        (Some((true, true)), true) => vec![Check::passed("schema")],
+        (Some(_), true) => vec![Check::failed(
+            "schema",
+            format!("the role lacks USAGE or CREATE on schema {schema}"),
+            Some(format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO {role};")),
+        )],
+        (Some((usage, create)), false) => std::iter::once(Check::of("schema", usage, || {
+            (
+                format!("the role lacks USAGE on schema {schema}"),
+                Some(format!("GRANT USAGE ON SCHEMA {schema} TO {role};")),
+            )
+        }))
+        .chain((!expected.managed).then(|| {
+            Check::excess("schema_create_unneeded", create, || {
+                (
+                    format!(
+                        "the role may create in schema {schema}, and the platform runs no DDL \
+                         there as it: the schema is adopted, and no migration or on_migrate \
+                         hook is applied to it"
+                    ),
+                    format!("REVOKE CREATE ON SCHEMA {schema} FROM {role};"),
+                )
+            })
+        }))
+        .collect(),
+    }
+}
+
 pub fn report(expected: &Expected<'_>, facts: &Facts, now: DateTime<Utc>) -> VerifyReport {
     let role = quote_ident(expected.role);
     let schema = folded_ident(expected.schema);
@@ -407,33 +448,20 @@ pub fn report(expected: &Expected<'_>, facts: &Facts, now: DateTime<Utc>) -> Ver
                 )),
             )
         }),
-        match facts.schema {
-            None => Check::failed(
-                "schema",
-                format!("schema {schema} does not exist"),
-                Some(format!("CREATE SCHEMA {schema} AUTHORIZATION {role};")),
-            ),
-            Some((true, true)) => Check::passed("schema"),
-            Some(_) => Check::failed(
-                "schema",
-                format!("the role lacks USAGE or CREATE on schema {schema}"),
-                Some(format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO {role};")),
-            ),
-        },
-        match facts.public_create {
-            PublicCreate::No => Check::passed("public_schema"),
-            PublicCreate::ThroughPublic => Check::failed(
-                "public_schema",
-                "every role may create in schema public, which is on every search path",
-                Some("REVOKE CREATE ON SCHEMA public FROM PUBLIC;".to_string()),
-            ),
-            PublicCreate::Granted => Check::failed(
-                "public_schema",
-                "the role may create in schema public, which is on every search path",
-                Some(format!("REVOKE CREATE ON SCHEMA public FROM {role};")),
-            ),
-        },
     ];
+    let public = match facts.public_create {
+        PublicCreate::No => Check::passed("public_schema"),
+        PublicCreate::ThroughPublic => Check::failed(
+            "public_schema",
+            "every role may create in schema public, which is on every search path",
+            Some("REVOKE CREATE ON SCHEMA public FROM PUBLIC;".to_string()),
+        ),
+        PublicCreate::Granted => Check::failed(
+            "public_schema",
+            "the role may create in schema public, which is on every search path",
+            Some(format!("REVOKE CREATE ON SCHEMA public FROM {role};")),
+        ),
+    };
     let tables = facts.tables.iter().map(|(table, exists, privileges)| {
         let qualified = format!("{schema}.{}", folded_ident(table));
         match (exists, privileges, expected.holds(table)) {
@@ -465,6 +493,8 @@ pub fn report(expected: &Expected<'_>, facts: &Facts, now: DateTime<Utc>) -> Ver
         exists
             .into_iter()
             .chain(reach)
+            .chain(schema_checks(expected, facts.schema))
+            .chain(std::iter::once(public))
             .chain(tables)
             .chain(read_only)
             .chain(cufflink)
@@ -713,6 +743,25 @@ pub(crate) fn requirements(manifest: &ServiceManifest) -> Vec<(String, Holds)> {
         .collect()
 }
 
+/// Whether the platform may run DDL in the service's schema as its role
+/// for this version: it makes and alters a managed schema's tables, applies
+/// migrations in `apply` mode as the role, and runs the `on_migrate` hook
+/// as the guest. An adopted schema with none of those sees no DDL from the
+/// role, and verifying it as a reader of that schema is enough.
+pub fn creates(manifest: &ServiceManifest) -> bool {
+    manifest.schema.is_managed()
+        || manifest.on_migrate.is_some()
+        || (!manifest.migrations.is_empty()
+            && manifest.migration_history().mode == HistoryMode::Apply)
+}
+
+/// Whether any of `known` versions needs [`creates`]; with none known, a
+/// version to come may, and CREATE is needed.
+pub fn creates_any<'a>(known: impl IntoIterator<Item = &'a ServiceManifest>) -> bool {
+    let mut known = known.into_iter().peekable();
+    known.peek().is_none() || known.any(creates)
+}
+
 /// The manifest of the version the service runs; `None` before its first
 /// deploy.
 pub async fn active_manifest(
@@ -747,6 +796,7 @@ pub async fn inspect(
         role: binding.role,
         managed: binding.managed,
         enqueues: binding.enqueues,
+        creates: binding.creates,
         service: &service.name,
         schema: &schema,
         tables: &tables,
@@ -779,6 +829,7 @@ pub struct Candidate<'a> {
     pub role: &'a str,
     pub managed: bool,
     pub enqueues: bool,
+    pub creates: bool,
     pub read_only_role: Option<&'a str>,
     pub password: Option<&'a SecretString>,
 }
@@ -820,6 +871,7 @@ mod tests {
             role: "loan_service_user",
             managed: false,
             enqueues: true,
+            creates: true,
             service: "loan-service",
             schema: "loan_service",
             tables: &[],
@@ -897,6 +949,150 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    fn schema_checks_of(report: &VerifyReport) -> Vec<&Check> {
+        report
+            .checks
+            .iter()
+            .filter(|c| c.check.starts_with("schema"))
+            .collect()
+    }
+
+    #[test]
+    fn a_role_the_platform_runs_no_ddl_as_needs_only_usage_on_its_schema() {
+        let reader = Expected {
+            creates: false,
+            ..expected()
+        };
+        let usage_only = Facts {
+            schema: Some((true, false)),
+            ..all_good()
+        };
+        let read = report(&reader, &usage_only, now());
+        assert!(read.verified, "{read:?}");
+        assert!(read.remediation.is_empty());
+        assert_eq!(
+            schema_checks_of(&read)
+                .iter()
+                .map(|c| (c.check.as_str(), c.ok, c.excess))
+                .collect::<Vec<_>>(),
+            [
+                ("schema", true, false),
+                ("schema_create_unneeded", true, false)
+            ]
+        );
+        let written = report(&expected(), &usage_only, now());
+        assert!(
+            !written.verified,
+            "a role the platform runs DDL as needs CREATE"
+        );
+        assert_eq!(
+            written.remediation,
+            ["GRANT USAGE, CREATE ON SCHEMA \"loan_service\" TO \"loan_service_user\";"]
+        );
+    }
+
+    #[test]
+    fn a_reader_without_usage_is_mended_with_usage_alone() {
+        let reader = Expected {
+            creates: false,
+            ..expected()
+        };
+        for held in [(false, false), (false, true)] {
+            let facts = Facts {
+                schema: Some(held),
+                ..all_good()
+            };
+            let mended = report(&reader, &facts, now());
+            assert!(!mended.verified, "{held:?}");
+            assert_eq!(
+                mended.remediation,
+                ["GRANT USAGE ON SCHEMA \"loan_service\" TO \"loan_service_user\";"],
+                "{held:?}"
+            );
+            assert_eq!(
+                schema_checks_of(&mended)[0].detail.as_deref(),
+                Some("the role lacks USAGE on schema \"loan_service\"")
+            );
+        }
+    }
+
+    #[test]
+    fn create_held_beyond_the_need_is_reported_and_fails_nothing() {
+        let reader = Expected {
+            creates: false,
+            ..expected()
+        };
+        let held = report(&reader, &all_good(), now());
+        assert!(held.verified, "{held:?}");
+        assert!(held.remediation.is_empty(), "nor is it mended: {held:?}");
+        assert_eq!(
+            held.checks
+                .iter()
+                .filter(|c| c.excess)
+                .map(|c| (c.check.as_str(), c.remedy.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>(),
+            [(
+                "schema_create_unneeded",
+                "REVOKE CREATE ON SCHEMA \"loan_service\" FROM \"loan_service_user\";"
+            )]
+        );
+        let owned = report(
+            &Expected {
+                managed: true,
+                ..reader
+            },
+            &all_good(),
+            now(),
+        );
+        assert!(owned.verified, "{owned:?}");
+        assert_eq!(
+            schema_checks_of(&owned)
+                .iter()
+                .map(|c| c.check.as_str())
+                .collect::<Vec<_>>(),
+            ["schema"],
+            "a role the platform made owns its schema, and CREATE comes with that"
+        );
+    }
+
+    #[test]
+    fn ddl_runs_as_the_role_unless_the_schema_is_adopted_and_nothing_is_applied() {
+        let manifest = |extra: serde_json::Value| -> ServiceManifest {
+            let mut manifest = serde_json::json!({"name": "catalog-service", "tables": []});
+            manifest
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(manifest).expect("manifest")
+        };
+        let migration = serde_json::json!([{"version": 1, "name": "init", "sql": "SELECT 1;"}]);
+        let table = serde_json::json!([{"name": "books", "columns": []}]);
+        let verify_only = serde_json::json!({"table": "history", "mode": "verify_only"});
+        assert!(creates(&manifest(serde_json::json!({}))));
+        assert!(!creates(&manifest(
+            serde_json::json!({"schema": "adopted"})
+        )));
+        assert!(!creates(&manifest(
+            serde_json::json!({"schema": "adopted", "tables": table})
+        )));
+        assert!(!creates(&manifest(serde_json::json!({
+            "schema": "adopted",
+            "migrations": migration,
+            "migration_history": verify_only
+        }))));
+        assert!(creates(&manifest(
+            serde_json::json!({"schema": "adopted", "migrations": migration})
+        )));
+        assert!(creates(&manifest(
+            serde_json::json!({"schema": "adopted", "on_migrate": "handle_on_migrate"})
+        )));
+        let reader = manifest(serde_json::json!({"schema": "adopted"}));
+        let managed = manifest(serde_json::json!({}));
+        assert!(creates_any(None), "a version to come may create");
+        assert!(!creates_any(Some(&reader)));
+        assert!(creates_any([&reader, &managed]));
     }
 
     #[test]
