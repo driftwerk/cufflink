@@ -84,11 +84,11 @@ wasmtime = { version = "36", default-features = false, features = ["cranelift", 
 
 config = "0.15"
 
-cufflink-types = { version = "0.21.0", path = "types" }
-cufflink-sdk-macros = { version = "0.21.0", path = "sdk-macros" }
-cufflink-migrate = { version = "0.21.0", path = "migrate" }
-cufflink-pgcodec = { version = "0.21.0", path = "pgcodec" }
-cufflink-sql-parse = { version = "0.1.0", path = "sql-parse" }
+cufflink-types = { version = "0.21.1", path = "types" }
+cufflink-sdk-macros = { version = "0.21.1", path = "sdk-macros" }
+cufflink-migrate = { version = "0.21.1", path = "migrate" }
+cufflink-pgcodec = { version = "0.21.1", path = "pgcodec" }
+cufflink-sql-parse = { version = "0.1.1", path = "sql-parse" }
 cufflink-secrets = { path = "secrets" }
 hex = "0.4.3"
 base64 = "0.22.1"
@@ -109,8 +109,8 @@ cufflink-shutdown = { path = "shutdown" }
 cufflink-supervisor = { path = "supervisor" }
 cufflink-test-guests = { path = "test-guests" }
 cufflink-testkit = { path = "testkit" }
-cufflink-nats = { version = "0.9.0", path = "nats" }
-cufflink-native = { version = "0.9.0", path = "native" }
+cufflink-nats = { version = "0.9.1", path = "nats" }
+cufflink-native = { version = "0.9.1", path = "native" }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
