@@ -71,21 +71,24 @@ impl Bindings {
     }
 
     async fn set(&self, body: Value) -> (u16, Value) {
+        self.set_for("loan-service", body).await
+    }
+
+    async fn set_for(&self, service: &str, body: Value) -> (u16, Value) {
         self.platform
-            .send(
-                Method::PUT,
-                &self.path("loan-service"),
-                &self.admin,
-                Some(&body),
-            )
+            .send(Method::PUT, &self.path(service), &self.admin, Some(&body))
             .await
     }
 
     async fn verify(&self) -> (u16, Value) {
+        self.verify_for("loan-service").await
+    }
+
+    async fn verify_for(&self, service: &str) -> (u16, Value) {
         self.platform
             .send(
                 Method::POST,
-                &format!("{}/verify", self.path("loan-service")),
+                &format!("{}/verify", self.path(service)),
                 &self.admin,
                 None,
             )
@@ -93,9 +96,13 @@ impl Bindings {
     }
 
     async fn show(&self) -> Value {
+        self.show_for("loan-service").await
+    }
+
+    async fn show_for(&self, service: &str) -> Value {
         let (status, body) = self
             .platform
-            .send(Method::GET, &self.path("loan-service"), &self.admin, None)
+            .send(Method::GET, &self.path(service), &self.admin, None)
             .await;
         assert_eq!(status, 200, "{body}");
         body
@@ -291,6 +298,204 @@ async fn a_binding_is_verified_by_what_the_role_can_reach_and_mended_by_what_it_
     assert_eq!(
         audited, 14,
         "every set, the verification it runs, and every verification asked for are audited"
+    );
+}
+
+fn catalog(version: &str, migrations: Value) -> Value {
+    json!({
+        "name": "catalog-service",
+        "version": version,
+        "mode": "crud",
+        "publishes": [],
+        "schema": "adopted",
+        "tables": [],
+        "private_tables": [{
+            "name": "books",
+            "columns": [
+                {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false},
+                {"name": "title", "column_type": "text", "primary_key": false, "nullable": true}
+            ]
+        }],
+        "migrations": migrations,
+        "migration_history": {"table": "schema_history", "baseline": 1},
+    })
+}
+
+fn schema_checks(report: &Value) -> Vec<(&str, bool, bool)> {
+    report["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|check| {
+            check["check"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("schema"))
+        })
+        .map(|check| {
+            (
+                check["check"].as_str().unwrap_or_default(),
+                check["ok"] == true,
+                check["excess"] == true,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_role_the_platform_runs_no_ddl_as_is_verified_on_usage_of_its_adopted_schema() {
+    let Some(test) = Bindings::start().await else {
+        return;
+    };
+    let (writer, reader) = (
+        test.db.role("loan_service_user"),
+        test.db.role("catalog_service_user"),
+    );
+    test.sql(&format!(
+        "CREATE SCHEMA catalog_service;
+         CREATE TABLE catalog_service.books (id uuid PRIMARY KEY, title text);
+         CREATE ROLE {reader} LOGIN PASSWORD 'pw-2';
+         GRANT USAGE ON SCHEMA catalog_service TO {reader};
+         GRANT SELECT ON catalog_service.books TO {reader};
+         CREATE ROLE {writer} LOGIN PASSWORD 'pw-1';"
+    ))
+    .await;
+    let (status, body) = test
+        .platform
+        .deploy(&test.tenant, &catalog("0.1.0", json!([])))
+        .await;
+    assert_eq!(status, 200, "deploy: {body}");
+
+    let (status, body) = test
+        .set_for(
+            "catalog-service",
+            json!({"role": reader, "password": "pw-2"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let report = &body["report"];
+    assert_eq!(
+        report["verified"], true,
+        "USAGE is all a reader needs: {report}"
+    );
+    assert_eq!(
+        schema_checks(report),
+        [
+            ("schema", true, false),
+            ("schema_create_unneeded", true, false)
+        ]
+    );
+    assert!(body["binding"]["verified_at"].is_string());
+
+    test.sql(&format!(
+        "GRANT CREATE ON SCHEMA catalog_service TO {reader}"
+    ))
+    .await;
+    let (_, body) = test.verify_for("catalog-service").await;
+    let report = &body["report"];
+    assert_eq!(report["verified"], true, "{report}");
+    assert!(remediation(report).is_empty(), "{report}");
+    assert_eq!(
+        schema_checks(report),
+        [
+            ("schema", true, false),
+            ("schema_create_unneeded", true, true)
+        ]
+    );
+    let excess = report["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|check| check["check"] == "schema_create_unneeded")
+        .expect("the excess is reported");
+    assert_eq!(
+        excess["remedy"],
+        format!("REVOKE CREATE ON SCHEMA \"catalog_service\" FROM \"{reader}\";"),
+        "with what takes it back"
+    );
+    test.sql(&format!(
+        "REVOKE CREATE ON SCHEMA catalog_service FROM {reader}"
+    ))
+    .await;
+
+    let (status, body) = test.set(json!({"role": writer, "password": "pw-1"})).await;
+    assert_eq!(status, 200, "{body}");
+    for statement in remediation(&body["report"]) {
+        test.sql(&statement).await;
+    }
+    let (_, body) = test.verify().await;
+    assert_eq!(body["report"]["verified"], true, "{body}");
+    let (status, body) = test.enforce_db_roles().await;
+    assert_eq!(status, 200, "{body}");
+
+    let migrating = catalog(
+        "0.1.1",
+        json!([{"version": 2, "name": "shelves", "sql": "CREATE TABLE catalog_service.shelves (id integer PRIMARY KEY);"}]),
+    );
+    let (status, body) = test.platform.deploy(&test.tenant, &migrating).await;
+    assert_ne!(
+        status, 200,
+        "a version that migrates as a role that may not create is refused: {body}"
+    );
+    assert!(
+        body.to_string()
+            .contains("service catalog-service has no database role"),
+        "{body}"
+    );
+    let shown = test.show_for("catalog-service").await;
+    assert_eq!(
+        shown["binding"]["verified_at"],
+        Value::Null,
+        "the binding was judged for the coming version before it ran anything: {shown}"
+    );
+    let report = &shown["binding"]["verify_report"];
+    assert_eq!(failed(report), ["schema"], "{report}");
+    assert_eq!(
+        remediation(report),
+        [format!(
+            "GRANT USAGE, CREATE ON SCHEMA \"catalog_service\" TO \"{reader}\";"
+        )]
+    );
+    let shelves: bool = test
+        .tenant_db
+        .query_one(
+            "SELECT to_regclass('catalog_service.shelves') IS NOT NULL",
+            &[],
+        )
+        .await
+        .expect("shelves")
+        .get(0);
+    assert!(!shelves, "nothing was applied");
+
+    let (_, body) = test.verify_for("catalog-service").await;
+    assert_eq!(
+        body["report"]["verified"], true,
+        "the running version still runs no DDL as the role: {body}"
+    );
+
+    test.sql(&format!(
+        "GRANT CREATE ON SCHEMA catalog_service TO {reader}"
+    ))
+    .await;
+    let (status, body) = test.platform.deploy(&test.tenant, &migrating).await;
+    assert_eq!(status, 200, "deploy: {body}");
+    let owner: String = test
+        .tenant_db
+        .query_one(
+            "SELECT tableowner::text FROM pg_tables
+             WHERE schemaname = 'catalog_service' AND tablename = 'shelves'",
+            &[],
+        )
+        .await
+        .expect("shelves")
+        .get(0);
+    assert_eq!(owner, reader, "the migration ran as the bound role");
+    let (_, body) = test.verify_for("catalog-service").await;
+    let report = &body["report"];
+    assert_eq!(report["verified"], true, "{report}");
+    assert_eq!(
+        schema_checks(report),
+        [("schema", true, false)],
+        "a version that migrates needs CREATE, and holding it is no excess"
     );
 }
 

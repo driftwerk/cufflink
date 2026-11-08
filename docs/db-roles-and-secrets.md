@@ -262,7 +262,18 @@ comes before the roles are verified:
    them anyway is reported `EXCESS`, with the `REVOKE` that takes each
    back; that fails nothing, and the platform takes nothing back itself.
    A deploy that makes a service one the platform enqueues for grants its
-   verified role first, whatever the policy, and fails when it cannot. Of a
+   verified role first, whatever the policy, and fails when it cannot.
+   Creating in the schema is needed only when the platform runs DDL there
+   as the role: the schema is managed, the service applies SQL migrations
+   in `apply` mode, or it declares `on_migrate`. A service whose
+   [adopted](schema-ownership.md#adopting-a-schema-that-exists) schema
+   sees none of these is verified on `USAGE` alone, and a role bound with
+   `--role` that may create there anyway is reported `EXCESS`
+   (`schema_create_unneeded`) with the `REVOKE CREATE` that takes it back.
+   A deploy of a version that needs `CREATE`, after one that did not,
+   verifies a verified role again first when the policy asks; under
+   `enforce` the deploy is then refused while the role may not create
+   there. Of a
    [private table](schema-ownership.md#private-tables) it checks only that
    the table exists: the platform runs no statement of its own there, so a
    role that holds nothing on one, or reaches it only through a function,
