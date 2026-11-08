@@ -1314,6 +1314,19 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.38.0
+
+Unreleased.
+
+- `db-role verify` requires CREATE on the service's schema only when the
+  platform runs DDL there as the role: a managed schema, SQL migrations in
+  `apply` mode, or `on_migrate`. A role of a service whose adopted schema
+  sees none of these is verified on USAGE alone, mended with
+  `GRANT USAGE ON SCHEMA`, and a role bound with `--role` that may create
+  there anyway is reported as excess (`schema_create_unneeded`), failing
+  nothing ([database roles](db-roles-and-secrets.md)). Every other
+  service's role is checked as before.
+
 ## Changes in v0.37.0
 
 PostgreSQL's parse tree of a statement for guests, from confined parser
