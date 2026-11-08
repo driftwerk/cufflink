@@ -471,6 +471,13 @@ Rolling a platform back from v0.37.0 to an earlier release:
 | The parser processes | Nothing: the older images do not ship `cufflink-sql-parser`, and the older binaries ignore the `SQL_PARSER_BIN` and `SQL_PARSE_*` variables |
 | The database | Nothing: v0.37.0 has no migration |
 
+Rolling a platform back from v0.37.1 to v0.37.0:
+
+| What v0.37.1 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Database roles verified on `USAGE` of their service's schema alone, because the platform runs no DDL there as them | A tenant under `db_roles: enforce` goes to `warn` first. The older platform requires every bound role to hold `CREATE` on its service's schema as well. Once it runs, apply the `GRANT USAGE, CREATE ON SCHEMA` its `cufflink services db-role verify` prints for each such role, then set `enforce` again, which it refuses while a role is not verified |
+| The database | Nothing: v0.37.1 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -1314,9 +1321,11 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
-## Changes in v0.38.0
+## Changes in v0.37.1
 
-Unreleased.
+No new module-declared feature. A service built for v0.37.0 deploys and
+runs on this platform unchanged. There is no migration and no new
+environment variable.
 
 - `db-role verify` requires CREATE on the service's schema only when the
   platform runs DDL there as the role: a managed schema, SQL migrations in
