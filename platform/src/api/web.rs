@@ -74,7 +74,7 @@ pub async fn upload_web_bundle(
             crate::repo::deployments::current_mode(&state.platform_db, service_id).await?;
         web::require_web(&service.name, running.as_ref())?;
         web::require_content(&sha256, &sha256_hex(&body))?;
-        web::store(&state, service_id, &sha256, &body, &user.subject).await
+        web::store(&state, service_id, &sha256, body, &user.subject).await
     }
     .await;
     let result = stored
@@ -122,8 +122,8 @@ pub async fn upload_web_artifact(
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     require_web_version(&state.platform_db, &service).await?;
 
-    let (bundle, _) =
-        web::store(&state, service_id, &sha256_hex(&body), &body, &user.subject).await?;
+    let sha256 = sha256_hex(&body);
+    let (bundle, _) = web::store(&state, service_id, &sha256, body, &user.subject).await?;
 
     let lock =
         super::deployments::acquire_deploy_lock(&state, service_id, super::deployments::OPERATION)

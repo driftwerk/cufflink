@@ -107,7 +107,7 @@ pub(crate) async fn store(
     state: &AppState,
     service_id: Uuid,
     sha256: &str,
-    bundle: &[u8],
+    bundle: bytes::Bytes,
     uploaded_by: &str,
 ) -> PlatformResult<(Artifact, Stored)> {
     if bundle.is_empty() {
@@ -123,7 +123,7 @@ pub(crate) async fn store(
     let present = stored_size(storage, &upload.s3_key).await? == Some(bundle.len() as u64);
     if !present {
         storage
-            .upload(&upload.s3_key, bundle.to_vec(), "application/gzip")
+            .upload(&upload.s3_key, Vec::from(bundle), "application/gzip")
             .await
             .map_err(|e| {
                 PlatformError::Internal(format!("Failed to store {}: {e}", upload.s3_key))
