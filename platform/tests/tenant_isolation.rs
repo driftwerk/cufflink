@@ -121,6 +121,11 @@ fn service_routes() -> Vec<Route> {
             Body::None,
         ),
         route(Method::POST, "/web", Body::None),
+        route(
+            Method::PUT,
+            "/web/artifacts/3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+            Body::None,
+        ),
         route(Method::GET, "/web/status", Body::None),
         route(
             Method::POST,

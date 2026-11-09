@@ -247,13 +247,7 @@ pub async fn delete_service(
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     let mode = crate::repo::deployments::current_mode(&state.platform_db, service_id).await?;
     let is_native = matches!(mode, Some(ServiceMode::Native));
-
-    let web_artifact_keys = crate::repo::deployments::artifact_keys(
-        &state.platform_db.get().await?,
-        service_id,
-        &ServiceMode::Web,
-    )
-    .await?;
+    let is_web = matches!(mode, Some(ServiceMode::Web));
 
     let leaving =
         crate::deployer::eventing::leave(&state, service.tenant_id, &user.tenant_slug, service_id)
@@ -281,7 +275,7 @@ pub async fn delete_service(
     leaving.complete(&state).await;
     state.registry.notify_change().await;
 
-    if !web_artifact_keys.is_empty() {
+    if is_web {
         let event_payload = json!({
             "service_id": service_id.to_string(),
             "service_name": service.name,
@@ -297,14 +291,6 @@ pub async fn delete_service(
         .await
         {
             tracing::warn!("Failed to publish undeploy event on {}: {}", subject, e);
-        }
-
-        if let Some(ref storage) = state.storage {
-            for s3_key in &web_artifact_keys {
-                if let Err(e) = storage.delete(s3_key).await {
-                    tracing::warn!("Failed to delete S3 artifact {}: {}", s3_key, e);
-                }
-            }
         }
     }
 
@@ -328,7 +314,7 @@ pub async fn delete_service(
         .await;
         native::announce_removal(&state, &user.tenant_slug, service_id, &service.name).await;
     }
-    native::delete_objects(&state, service_id).await;
+    crate::deployer::artifacts::delete_objects(&state, service_id).await;
 
     Ok(Json(json!({ "deleted": true })))
 }

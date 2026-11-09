@@ -212,7 +212,8 @@ mod tests {
                 (5, "extensions"),
                 (6, "runner_keys"),
                 (7, "capacity_deferrals"),
-                (8, "tenant_buckets")
+                (8, "tenant_buckets"),
+                (9, "web_uploads"),
             ]
         );
     }

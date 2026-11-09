@@ -347,7 +347,7 @@ pub async fn list_by_service(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deleted {
-    pub native_key: Option<String>,
+    pub artifact_key: Option<String>,
 }
 
 pub async fn delete_by_version(
@@ -358,31 +358,36 @@ pub async fn delete_by_version(
     Ok(client
         .query_opt(
             "DELETE FROM deployments WHERE service_id = $1 AND version = $2
-             RETURNING CASE WHEN manifest->>'mode' = 'native' THEN artifact_s3_key END",
+             RETURNING CASE WHEN manifest->>'mode' IN ('native', 'web') THEN artifact_s3_key END",
             &[&service_id, &version],
         )
         .await?
         .map(|row| Deleted {
-            native_key: row.get(0),
+            artifact_key: row.get(0),
         }))
 }
 
-pub async fn artifact_keys(
+pub async fn record_bundle(
     client: &impl deadpool_postgres::GenericClient,
     service_id: Uuid,
-    mode: &ServiceMode,
-) -> PlatformResult<Vec<String>> {
+    version: i32,
+    bundle: &Artifact,
+) -> PlatformResult<bool> {
     Ok(client
-        .query(
-            "SELECT DISTINCT artifact_s3_key FROM deployments
-             WHERE service_id = $1 AND manifest->>'mode' = $2 AND artifact_s3_key IS NOT NULL
-             ORDER BY 1",
-            &[&service_id, &mode.as_str()],
+        .execute(
+            "UPDATE deployments SET artifact_s3_key = $3, artifact_hash = $4, artifact_size = $5
+             WHERE service_id = $1 AND version = $2
+               AND manifest->>'mode' = 'web' AND artifact_s3_key IS NULL",
+            &[
+                &service_id,
+                &version,
+                &bundle.s3_key,
+                &bundle.hash,
+                &bundle.size,
+            ],
         )
         .await?
-        .iter()
-        .map(|row| row.get(0))
-        .collect())
+        == 1)
 }
 
 pub async fn records_artifact(
@@ -585,6 +590,55 @@ mod tests {
         assert_eq!(deployment.artifact.as_ref(), Some(&bundle));
         let current = current(&pool, site).await.expect("read").expect("current");
         assert_eq!((current.version, current.artifact), (1, Some(bundle)));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_web_version_returns_its_key() {
+        let Some((_db, tenant, pool)) = migrated().await else {
+            return;
+        };
+        let (site, notes) = (
+            service(&pool, tenant.id, "site").await,
+            service(&pool, tenant.id, "notes").await,
+        );
+        let bundle = Artifact {
+            s3_key: format!("web/{site}/{}.tar.gz", "3f".repeat(32)),
+            hash: "3f".repeat(32),
+            size: 41,
+        };
+        let web = ServiceManifest {
+            name: "site".into(),
+            mode: ServiceMode::Web,
+            ..Default::default()
+        };
+        activated(&pool, site, &web, Some(VersionArtifact::Web(&bundle))).await;
+        let crud = ServiceManifest {
+            name: "notes".into(),
+            ..Default::default()
+        };
+        activated(&pool, notes, &crud, None).await;
+        let client = pool.get().await.expect("checkout");
+
+        assert!(records_artifact(&client, &bundle.s3_key)
+            .await
+            .expect("read"));
+        assert_eq!(
+            delete_by_version(&client, site, 1).await.expect("deleted"),
+            Some(Deleted {
+                artifact_key: Some(bundle.s3_key.clone())
+            })
+        );
+        assert!(!records_artifact(&client, &bundle.s3_key)
+            .await
+            .expect("read"));
+        assert_eq!(
+            delete_by_version(&client, notes, 1).await.expect("deleted"),
+            Some(Deleted { artifact_key: None })
+        );
+        assert_eq!(
+            delete_by_version(&client, site, 1).await.expect("read"),
+            None
+        );
     }
 
     #[tokio::test]

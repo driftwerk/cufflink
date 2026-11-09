@@ -2,6 +2,7 @@ pub mod job;
 pub mod manifest;
 pub mod validator;
 
+pub(crate) mod artifacts;
 pub(crate) mod eventing;
 pub(crate) mod module;
 pub(crate) mod native;

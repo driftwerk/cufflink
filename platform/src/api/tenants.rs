@@ -302,14 +302,15 @@ pub async fn delete_tenant(
 
     let mut leaving = Vec::new();
     let mut native_services = Vec::new();
+    let mut web_services = Vec::new();
     let mut service_ids = Vec::new();
     for service in crate::repo::services::list_by_tenant(&state.platform_db, tenant.id).await? {
         leaving.push(crate::deployer::eventing::leave(&state, tenant.id, &slug, service.id).await?);
         service_ids.push(service.id);
-        if let Some(ServiceMode::Native) =
-            crate::repo::deployments::current_mode(&state.platform_db, service.id).await?
-        {
-            native_services.push(service);
+        match crate::repo::deployments::current_mode(&state.platform_db, service.id).await? {
+            Some(ServiceMode::Native) => native_services.push(service),
+            Some(ServiceMode::Web) => web_services.push(service),
+            Some(ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container) | None => {}
         }
     }
 
@@ -334,11 +335,8 @@ pub async fn delete_tenant(
     }
     state.registry.notify_change().await;
 
-    let undeployed_services: std::collections::HashSet<&str> = web_artifacts
-        .iter()
-        .map(|w| w.service_name.as_str())
-        .collect();
-    for service_name in &undeployed_services {
+    for service in &web_services {
+        let service_name = &service.name;
         let subject = format!("undeploy.web.{}.{}", slug, service_name);
         let payload = serde_json::json!({
             "service_name": service_name,
@@ -363,18 +361,7 @@ pub async fn delete_tenant(
         crate::deployer::native::announce_removal(&state, &slug, service.id, &service.name).await;
     }
     for service_id in service_ids {
-        crate::deployer::native::delete_objects(&state, service_id).await;
-    }
-
-    if let Some(ref storage) = state.storage {
-        for artifact in &web_artifacts {
-            if let Err(e) = storage.delete(&artifact.artifact_s3_key).await {
-                warn!(
-                    "Failed to delete S3 artifact {} for tenant teardown: {}",
-                    artifact.artifact_s3_key, e
-                );
-            }
-        }
+        crate::deployer::artifacts::delete_objects(&state, service_id).await;
     }
 
     let database = state
@@ -392,7 +379,7 @@ pub async fn delete_tenant(
 
     info!(
         tenant = %slug,
-        undeployed_services = undeployed_services.len(),
+        undeployed_services = web_services.len(),
         removed_artifacts = web_artifacts.len(),
         native_services = native_services.len(),
         database_dropped,
@@ -401,7 +388,7 @@ pub async fn delete_tenant(
 
     Ok(Json(serde_json::json!({
         "message": format!("Tenant '{}' deleted", slug),
-        "web_services_undeployed": undeployed_services.len(),
+        "web_services_undeployed": web_services.len(),
         "web_artifacts_removed": web_artifacts.len(),
         "native_services_undeployed": native_services.len(),
         "database_dropped": database_dropped,
