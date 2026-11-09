@@ -12,7 +12,7 @@ use crate::extensions::Registration;
 use crate::nats_manager::deploy_fanout::DeployReady;
 use crate::registry::ServiceIdentity;
 use crate::repo::deployments::{
-    activate_version, snapshot, ActivateVersion, Deployment, NativeVersion,
+    activate_version, snapshot, ActivateVersion, Deployment, NativeVersion, VersionArtifact,
 };
 use crate::AppState;
 use cufflink_types::ServiceMode;
@@ -217,10 +217,10 @@ pub(crate) async fn run_locked(
             let binary = ctx.native.ok_or_else(super::native::missing)?;
             let artifact = super::native::store(state, service.id, binary, uploads).await?;
             fail_after_schema()?;
-            let native = NativeVersion {
+            let native = VersionArtifact::Native(NativeVersion {
                 artifact: &artifact,
                 actor: ctx.actor,
-            };
+            });
             activate_in_runner(ctx, service, new_version, Some(native)).await
         }
         ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => {
@@ -233,7 +233,7 @@ async fn activate_in_runner(
     ctx: &DeployContext<'_>,
     service: crate::repo::services::Service,
     new_version: i32,
-    native: Option<NativeVersion<'_>>,
+    artifact: Option<VersionArtifact<'_>>,
 ) -> PlatformResult<DeployOutcome> {
     let manifest = ctx.manifest;
     let deployment = activate_version(
@@ -247,7 +247,7 @@ async fn activate_in_runner(
             commit_hash: ctx.commit_hash,
             schema_json: None,
             schema_hash: &manifest.schema_hash()?,
-            native,
+            artifact,
         },
     )
     .await?;
@@ -441,10 +441,10 @@ pub(crate) async fn rollback_locked(
                     commit_hash: target_commit_hash.as_deref(),
                     schema_json: None,
                     schema_hash: &manifest.schema_hash()?,
-                    native: Some(NativeVersion {
+                    artifact: Some(VersionArtifact::Native(NativeVersion {
                         artifact: &artifact,
                         actor: &user.subject,
-                    }),
+                    })),
                 },
             )
             .await?;
@@ -454,7 +454,31 @@ pub(crate) async fn rollback_locked(
                 deployment,
             )
         }
-        ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container | ServiceMode::Web => {
+        ServiceMode::Web => {
+            let artifact =
+                super::web::restore(state, &service.name, &deployments, target_deploy).await?;
+            let deployment = activate_version(
+                &state.platform_db,
+                ActivateVersion {
+                    service_id,
+                    version: new_version,
+                    manifest_hash: &deploy_hash(&manifest)?,
+                    manifest: &manifest,
+                    wasm_hash: None,
+                    commit_hash: target_commit_hash.as_deref(),
+                    schema_json: None,
+                    schema_hash: &manifest.schema_hash()?,
+                    artifact: Some(VersionArtifact::Web(&artifact)),
+                },
+            )
+            .await?;
+            (
+                schema::SchemaReport::default(),
+                EventingPlan::default(),
+                deployment,
+            )
+        }
+        ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => {
             let eventing = eventing::prepare(state, &manifest, &identity).await?;
             let left = snapshot(
                 &state.platform_db,
@@ -501,7 +525,7 @@ pub(crate) async fn rollback_locked(
                             .await?,
                     ),
                     schema_hash: &manifest.schema_hash()?,
-                    native: None,
+                    artifact: None,
                 },
             )
             .await?;
@@ -525,7 +549,7 @@ pub(crate) async fn rollback_locked(
 pub(crate) async fn after_rollback(
     state: &Arc<AppState>,
     outcome: &RollbackOutcome,
-) -> PlatformResult<()> {
+) -> PlatformResult<Option<bool>> {
     announce(state, outcome.identity.service_id, None).await;
     match outcome.manifest.mode {
         ServiceMode::Native => {
@@ -536,17 +560,19 @@ pub(crate) async fn after_rollback(
                 &outcome.manifest,
             )
             .await;
-            Ok(())
+            Ok(None)
         }
-        ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container | ServiceMode::Web => {
-            eventing::after_rollback(
-                state,
-                &outcome.manifest,
-                &outcome.identity,
-                &outcome.eventing,
-            )
-            .await
-        }
+        ServiceMode::Web => Ok(Some(
+            super::web::announce(state, &outcome.identity, &outcome.deployment).await,
+        )),
+        ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => eventing::after_rollback(
+            state,
+            &outcome.manifest,
+            &outcome.identity,
+            &outcome.eventing,
+        )
+        .await
+        .map(|()| None),
     }
 }
 

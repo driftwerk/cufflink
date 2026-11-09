@@ -616,6 +616,29 @@ command that forces the same one: `cufflink rollback --version <n>
 Against a platform older than v0.30.0 `rollback --commit` works, since the
 lookup is the CLI's, but the version it activates reports no commit.
 
+### Web apps
+
+From v0.38.0 a rollback of a web app activates a version that records the
+target's bundle, under the key the target records, and publishes
+`deploy.web.{tenant}.{service}`, so the runners switch to the earlier code
+as they do after a deploy. The answer carries the bundle's SHA-256 as
+`artifact_hash` and says whether the runners were told (`runners_told`),
+and the CLI prints `  Bundle:         <sha256>`. A runner that missed the
+event serves the rolled-back version once it next reads the app's current
+version. Before v0.38.0 such a rollback activated a version with no bundle
+and told no runner.
+
+The platform refuses the rollback with `409`, before anything is written,
+when:
+
+| The target | The answer |
+|---|---|
+| records no bundle (its build or upload never completed) | `v7 of site has no bundle (its build or upload never completed); the newest earlier version with one is v5: cufflink rollback --version 5`, or that no earlier version has one |
+| records a bundle that is missing from object storage, or stored at another size | `the bundle of v5 (web/…) is missing from object storage; deploy the app again`, or the two sizes |
+
+The default target, the version before the running one, is refused the same
+way: the CLI never lands on a version other than the one asked for.
+
 ## Tenant databases and PgBouncer
 
 | Variable | Default | Meaning |
@@ -849,11 +872,31 @@ read the file once, as they start.
   leaves the running app as it was. A directory no process runs from is
   removed once nothing is installing or starting from it, 5 s after its
   process was replaced, with the directories of earlier releases.
+- **Rollbacks.** A rollback activates a version that records the target's
+  bundle and publishes `deploy.web` as a deploy does ([rolling
+  back](#web-apps)).
 - **Deploy events** only say which app changed: the runner reads what runs
   of it, its bundle, hash and service, from the database (or the runner API,
   [tenant-scoped](#tenant-scoped-web-runner)), never from the event, so no
   publisher on `deploy.web.>` can pair a bundle with another service's
   configs.
+- **Converging.** Deploy events and the runner's own reconcile go through
+  one queue, drained by one task, so two starts of an app never overlap,
+  and a burst of events for an app runs one deploy of its newest version.
+  At start and every `WEB_RECONCILE_SECS` (default 30) the runner reads the
+  current deployment of every app it runs, in one query (one runner API
+  call, [tenant-scoped](#tenant-scoped-web-runner)), and switches each app
+  whose current version records a bundle of another SHA-256 than the one it
+  runs from. A runner that missed an event, a rollback's included, so
+  serves the current version within one period. The reconcile never stops
+  an app (one whose current version has no bundle, or that is gone, keeps
+  running: stopping is left to `undeploy.web` and a refused key), never
+  starts one that is not running (its first request does), and does not
+  try again a bundle whose new process failed its health check until a
+  deploy event names the app or its current bundle changes. A version
+  whose bundle records no hash is switched to by its events alone. A deploy
+  event, and a switch, clear the app's remembered failed cold start and
+  unknown host, so its next request reads the current version again.
 - An app's stdout and stderr are logged at `debug` under the target
   `web_child` (they may carry the app's users' data): lines cut at 8 KiB, at
   most 100 lines per stream per 10 s, the rest counted in a summary line.
@@ -882,7 +925,7 @@ only what reaches its tenant:
 | `WEB_TENANT` | — | The slug of the one tenant whose apps this runner serves. Set, the runner needs `PLATFORM_URL` and a runner key, and reads no `DATABASE_URL`, `CUFFLINK_SECRETS_*` or storage settings |
 | `PLATFORM_URL` | — | The platform's URL the runner API is reached at (its internal address), `http` or `https`; without `WEB_TENANT` only a value apps are passed |
 | `CUFFLINK_RUNNER_KEY` / `CUFFLINK_RUNNER_KEY_FILE` | — | The tenant's web runner key (`cufflink tenants runner-keys create <tenant> --for web`), or a file holding it, read at each use; a key without `WEB_TENANT` is refused at start. An app can read a file the runner can (it runs as the runner's user), which gives it its own tenant's other apps' configs, never its native services': prefer the variable |
-| `WEB_POLL_SECS` | `30` | How often the runner asks the runner API whether its key is still accepted |
+| `WEB_POLL_SECS` | `30` | Kept as an alias of `WEB_RECONCILE_SECS`: set alone, it sets how often the runner asks the runner API for its apps, which also tells it whether its key is still accepted. With both set, `WEB_RECONCILE_SECS` wins and the runner logs that `WEB_POLL_SECS` is ignored |
 
 Such a runner reads its tenant's apps, each bundle (by its SHA-256, checked
 again as it arrives) and each app's configs from the runner API
@@ -891,18 +934,20 @@ served that way and must be uploaded again. It answers 404 for a host of
 another tenant, subscribes only `deploy.web.<tenant>.>` and
 `undeploy.web.<tenant>.>`, refuses an event that names another tenant, and
 takes a deploy event only as a sign to read that app's deployment from the
-runner API, never its bundle, hash or service from the event.
+runner API, never its bundle, hash or service from the event. One call
+to the runner API every `WEB_RECONCILE_SECS` both checks its key and
+converges its apps ([converging](#web-runner)).
 `/_cufflink/ready` answers 503 until the runner API has accepted the key.
 When it refuses the key (401: revoked, or the tenant deleted), or answers
 for another tenant than `WEB_TENANT`, the runner stops every app of the
 tenant, removes what they ran from, answers their hosts 503 and stays
-unready, asking again every `WEB_POLL_SECS`; any other failure keeps the
+unready, asking again every `WEB_RECONCILE_SECS`; any other failure keeps the
 apps running. A key minted `--for native` finds nothing here (404). Rotate
 a key as for the extension runner (below): the new key first, the old one
 revoked once the runner uses the new one. A request the runner made with
 the old key just before it was revoked can still be refused: the runner
-then stops its apps and serves again at its next poll with the new key,
-within one `WEB_POLL_SECS`.
+then stops its apps and serves again at its next reconcile with the new
+key, within one `WEB_RECONCILE_SECS`.
 
 **Network.** Its apps run with the runner's network, so give the runner a
 network that reaches `PLATFORM_URL` and NATS alone: no route to Postgres,

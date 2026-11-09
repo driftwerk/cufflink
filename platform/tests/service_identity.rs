@@ -132,7 +132,7 @@ async fn a_declared_schema_is_where_the_service_reads_and_writes() {
             commit_hash: None,
             schema_json: None,
             schema_hash: "",
-            native: None,
+            artifact: None,
         },
     )
     .await

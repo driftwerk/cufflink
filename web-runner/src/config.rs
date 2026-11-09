@@ -18,7 +18,6 @@ pub enum Scope {
         tenant: RunnerTenant,
         platform_url: String,
         runner_key: RunnerKey,
-        poll_every: Duration,
     },
 }
 
@@ -39,9 +38,6 @@ impl Scope {
                 tenant: RunnerTenant::parse("WEB_TENANT", tenant)?,
                 platform_url: vars.required("PLATFORM_URL").and_then(platform_url)?,
                 runner_key: key.map_or_else(|| RunnerKey::from_vars(vars), Ok)?,
-                poll_every: vars
-                    .positive("WEB_POLL_SECS", 30)
-                    .map(Duration::from_secs)?,
             }),
             (None, Some(_)) => Err(eyre::eyre!(
                 "{KEY_VAR} (or {KEY_FILE_VAR}) is set without WEB_TENANT: set WEB_TENANT to serve \
@@ -51,6 +47,35 @@ impl Scope {
                 .required("DATABASE_URL")
                 .map(|database_url| Self::Shared { database_url }),
         }
+    }
+}
+
+const RECONCILE_VAR: &str = "WEB_RECONCILE_SECS";
+const POLL_VAR: &str = "WEB_POLL_SECS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reconcile {
+    pub every: Duration,
+    pub poll_ignored: bool,
+}
+
+impl Reconcile {
+    fn from_vars(
+        vars: &Vars<impl Fn(&str) -> Option<String>>,
+        scope: &Scope,
+    ) -> eyre::Result<Self> {
+        let (reconcile, poll) = (
+            vars.get(RECONCILE_VAR),
+            scope.tenant().and_then(|_| vars.get(POLL_VAR)),
+        );
+        let name = match (&reconcile, &poll) {
+            (None, Some(_)) => POLL_VAR,
+            _ => RECONCILE_VAR,
+        };
+        Ok(Self {
+            every: vars.positive(name, 30).map(Duration::from_secs)?,
+            poll_ignored: reconcile.is_some() && poll.is_some(),
+        })
     }
 }
 
@@ -66,6 +91,7 @@ pub struct WebRunnerConfig {
     pub hostname_format: HostnameFormat,
     pub shutdown_grace: Duration,
     pub child_stop_timeout: Duration,
+    pub reconcile: Reconcile,
     pub env_mode: EnvMode,
     pub children: ChildSettings,
     pub artifact_caps: ArchiveCaps,
@@ -80,8 +106,10 @@ impl WebRunnerConfig {
         let secs = |name: &str, default: u64| vars.parsed(name, default).map(Duration::from_secs);
         let runner_port: u16 = or("RUNNER_PORT", "3100").parse()?;
         let port_range = app_ports(vars.get("WEB_PORT_RANGE").as_deref(), runner_port)?;
+        let scope = Scope::from_vars(&vars)?;
+        let reconcile = Reconcile::from_vars(&vars, &scope)?;
         Ok(Self {
-            scope: Scope::from_vars(&vars)?,
+            scope,
             nats_url: or("NATS_URL", "nats://localhost:4222"),
             nats_auth: cufflink_nats::NatsAuth::from_vars(|name| vars.get(name))?,
             runner_port,
@@ -93,6 +121,7 @@ impl WebRunnerConfig {
             hostname_format: or("CUFFLINK_HOSTNAME_FORMAT", "flat").parse()?,
             shutdown_grace: secs("SHUTDOWN_GRACE_SECS", 45)?,
             child_stop_timeout: secs("WEB_CHILD_STOP_TIMEOUT_SECS", 10)?,
+            reconcile,
             env_mode: env_mode(vars.get(WEB_ENV.passthrough).as_deref())?,
             children: ChildSettings::from_vars(&vars)?,
             artifact_caps: ArchiveCaps {
@@ -156,6 +185,13 @@ mod tests {
         assert_eq!(config.hostname_format, HostnameFormat::Flat);
         assert_eq!(config.shutdown_grace, Duration::from_secs(45));
         assert_eq!(config.child_stop_timeout, Duration::from_secs(10));
+        assert_eq!(
+            config.reconcile,
+            Reconcile {
+                every: Duration::from_secs(30),
+                poll_ignored: false
+            }
+        );
         assert_eq!(config.env_mode, env_mode(None).expect("the allowlist"));
         assert_eq!(config.artifact_caps.max_entries, 200_000);
         assert_eq!(config.artifact_caps.max_bytes, 2 << 30);
@@ -239,26 +275,11 @@ mod tests {
                 ("WEB_TENANT", "acme"),
                 ("PLATFORM_URL", "http://platform:8080/"),
                 ("CUFFLINK_RUNNER_KEY_FILE", "/run/secrets/runner-key"),
-                ("WEB_POLL_SECS", "5"),
             ])
             .expect("tenant-scoped"),
-            Scope::TenantScoped {
-                tenant: RunnerTenant::parse("WEB_TENANT", "acme".into()).expect("a slug"),
-                platform_url: "http://platform:8080".into(),
-                runner_key: RunnerKey::File("/run/secrets/runner-key".into()),
-                poll_every: Duration::from_secs(5),
-            },
+            tenant_scoped(),
             "and needs no database"
         );
-        assert!(matches!(
-            scope(&[
-                ("WEB_TENANT", "acme"),
-                ("PLATFORM_URL", "http://platform:8080"),
-                ("CUFFLINK_RUNNER_KEY", "cfr_AAAAAAAAAAAA_s3cret"),
-            ])
-            .expect("tenant-scoped"),
-            Scope::TenantScoped { poll_every, .. } if poll_every == Duration::from_secs(30)
-        ));
     }
 
     #[test]
@@ -312,15 +333,74 @@ mod tests {
             ("CUFFLINK_RUNNER_KEY", "k"),
         ])
         .starts_with("PLATFORM_URL: 'platform:8080'"));
+    }
+
+    fn reconcile(pairs: &[(&str, &str)]) -> eyre::Result<Reconcile> {
+        reconcile_of(&tenant_scoped(), pairs)
+    }
+
+    fn reconcile_of(scope: &Scope, pairs: &[(&str, &str)]) -> eyre::Result<Reconcile> {
+        Reconcile::from_vars(&Vars(cufflink_settings::fixed(pairs)), scope)
+    }
+
+    fn tenant_scoped() -> Scope {
+        Scope::TenantScoped {
+            tenant: RunnerTenant::parse("WEB_TENANT", "acme".into()).expect("a slug"),
+            platform_url: "http://platform:8080".into(),
+            runner_key: RunnerKey::File("/run/secrets/runner-key".into()),
+        }
+    }
+
+    #[test]
+    fn a_zero_reconcile_period_is_refused() {
+        for name in [RECONCILE_VAR, POLL_VAR] {
+            assert_eq!(
+                reconcile(&[(name, "0")]).expect_err(name).to_string(),
+                format!("{name} must be greater than 0")
+            );
+        }
+    }
+
+    #[test]
+    fn the_poll_period_sets_the_reconcile_period_unless_that_is_set_too() {
+        let every = |secs, poll_ignored| Reconcile {
+            every: Duration::from_secs(secs),
+            poll_ignored,
+        };
         assert_eq!(
-            refused(&[
-                ("WEB_TENANT", "acme"),
-                ("PLATFORM_URL", "http://platform:8080"),
-                ("CUFFLINK_RUNNER_KEY", "k"),
-                ("WEB_POLL_SECS", "0"),
-            ]),
-            "WEB_POLL_SECS must be greater than 0"
+            reconcile(&[(POLL_VAR, "5")]).expect("poll"),
+            every(5, false)
         );
+        assert_eq!(
+            reconcile(&[(RECONCILE_VAR, "7")]).expect("reconcile"),
+            every(7, false)
+        );
+        assert_eq!(
+            reconcile(&[(RECONCILE_VAR, "7"), (POLL_VAR, "5")]).expect("both"),
+            every(7, true)
+        );
+        assert_eq!(
+            reconcile(&[(RECONCILE_VAR, "7"), (POLL_VAR, "0")]).expect("an ignored poll"),
+            every(7, true),
+            "an ignored WEB_POLL_SECS is not read"
+        );
+    }
+
+    #[test]
+    fn a_shared_runner_never_reads_the_poll_period() {
+        let shared = Scope::Shared {
+            database_url: "postgres://platform".into(),
+        };
+        for poll in ["5", "0"] {
+            assert_eq!(
+                reconcile_of(&shared, &[(POLL_VAR, poll)]).expect(poll),
+                Reconcile {
+                    every: Duration::from_secs(30),
+                    poll_ignored: false
+                },
+                "WEB_POLL_SECS={poll} is a tenant-scoped runner's alone"
+            );
+        }
     }
 
     #[test]

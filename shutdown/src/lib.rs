@@ -79,6 +79,11 @@ impl Shutdown {
         self.is_triggered() && self.remaining() <= KILL_MARGIN
     }
 
+    pub async fn hard_deadline(&self) {
+        self.cancelled().await;
+        tokio::time::sleep(self.remaining().saturating_sub(KILL_MARGIN)).await;
+    }
+
     pub fn spawn<F>(&self, name: &'static str, fut: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,

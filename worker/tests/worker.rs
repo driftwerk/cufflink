@@ -88,7 +88,7 @@ async fn record_deployment(
             commit_hash: None,
             schema_json: None,
             schema_hash: "",
-            native: None,
+            artifact: None,
         },
     )
     .await
@@ -1952,7 +1952,7 @@ impl Backups {
                 commit_hash: None,
                 schema_json: None,
                 schema_hash: "",
-                native: None,
+                artifact: None,
             },
         )
         .await

@@ -2,7 +2,9 @@ use cufflink_testkit as common;
 
 use common::TestDb;
 use cufflink_platform::errors::PlatformError;
-use cufflink_platform::repo::deployments::{self, ActivateVersion, Artifact, NativeVersion};
+use cufflink_platform::repo::deployments::{
+    self, ActivateVersion, Artifact, NativeVersion, VersionArtifact,
+};
 use cufflink_platform::repo::{extensions, services};
 use cufflink_types::{ProvidedExtension, ServiceManifest, ServiceMode};
 use deadpool_postgres::Pool;
@@ -54,10 +56,12 @@ async fn activate(
             commit_hash: None,
             schema_json: None,
             schema_hash: "",
-            native: matches!(manifest.mode, ServiceMode::Native).then_some(NativeVersion {
-                artifact: &artifact,
-                actor: "admin",
-            }),
+            artifact: matches!(manifest.mode, ServiceMode::Native).then_some(
+                VersionArtifact::Native(NativeVersion {
+                    artifact: &artifact,
+                    actor: "admin",
+                }),
+            ),
         },
     )
     .await
