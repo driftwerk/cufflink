@@ -240,6 +240,11 @@ and from now on for web too.
 - Same manifest and same bundle: `Skipped`. As today, the commit label
   moves.
 - Anything else: a new version.
+- A web deploy that names no bundle (an older CLI's register, section
+  2.8) compares the manifest alone, as today. `code_hash` then answers
+  `None` on both sides. An unchanged manifest is still skipped, so an
+  older CLI never activates a version without a bundle before it builds,
+  unless `package.json`'s version changed, as today.
 - A changed `package.json` version with the same bundle is still a new
   version. The manifest changed, and `version` stays in the manifest as a
   label.
@@ -371,12 +376,24 @@ A web runner converges the apps it runs, as the extension runner does
     one query. That is `source.rs:226-236`'s query over
     `unnest($1::text[], $2::text[])` pairs of tenant and service.
   - A tenant-scoped runner reads one `GET /api/runner/web`. `watch_key`'s
-    poll and the reconcile become one loop: the answer that tells the key
-    is accepted is also the set to converge on. A refused key retires the
-    tenant's apps as it does today.
+    poll and the reconcile become one loop on the `WEB_RECONCILE_SECS`
+    tick: the answer that tells the key is accepted is also the set to
+    converge on. A refused key retires the tenant's apps as it does today.
+    `WEB_POLL_SECS` is still read: when it is set and
+    `WEB_RECONCILE_SECS` is not, it sets the tick, so an install that
+    tuned it keeps its period.
 - **What it does,** for each app it runs whose current deployment has a
   bundle of a different SHA-256 than the one it runs from: `apps.deploy`,
   which is the path an event takes.
+- **One change of an app at a time.** Events and reconcile switches go
+  through one queue. The deploy-event handler no longer calls
+  `apps.deploy` itself. It pushes the app's key into a `Coalescer`
+  (`web-runner/src/coalescer.rs`, which already folds a burst of
+  requests into one), and a single `web_converge` task drains it. That
+  task re-reads the app's current deployment and runs `apps.deploy`.
+  The reconcile tick pushes the keys it would switch into the same
+  queue. Two starts of the same app can then never overlap, and a burst
+  of events for one app runs one deploy of the newest version.
 - **What it never does.**
   - It never stops an app. An app whose current version has no bundle,
     or that no longer appears, keeps running. Undeploy stays event-driven
@@ -447,25 +464,36 @@ stops the replaced child. It returns it, and `Apps::run` hands it to
 so the event loop moves on at once (section 1.5). The task:
 
 1. closes the old release's gate;
-2. waits for the first of three things: `in_flight.idle()`,
-   `WEB_DRAIN_GRACE_SECS`, or the runner's shutdown;
+2. waits for `in_flight.idle()` or `WEB_DRAIN_GRACE_SECS`, whichever
+   comes first;
 3. stops the child with `Stop::Terminate(WEB_CHILD_STOP_TIMEOUT_SECS)`,
    which sends SIGTERM and then SIGKILL (`supervisor/src/child.rs:52-63`);
 4. drops its hold on the old directory and prunes. The directory hold of
    section 1.6 becomes "until the old process has exited", and
    `OLD_VERSION_KEPT` is removed.
 
+`ProcessManager` keeps each child being drained in a `draining` list.
+The task takes it out of that list for step 3, and nobody else stops it.
+
 **Settings and edge cases.**
 
 - `WEB_DRAIN_GRACE_SECS=0` keeps today's behaviour: the replaced child is
   killed at once, with no wait and no SIGTERM.
-- Shutdown cuts a drain short to step 3. `shutdown_all` only reaches
-  children still in the table, so the drain task is what stops a child
-  being drained. It runs on `Shutdown`, so the runner's exit waits for
-  it within `SHUTDOWN_GRACE_SECS`, like the supervisor tasks. A step 3
-  that starts at shutdown takes at most `WEB_CHILD_STOP_TIMEOUT_SECS`,
-  which already fits the shutdown budget. So no cross-check between the
-  grace and `SHUTDOWN_GRACE_SECS` is needed.
+- **Shutdown.** The runner first lets its HTTP server finish the
+  requests in flight (`web-runner/src/main.rs:162-171`), proxied requests
+  to a child being drained included. Then it stops its children
+  (`main.rs:173-178`).
+  - The drain task therefore does not react to shutdown itself. It keeps
+    waiting as in step 2.
+  - `shutdown_all` takes the children of the table **and** the `draining`
+    list, and stops them all with `Stop::Terminate(child_stop_timeout)`,
+    after the HTTP phase.
+  - A drain task that finds its child already taken by `shutdown_all`
+    only drops its directory hold. Its outcome is counted as `shutdown`.
+  - The HTTP phase's budget already leaves `WEB_CHILD_STOP_TIMEOUT_SECS`
+    for the children (`main.rs:162-164`). So no cross-check between the
+    grace and `SHUTDOWN_GRACE_SECS` is needed: whatever the grace, a
+    drained child is stopped within the shutdown budget.
 - A second swap while the first drain runs drains its own replaced child.
   Each drain owns one child.
 - A new process that fails its health check replaces nothing, so nothing
@@ -483,13 +511,13 @@ so the event loop moves on at once (section 1.5). The task:
 
 ### 2.8 The legacy upload route
 
-`POST /api/services/{id}/web` stays for CLIs older than this release and
-for the mend in section 7.2. It stores by content (section 2.1) and
+`POST /api/services/{id}/web` stays for CLIs older than this release. It
+stores by content (section 2.1) and
 records an upload row. Then, under the deploy lock:
 
 | The current version | The route |
 |---|---|
-| records no bundle | records this bundle on that row (`UPDATE … WHERE artifact_s3_key IS NULL`), then announces. This fills the hole that an older CLI's register, or an older replica, left |
+| records no bundle | records this bundle on that row (`UPDATE … WHERE artifact_s3_key IS NULL`), then announces. This fills the hole that an older CLI's register left |
 | records this bundle | changes nothing, and announces |
 | records another bundle | activates a **new** version with the current row's manifest and commit and this bundle, then announces. The running version's row and object are never touched |
 
@@ -498,7 +526,7 @@ now records the bundle) and `"released": true|false`.
 
 **Deploys without a bundle.** A web deploy that names no `web_artifact` is
 what every older CLI sends. During this release it is accepted as today,
-with `"warnings": ["this CLI registers a web app before building it; …
+and skipped by its manifest alone (section 2.2), with `"warnings": ["this CLI registers a web app before building it; …
 upgrade the CLI"]` and `cufflink_web_legacy_deploys_total` (question 1).
 A failed build from an older CLI can still leave a version with no bundle.
 Rollback (section 2.4) and the runners (section 2.6) handle such a
@@ -661,7 +689,8 @@ the platform test of `supports` against the doc tables requires.
 | `web_artifact.sha256` is the bundle sent, and the release deployed | prints `Released site v8 (bundle 3f9a…)`, exit 0 |
 | the same, and it was skipped | prints `site v7 already runs bundle 3f9a…; nothing to release`, exit 0 |
 | `409`, bundle not uploaded or no longer stored | uploads once more and releases once more. A second `409` fails with the platform's words |
-| names no `web_artifact`: an older replica took the release (section 7.2) | posts the same bundle to `POST /api/services/{id}/web`, which records it on the version that replica created, and warns `an older platform replica took the release; the bundle was attached to v8. Is a platform upgrade in progress?`. Exit 0 when that answer names the bundle, otherwise fails with `site v8 has no bundle: deploy again once the platform is upgraded` |
+| `422` naming the unknown field `web_artifact`: an older replica took the release (section 7.2) | fails, and nothing was released: `an older platform replica refused the release; site still runs v7. Is a platform upgrade in progress? Deploy again once it has finished` |
+| a deployed answer that names no `web_artifact` | fails: `the platform answered without the bundle it released; check cufflink deployments list for site`. No platform of this release answers that way. The check guards against a proxy or replica that drops the field |
 | `runners_told: false` | warns that the runners pick the version up within `WEB_RECONCILE_SECS`. Exit 0 |
 
 A failure in steps 2 to 6 releases nothing. The CLI's message says so:
@@ -693,8 +722,8 @@ A failure in steps 2 to 6 releases nothing. The CLI's message says so:
 | the rollback target's object is missing | the running version (`409`) | nothing |
 | the new process fails its health check | the old process, undrained and serving | the failed SHA-256 is remembered, and reconcile does not retry it until an event or a new hash |
 | the old process still has requests at the end of the grace | the new process | those requests are cut by SIGTERM, then SIGKILL after `WEB_CHILD_STOP_TIMEOUT_SECS`. Counted as `grace_elapsed` |
-| the runner shuts down during a drain | nothing | the drain goes straight to SIGTERM. Counted as `shutdown` |
-| an older replica takes the release | the version it created, with the bundle attached by the CLI's mend (section 4.5) | when the mend also fails, a version with no bundle. Section 2.4 and section 2.6 keep that safe, and the CLI says how to repair it |
+| the runner shuts down during a drain | nothing | the HTTP phase lets the requests in flight end, then `shutdown_all` sends SIGTERM to the drained child with the others. Counted as `shutdown` |
+| an older replica takes the release | the running version (`422` for the unknown `web_artifact`) | the upload row. The CLI says to deploy again once the upgrade has finished |
 
 ## 6. Configuration
 
@@ -703,7 +732,7 @@ A failure in steps 2 to 6 releases nothing. The CLI's message says so:
 | `WEB_DRAIN_GRACE_SECS` | web runner | `30` | How long a replaced process may finish the requests it was given before SIGTERM. `0`: killed at once, as before this release. Above `3600` is refused at start |
 | `WEB_CHILD_STOP_TIMEOUT_SECS` | web runner | `10` (unchanged) | Between SIGTERM and SIGKILL, now for drained processes as well as at shutdown |
 | `WEB_RECONCILE_SECS` | web runner | `30` | How often the apps it runs are converged without an event. Must be positive |
-| `WEB_POLL_SECS` | tenant-scoped web runner | `30` (unchanged) | Kept for the key check. The reconcile reads the same answer on its own tick. When both are set, each keeps its own period |
+| `WEB_POLL_SECS` | tenant-scoped web runner | `30` (unchanged) | Kept as an alias. A tenant-scoped runner checks its key and converges in one loop (section 2.6). When only `WEB_POLL_SECS` is set, it sets that loop's period. When both are set, `WEB_RECONCILE_SECS` wins and the runner logs that `WEB_POLL_SECS` is ignored |
 | `WEB_UPLOAD_RETENTION_SECS` | platform | `86400` | How long an upload no version records is kept. Must be at least `3600`, so a release is never refused for a bundle it just uploaded |
 
 No setting changes behaviour for WASM, CRUD, container or native
@@ -716,8 +745,8 @@ services.
 | CLI | Platform | Outcome |
 |---|---|---|
 | new | new | reserve, upload, release |
-| new | older | refused before building, naming `web_releases` (section 4.5) |
-| older | new | works as today: an artifact-less register (accepted with a warning) and the legacy upload (section 2.8), which never replaces a recorded bundle and releases new content as a new version. A failed build can still leave a version with no bundle. Upgrade the CLI with the platform |
+| new | older | refused before building, naming `web_releases` (section 4.5). An older platform would also refuse the release itself with a `422` for the unknown `web_artifact` |
+| older | new | works as today, but safer: the artifact-less register is accepted with a warning and skipped by its manifest alone (section 2.2). The legacy upload (section 2.8) never replaces a recorded bundle, and releases new content as a new version. A failed build after a changed `package.json` version can still leave a version with no bundle, as today. Upgrade the CLI with the platform |
 | older | older | as today |
 
 The runner is independent of both:
@@ -742,7 +771,7 @@ If it happens anyway:
 | The release is taken by | Effect | The CLI |
 |---|---|---|
 | a new replica | released | as section 4.5 |
-| an older replica | it ignores `web_artifact` (unknown fields are dropped) and activates a version with no bundle, as an older CLI's register does | sees no `web_artifact` in the answer and mends through the legacy upload, which either replica accepts. On an older replica it fills the current version, as today. On a new one it fills the version with no bundle (section 2.8) |
+| an older replica | `DeployRequest` has `deny_unknown_fields` (`platform/src/api/deployments.rs:33-35`), so it answers `422` for `web_artifact` and creates nothing | fails, and nothing was released (section 4.5). The upload it made stays an unreleased upload |
 | an older replica, for the upload `PUT` | `404` or `405` (unknown route) | fails before releasing: `the platform does not take web bundles by content: is a platform upgrade in progress?` |
 | an older replica, for a rollback | the hole of section 1.4 | nothing to check. The runners keep the old process, and section 2.6 keeps it running. Roll back again once the platform is upgraded |
 
@@ -808,6 +837,7 @@ release.
 - `pipeline.rs`:
   - `a_web_apps_code_hash_is_its_bundle_hash`;
   - `the_same_bundle_and_manifest_is_skipped`;
+  - `a_legacy_web_deploy_with_an_unchanged_manifest_is_still_skipped`;
   - `a_new_bundle_under_the_same_package_version_is_a_new_version`;
   - `the_same_bundle_under_a_new_package_version_is_a_new_version`.
 - `api/deployments.rs`:
@@ -870,7 +900,10 @@ today):
   - `a_missed_event_is_caught_by_the_next_reconcile`;
   - `reconcile_never_stops_an_app_whose_current_version_has_no_bundle`;
   - `reconcile_does_not_retry_a_bundle_that_failed_its_health_check_until_an_event`;
-  - `reconcile_starts_no_app_that_is_not_running`.
+  - `reconcile_starts_no_app_that_is_not_running`;
+  - `an_event_and_a_reconcile_for_one_app_start_it_once`. Both are queued
+    while a slow start runs, and one more start follows, of the newest
+    version.
 - **Warmer:** `a_deploy_event_clears_the_warmers_not_found_entry`.
 - **Gate (`process_manager.rs`):**
   - `a_closed_gate_admits_no_request_and_is_idle_when_the_last_ends`;
@@ -881,7 +914,9 @@ today):
     swap, and it ends 200 with the old marker;
   - `a_request_past_the_grace_is_cut_and_the_process_stopped`;
   - `a_zero_grace_kills_the_replaced_process_at_once`;
-  - `shutdown_cuts_a_drain_short_and_stops_the_old_process`;
+  - `shutdown_stops_a_drained_process_after_the_http_phase`. A request
+    in flight on the old process still ends 200 when the runner shuts
+    down, and the old process is stopped by `shutdown_all`;
   - `the_replaced_directory_stays_until_its_process_has_exited`.
 - `config.rs`:
   - `the_settings_default_as_documented` (extended);
@@ -902,10 +937,10 @@ inactive-deploy tests do):
 - **Failures release nothing:**
   - `a_failed_build_releases_nothing`;
   - `a_failed_upload_releases_nothing`.
-- **Retries and mends:**
+- **Retries and refusals:**
   - `a_bundle_no_longer_stored_is_uploaded_again_once`;
-  - `an_answer_without_the_bundle_mends_through_the_legacy_upload`;
-  - `a_mend_that_fails_says_the_version_has_no_bundle`.
+  - `a_release_an_older_replica_refuses_says_nothing_was_released`;
+  - `a_deployed_answer_without_the_bundle_fails`.
 - **Negotiation:**
   `a_platform_without_web_releases_is_refused_before_building`.
 - **Rollback:** `a_web_rollback_prints_the_bundle_it_runs`
@@ -925,8 +960,9 @@ and `cargo test --workspace`, and updates the docs and the
    - Tests: rollback in-crate and the three rollback integration tests.
    - Works with legacy keys alone, so it ships before anything else.
 2. **Web runners converge** (#62, runner).
-   - `WEB_RECONCILE_SECS`, the shared runner's batch read, and
-     `watch_key` merged with the reconcile.
+   - `WEB_RECONCILE_SECS`, the shared runner's batch read, `watch_key`
+     merged with the reconcile, and the single converge queue that events
+     and reconcile share.
    - The failed-hash memory and `LazyWarmer::forget`.
    - Tests: reconcile and warmer.
 3. **Web bundles by content** (#63, platform).
@@ -1026,4 +1062,5 @@ PRs 1, 2 and 5 can be reviewed in parallel. PR 4 follows PR 3.
 | 7 | Should a skipped web release publish `deploy.web` again? | Yes. It is free for a runner that already runs the bundle, and it repairs one that missed the first event |
 | 8 | Should the runner's reconcile ever stop an app? | No. It only switches to a different bundle. Stopping stays with `undeploy.web` and a refused key |
 | 9 | Should a missing rollback target object be `409` (proposed) rather than the `500` native rollbacks answer today? | `409` for web. Native is left as it is in this change |
-| 10 | Should reserving be its own route (`POST /api/services/web`), rather than a flag on deploy? | Its own route, for web apps only: it creates no version, so it should not look like a deploy |
+| 10 | #64 asks for SIGTERM, then a wait. This design waits for the requests the runner forwarded, and only then sends SIGTERM (section 8.3). Is that order acceptable? | Yes. Whether a request finishes then holds for any app, not only one that handles SIGTERM gracefully |
+| 11 | Should reserving be its own route (`POST /api/services/web`), rather than a flag on deploy? | Its own route, for web apps only: it creates no version, so it should not look like a deploy |
