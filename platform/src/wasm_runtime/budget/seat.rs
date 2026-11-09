@@ -861,6 +861,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slot_already_handed_to_the_head_arrival_still_goes_to_the_resume() {
+        for _ in 0..64 {
+            let gate = Gate::new(1);
+            let running_guest = gate.try_take().expect("the running guest's slot");
+            let mut arrival = pin!(gate.admit());
+            assert!(poll!(arrival.as_mut()).is_pending());
+            let (cancel, shutdown) = (CancellationToken::new(), running());
+            let mut resume = pin!(parked(&[&gate], InvocationKind::Route).resume(by(
+                Duration::from_secs(5),
+                &cancel,
+                &shutdown
+            )));
+            assert!(poll!(resume.as_mut()).is_pending());
+            drop(running_guest);
+            assert!(
+                poll!(arrival.as_mut()).is_pending(),
+                "the resume's notice wins over the slot handed to the arrival"
+            );
+            assert!(matches!(poll!(resume.as_mut()), Poll::Ready(Ok(_))));
+        }
+    }
+
+    #[tokio::test]
     async fn resumes_take_freed_slots_in_their_own_order() {
         let gate = Gate::new(1);
         let running_guest = gate.try_take().expect("the running guest's slot");
