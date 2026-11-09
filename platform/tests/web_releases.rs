@@ -557,6 +557,34 @@ async fn an_upload_is_stored_by_content_and_releases_nothing() {
 }
 
 #[tokio::test]
+async fn concurrent_uploads_of_the_same_bundle_store_it_once() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = b"bundle uploaded twice at once".as_slice();
+    let sha256 = sha256_hex(bundle);
+
+    let ((first, a), (second, b)) = tokio::join!(
+        w.put(&service_id, &sha256, bundle),
+        w.put(&service_id, &sha256, bundle)
+    );
+    assert_eq!((first, second), (200, 200), "{a} {b}");
+    for answer in [&a, &b] {
+        assert_eq!(answer["sha256"], json!(sha256));
+        assert_eq!(answer["size"], bundle.len());
+    }
+    assert_eq!(
+        w.uploads(&service_id).await,
+        [(sha256.clone(), World::key(&service_id, bundle))]
+    );
+    assert_eq!(
+        w.stored(&World::key(&service_id, bundle)).await.as_deref(),
+        Some(bundle)
+    );
+}
+
+#[tokio::test]
 async fn an_upload_whose_bytes_are_not_its_hash_is_refused() {
     let Some(mut w) = World::start().await else {
         return;
@@ -921,6 +949,47 @@ async fn pruning_removes_a_bundle_no_version_records_and_keeps_a_shared_one() {
     assert_eq!(
         w.uploads(&service_id).await,
         [(sha256_hex(first), World::key(&service_id, first))]
+    );
+}
+
+#[tokio::test]
+async fn pruning_keeps_a_bundle_uploaded_again_since() {
+    let Some(mut w) = World::start().await else {
+        return;
+    };
+    let (first, second) = (
+        b"bundle of the first".as_slice(),
+        b"bundle of the second".as_slice(),
+    );
+    let (service_id, shipped) = w.ship("0.1.0", first).await;
+    w.ship("0.2.0", second).await;
+    for bundle in [first, second] {
+        w.age_uploads(&service_id, &sha256_hex(bundle)).await;
+    }
+    assert_eq!(w.uploaded(&service_id, first).await["stored"], "present");
+
+    let (status, pruned) = w
+        .send(
+            Method::POST,
+            &format!("/api/services/{service_id}/deployments/prune"),
+            w.deployer(),
+            &json!({"keep": 1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{pruned}");
+    assert_eq!(pruned["deleted_versions"], json!([version_of(&shipped)]));
+    assert_eq!(
+        w.stored(&World::key(&service_id, first)).await.as_deref(),
+        Some(first),
+        "an upload within the retention holds the bundle its pruned version recorded"
+    );
+    let (status, released) = w
+        .release_named("0.3.0", &sha256_hex(first), first.len())
+        .await;
+    assert_eq!(status, 200, "{released}");
+    assert_eq!(
+        released["web_artifact"],
+        json!({"sha256": sha256_hex(first), "size": first.len()})
     );
 }
 
