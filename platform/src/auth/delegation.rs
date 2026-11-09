@@ -130,14 +130,35 @@ impl Delegation {
 }
 
 pub struct SeenIdentities {
-    seen: Mutex<HashMap<Uuid, i64>>,
+    seen: Mutex<Seen>,
     capacity: usize,
+}
+
+#[derive(Default)]
+struct Seen {
+    expiring: HashMap<Uuid, i64>,
+    earliest: Option<i64>,
+}
+
+impl Seen {
+    fn forget(&mut self, live: impl Fn(&i64) -> bool) {
+        self.expiring.retain(|_, expires_at| live(expires_at));
+        self.earliest = self.expiring.values().min().copied();
+    }
+
+    fn remember(&mut self, jti: Uuid, expires_at: i64) {
+        self.expiring.insert(jti, expires_at);
+        self.earliest = Some(
+            self.earliest
+                .map_or(expires_at, |earliest| earliest.min(expires_at)),
+        );
+    }
 }
 
 impl SeenIdentities {
     pub fn new(capacity: usize) -> Self {
         Self {
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::new(Seen::default()),
             capacity,
         }
     }
@@ -150,16 +171,16 @@ impl SeenIdentities {
     ) -> Result<(), DelegationError> {
         let live = |expires_at: &i64| expires_at.saturating_add(CLOCK_SKEW_SECS) >= now;
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if seen.get(&jti).is_some_and(live) {
+        if seen.expiring.get(&jti).is_some_and(live) {
             return Err(DelegationError::Replayed);
         }
-        if seen.len() >= self.capacity {
-            seen.retain(|_, expires_at| live(expires_at));
+        if seen.expiring.len() >= self.capacity && seen.earliest.is_some_and(|e| !live(&e)) {
+            seen.forget(live);
         }
-        if seen.len() >= self.capacity {
+        if seen.expiring.len() >= self.capacity {
             Err(DelegationError::ReplayCapacity)
         } else {
-            seen.insert(jti, expires_at);
+            seen.remember(jti, expires_at);
             Ok(())
         }
     }
@@ -435,6 +456,18 @@ pub(crate) mod tests {
             Err(DelegationError::Replayed),
             "a full set still names a replay as one"
         );
+        for later in 11..=35 {
+            assert_eq!(
+                seen.first_use(Uuid::from_u128(100 + later as u128), NOW + 90, NOW + later),
+                Err(DelegationError::ReplayCapacity),
+                "refused while every identity it holds is live"
+            );
+        }
+        assert_eq!(
+            seen.first_use(Uuid::from_u128(4), NOW + 90, NOW + 36),
+            Ok(()),
+            "admitted once the earliest has expired"
+        );
     }
 
     #[tokio::test]
@@ -471,6 +504,55 @@ pub(crate) mod tests {
             check(&seen, &redis, &claims(None), Arrival::Network, NOW).await,
             Ok(()),
             "a service-only identity never asks Redis"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replay_to_another_replica_is_refused_through_redis() {
+        let Some(url) = cufflink_testkit::infra()
+            .await
+            .and_then(|infra| infra.require_redis())
+        else {
+            return;
+        };
+        let redis = RedisHandle::connect_in_background(url).expect("a handle");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !redis.is_connected() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Redis connects");
+        let acme = tenant("acme", Some("acme"));
+        let delegated = claims(Delegation::of(&user(&acme)));
+        let (first, second) = (SeenIdentities::new(8), SeenIdentities::new(8));
+        assert_eq!(
+            check(&first, &redis, &delegated, Arrival::Network, NOW).await,
+            Ok(())
+        );
+        assert_eq!(
+            check(&second, &redis, &delegated, Arrival::Network, NOW + 1).await,
+            Err(DelegationError::Replayed),
+            "another replica's seen-set has not seen it, Redis has"
+        );
+        let key = format!("cufflink:sid:{}", delegated.jti);
+        let ttl = redis
+            .call(|mut conn| async move {
+                redis::cmd("TTL")
+                    .arg(&key)
+                    .query_async::<i64>(&mut conn)
+                    .await
+            })
+            .await
+            .expect("a TTL");
+        assert!(
+            (1..=35).contains(&ttl),
+            "kept until the identity expires: {ttl}"
+        );
+        let fresh = claims(Delegation::of(&user(&acme)));
+        assert_eq!(
+            check(&second, &redis, &fresh, Arrival::Network, NOW).await,
+            Ok(())
         );
     }
 
