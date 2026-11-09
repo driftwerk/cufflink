@@ -112,6 +112,13 @@ impl PostureGate {
         }
     }
 
+    fn presents(&self, call: Option<ServiceCaller>) -> Option<ServiceCaller> {
+        match self {
+            PostureGate::PartnerKey { .. } => call.map(ServiceCaller::without_delegation),
+            _ => call,
+        }
+    }
+
     fn tolerates_invalid_credential(&self) -> bool {
         matches!(self, PostureGate::Legacy | PostureGate::Public)
     }
@@ -194,7 +201,7 @@ pub(crate) async fn authorize_route(
             })
         }
         gate => {
-            let call = internal::continued(service, target, identity, now)?;
+            let call = gate.presents(internal::continued(service, target, identity, now)?);
             let delegated = delegated_user(call.as_ref(), tenant);
             admit_principal(state, service, tenant, headers, delegated, gate)
                 .await
@@ -305,6 +312,52 @@ async fn authorize_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_api_key_route_sets_the_delegated_user_aside_and_says_so() {
+        let acme = crate::tenant_catalog::tests::tenant("acme", Some("acme"));
+        let delegated = ServiceCaller {
+            service: "catalog-service".into(),
+            on_behalf_of: Some("clara".into()),
+            depth: 1,
+            remaining: std::time::Duration::from_secs(5),
+            delegated: crate::auth::service_identity::Delegation::of(
+                &crate::auth::delegation::tests::user(&acme),
+            ),
+        };
+        let presented = |gate: PostureGate| {
+            gate.presents(Some(delegated.clone())).map(|call| {
+                (
+                    call.to_json().get("delegated").cloned(),
+                    call.calling().delegated,
+                )
+            })
+        };
+        assert_eq!(
+            presented(PostureGate::PartnerKey {
+                scope: "loans:ingest".into()
+            }),
+            Some((None, false)),
+            "the guest and the audit see no delegated user"
+        );
+        for gate in [
+            PostureGate::Legacy,
+            PostureGate::Public,
+            PostureGate::RequirePrincipal,
+            PostureGate::RequirePermission {
+                area: "loans".into(),
+                operation: "approve".into(),
+            },
+            PostureGate::Scoped {
+                area: "loans".into(),
+                operation: "view".into(),
+                owner_field: None,
+            },
+        ] {
+            assert_eq!(presented(gate), Some((Some(Value::Bool(true)), true)));
+        }
+        assert!(PostureGate::Public.presents(None).is_none());
+    }
 
     #[test]
     fn gate_maps_each_posture() {

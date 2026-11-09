@@ -83,8 +83,8 @@ exactly as on a direct call: `authenticated`, `owner` and
 user's own grants, CRUD tables apply `auth_required`, `owner_field` and
 `permission_area` to them, and an `internal` route sees them in `req.auth()`
 beside the calling service in `req.caller()`. An `api_key` route ignores
-the user: only a partner key passes it, and its audit record names the
-calling service. A credential header beside the identity is ignored. The
+the user: only a partner key passes it, its guest sees no `delegated`
+flag, and its audit record names the calling service. A credential header beside the identity is ignored. The
 user never has platform-admin or deploy authority on the target. The
 request's `caller` object gains `"delegated": true`, and the audit record
 names the user as actor with the calling service as `actor.via`.

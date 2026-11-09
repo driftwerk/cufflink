@@ -32,6 +32,13 @@ impl ServiceCaller {
         }
     }
 
+    pub(crate) fn without_delegation(self) -> Self {
+        Self {
+            delegated: None,
+            ..self
+        }
+    }
+
     pub(crate) fn to_json(&self) -> Value {
         let caller = json!({
             "service": self.service,
