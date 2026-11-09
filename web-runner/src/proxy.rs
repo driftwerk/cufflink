@@ -182,3 +182,50 @@ where
         self.body.size_hint()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_manager::InFlight;
+    use http_body_util::{BodyExt, Full, StreamBody};
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    async fn idle_within(in_flight: &InFlight, within: Duration) -> bool {
+        tokio::time::timeout(within, in_flight.idle()).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_request_counts_until_its_body_ends() {
+        let in_flight = InFlight::new();
+        let mut body = Counted {
+            body: Full::new(Bytes::from_static(b"done")),
+            entered: in_flight.enter(),
+        };
+        assert_eq!(in_flight.close(), 1);
+        assert!(!idle_within(&in_flight, Duration::from_millis(100)).await);
+        while body.frame().await.is_some() {}
+        assert!(
+            idle_within(&in_flight, Duration::from_secs(1)).await,
+            "a body read to its end no longer counts, though not yet dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_client_goes_away_no_longer_counts() {
+        let in_flight = InFlight::new();
+        let streaming = Counted {
+            body: StreamBody::new(futures_util::stream::pending::<
+                Result<Frame<Bytes>, Infallible>,
+            >()),
+            entered: in_flight.enter(),
+        };
+        assert_eq!(in_flight.close(), 1);
+        assert!(
+            !idle_within(&in_flight, Duration::from_millis(100)).await,
+            "a stream still being sent counts"
+        );
+        drop(streaming);
+        assert!(idle_within(&in_flight, Duration::from_secs(1)).await);
+    }
+}

@@ -480,6 +480,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reconcile_switch_drains_the_replaced_process() {
+        let Some(w) = world(21218..=21220).await else {
+            return;
+        };
+        w.start(1, serving("one", &w.log)).await;
+        let lease = w
+            .apps
+            .process_manager
+            .lease(&w.tenant, "site")
+            .expect("a lease");
+        w.release(2, Some(serving("two", &w.log))).await;
+        w.converger.reconcile().await;
+        w.drain().await;
+        assert_eq!(w.running(), Some(2));
+        let answer = |port: u16| async move {
+            reqwest::get(format!("http://127.0.0.1:{port}/"))
+                .await?
+                .text()
+                .await
+        };
+        assert_eq!(
+            answer(lease.port).await.expect("still serves"),
+            "one",
+            "the replaced process serves the request it was given"
+        );
+        let old_port = lease.port;
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while answer(old_port).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("stopped once its last request ended");
+        w.stop().await;
+    }
+
+    #[tokio::test]
     async fn reconcile_never_stops_an_app_whose_current_version_has_no_bundle() {
         let Some(w) = world(21203..=21204).await else {
             return;
