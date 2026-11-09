@@ -1348,6 +1348,20 @@ Unreleased. No new module-declared feature, and no migration.
   that come while it waits for it; an arrival already queued for that slot
   keeps its place. Nothing releases slots yet, so admission is otherwise
   unchanged.
+- Web runners converge without an event: at start and every
+  `WEB_RECONCILE_SECS` (default 30) a runner reads the current deployment
+  of the apps it runs, in one query or one runner API call, and switches an
+  app whose current version records another bundle than the one it runs,
+  so a runner that missed a deploy event serves the current version within
+  one period. It never stops an app, starts none that is not running, and
+  does not retry a bundle that failed its health check until a deploy event
+  or a new bundle ([converging](deployment.md#web-runner)). Deploy events
+  and the reconcile share one queue, so two starts of an app never overlap
+  and a burst of events runs one deploy of the newest version. A deploy
+  event clears the app's remembered failed cold start and unknown host. A
+  tenant-scoped runner's key check is the same call; its `WEB_POLL_SECS` is
+  kept as an alias, read only when `WEB_RECONCILE_SECS` is unset. Runner
+  setting only: no platform change, and runners upgrade in any order.
 
 ## Changes in v0.37.1
 
