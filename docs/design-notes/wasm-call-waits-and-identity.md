@@ -1622,6 +1622,8 @@ SDK PR comes first):
 
 ## 12. Owner questions
 
+Decided 2026-11-09: the maintainer accepted every recommended default below.
+
 Each question has a recommended default, which the design above assumes.
 
 1. **Should a route be able to release its own `max_concurrent` slot too?**
