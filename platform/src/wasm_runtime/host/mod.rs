@@ -1,12 +1,15 @@
 use super::budget::{
-    stepped, Capped, ChargedJson, ChargedJsonError, Hold, HostCaps, Meter, Refused,
+    stepped, Capped, ChargedJson, ChargedJsonError, Hold, HostCaps, Lent, Meter, Refused, ResumeBy,
+    Seat, Taken,
 };
-use super::{wt, InvocationKind, WasmLimits};
+use super::{wt, Interrupt, InvocationKind, WasmLimits};
 use crate::nats_manager::subjects::PublishScope;
 use crate::policy::PolicySet;
 use crate::registry::ServiceIdentity;
 use crate::router::jobs::AuthSnapshot;
+use crate::shutdown::Shutdown;
 use crate::AppState;
+use cufflink_types::host::wait::Wait;
 use std::collections::HashSet;
 use std::future::Future;
 use std::ops::Range;
@@ -255,13 +258,53 @@ fn block_on_within<T, E>(
     cancel: &CancellationToken,
     fut: impl Future<Output = Result<T, E>>,
 ) -> Result<T, HostIoError<E>> {
+    block_on(bounded(timeout, cancel, fut))
+}
+
+async fn bounded<T, E>(
+    timeout: Duration,
+    cancel: &CancellationToken,
+    fut: impl Future<Output = Result<T, E>>,
+) -> Result<T, HostIoError<E>> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(HostIoError::Cancelled),
+        ended = tokio::time::timeout(timeout, fut) => ended
+            .map_err(|_| HostIoError::TimedOut(timeout))?
+            .map_err(HostIoError::Failed),
+    }
+}
+
+pub(crate) type Released<T> = Result<(T, Vec<Taken>), Interrupt>;
+
+pub(crate) struct Waiting<'a> {
+    pub timeout: Duration,
+    pub resume: ResumeBy<'a>,
+}
+
+fn block_on_released<T, E>(
+    mut lent: Lent,
+    waiting: Waiting<'_>,
+    fut: impl Future<Output = Result<T, E>>,
+) -> Released<Result<T, HostIoError<E>>> {
     block_on(async {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(HostIoError::Cancelled),
-            ended = tokio::time::timeout(timeout, fut) => ended
-                .map_err(|_| HostIoError::TimedOut(timeout))?
-                .map_err(HostIoError::Failed),
+        let call = bounded(waiting.timeout, waiting.resume.cancel, fut);
+        tokio::pin!(call);
+        let parked = match lent.requested() {
+            false => None,
+            true => tokio::select! {
+                biased;
+                ended = &mut call => return Ok((ended, lent.answered_first())),
+                () = tokio::time::sleep(lent.after()) => lent.park().ok(),
+            },
+        };
+        let ended = call.await;
+        match parked {
+            None => Ok((ended, lent.into_releasable())),
+            Some(parked) => parked
+                .resume(waiting.resume)
+                .await
+                .map(|retaken| (ended, retaken)),
         }
     })
 }
@@ -282,6 +325,8 @@ pub(crate) struct HostStateInit {
     pub guest_limits: GuestLimits,
     pub kind: InvocationKind,
     pub policies: Arc<PolicySet>,
+    pub seat: Seat,
+    pub shutdown: Shutdown,
 }
 
 pub struct HostState {
@@ -303,6 +348,8 @@ pub struct HostState {
     host_response: Option<HostResponse>,
     pub db: DbSession,
     length_violation_logged: bool,
+    seat: Seat,
+    shutdown: Shutdown,
 }
 
 impl HostState {
@@ -327,6 +374,8 @@ impl HostState {
             policies: init.policies,
             host_response: None,
             length_violation_logged: false,
+            seat: init.seat,
+            shutdown: init.shutdown,
         }
     }
 
@@ -339,6 +388,25 @@ impl HostState {
         Bounds {
             remaining: self.remaining_budget(),
             cancel: self.cancel.clone(),
+        }
+    }
+
+    pub(crate) fn lend(&mut self, wait: Wait) -> Lent {
+        self.seat.lend(wait, self.db.open_count() > 0)
+    }
+
+    pub(crate) fn restore(&mut self, retaken: Vec<Taken>) {
+        self.seat.restore(retaken);
+    }
+
+    pub(crate) fn waiting(&self, timeout: Duration) -> Waiting<'_> {
+        Waiting {
+            timeout,
+            resume: ResumeBy {
+                until: self.deadline,
+                cancel: &self.cancel,
+                shutdown: &self.shutdown,
+            },
         }
     }
 
@@ -517,6 +585,7 @@ pub const HOST_FEATURES: &[(&str, &[&str])] = &[
     ("util_v2", &["util_sleep_ms", "util_now_millis"]),
     ("ext_call", &["ext_call"]),
     ("sql_parse", &["sql_parse"]),
+    ("wait_release", &["http_fetch_v2", "service_call"]),
 ];
 
 pub fn supported_features(host_fns: &HashSet<&'static str>) -> Vec<&'static str> {
@@ -729,6 +798,172 @@ mod bounded_call_tests {
             bounded(Duration::from_secs(5), within).await.expect("join"),
             Err(HostIoError::TimedOut(after)) if after == within
         ));
+    }
+}
+
+#[cfg(test)]
+mod released_wait_tests {
+    use super::*;
+    use crate::wasm_runtime::budget::{seats, Gate};
+    use std::time::Instant;
+    use tokio::sync::OwnedSemaphorePermit;
+
+    const AFTER: Duration = Duration::from_millis(20);
+
+    type Ended<T> = Result<(Result<T, HostIoError<String>>, usize), Interrupt>;
+
+    async fn released<T: Send + 'static>(
+        seat: Seat,
+        transaction_open: bool,
+        until: Duration,
+        cancel: CancellationToken,
+        call: impl Future<Output = Result<T, String>> + Send + 'static,
+    ) -> (Seat, Ended<T>) {
+        tokio::task::spawn_blocking(move || {
+            let mut seat = seat;
+            let shutdown = Shutdown::new(Duration::from_secs(30));
+            let lent = seat.lend(Wait::Release, transaction_open);
+            let waiting = Waiting {
+                timeout: Duration::from_secs(5),
+                resume: ResumeBy {
+                    until: Instant::now() + until,
+                    cancel: &cancel,
+                    shutdown: &shutdown,
+                },
+            };
+            let ended = block_on_released(lent, waiting, call).map(|(answer, retaken)| {
+                let slots = retaken.len();
+                seat.restore(retaken);
+                (answer, slots)
+            });
+            (seat, ended)
+        })
+        .await
+        .expect("joined")
+    }
+
+    fn free_after(gate: &Arc<Gate>, wait: Duration) -> impl Future<Output = Result<usize, String>> {
+        let gate = Arc::clone(gate);
+        async move {
+            tokio::time::sleep(wait).await;
+            Ok(gate.available())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_answered_within_the_threshold_touches_no_semaphore() {
+        let gate = Gate::new(1);
+        let seat = seats::lone(&gate, Some((1, 1)), AFTER);
+        let (seat, ended) = released(
+            seat,
+            false,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            free_after(&gate, Duration::ZERO),
+        )
+        .await;
+        assert!(matches!(ended, Ok((Ok(0), 1))), "{ended:?}");
+        assert_eq!(gate.available(), 0);
+        assert_eq!(seats::pools(&seat), (1, 1));
+        drop(seat);
+        assert_eq!(gate.available(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_call_gives_its_slots_back_and_takes_them_again_before_it_returns() {
+        let gate = Gate::new(1);
+        let seat = seats::lone(&gate, Some((1, 1)), AFTER);
+        let (seat, ended) = released(
+            seat,
+            false,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            free_after(&gate, AFTER * 5),
+        )
+        .await;
+        assert!(
+            matches!(ended, Ok((Ok(1), 1))),
+            "the slot is free while the call waits, and retaken: {ended:?}"
+        );
+        assert_eq!(gate.available(), 0);
+        assert_eq!(seats::pools(&seat), (1, 1), "the wait permits go back");
+        drop(seat);
+        assert_eq!(gate.available(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_with_an_open_transaction_holds_its_slots() {
+        let gate = Gate::new(1);
+        let seat = seats::lone(&gate, Some((1, 1)), AFTER);
+        let (_seat, ended) = released(
+            seat,
+            true,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            free_after(&gate, AFTER * 5),
+        )
+        .await;
+        assert!(matches!(ended, Ok((Ok(0), 1))), "{ended:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_releasing_off_a_slow_call_holds_its_slots() {
+        let gate = Gate::new(1);
+        let seat = seats::lone(&gate, None, AFTER);
+        let (_seat, ended) = released(
+            seat,
+            false,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+            free_after(&gate, AFTER * 5),
+        )
+        .await;
+        assert!(matches!(ended, Ok((Ok(0), 1))), "{ended:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_cancelled_while_parked_frees_everything() {
+        let gate = Gate::new(1);
+        let seat = seats::lone(&gate, Some((1, 1)), AFTER);
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        let (seat, ended) = released(seat, false, Duration::from_secs(5), cancel, async move {
+            tokio::time::sleep(AFTER * 5).await;
+            canceller.cancel();
+            std::future::pending::<Result<(), String>>().await
+        })
+        .await;
+        assert_eq!(ended.err(), Some(Interrupt::Cancelled));
+        assert_eq!(gate.available(), 1);
+        assert!(seats::quiet(&gate));
+        assert_eq!(seats::pools(&seat), (1, 1));
+        assert_eq!(seat.len(), 0, "the seat holds nothing the store must drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_that_cannot_resume_by_its_deadline_holds_nothing() {
+        let gate = Gate::new(1);
+        let seat = seats::lone(&gate, Some((1, 1)), AFTER);
+        let taker = Arc::clone(&gate);
+        let (seat, ended) = released(
+            seat,
+            false,
+            AFTER * 10,
+            CancellationToken::new(),
+            async move {
+                tokio::time::sleep(AFTER * 5).await;
+                Ok::<Option<OwnedSemaphorePermit>, String>(taker.try_take())
+            },
+        )
+        .await;
+        assert_eq!(
+            ended.map(|(answer, slots)| (answer.is_ok(), slots)).err(),
+            Some(Interrupt::Deadline),
+            "another guest took the released slot and held it past the deadline"
+        );
+        assert_eq!(gate.available(), 1);
+        assert!(seats::quiet(&gate));
+        assert_eq!(seats::pools(&seat), (1, 1));
     }
 }
 

@@ -71,7 +71,7 @@ impl Default for WasmLimits {
             max_instances: 1,
             max_guest_len: 64 * MIB,
             max_response_bytes: 64 * MIB,
-            max_concurrent: 256,
+            max_concurrent: budget::DEFAULT_MAX_CONCURRENT,
             epoch_tick: Duration::from_millis(100),
             module_cache_max: 128,
             admission_wait: Duration::from_millis(1000),
@@ -102,7 +102,7 @@ impl WasmLimits {
             );
         }
         let defaults = Self::default();
-        let max_concurrent = env_var("WASM_MAX_CONCURRENT", defaults.max_concurrent)?;
+        let max_concurrent = budget::max_concurrent(cufflink_settings::process_var)?;
         let budget = budget::BudgetConfig::from_vars(
             cufflink_settings::process_var,
             budget::detect_cgroup(std::path::Path::new("/")),
@@ -1021,7 +1021,7 @@ impl WasmEngine {
         deadline: Instant,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<GuestOutput, ExecutionError> {
-        let (_seat, charge) = admission.into_parts();
+        let (seat, charge) = admission.into_parts();
         let mut copying = None;
         let _span = scoped_span!(
             "wasm_handler",
@@ -1070,6 +1070,8 @@ impl WasmEngine {
                 guest_limits,
                 kind: inv.kind,
                 policies,
+                seat,
+                shutdown: self.shutdown.clone(),
             }),
         );
         store.limiter(|host| &mut host.guest_limits);

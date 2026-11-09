@@ -1,8 +1,8 @@
-use super::util::{ended, exchange};
+use super::util::{ended, exchange_released};
 use super::{
-    block_on_within, budget_cap, clamp_to_budget, duration_from_env, fanout_concurrency,
-    read_guest_bytes, read_guest_string, wrap, write_in_order, BatchResult, HostIoError, HostState,
-    ResponseText,
+    block_on_released, block_on_within, budget_cap, clamp_to_budget, duration_from_env,
+    fanout_concurrency, read_guest_bytes, read_guest_string, wrap, write_in_order, BatchResult,
+    HostIoError, HostState, Lent, Released, ResponseText,
 };
 use crate::egress::{
     EgressDenied, EgressError, EgressGuard, EgressPolicy, EgressTarget, OutboundRequest,
@@ -476,13 +476,17 @@ pub(super) fn register_v2(
         linker,
         names,
         "http_fetch_v2",
-        |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
-            exchange(
+        |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
+            exchange_released(
                 &mut caller,
                 "http_fetch_v2",
                 (ptr, len),
                 |reason| recorded(Err(invalid(reason))),
-                |state, request| recorded(fetch_v2(state, request)),
+                |request: &FetchRequestV2| request.wait,
+                |state, request, lent| {
+                    fetch_v2(state, request, lent)
+                        .map(|(outcome, retaken)| (recorded(outcome), retaken))
+                },
             )
         },
     )
@@ -542,7 +546,8 @@ fn invalid(message: impl Into<String>) -> HttpErrorEnvelope {
 fn fetch_v2(
     state: &HostState,
     request: FetchRequestV2,
-) -> Result<FetchResponseV2, HttpErrorEnvelope> {
+    lent: Lent,
+) -> Released<Result<FetchResponseV2, HttpErrorEnvelope>> {
     let _span = tracing::info_span!(
         "http.fetch",
         otel.kind = "client",
@@ -559,13 +564,19 @@ fn fetch_v2(
         outbound_http_timeout(),
         state.remaining_budget(),
     );
-    let plan = plan(request, &limits, &boundary(), timeout).map(traced)?;
-    block_on_within(
-        timeout,
-        &state.cancel,
+    let plan = match plan(request, &limits, &boundary(), timeout) {
+        Ok(plan) => traced(plan),
+        Err(refused) => return Ok((Err(refused), lent.into_releasable())),
+    };
+    let (answered, retaken) = block_on_released(
+        lent,
+        state.waiting(timeout),
         state.guest_egress().fetch_v2(plan, &limits),
-    )
-    .map_err(|e| ended(e, |waited| error(HttpErrorKind::Timeout, waited)))
+    )?;
+    Ok((
+        answered.map_err(|e| ended(e, |waited| error(HttpErrorKind::Timeout, waited))),
+        retaken,
+    ))
 }
 
 fn recorded(outcome: Result<FetchResponseV2, HttpErrorEnvelope>) -> FetchResponseV2 {

@@ -1,4 +1,4 @@
-use super::{block_on_within, clamp_to_budget, read_guest_bytes, wrap, HostIoError, HostState};
+use super::{block_on_released, clamp_to_budget, read_guest_bytes, wrap, HostIoError, HostState};
 use crate::app::routes::SvcService;
 use crate::auth::delegation::MintedHere;
 use crate::auth::service_identity::{self, Claims, MAX_CALL_DEPTH};
@@ -12,6 +12,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use cufflink_types::host::wait::Wait;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::Value;
@@ -77,6 +78,8 @@ struct CallRequest {
     headers: BTreeMap<String, String>,
     #[serde(default)]
     body_b64: Option<String>,
+    #[serde(default)]
+    wait: Wait,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,18 +627,25 @@ pub(super) fn register(
         linker,
         names,
         "service_call",
-        |mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
-            let bytes = host_try!(read_guest_bytes(&mut caller, "service_call", ptr, len));
+        |mut caller: wasmtime::Caller<'_, HostState>,
+         ptr: i32,
+         len: i32|
+         -> wasmtime::Result<i32> {
+            let bytes = match read_guest_bytes(&mut caller, "service_call", ptr, len) {
+                Ok(bytes) => bytes,
+                Err(err) => return Ok(err.code()),
+            };
             let started = Instant::now();
             let mut body = caller.data().hold();
             let reserved = response_limit(caller.data());
             if let Err(capacity) = body.grow(usize::try_from(reserved).unwrap_or(usize::MAX)) {
-                return caller.data_mut().refused(Refused::Budget(capacity));
+                return Ok(caller.data_mut().refused(Refused::Budget(capacity)));
             }
-            let state = caller.data();
             let resolved = OnceCell::new();
             let outcome = match serde_json::from_slice::<CallRequest>(&bytes) {
                 Ok(request) => {
+                    let lent = caller.data_mut().lend(request.wait);
+                    let state = caller.data();
                     let timeout = clamp_to_budget(None, DEFAULT_TIMEOUT, state.remaining_budget());
                     let span = tracing::info_span!(
                         "service_call",
@@ -643,12 +653,13 @@ pub(super) fn register(
                         otel.kind = "client",
                         target = %request.service,
                     );
-                    block_on_within(
-                        timeout,
-                        &state.cancel,
+                    let (answered, retaken) = block_on_released(
+                        lent,
+                        state.waiting(timeout),
                         call(state, request, timeout, &resolved).instrument(span),
-                    )
-                    .map_err(|e| match e {
+                    )?;
+                    caller.data_mut().restore(retaken);
+                    answered.map_err(|e| match e {
                         HostIoError::TimedOut(_) | HostIoError::Cancelled => CallFailure::Timeout,
                         HostIoError::Failed(failure) => failure,
                     })
@@ -660,7 +671,7 @@ pub(super) fn register(
             let target_label = resolved.into_inner().unwrap_or_else(|| "-".to_string());
             metrics::counter!(
                 "cufflink_service_calls_total",
-                "caller" => state.identity.service_name.clone(),
+                "caller" => caller.data().identity.service_name.clone(),
                 "target" => target_label,
                 "result" => result_label(&outcome),
             )
@@ -672,9 +683,9 @@ pub(super) fn register(
                     .as_ref()
                     .map_or(0, |response| response.body.capacity()),
             );
-            caller
+            Ok(caller
                 .data_mut()
-                .respond_json("service_call", &envelope(&outcome))
+                .respond_json("service_call", &envelope(&outcome)))
         },
     )
 }
@@ -693,7 +704,24 @@ mod tests {
             path: path.into(),
             headers: BTreeMap::new(),
             body_b64: None,
+            wait: Wait::Hold,
         }
+    }
+
+    #[test]
+    fn a_call_holds_its_slots_unless_it_asks_to_release_them() {
+        let parsed = |wait: Value| {
+            let mut call =
+                json!({"service": "loan-service", "method": "POST", "path": "/_fn/assess"});
+            if !wait.is_null() {
+                call["wait"] = wait;
+            }
+            serde_json::from_value::<CallRequest>(call).map(|request| request.wait)
+        };
+        assert_eq!(parsed(Value::Null).ok(), Some(Wait::Hold));
+        assert_eq!(parsed(json!("hold")).ok(), Some(Wait::Hold));
+        assert_eq!(parsed(json!("release")).ok(), Some(Wait::Release));
+        assert!(parsed(json!("park")).is_err());
     }
 
     #[test]
