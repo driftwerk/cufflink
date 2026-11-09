@@ -2,12 +2,15 @@ use super::body;
 use super::request::{guest_headers, parse_body, RequestV2, RouteRequest, StrictTarget};
 use super::stream::GuestBodies;
 use crate::audit::{Actor, AuditRecord};
+use crate::auth::delegation::Arrival;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::outbox::emit::Sink;
 use crate::registry::RegisteredService;
 use crate::router::authz::guest_auth_json;
 use crate::router::guest_response::{decode, DecodeError};
-use crate::router::postures::{authorize_route, Authorized, NamedPrincipal, ServiceCaller, Target};
+use crate::router::postures::{
+    authorize_route, Authorized, NamedPrincipal, Presented, ServiceCaller, Target,
+};
 use crate::router::sse::stream_principal;
 use crate::router::sse_bridge::{self, Reducer, ReducerContext};
 use crate::router::strict::split_svc_path;
@@ -43,6 +46,7 @@ pub(crate) struct CustomCall {
     pub headers: HeaderMap,
     pub body: Body,
     pub peer: Option<SocketAddr>,
+    pub arrival: Arrival,
 }
 
 pub(crate) enum Refusal {
@@ -157,6 +161,7 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         headers,
         body,
         peer,
+        arrival,
     } = call;
     let route_index = route;
     let route = service
@@ -177,7 +182,10 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
         state,
         &service,
         &tenant,
-        &headers,
+        Presented {
+            headers: &headers,
+            arrival,
+        },
         route.posture.as_ref(),
         &target,
     )
@@ -538,7 +546,7 @@ fn actor(
         ))
     };
     match (call, principal) {
-        (Some(call), _) => Actor::service(&call.service),
+        (Some(call), _) => Actor::called(call.calling(), user),
         (None, Some(NamedPrincipal::ApiKey(key))) => {
             partner(key).unwrap_or_else(|| Actor::of(user))
         }
@@ -589,6 +597,7 @@ mod tests {
             on_behalf_of: Some("user-1".into()),
             depth: 1,
             remaining: Duration::from_secs(5),
+            delegated: None,
         };
         let key = uuid::Uuid::from_u128(3);
         let partner = NamedPrincipal::ApiKey(json!({"id": key, "name": "acme", "scopes": []}));
@@ -608,6 +617,53 @@ mod tests {
         ] {
             assert_eq!(actor(None, &nobody, unnamed).kind, ActorKind::Anonymous);
         }
+    }
+
+    #[test]
+    fn audit_records_the_user_via_the_calling_service() {
+        let acme = crate::tenant_catalog::tests::tenant("acme", Some("acme"));
+        let clara = crate::auth::delegation::tests::user(&acme);
+        let caller = ServiceCaller {
+            service: "catalog-service".into(),
+            on_behalf_of: Some(clara.subject.clone()),
+            depth: 1,
+            remaining: Duration::from_secs(5),
+            delegated: crate::auth::service_identity::Delegation::of(&clara),
+        };
+        let user = Some(clara);
+        let recorded = actor(Some(&caller), &user, None);
+        assert_eq!(
+            (
+                recorded.kind,
+                recorded.sub.as_str(),
+                recorded.via.as_deref()
+            ),
+            (ActorKind::User, "clara", Some("catalog-service"))
+        );
+        let record = audit_record(
+            &RegisteredService {
+                service_id: uuid::Uuid::nil(),
+                tenant_id: acme.id,
+                tenant_slug: "acme".into(),
+                name: "loan-service".into(),
+                manifest: serde_json::from_value(json!({"name": "loan-service", "tables": []}))
+                    .expect("manifest"),
+                version: 1,
+                wasm_hash: None,
+                commit_hash: None,
+            },
+            "assess",
+            &user,
+            recorded,
+            None,
+            json!({}),
+        );
+        let durable = record.durable_payload();
+        assert_eq!(
+            (&durable["user_id"], &durable["actor"]["via"]),
+            (&json!("clara"), &json!("catalog-service"))
+        );
+        assert!(record.legacy_payload().get("actor").is_none());
     }
 
     #[test]
@@ -699,6 +755,7 @@ mod tests {
             headers: HeaderMap::new(),
             body: Body::empty(),
             peer: None,
+            arrival: Arrival::Network,
         }
     }
 

@@ -608,6 +608,7 @@ mod tests {
             on_behalf_of: None,
             depth: 3,
             remaining: std::time::Duration::from_secs(5),
+            delegated: None,
         };
         let request = RouteRequest {
             method: "POST",

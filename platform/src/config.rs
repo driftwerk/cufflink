@@ -68,6 +68,7 @@ pub struct PlatformConfig {
     pub secret_storage: crate::secrets::StorageMode,
     pub dev_bootstrap: Option<crate::app::dev_bootstrap::DevBootstrap>,
     pub service_identity_keys: Option<String>,
+    pub service_identity_replay_max: usize,
     pub extensions: crate::extensions::ExtensionsConfig,
     pub sql_parse: crate::sql_parser::SqlParseSettings,
 }
@@ -266,6 +267,10 @@ impl PlatformConfig {
             secret_keys,
             dev_bootstrap,
             service_identity_keys: vars(crate::auth::service_identity::KEYS_ENV),
+            service_identity_replay_max: positive(
+                crate::auth::delegation::REPLAY_MAX_ENV,
+                crate::auth::delegation::DEFAULT_REPLAY_MAX,
+            )?,
             extensions: crate::extensions::ExtensionsConfig::from_env()?,
             sql_parse: crate::sql_parser::SqlParseSettings::from_vars(&vars)?,
         })
@@ -335,6 +340,7 @@ impl PlatformConfig {
             secret_storage: crate::secrets::StorageMode::Plaintext,
             dev_bootstrap: None,
             service_identity_keys: None,
+            service_identity_replay_max: crate::auth::delegation::DEFAULT_REPLAY_MAX,
             extensions: Default::default(),
             sql_parse: Default::default(),
         }

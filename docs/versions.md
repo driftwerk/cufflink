@@ -1321,6 +1321,21 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.38.0
+
+Unreleased.
+
+- A service identity can carry a delegated end user, signed inside it
+  (`act`). The target admits that user on every posture as on a direct
+  call, refuses one whose token has expired or that is used a second time
+  with 401 on every posture, and records the user as the audit actor with
+  the calling service as `actor.via` ([service calls](service-calls.md#a-delegated-user)).
+  Nothing mints one yet; identities without one are byte-for-byte as
+  before. New setting `SERVICE_IDENTITY_REPLAY_MAX`.
+- `docs/service-calls.md` no longer says every replayed identity is
+  refused: an identity is bound to one call and lives at most 60 s, and is
+  single-use only when it carries a delegated user.
+
 ## Changes in v0.37.1
 
 No new module-declared feature. A service built for v0.37.0 deploys and

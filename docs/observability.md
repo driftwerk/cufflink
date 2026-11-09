@@ -383,7 +383,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_sse_bridge_streams_active` | gauge | — | Bridged (`sse(...)`) streams open |
 | `cufflink_sse_bridge_events_total` | counter | `result` (`forwarded`, `reduced`, `dropped`, `reducer_error`) | Messages a bridged stream handled |
 | `cufflink_sse_bridge_closed_total` | counter | `reason` (`client`, `timeout`, `reducer`, `shutdown`, `overflow`, `subscription_ended`) | Why bridged streams ended |
-| `cufflink_service_identity_rejected_total` | counter | `reason` (`missing`, `format`, `unknown_key`, `signature`, `expired`, `not_yet_valid`, `lifetime`, `tenant`, `service`, `method`, `path`, `depth`, `caller`, `budget`) | Service identities refused on internal routes, spent budgets refused anywhere, and invalid identities ignored on other routes |
+| `cufflink_service_identity_rejected_total` | counter | `reason` (`missing`, `format`, `unknown_key`, `signature`, `expired`, `not_yet_valid`, `lifetime`, `tenant`, `service`, `method`, `path`, `depth`, `caller`, `budget`, `delegation_expired`, `replayed`, `replay_capacity`, `replay_unavailable`) | Service identities refused on internal routes, spent budgets and refused delegated users refused anywhere, and invalid identities ignored on other routes |
 | `cufflink_api_key_rejected_total` | counter | `reason` | Tenant API keys refused (unknown or expired) |
 | `cufflink_api_keys_revoked_total` | counter | `reason` | Tenant API keys revoked |
 | `cufflink_partner_key_rejected_total` | counter | `reason` (`malformed`, `unknown`, `revoked`, `expired`, `tenant`, `scope`) | Partner keys refused |

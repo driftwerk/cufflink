@@ -69,7 +69,7 @@ Deploy your audit-service *before* you need the history.
 | `service` | Service name |
 | `table` | Table name (null for custom routes) |
 | `action` | `create`, `update`, `delete`, or `custom:{handler_name}` |
-| `user_id` | Keycloak subject ID (or the API key's subject), or `"anonymous"` |
+| `user_id` | Keycloak subject ID (or the API key's subject), or `"anonymous"`. A service call that carries a delegated user records that user; the durable record's `actor.via` names the calling service ([policies](policies.md#durable-audit-and-webhook-deliveries)) |
 | `user_name` | User's display name, or `""` when unknown (API keys, anonymous callers) |
 | `record_id` | Primary key of the affected record (null for custom routes) |
 | `data` | New data (create/update), the request body (custom routes), or null |

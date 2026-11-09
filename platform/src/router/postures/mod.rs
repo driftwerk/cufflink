@@ -3,6 +3,7 @@ mod internal;
 mod scoped;
 
 use crate::auth::binding::bind_principal;
+use crate::auth::delegation::Arrival;
 use crate::auth::partner_keys::PartnerPrincipal;
 use crate::auth::permissions::resolve_permissions_cached;
 use crate::auth::scope::EffectiveScope;
@@ -166,30 +167,48 @@ pub(crate) struct Authorized {
     pub call: Option<ServiceCaller>,
 }
 
+pub(crate) struct Presented<'a> {
+    pub headers: &'a HeaderMap,
+    pub arrival: Arrival,
+}
+
 pub(crate) async fn authorize_route(
     state: &Arc<AppState>,
     service: &RegisteredService,
     tenant: &TenantEntry,
-    headers: &HeaderMap,
+    presented: Presented<'_>,
     posture: Option<&RoutePosture>,
     target: &Target<'_>,
 ) -> PlatformResult<Authorized> {
+    let Presented { headers, arrival } = presented;
     let now = chrono::Utc::now().timestamp();
-    let identity = internal::identity(state, service, headers, target, now);
+    let identity = internal::presented(state, service, headers, target, arrival, now).await?;
     match PostureGate::of(posture) {
         PostureGate::ServiceIdentity { callers } => {
             internal::admit(service, target, &callers, identity, now).map(|caller| Authorized {
-                principal: Principal::Service,
+                principal: delegated_user(Some(&caller), tenant)
+                    .map_or(Principal::Service, |user| {
+                        Principal::User(Some(Box::new(user)))
+                    }),
                 call: Some(caller),
             })
         }
         gate => {
             let call = internal::continued(service, target, identity, now)?;
-            admit_principal(state, service, tenant, headers, gate)
+            let delegated = delegated_user(call.as_ref(), tenant);
+            admit_principal(state, service, tenant, headers, delegated, gate)
                 .await
                 .map(|principal| Authorized { principal, call })
         }
     }
+}
+
+pub(crate) fn delegated_user(
+    call: Option<&ServiceCaller>,
+    tenant: &TenantEntry,
+) -> Option<AuthUser> {
+    call.and_then(|call| call.delegated.clone())
+        .map(|delegation| delegation.into_user(&tenant.tenant))
 }
 
 async fn admit_principal(
@@ -197,6 +216,7 @@ async fn admit_principal(
     service: &RegisteredService,
     tenant: &TenantEntry,
     headers: &HeaderMap,
+    delegated: Option<AuthUser>,
     gate: PostureGate,
 ) -> PlatformResult<Principal> {
     match gate {
@@ -213,34 +233,48 @@ async fn admit_principal(
         } => scoped::admit(
             state,
             service,
-            tenant,
-            headers,
+            present(state, tenant, headers, delegated).await,
             &area,
             &operation,
             owner_field.as_deref(),
         )
         .await
         .map(|(user, scope)| Principal::Scoped(Box::new(user), scope)),
-        gate => authorize_user(state, service, tenant, headers, gate)
-            .await
-            .map(|user| Principal::User(user.map(Box::new))),
+        gate => authorize_user(
+            state,
+            service,
+            present(state, tenant, headers, delegated).await,
+            gate,
+        )
+        .await
+        .map(|user| Principal::User(user.map(Box::new))),
+    }
+}
+
+async fn present(
+    state: &Arc<AppState>,
+    tenant: &TenantEntry,
+    headers: &HeaderMap,
+    delegated: Option<AuthUser>,
+) -> PlatformResult<Option<AuthUser>> {
+    match delegated {
+        Some(user) => Ok(Some(user)),
+        None => match authenticate(headers, state).await {
+            AuthOutcome::Absent => Ok(None),
+            AuthOutcome::Present(result) => {
+                result.and_then(|user| bind_principal(state, Some(*user), tenant, headers))
+            }
+        },
     }
 }
 
 async fn authorize_user(
     state: &Arc<AppState>,
     service: &RegisteredService,
-    tenant: &TenantEntry,
-    headers: &HeaderMap,
+    presented: PlatformResult<Option<AuthUser>>,
     gate: PostureGate,
 ) -> PlatformResult<Option<AuthUser>> {
-    let bound = match authenticate(headers, state).await {
-        AuthOutcome::Absent => Ok(None),
-        AuthOutcome::Present(result) => {
-            result.and_then(|user| bind_principal(state, Some(*user), tenant, headers))
-        }
-    };
-    let principal = gate.admit(bound)?;
+    let principal = gate.admit(presented)?;
 
     if matches!(gate, PostureGate::Legacy) {
         metrics::counter!(
