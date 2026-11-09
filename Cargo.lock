@@ -1176,6 +1176,7 @@ name = "cufflink-cli"
 version = "0.28.1"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "clap",
  "comfy-table",

@@ -410,14 +410,10 @@ A web app is released with its bundle from v0.38.0 on (`web_releases`):
 
 | CLI | Platform | Outcome |
 |-----|----------|---------|
-| new | new | reserve, upload by content, release ([web releases](deployment.md#web-releases)) |
+| new | new | reserve, build, upload by content (skipped when the running version already records that bundle), release ([web releases](deployment.md#web-releases)). A failed build or upload releases nothing |
 | new | older | refused before building, naming `web_releases`. An older platform would also refuse the release itself with a `422` for the unknown `web_artifact` |
 | older | new | works as before, but safer: the deploy that registers the app before its build is accepted with a warning and skipped by its manifest alone, and its upload never replaces a recorded bundle, releasing new content as a new version. A failed build after a changed `package.json` version can still leave a version with no bundle. Upgrade the CLI with the platform |
 | older | older | as before |
-
-The CLI's side of this release (the "new" rows, and the refusal before
-building) is still to land: until it does, `cufflink deploy` of a web app
-takes the path of the "older" rows on either platform.
 
 The web runner is independent of both: a runner of any release reads the
 content keys as it reads the earlier ones, since they are opaque, and
@@ -1386,10 +1382,26 @@ and `wait_release`.
   version and no recent upload holds it; deleting a web app or its tenant
   removes every object under `web/{service_id}/`. An upload no version
   records is removed after `WEB_UPLOAD_RETENTION_SECS` (default 86 400, at
-  least 3 600).
+  least 3 600, at most 2 592 000: a value outside that range stops the
+  platform at start).
 - Uploads are audited as `web.upload` and counted as
-  `cufflink_web_uploads_total{result}`; a release's audit row carries
-  `artifact_hash`.
+  `cufflink_web_uploads_total{result}`, where `error` counts an upload the
+  platform failed to store (object storage or its database) apart from one
+  it `refused`; a release's audit row carries `artifact_hash`.
+- `cufflink deploy` of a web app releases it in one step: it asks for
+  `web_releases` and refuses a platform without it before building, runs
+  the app's checks, reserves the app, builds the bundle, uploads it by its
+  SHA-256 unless the running version already records it, and releases it
+  in one deploy naming it in `web_artifact`. A release the platform refuses
+  with `409` (the bundle not uploaded or no longer stored, or another
+  deploy holding the lock) is uploaded and released once more. The CLI checks that the answer names the bundle it
+  sent, prints `Released site v8 (bundle 3f9a…)` or that the running
+  version already runs it, and warns when the runners were not told. A
+  failed build or upload, or a refused release, says that nothing was
+  released and which version still runs
+  ([web releases](deployment.md#web-releases)).
+  A CLI of this release cannot deploy a web app to an earlier platform: pin
+  the CLI to the earlier release for that.
 - `cufflink rollback` of a web app switches: the version it activates
   records the target's bundle, under the key the target records, and the
   platform publishes `deploy.web` so the runners serve it. A target that
