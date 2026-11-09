@@ -791,6 +791,14 @@ impl Pools {
 
 static RUNTIME_THREADS: AtomicUsize = AtomicUsize::new(0);
 
+fn thread_started() {
+    RUNTIME_THREADS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn thread_stopped() {
+    RUNTIME_THREADS.fetch_sub(1, Ordering::Relaxed);
+}
+
 fn blocking_threads() -> usize {
     let workers =
         tokio::runtime::Handle::try_current().map_or(0, |runtime| runtime.metrics().num_workers());
@@ -806,19 +814,18 @@ pub fn runtime() -> eyre::Result<tokio::runtime::Runtime> {
         .thread_stack_size(thread_stack_bytes(cufflink_settings::process_var)?)
         .thread_keep_alive(Duration::from_secs(2))
         .max_blocking_threads(Pools::from_vars(cufflink_settings::process_var)?.blocking)
-        .on_thread_start(|| {
-            RUNTIME_THREADS.fetch_add(1, Ordering::Relaxed);
-        })
-        .on_thread_stop(|| {
-            RUNTIME_THREADS.fetch_sub(1, Ordering::Relaxed);
-        })
+        .on_thread_start(thread_started)
+        .on_thread_stop(thread_stopped)
         .build()
         .map_err(|e| eyre::eyre!("build the runtime: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sets_mmap_threshold, Class, Pools};
+    use super::{
+        blocking_threads, sets_mmap_threshold, thread_started, thread_stopped, Class, Pools,
+    };
+    use std::time::Duration;
 
     #[test]
     fn the_mmap_threshold_is_set_only_under_a_budget_and_never_over_the_operators() {
@@ -834,6 +841,36 @@ mod tests {
             "glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=4194304"
         )]));
         assert!(with(&[("GLIBC_TUNABLES", "glibc.malloc.arena_max=2")]));
+    }
+
+    #[test]
+    fn the_blocking_thread_gauge_counts_blocking_threads_and_not_workers() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .thread_keep_alive(Duration::from_millis(50))
+            .on_thread_start(thread_started)
+            .on_thread_stop(thread_stopped)
+            .build()
+            .expect("runtime");
+        let settles_at = |threads: usize| async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while blocking_threads() != threads {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+        runtime.block_on(async {
+            assert!(settles_at(0).await, "{}", blocking_threads());
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let blocking = tokio::task::spawn_blocking(move || released.recv());
+            assert!(settles_at(1).await, "{}", blocking_threads());
+            release.send(()).expect("send");
+            blocking.await.expect("joined").expect("received");
+            assert!(settles_at(0).await, "an idle blocking thread exits");
+        });
     }
 
     #[test]
