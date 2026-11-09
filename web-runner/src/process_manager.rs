@@ -758,6 +758,87 @@ pub(crate) mod tests {
         manager.shutdown_all(Duration::from_secs(2)).await;
     }
 
+    #[tokio::test]
+    async fn a_draining_process_keeps_its_port_and_its_own_exit_leaves_the_successor_serving() {
+        if !node_available().await {
+            return;
+        }
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let manager = ProcessManager::new(
+            3293..=3295,
+            "example.com".into(),
+            "https".into(),
+            HostnameFormat::Flat,
+            crate::child_env::env_mode(None).expect("the built-in allowlist"),
+            ChildSettings::default(),
+            Shutdown::new(Duration::from_secs(5)),
+        );
+        let deploy = |service, version, name: &str| {
+            manager.deploy(
+                "acme",
+                service,
+                Release::new(version, fake_next_app(&root.path().join(name))),
+                HashMap::new(),
+            )
+        };
+        let port = |outcome| match outcome {
+            Ok(DeployOutcome::Success { port, replaced }) => (port, replaced),
+            _ => panic!("deployed"),
+        };
+        let (old_port, _) = port(deploy("site", 1, "one").await);
+        let pid = reqwest::get(format!("http://127.0.0.1:{old_port}/"))
+            .await
+            .expect("served")
+            .json::<serde_json::Value>()
+            .await
+            .expect("json")["pid"]
+            .to_string();
+        let (new_port, replaced) = port(deploy("site", 2, "two").await);
+        let replaced = replaced.expect("the first release is replaced");
+        assert_eq!(
+            port(deploy("blog", 1, "blog").await).0,
+            3295,
+            "a draining process's port is not handed to another app"
+        );
+
+        Command::new("kill")
+            .args(["-9", &pid])
+            .status()
+            .await
+            .expect("kill");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reqwest::get(format!("http://127.0.0.1:{old_port}/"))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the draining process exited");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            manager.lease("acme", "site").map(|lease| lease.port),
+            Some(new_port),
+            "the exit of a replaced process leaves its successor in place"
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                manager.stop_replaced(&replaced, Stop::Terminate(Duration::from_secs(5)))
+            )
+            .await
+            .expect("stopping a process that has exited does not wait"),
+            Halt::Stopped(None)
+        );
+        assert_eq!(
+            port(deploy("blog", 2, "blog-two").await).0,
+            old_port,
+            "its port is free once it has exited"
+        );
+        manager.shutdown_all(Duration::from_secs(2)).await;
+    }
+
     pub(crate) async fn node_available() -> bool {
         let available = Command::new("node").arg("--version").output().await.is_ok();
         assert!(

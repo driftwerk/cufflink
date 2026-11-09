@@ -181,11 +181,14 @@ impl Apps {
             return Ok(Ran::AlreadyRunning);
         }
         let release = Release::new(deployment.version, installed.dir.clone());
+        let running = self
+            .process_manager
+            .release(tenant, service)
+            .map(|running| self.holds.hold(running.dir));
         let outcome = self
             .process_manager
             .deploy(tenant, service, release, environment)
             .await;
-        drop(installed);
         let ran = outcome.wrap_err("spawn").map(|outcome| match outcome {
             DeployOutcome::Success { port, replaced } => {
                 if let Some(replaced) = replaced {
@@ -195,6 +198,7 @@ impl Apps {
             }
             DeployOutcome::HealthCheckFailed { port, error } => Ran::Unhealthy { port, error },
         });
+        drop((installed, running));
         self.prune(tenant, service).await;
         ran
     }
