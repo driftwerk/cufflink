@@ -616,6 +616,29 @@ command that forces the same one: `cufflink rollback --version <n>
 Against a platform older than v0.30.0 `rollback --commit` works, since the
 lookup is the CLI's, but the version it activates reports no commit.
 
+### Web apps
+
+From v0.38.0 a rollback of a web app activates a version that records the
+target's bundle, under the key the target records, and publishes
+`deploy.web.{tenant}.{service}`, so the runners switch to the earlier code
+as they do after a deploy. The answer carries the bundle's SHA-256 as
+`artifact_hash` and says whether the runners were told (`runners_told`),
+and the CLI prints `  Bundle:         <sha256>`. A runner that missed the
+event serves the rolled-back version once it next reads the app's current
+version. Before v0.38.0 such a rollback activated a version with no bundle
+and told no runner.
+
+The platform refuses the rollback with `409`, before anything is written,
+when:
+
+| The target | The answer |
+|---|---|
+| records no bundle (its build or upload never completed) | `v7 of site has no bundle (its build or upload never completed); the newest earlier version with one is v5: cufflink rollback --version 5`, or that no earlier version has one |
+| records a bundle that is missing from object storage, or stored at another size | `the bundle of v5 (web/…) is missing from object storage; deploy the app again`, or the two sizes |
+
+The default target, the version before the running one, is refused the same
+way: the CLI never lands on a version other than the one asked for.
+
 ## Tenant databases and PgBouncer
 
 | Variable | Default | Meaning |
@@ -849,6 +872,9 @@ read the file once, as they start.
   leaves the running app as it was. A directory no process runs from is
   removed once nothing is installing or starting from it, 5 s after its
   process was replaced, with the directories of earlier releases.
+- **Rollbacks.** A rollback activates a version that records the target's
+  bundle and publishes `deploy.web` as a deploy does ([rolling
+  back](#web-apps)).
 - **Deploy events** only say which app changed: the runner reads what runs
   of it, its bundle, hash and service, from the database (or the runner API,
   [tenant-scoped](#tenant-scoped-web-runner)), never from the event, so no

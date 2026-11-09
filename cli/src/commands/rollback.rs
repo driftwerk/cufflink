@@ -197,6 +197,43 @@ fn forced(name: &str, version: i32, env: Option<&str>) -> String {
     format!("cufflink rollback --version {version} --service {name}{env} --allow-destructive")
 }
 
+fn rolled_back(
+    body: &serde_json::Value,
+    target: i32,
+    mode: Option<&cufflink_types::ServiceMode>,
+) -> Vec<String> {
+    let restored = [
+        (body["wasm_restored"].as_bool() == Some(true))
+            .then(|| format!("  WASM binary:    restored from v{target}")),
+        body["native_hash"].as_str().map(|hash| {
+            format!(
+                "  Native binary:  restored from v{target} ({})",
+                &hash[..16.min(hash.len())]
+            )
+        }),
+        matches!(mode, Some(cufflink_types::ServiceMode::Web))
+            .then(|| body["artifact_hash"].as_str())
+            .flatten()
+            .map(|hash| format!("  Bundle:         {hash}")),
+        body["rolled_back_from_commit"]
+            .as_str()
+            .map(|commit| format!("  Source commit:  {commit}")),
+    ];
+    [
+        format!(
+            "Rolled back {} to v{} (now v{})",
+            body["name"].as_str().unwrap_or("?"),
+            body["rolled_back_to"],
+            body["new_version"]
+        ),
+        format!("  Schema changes: {}", body["schema_changes"]),
+        format!("  Deployment ID:  {}", body["deployment_id"]),
+    ]
+    .into_iter()
+    .chain(restored.into_iter().flatten())
+    .collect()
+}
+
 pub async fn run(
     to: To,
     service: Option<&str>,
@@ -232,27 +269,9 @@ pub async fn run(
 
     if resp.status().is_success() {
         let body: serde_json::Value = resp.json().await?;
-        println!(
-            "Rolled back {} to v{} (now v{})",
-            body["name"].as_str().unwrap_or("?"),
-            body["rolled_back_to"],
-            body["new_version"]
-        );
-        println!("  Schema changes: {}", body["schema_changes"]);
-        println!("  Deployment ID:  {}", body["deployment_id"]);
-        if body["wasm_restored"].as_bool() == Some(true) {
-            println!("  WASM binary:    restored from v{}", target);
-        }
-        if let Some(hash) = body["native_hash"].as_str() {
-            println!(
-                "  Native binary:  restored from v{} ({})",
-                target,
-                &hash[..16.min(hash.len())]
-            );
-        }
-        if let Some(commit) = body["rolled_back_from_commit"].as_str() {
-            println!("  Source commit:  {}", commit);
-        }
+        rolled_back(&body, target, service.mode.as_ref())
+            .iter()
+            .for_each(|line| println!("{line}"));
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -438,6 +457,38 @@ mod tests {
         assert_eq!(
             forced("notes", 3, None),
             "cufflink rollback --version 3 --service notes --allow-destructive"
+        );
+    }
+
+    #[test]
+    fn a_web_rollback_prints_the_bundle_it_runs() {
+        let bundle = "3f9a".repeat(16);
+        let body = json!({
+            "name": "site",
+            "rolled_back_to": 5,
+            "new_version": 9,
+            "schema_changes": 0,
+            "deployment_id": "d-9",
+            "wasm_restored": false,
+            "native_hash": null,
+            "artifact_hash": bundle,
+            "rolled_back_from_commit": A,
+        });
+        assert_eq!(
+            rolled_back(&body, 5, Some(&cufflink_types::ServiceMode::Web)),
+            [
+                "Rolled back site to v5 (now v9)".to_string(),
+                "  Schema changes: 0".to_string(),
+                "  Deployment ID:  \"d-9\"".to_string(),
+                format!("  Bundle:         {bundle}"),
+                format!("  Source commit:  {A}"),
+            ]
+        );
+        assert!(
+            !rolled_back(&body, 5, Some(&cufflink_types::ServiceMode::Wasm))
+                .iter()
+                .any(|line| line.contains("Bundle")),
+            "only a web app runs a bundle"
         );
     }
 
