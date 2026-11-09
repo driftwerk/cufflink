@@ -1349,6 +1349,7 @@ environment variable.
 - A failed `deploy.web` publish is counted as
   `cufflink_web_announce_failures_total`.
 
+## Changes in v0.37.1
 
 No new module-declared feature. A service built for v0.37.0 deploys and
 runs on this platform unchanged. There is no migration and no new
