@@ -414,6 +414,10 @@ A web app is released with its bundle from v0.38.0 on (`web_releases`):
 | older | new | works as before, but safer: the deploy that registers the app before its build is accepted with a warning and skipped by its manifest alone, and its upload never replaces a recorded bundle, releasing new content as a new version. A failed build after a changed `package.json` version can still leave a version with no bundle. Upgrade the CLI with the platform |
 | older | older | as before |
 
+The CLI's side of this release (the "new" rows, and the refusal before
+building) is still to land: until it does, `cufflink deploy` of a web app
+takes the path of the "older" rows on either platform.
+
 The web runner is independent of both: a runner of any release reads the
 content keys as it reads the earlier ones, since they are opaque, and
 switches on the events of releases and rollbacks alike.
