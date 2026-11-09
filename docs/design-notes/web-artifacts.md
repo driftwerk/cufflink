@@ -3,8 +3,10 @@
 Proposed. Covers issues #61 (build once and deploy the artifact), #66 (an
 opt-in flag to skip the in-deploy checks) and #67 (leave `.next/cache` out of
 the artifact). Section 14 holds the questions for the maintainer, each with
-a proposed default. Section 8 says how this fits the web deploy lifecycle
-design (#62, #63, #64), which is written in parallel.
+a proposed default. It builds on the web deploy lifecycle design
+(`docs/design-notes/web-deploy-lifecycle.md`, #62, #63, #64), proposed in
+parallel, which owns storage, registration and rollback; section 8 says
+where the two meet.
 
 ## Outcome
 
@@ -65,7 +67,11 @@ at v0.37.1.
    (`deploy.rs:1518-1527`), which also inherits the whole environment of
    the shell that ran the CLI. `fetch_service_configs` answers an empty list
    on any failure (a refused request, a body that is not JSON), so a build
-   can go ahead without the platform's values and nothing says so.
+   can go ahead without the platform's values and nothing says so. The
+   platform answers a secret's value as `***` (`MASKED`,
+   `platform/src/api/config.rs:19`, used at `config.rs:183`), so a secret set
+   on the platform and not declared in `Cufflink.toml` reaches the build as
+   that placeholder.
 5. It packs `.next`, `node_modules`, `package.json` and `public` with the
    system's `tar czfh - --exclude=.next/cache …` (`create_web_tarball` and
    `web_tarball_args`, `deploy.rs:1644-1695`). In a pnpm workspace,
@@ -206,8 +212,10 @@ SHA-256 the platform's `artifact_hash` with nothing to re-derive.
 
 The entry is read by the CLI before it deploys a bundle and by the platform
 when it takes an upload; both read only the first entry and stop. The runner
-unpacks it into the app's directory with the rest. `next start` serves only
-`public/` and `.next/static`, so the file is never served, and it tells
+unpacks it into the app's directory with the rest. `next start` serves
+files from `public/` and `.next/static` only (in the Next.js versions
+checked when this is implemented, which the test in section 10 pins), so
+the file is never served, and it tells
 anyone looking at an app's directory on a runner what it was built from. The
 runner's entry rules (`artifact.rs:21-72`) admit it unchanged.
 
@@ -239,9 +247,9 @@ already uses to read it, by a new module `cli/src/web_bundle.rs`. The host's
 - **Time.** Every entry carries the same modification time: the
   `SOURCE_DATE_EPOCH` variable when it is set (the reproducible-builds
   convention), and otherwise the time the build started, recorded as
-  `mtime`. A fixed `0` would be simpler and is rejected: Next.js serves
-  `public/` with `Last-Modified` and a weak ETag made of the file's size and
-  modification time, so with one time for every release a changed file of
+  `mtime`. A fixed `0` would be simpler and is rejected: Next.js's static
+  serving of `public/` sends `Last-Modified` and, through `send`, a weak
+  ETag made of the file's size and modification time, so with one time for every release a changed file of
   the same size would keep its ETag and browsers would keep the old one.
   One time per build gives every release new validators, and
   `SOURCE_DATE_EPOCH` gives a pipeline identical bytes from identical trees.
@@ -421,6 +429,12 @@ for every environment whose build-time values are its own; an app that
 wants one bundle for staging and production reads what differs at run time
 and lists nothing else in `[web].build_env`.
 
+**Platform secrets.** An entry the platform marks `is_secret` is never a
+build-time value: its value is answered as `***`, and handing a build the
+placeholder is worse than handing it nothing. Such entries are left out
+before the values are narrowed and digested; a secret reaches a build only
+from the vault, through `Cufflink.toml` (question 8).
+
 **Reading the platform's configs.** `fetch_service_configs` stops answering
 an empty list on a failure. A service the platform does not have has no
 configs (an empty list); any other failure stops the build or the deploy
@@ -497,144 +511,102 @@ the policy (section 5) govern the honest path: they make a skip visible and
 let a tenant restrict who may ask for one. They are not a security boundary,
 and the documentation says so in those words.
 
-### 2.6 The platform stores bundles by content
+### 2.6 Storing, finding and releasing a bundle
 
-**Where.** `web/{tenant_id}/bundles/{sha256}.tar.gz`, under the reserved
-`web/` prefix. The key names content, so an object under it is never
-replaced, and it names a tenant rather than a service because a bundle is
-uploaded before its version is registered (#63), when a new service has no
-id yet. The bundle's own `service` binds it to one service of that tenant.
+The lifecycle design (`docs/design-notes/web-deploy-lifecycle.md`, #62 #63
+#64) settles how a web version is registered, and this note builds on it
+rather than beside it. From that design this note takes, unchanged:
 
-**What the platform knows of a bundle.** A new table, in the platform
-migration `V9__web_bundles.sql`:
+- **Storage by content** at `web/{service_id}/{sha256}.tar.gz`
+  (`deployer::web::object_key`), never rewritten; old `v{n}` keys stay valid
+  because every reader takes the key from the row.
+- **Reserve, build, upload, release.** `POST /api/services/web` reserves the
+  service and gives a first deploy its `service_id` before anything is
+  built, so config sync and the build's configs keep today's order and a
+  new service's process never starts without its config.
+  `PUT /api/services/{id}/web/artifacts/{sha256}` stores a bundle and records
+  it in `web_uploads`. `POST /api/services/deploy` with `web_artifact:
+  {sha256, size}` releases it: one transaction moves `current_version` and
+  records the bundle, and a release whose manifest and bundle hash equal the
+  running version's is skipped.
+- **Rollback** carrying the target's bundle, the runners told after every
+  change, unreleased uploads removed after `WEB_UPLOAD_RETENTION_SECS`, and
+  object deletion guarded by `records_artifact`.
+- **The feature** `web_releases`.
 
-```sql
-CREATE TABLE web_bundles (
-    tenant_id   uuid        NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
-    sha256      text        NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    service     text        NOT NULL,
-    size_bytes  bigint      NOT NULL CHECK (size_bytes > 0),
-    s3_key      text        NOT NULL,
-    meta        jsonb       NOT NULL,
-    uploaded_by text        NOT NULL,
-    uploaded_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, sha256)
-);
-```
+This note adds three things to that design.
 
-`meta` is the bundle's first entry less its `manifest`, so `checks` and
-`build_env` are read where versions are listed. A version keeps naming its
-object as today, by `artifact_s3_key`, `artifact_hash` and `artifact_size`
-on its row; the listing joins `web_bundles` on `(tenant_id, artifact_hash)`.
+**The bundle's record, read at upload.** The upload route reads the first
+entry of the body after it has checked the body's hash, and only that entry:
 
-**Upload.** `PUT /api/web/bundles/{sha256}` with the bundle as the body
-(`application/gzip`), under `DeployAuth`, inside the artifact body limit:
+- When the first entry is `.cufflink/bundle.json`, it must be at most
+  64 KiB, a format the platform reads, of mode `web`, and name the service
+  the path names (`{id}`'s name). Otherwise 422 naming what is wrong: `it is
+  web bundle format 2, and this platform reads format 1`; `it is a bundle of
+  site-admin, and this upload is to site`. Nothing is stored.
+- When it is anything else, the archive is taken as today's archives are,
+  with no record. A CLI of the lifecycle release that predates this note
+  uploads such archives, and they stay valid: the record is never required.
+- The record, less its `manifest`, is kept in a new nullable column of the
+  lifecycle design's table, in this note's migration
+  (`V10__web_upload_records.sql`, after the lifecycle design's
+  `V9__web_uploads.sql`):
 
-1. The path's hash must be 64 lower-case hex digits (`is_sha256`), else 400.
-2. The body's SHA-256 must be the path's, else 422: `the body's SHA-256 is
-   <found>, and the path names <given>`.
-3. The first entry must be `.cufflink/bundle.json`, at most 64 KiB, a format
-   the platform reads, of mode `web`, naming a valid service name, with a
-   well-formed `checks`. Otherwise 422 naming what is wrong (`it is web
-   bundle format 2, and this platform reads format 1`, `its first entry is
-   .next/BUILD_ID, not .cufflink/bundle.json`).
-4. Under `deploy_checks: enforce`, a bundle whose checks were skipped is
-   refused (403) before it is stored when the uploading credential may not
-   skip (section 5), so a refused deploy leaves no object behind.
-5. The object is stored and the row inserted (`ON CONFLICT DO NOTHING`).
-   A bundle already held is not stored again, and the answer is the same:
-   `200 {"sha256", "size_bytes", "service", "stored": false}`; a new one is
-   `201` with `"stored": true`.
+  ```sql
+  SET LOCAL lock_timeout = '10s';
+  ALTER TABLE web_uploads ADD COLUMN IF NOT EXISTS record jsonb;
+  ```
 
-The body is taken as `Bytes` and handed to storage as `Vec::from(body)`,
-without today's second copy. The platform reads only the first entry; it
-does not walk the archive, which the CLI did before it sent it and the runner
-does when it unpacks it.
+- At release, a bundle with a record whose `manifest` is not the release's
+  manifest is refused (422, `bundle <sha256> of site was built with another
+  manifest than this release sends`), so a bundle deploys only as what it
+  was built as.
 
-**Lookup.** `HEAD /api/web/bundles/{sha256}` answers 200 with `Content-Length`
-the bundle's size when the tenant holds it, else 404. The CLI asks before it
-uploads, which is what makes a second deploy of a file seconds long.
+**Finding a bundle without sending it.** `HEAD
+/api/services/{id}/web/artifacts/{sha256}`, under the same authorisation as
+the upload, answers 200 with `Content-Length` the stored size when the
+service has an upload row for that hash whose object is stored, else 404.
+The lifecycle design's upload skips the put when the object is there, but
+its body has already crossed the network by then; the lookup is what makes
+a second deploy of a file a few small requests. The CLI asks before it
+uploads, and uploads when the answer is 404.
 
-**Deploy by hash.** `POST /api/services/deploy` takes a new field,
-`web_bundle: "<sha256>"`, for a web manifest only (422 for any other mode).
-The platform refuses, before it claims the deploy lock:
+**The policy at upload.** Under `deploy_checks: enforce`, a bundle whose
+record says its checks were skipped is refused (403) before it is stored
+when the uploading credential may not skip (section 5), so a refused deploy
+leaves no object behind. The release checks again with the releasing
+credential.
 
-- a hash the tenant holds no bundle under: 409 `no web bundle <sha256> is
-  uploaded for this tenant; upload it first (PUT /api/web/bundles/<sha256>)`;
-- a bundle of another service: 422 `web bundle <sha256> is site-admin's, and
-  this deploy is of site`;
-- a bundle whose `manifest` is not the request's: 422 `web bundle <sha256>
-  was built with another manifest than this deploy sends`.
+The upload keeps the lifecycle design's body limit and buffering. The body
+reaches storage as a `Vec<u8>`; converting the request's `Bytes` with
+`Vec::from` avoids a copy when the buffer is uniquely owned, as it is for a
+request body read whole, and costs one copy otherwise.
 
-What happens next is #63's: the version is registered and activated with the
-bundle's key, hash and size in one transaction, a deploy whose manifest and
-bundle hash both equal the running version's is skipped, and
-`deploy.web.<tenant>.<service>` is published once the version is active
-(section 8 lists what this note relies on).
+### 2.7 Config
 
-**Rollback.** A rollback of a web app copies the target version's
-`artifact_s3_key`, `artifact_hash` and `artifact_size` to the new version and
-publishes `deploy.web` (#62). With objects named by content this is a copy of
-three columns; no object is copied.
-
-**Deleting.** Every path that removes a version or a service deletes an
-object only when no version row of any service still names it
-(`records_artifact`, `deployments.rs:374-386`), and removes its
-`web_bundles` row with it:
-
-- deleting a version (`delete_by_version` returns the web key as well as the
-  native one, which also ends the leak in section 1.3);
-- pruning versions (the same path);
-- deleting a service (today's loop over `artifact_keys`, now guarded);
-- deleting a tenant (the cascade removes the rows; the tenant's prefix
-  `web/{tenant_id}/` is deleted with `delete_prefix`).
-
-A bundle uploaded and never deployed is deleted at the tenant's next upload
-once it is more than 24 hours old and no version names it: one query over
-`web_bundles` for that tenant, then a delete per object. No background job
-is added.
-
-### 2.7 Config travels with the version
-
-Today the CLI registers a version, applies config, builds and uploads, so a
-web app's process starts after its config was applied. Once a version is
-registered only after its bundle exists (#63), a new service's first version
-would be active, and its process started, before the CLI could apply its
-config (the config routes take a service id that does not exist until the
-deploy creates it).
-
-The deploy request therefore takes the environment's config with it, for a
-web manifest with `web_bundle`: a field `config` holding exactly the body of
-`PUT /api/services/{id}/config/apply` (`ApplyConfigRequest`,
-`platform/src/api/config.rs:42-48`) with `prune: false` and `dry_run:
-false`. The platform applies it in the transaction that activates the
-version, by the code the apply route runs, so the runner never sees the new
-version without its config or the new config with the old version. The
-deploy's answer carries the apply's diff, printed as `  Applied config: …`
-as today. The deploy job's stored `request` (`Admitted::request`,
-`deployments.rs:183-196`) never holds `config`: it holds the names it
-applied.
-
-This is the one place where this note and #63's touch the same code; if
-#63's note settles the order another way that keeps the invariant in section
-8, this field goes.
+The reserve step keeps today's order (config sync before the build, both
+after the service exists), so this note changes nothing about config. A
+deploy of a bundle syncs the environment's config before it releases, as a
+deploy from source does.
 
 ### 2.8 What the deploy record shows
 
 - `GET /api/services/{id}/deployments` adds to each web version `"bundle":
   {"checks": …, "build_env": {"environment", "names", "digest"},
-  "node_modules": …, "commit_hash": …}` from `web_bundles.meta`, or `null`
-  for a version uploaded the old way.
+  "node_modules": …, "commit_hash": …}` from the upload row's `record`
+  (joined on `service_id` and `artifact_hash`), or `null` for a version
+  whose bundle has no record (an older CLI, or the legacy upload route).
+  `checks` appears only on a platform that advertises `deploy_checks`.
 - `cufflink deployments list` adds a column `CHECKS`: `ran`, `none`,
-  `SKIPPED`, or `-` (not reported, or not a web app), and a column `BUNDLE`
-  with the short hash.
+  `SKIPPED`, or `-` (not reported, or not a web app), beside the lifecycle
+  design's bundle hash.
 - The deploy's own output adds `  Checks:  typecheck, lint, test passed` or
   `  Checks:  skipped (--skip-checks)`.
-- The audit entry `deploy` adds `checks` and `bundle` to its details, beside
-  the credential that `audit::record` writes. A skipped deploy that carries
-  `web_bundle` writes an audit entry `deploy.skipped` with the same details,
-  so a skip of the checks is recorded even when the bytes were already
-  running.
+- The release's audit entry `deploy` adds `checks` and `build_env` to its
+  details, beside the credential `audit::record` writes and the lifecycle
+  design's `artifact_hash`. A skipped release of a bundle with a record
+  writes an audit entry `deploy.skipped` with the same details, so a skip of
+  the checks is recorded even when the bytes were already running.
 
 ## 3. CLI
 
@@ -686,14 +658,16 @@ it asks the platform's version and features, prints the negotiated line,
 sends `cli_version` and `api_version`, and checks every flag against the
 features before anything is built.
 
-From source, against a platform with `web_bundles`:
+From source, against a platform with `web_releases` (without it, the CLI
+fails before building, as the lifecycle design says):
 
-1. Read the project, the vault and the platform's configs for the service
-   (section 2.4); refuse on a failure.
-2. Run the checks, unless `--skip-checks`.
-3. Build, write the bundle to a temporary directory.
-4. `HEAD` the bundle; `PUT` it when the platform does not hold it.
-5. `POST /api/services/deploy` with `web_bundle` and `config`.
+1. Reserve the service (`POST /api/services/web`).
+2. Sync the environment's config; read the platform's configs for the
+   service (section 2.4); refuse on a failure.
+3. Run the checks, unless `--skip-checks`.
+4. Build, write the bundle to a temporary directory.
+5. `HEAD` the bundle; `PUT` it when the platform does not hold it.
+6. Release: `POST /api/services/deploy` with `web_artifact`.
 
 With `--bundle <file>`:
 
@@ -703,8 +677,9 @@ With `--bundle <file>`:
    `web bundle` in place of `bundle`. Compute the file's SHA-256.
 2. Refuse a bundle of another service than `Cufflink.toml`'s `[service].name`
    (`foreign_project`, as for a WASM bundle).
-3. Compare build-time values (section 2.4).
-4. Steps 4 and 5 above.
+3. Reserve, sync config, read the platform's configs, and compare build-time
+   values (section 2.4).
+4. Steps 5 and 6 above.
 
 ```
 Deploying site (mode: web) from the bundle out/site.bundle (built by cufflink v0.38.0)...
@@ -712,7 +687,7 @@ Deploying site (mode: web) from the bundle out/site.bundle (built by cufflink v0
   Build env: staging, as production would build it
   Checks:    typecheck, lint, test passed
   SHA-256:   9e8d7c6b5a…
-  platform v0.38.0 (features …, web_bundles, deploy_checks)
+  platform v0.38.0 (features …, web_releases, web_bundles, deploy_checks)
   The platform already holds this bundle
 ```
 
@@ -726,26 +701,29 @@ Deploying site (mode: web) from the bundle out/site.bundle (built by cufflink v0
 - `cli/src/bundle.rs` gains `enum Read { Wasm(Bundle), Web(web_bundle::Meta) }`
   decided by the first bytes inside the gzip stream; `run_bundle` matches on
   it.
-- `deploy_web` becomes three functions with one job each: `web_bundle_of_sources`
-  (checks, build env, build, write), `uploaded` (HEAD, PUT) and `deployed`
-  (the request). `cufflink build --bundle` calls the first; a deploy from
+- The lifecycle design's `deploy_web` steps become three functions with one
+  job each: `web_bundle_of_sources` (checks, build env, build, write),
+  `uploaded` (HEAD, PUT) and `released` (the release request and the
+  lifecycle design's answer checks). `cufflink build --bundle` calls the first; a deploy from
   source calls all three; `deploy --bundle` calls the last two.
 - `run_npm_script`, `detect_package_manager` and `format_command_output`
   are kept. `create_web_tarball` and `web_tarball_args` are removed.
 
 ## 4. API
 
-| Method | Path | New | Body / answer |
+What this note adds to the lifecycle design's routes:
+
+| Method | Path | Change | Body / answer |
 |---|---|---|---|
-| `HEAD` | `/api/web/bundles/{sha256}` | yes | 200 with `Content-Length`, or 404 |
-| `PUT` | `/api/web/bundles/{sha256}` | yes | the bundle; 201 or 200 `{"sha256", "size_bytes", "service", "stored"}`; 400, 403, 413, 422 as in section 2.6 |
-| `POST` | `/api/services/deploy` | fields | `web_bundle` (sha256), `config` (`ApplyConfigRequest`), web manifests only |
-| `GET` | `/api/services/{id}/deployments` | field | `bundle` per version |
-| `POST` | `/api/services/{id}/web` | unchanged | kept for CLIs that predate `web_bundles`: stores under the version's key as today, records no `meta`. Deprecated in the release notes |
+| `HEAD` | `/api/services/{id}/web/artifacts/{sha256}` | new | 200 with `Content-Length`, or 404 |
+| `PUT` | `/api/services/{id}/web/artifacts/{sha256}` | reads the record | 422 for a malformed record or one of another service; 403 under `deploy_checks: enforce` (section 2.6). The answer adds `"record": true|false` |
+| `POST` | `/api/services/deploy` | checks the record | 422 when the bundle's recorded manifest is not the release's; 403 under `deploy_checks: enforce` |
+| `GET` | `/api/services/{id}/deployments` | field | `bundle` per web version |
 | `GET` | `/api/services/{id}/web/status` | field | `bundle` as in the listing |
 
-Both new routes are under the control routes' artifact body limit and its
-concurrency limit, as the old upload is.
+No request gains a field: the record travels inside the bundle. The legacy
+`POST /api/services/{id}/web` is the lifecycle design's to keep or retire;
+it reads no record.
 
 ## 5. The `deploy_checks` policy
 
@@ -776,9 +754,12 @@ pub(crate) fn skip_violation(
 }
 ```
 
-- Keys are named by id, because `cufflink login` gives every developer an API
-  key too: the id, from `cufflink keys list`, is what tells a pipeline's key
-  from a developer's.
+- Keys are named by id, because `cufflink login` gives every developer a
+  tenant API key too: the id, which `cufflink auth list` prints for the
+  tenant's API keys (and `cufflink tenants list-api-keys` for a platform
+  admin), is what tells a pipeline's key from a developer's. Partner keys
+  (`cufflink keys`) serve a tenant's `api_key` routes and are not deploy
+  credentials, so they never appear here.
 - A version with no record (an old CLI) is never a violation: such a CLI
   always ran the checks before it built.
 - `enforce` with an empty list is valid: nobody may skip.
@@ -796,33 +777,34 @@ cufflink tenants policy set harbor deploy_checks enforce \
 
 ## 6. Features and compatibility
 
-Two platform features, one per platform PR:
+This note relies on the lifecycle design's `web_releases` and adds two
+platform features, one per platform PR:
 
-| Feature | Provides |
-|---|---|
-| `web_bundles` | `HEAD`/`PUT /api/web/bundles/{sha256}`, `web_bundle` and `config` on a web deploy, versions keyed by bundle (#63), rollback carrying the bundle (#62), the `bundle` field of the listing |
-| `deploy_checks` | `checks` read from a bundle and recorded, shown in the listing and audit log; the `deploy_checks` policy |
+| Feature | Provides | Advertised |
+|---|---|---|
+| `web_bundles` | the record read and kept at upload, the manifest check at release, `HEAD` on the upload path, `bundle` in the listing (without `checks`) | only with `web_releases` |
+| `deploy_checks` | `checks` in the listing and the audit details, `deploy.skipped`, the `deploy_checks` policy at upload and release | only with `web_bundles` |
 
-`deploy_checks` is advertised only with `web_bundles`. The feature tables in
-`docs/versions.md` change in the PR that adds each feature, since a platform
-test compares them with `supports`.
+The feature tables in `docs/versions.md` change in the PR that adds each
+feature, since a platform test compares them with `supports`.
 
 | CLI | Platform | What happens |
 |---|---|---|
-| new | `web_bundles` and `deploy_checks` | Sections 2 and 3 |
-| new | `web_bundles` only | As above; `--skip-checks`, and a bundle whose checks were skipped, are refused (section 2.5); the listing shows no checks |
-| new | neither | A deploy from source, or of a bundle whose checks ran, goes the old way: register, apply config, upload the same bytes with `POST /api/services/{id}/web`. The CLI prints `platform … predates web_bundles: registering, then uploading`. The hash the platform records is the bundle's, since the bytes are. `--skip-checks` is refused |
-| older than this | any | Unchanged: the old flow, the old route, no record (`-` in the listing). Its archive is made by the host's `tar` |
-| older than this | any, given a web bundle | `deploy --bundle <web bundle>`: `it is not a bundle (…)`. Build it again with the newer CLI, or deploy from source |
+| this note's | all three features | Sections 2 and 3 |
+| this note's | `web_releases` and `web_bundles` | As above; `--skip-checks`, and a bundle whose checks were skipped, are refused (section 2.5); the listing shows no checks |
+| this note's | `web_releases` only | Bundles are uploaded without a lookup (`PUT` every time) and their records are not kept; `--skip-checks` and skipped bundles are refused |
+| this note's | no `web_releases` | Refused before building, in the lifecycle design's words |
+| the lifecycle release, before this note | any with `web_releases` | Unchanged: archives with no record, shown as not reported (`-`) |
+| older than the lifecycle release | any | As the lifecycle design says |
+| older than this note | any, given a web bundle | `deploy --bundle <web bundle>`: `it is not a bundle (…)`. Build it again with the newer CLI, or deploy from source |
 
 **Rolling a platform back** below the release that adds `web_bundles`:
 
 | What it added | Before rolling the platform back |
 |---|---|
-| Versions whose objects are under `web/{tenant_id}/bundles/` | Nothing: the older runner and runner API read the key from the version's row, whatever it is |
-| `web_bundles` rows and the `deploy_checks` policy | Nothing: the older platform reads neither. A tenant's `deploy_checks` row stays and applies again after the next upgrade |
-| Deleting a service on the older platform | Its loop deletes every key the service's rows name, so a bundle object is deleted with its service as before |
-| The database | `V9__web_bundles.sql` adds a table only; the older platform ignores it |
+| `web_uploads.record` and the `deploy_checks` policy | Nothing: the older platform reads neither. A tenant's `deploy_checks` row stays, and applies again after the next upgrade |
+| Bundles with a `.cufflink/` first entry | Nothing: the older platform stores and serves them as archives, and the runner unpacks them as before |
+| The database | `V10__web_upload_records.sql` adds a nullable column only; the older platform ignores it |
 
 ## 7. Failure handling
 
@@ -830,48 +812,52 @@ test compares them with `supports`.
 |---|---|---|
 | A check fails | Nothing written or sent | `Linting failed:` and the script's output (unchanged) |
 | The build fails | No bundle file; a file that was there stays | `Build failed:` and its output (unchanged) |
-| The platform's configs cannot be read | Nothing built or sent | `Cannot read site's configs on staging (…)` |
+| The platform's configs cannot be read | Nothing built or sent beyond the reservation, which changes nothing that runs | `Cannot read site's configs on staging (…)` |
 | A `[web].build_env` name has no value | Nothing built | Section 2.4 |
 | `pnpm deploy` fails, building a bundle | No bundle | Section 2.3 |
 | A link loops, dangles or is special | No bundle | The path and why |
-| The build-time values differ from the target's | Nothing sent | Section 2.4 |
-| The upload is cut off or refused | Nothing registered; at most a stored object no version names, deleted after 24 h | The status and the platform's words; running the deploy again uploads again |
-| The upload is too large (413) | Nothing stored | `the platform takes bundles up to its artifact body limit; this one is 312 MiB` |
-| The upload succeeds and the deploy request fails | A stored bundle no version names, deleted after 24 h unless deployed | The deploy's refusal; running it again finds the bundle (`HEAD` 200) and sends only the request |
-| The bundle went between `HEAD` and the deploy (409) | Nothing registered | The CLI uploads once more and sends the request again; a second 409 is the error |
-| The policy refuses a skip | Nothing stored or registered | Section 5 |
+| The build-time values differ from the target's | Nothing uploaded or released | Section 2.4 |
+| The record is malformed or of another service | Nothing stored | The platform's 422 |
+| `--skip-checks` from source by a key that may not skip, under `enforce` | Nothing stored or released; the build ran, since only a platform admin can read the policy | Section 5's refusal, at the upload |
+| The upload is cut off, refused or too large | Nothing released; at most an upload no version records, removed after `WEB_UPLOAD_RETENTION_SECS` | The status and the platform's words; running the deploy again uploads again |
+| The upload succeeds and the release fails | An unreleased upload, removed after the retention unless released | The release's refusal; running the deploy again finds the bundle (`HEAD` 200) and sends only the release |
+| The bundle went between `HEAD` and the release (409) | Nothing released | The lifecycle design's answer: the CLI uploads once more and releases once more |
 | The runner cannot unpack the bundle | The running app stays as it was (unchanged) | The runner's log names the entry and the cap |
 
-A bundle the platform holds is never replaced or changed, so no failure at
-any step alters what a running version serves.
+A stored bundle is never replaced, so no failure at any step alters what a
+running version serves.
 
 ## 8. How this fits the web deploy lifecycle design
 
-The lifecycle design (#62 rollback that switches, #63 transactional deploys
-and versions by content, #64 draining the replaced process) and this one are
-written in parallel. This note assumes #63 makes a web version's identity its
-manifest and its bundle's hash, and registers a version only once its bundle
-is stored. The two meet in the deploy request and in storage, and both hold
-these invariants:
+The lifecycle design (#62, #63, #64; `docs/design-notes/web-deploy-lifecycle.md`,
+proposed in parallel) owns the storage key, the `web_uploads` table, the
+reserve, upload and release routes, the `web_artifact` field, the skip rule,
+rollback, telling the runners, the swap and draining, retention of
+unreleased uploads, and the `web_releases` feature. This note owns the
+bundle's format and writer, what a bundle holds, build-time values, the
+checks and their record, the lookup route, and the `deploy_checks` policy.
+It adds to the lifecycle design's code in three places: the upload reads the
+record, the release compares the recorded manifest, and the listing joins
+the record.
 
-1. A bundle is stored, under a key that names its content, before any version
-   names it. An object under such a key is never replaced.
-2. A web deploy names its bundle by SHA-256, and that hash is the uploaded
-   file's, the row's `artifact_hash` and the runner's directory name.
-3. A deploy whose manifest and bundle hash equal the running version's is
+Both notes hold these invariants:
+
+1. A bundle is stored under a key that names its content before any version
+   records it, and an object under such a key is never replaced.
+2. A web release names its bundle by SHA-256, and that hash is the uploaded
+   file's, the row's `artifact_hash` and the runner's directory name. This
+   note makes it the build's printed hash as well.
+3. A release whose manifest and bundle hash equal the running version's is
    skipped; any other registers a new version, in one transaction with its
-   bundle columns and its config.
-4. A rollback carries the target version's bundle columns.
-5. The runner starts a version only with the config its deploy applied.
-6. A bundle's metadata is read by the platform at upload and only there.
-
-This note owns the bundle format, the writer, the build-time values, the
-checks and their record, the upload and lookup routes, the policy, and the
-`web_bundle` and `config` fields. #63's note owns registration, the skip
-rule and when `deploy.web` is published; #62's the rollback; #64's the
-runner's swap. If #63's note lands first with its own upload route or field
-names that hold the invariants, this note takes them and drops its own; the
-feature name `web_bundles` stands for whichever ships them.
+   bundle columns.
+4. The retention sweep never removes an upload a release is claiming: the
+   release's claim and the sweep's delete exclude each other (the
+   lifecycle design's claim runs under the deploy lock and heads the object;
+   the sweep deletes a row only when no deployment records it, and removes
+   the object after its delete commits).
+5. A bundle's record is read by the platform at upload and only there.
+6. The record is optional: an archive without one deploys as before and is
+   shown as not reported.
 
 ## 9. Alternatives considered
 
@@ -908,11 +894,12 @@ stays a statement by the deployer, documented as such.
 Contrary to the owner's rule that nothing skips the checks implicitly.
 Rejected.
 
-### 9.6 A background sweeper for unused uploads
+### 9.6 A store of bundles per tenant
 
-A job would delete them on time rather than at the next upload, at the cost
-of a scheduled task per platform. At the expected volume, one deploy at a
-time per service, the next upload comes soon enough. Rejected for now.
+An upload keyed by tenant rather than service would not need the service to
+exist first. The lifecycle design's reserve step gives every deploy a
+service id before it builds, which also keeps config in today's order, so
+the per-service key it chose is kept and this note adds nothing beside it.
 
 ## 10. Tests
 
@@ -952,48 +939,51 @@ Named as the repository names its tests: a sentence of what is proved.
 - `no_variable_or_setting_skips_the_checks`: with `CI=true` and every
   `CUFFLINK_*` variable set, a build without the flag runs the scripts (a
   package whose scripts write marker files).
+- `platform_secrets_never_reach_a_build`: a stub answering an `is_secret`
+  entry as `***`; the build's environment lacks it, and `[web].build_env`
+  naming it is refused.
 - `a_failed_config_read_stops_the_build` and
   `a_service_the_platform_lacks_has_no_configs`, against the stub platform
   (`cli/src/commands/stub.rs`).
 - `a_bundle_the_platform_holds_is_not_uploaded_again`: stub answers `HEAD`
   200; no `PUT` is made.
 - `a_missing_bundle_is_uploaded_once_more_after_a_409`.
-- `an_older_platform_is_deployed_the_old_way_with_the_same_bytes`: stub
-  without `web_bundles`; the body of `POST /api/services/{id}/web` is the
-  bundle file.
+- `a_platform_without_web_bundles_is_sent_the_bundle_without_a_lookup`:
+  stub with `web_releases` only; no `HEAD`, a `PUT` whose body is the file.
+- `a_platform_without_web_releases_is_refused_before_the_build`.
 - `a_web_deploy_negotiates_like_any_other`: the request carries
   `cli_version` and `api_version`.
 
 **Platform** (integration, own Postgres and storage, invented tenants `acme`
-and `globex`, service `site`):
+and `globex`, service `site`; on top of the lifecycle design's tests):
 
-- `an_upload_is_stored_once_by_its_hash_and_answered_the_same_again`.
-- `an_upload_whose_body_is_not_its_hash_is_refused`.
-- `an_upload_without_a_bundle_record_first_is_refused`.
-- `a_deploy_names_only_a_bundle_its_tenant_uploaded`: `globex` cannot
-  deploy `acme`'s hash (409, as if absent).
-- `a_bundle_of_another_service_or_manifest_is_refused`.
-- `a_deploy_of_the_running_bundle_is_skipped_and_audited` (with #63).
-- `a_rollback_serves_the_earlier_bundle` (with #62).
-- `config_and_version_change_together`: a deploy whose config apply fails
-  activates nothing.
-- `an_object_is_deleted_only_when_no_version_names_it`: version delete,
-  prune, service delete.
-- `an_unused_upload_is_deleted_after_a_day_at_the_next_upload`.
+- `an_upload_keeps_the_record_of_its_first_entry`.
+- `an_archive_without_a_record_is_stored_as_before`: `record` is null and
+  the listing shows `bundle: null`.
+- `a_record_of_another_service_or_format_is_refused_and_nothing_is_stored`.
+- `a_record_larger_than_64_kib_is_refused`.
+- `a_release_of_a_bundle_built_with_another_manifest_is_refused`.
+- `a_lookup_finds_only_a_stored_upload_of_that_service`: 404 for another
+  service's hash, for `globex` asking for `acme`'s, and for an upload row
+  whose object is gone.
 - `the_listing_shows_the_checks_of_each_version_and_none_for_old_uploads`.
+- `a_skipped_release_of_a_recorded_bundle_is_audited`.
 - `deploy_checks_refuses_a_skip_by_an_unlisted_key_only_when_enforced`:
   `off`, `warn` (counter and log, allowed), `enforce` (403 at upload and at
-  deploy), a listed key allowed, a token refused.
+  release), a listed key allowed, a token refused.
+- `a_key_that_may_skip_cannot_hand_its_upload_to_one_that_may_not`: upload
+  by a listed key, release by an unlisted one, refused under `enforce`.
 - `a_version_with_no_record_is_never_a_violation`.
 - `the_deploy_checks_policy_config_refuses_unknown_fields`.
-- `bundle_keys_are_reserved_from_guests`: `storage_scope`'s reserved-key
-  test gains the new key.
-- `supports_matches_the_feature_tables` (existing) passes with both features.
+- `supports_matches_the_feature_tables` (existing) passes with both
+  features.
 
 **Web runner** (existing harness):
 
 - `a_bundle_with_its_record_unpacks_and_starts`: the `.cufflink/` entry is
-  admitted and the app starts.
+  admitted, the app starts, and `GET /.cufflink/bundle.json` on the app is
+  not the record (a fixture app built with the Next.js version the
+  examples use).
 
 ## 11. PR plan
 
@@ -1005,27 +995,28 @@ changes.
    tests; a deploy from source packs with it instead of `tar`; the exclusion
    constant; the `TempDir` fix. No format record yet, no API change; the
    uploaded archive is otherwise what it was.
-2. **Types and platform: `web_bundles`.** `Checks`, `Script` and the record
-   type in `cufflink-types`; `V9__web_bundles.sql`; the two routes; the
-   `web_bundle` and `config` fields; guarded deletes and the sweep; the
-   listing field; the feature and its `versions.md` row. Written with #63's
-   registration, or after it.
+2. **Types and platform: `web_bundles`.** After the lifecycle design's
+   platform PR. `Checks`, `Script` and the record type in `cufflink-types`;
+   `V10__web_upload_records.sql`; the record read at upload; the manifest
+   check at release; `HEAD` on the upload path; the listing field; the
+   feature and its `versions.md` row.
 3. **Platform: `deploy_checks`.** The record in the listing, the audit
    details, `deploy.skipped`, the policy key, its validation and metric; the
    feature and its row.
 4. **CLI: web bundles.** The record entry, `BuildEnv`, `[web].build_env`,
    the failing config read, `cufflink build --bundle` for web apps,
-   `deploy --bundle` of a web bundle, the deploy from source through upload
-   and deploy by hash, the fallback for older platforms, `Destination` for
-   web deploys, the new list columns.
+   `deploy --bundle` of a web bundle, the lookup before the upload, the
+   lifecycle design's release steps split into the three functions of
+   section 3.3, the new list column. After the lifecycle design's CLI PR.
 5. **CLI: `--skip-checks` (#66).** The flag on both commands, its
    refusals, the warning, the record.
 6. **Docs.** `docs/deployment.md` (bundles for web apps, build-time values,
    the checks, the record), `docs/policies.md` (`deploy_checks`), release
    notes.
 
-PRs 2 and 3 can be reviewed together with 4 and 5 against a local platform;
-1 stands alone.
+PR 1 stands alone and can land before the lifecycle design's PRs. PRs 2 to
+5 follow that design's platform and CLI PRs, and PRs 2 and 3 can be
+reviewed together with 4 and 5 against a local platform.
 
 ## 12. Documentation and release notes
 
@@ -1035,7 +1026,8 @@ the checks and the flag, the record, and the refusals table. The sentence
 "`cufflink build --bundle` refuses … a web app" goes. `docs/policies.md`
 gains the key's row. `docs/versions.md` gains:
 
-- **Features added in v0.38.0:** `web_bundles`, `deploy_checks`.
+- **Features added in v0.38.0:** `web_bundles`, `deploy_checks` (beside the
+  lifecycle design's `web_releases`).
 - **Changes in v0.38.0:**
   - Web apps build into bundles: `cufflink build --bundle` and `cufflink
     deploy --bundle`; the build's SHA-256 is the deployed hash; a held
@@ -1049,9 +1041,9 @@ gains the key's row. `docs/versions.md` gains:
   - Bundles never hold `.next/cache` or `node_modules/.cache`, on any host;
     archives are written by the CLI, not the host's `tar`, with one order,
     no owners and one time per build (`SOURCE_DATE_EPOCH` when set).
-  - Web objects are stored by content under `web/{tenant}/bundles/`;
-    deleted and pruned web versions' objects are deleted.
-  - `POST /api/services/{id}/web` is deprecated; CLIs before v0.38.0 use it.
+  - Uploads keep the bundle's record; `HEAD` on the upload path finds a
+    stored bundle; the listing and audit log show each web version's checks
+    and build-time value names.
   - A web bundle cannot be deployed by a CLI before v0.38.0 (`it is not a
     bundle`).
 - **Rolling a platform back from v0.38.0:** the table in section 6.
@@ -1066,7 +1058,8 @@ gains the key's row. `docs/versions.md` gains:
   key's to say.
 - Deploying a bundle the platform holds by its hash alone, without the
   file. Within one platform that is a rollback (#62).
-- The process swap and draining (#64).
+- Storage keys, registration, rollback, retention and the swap: the
+  lifecycle design's (#62, #63, #64).
 
 ## 14. Questions for the maintainer
 
@@ -1092,13 +1085,16 @@ gains the key's row. `docs/versions.md` gains:
    versions in use.*
 6. **The policy's default mode.** *Default: `off` (any credential may skip,
    and every skip is recorded); a tenant opts in to `warn` or `enforce`.*
-7. **Config in the deploy request.** It makes config and version change
-   together and lets a new service start with its config once registration
-   waits for the bundle. *Default: yes, `config` on the web deploy request,
-   settled with #63's note.*
-8. **How long does the old upload route stay?** *Default: deprecated in
-   v0.38.0, removed no earlier than two minor releases later, with the
-   release notes naming the CLI version that stops using it.*
+7. **Must an upload carry a record?** Requiring it would make every version
+   show its checks, and would refuse archives from the lifecycle release's
+   CLI. *Default: never required; an archive without one is stored as
+   before and shown as not reported.*
+8. **Platform secrets in a build.** The platform answers a secret's value as
+   `***` (section 2.4), so today a build can be given that placeholder.
+   *Default: leave platform secrets out of the build altogether; a secret
+   reaches a build only from the vault through `Cufflink.toml`, and
+   `[web].build_env` naming a platform-only secret is refused with that
+   reason.*
 9. **Audit skipped deploys?** A deploy that changes nothing writes no audit
    entry today. *Default: a skipped web deploy with a bundle writes
    `deploy.skipped`, so a skip of the checks is always recorded; other
