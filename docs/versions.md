@@ -1321,6 +1321,32 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.38.0
+
+Unreleased. No new module-declared feature, and no migration.
+
+- **Pool sizes.** With the new `WASM_WAIT_RELEASE` at its default `on`,
+  the blocking pool's ceiling is
+  `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
+  pool is `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 4` permits, room for
+  guests that will wait on an outbound call without their slots
+  ([wait pools](scaling.md#wait-pools)). With the defaults, the
+  ceiling rises from 1 344 to 2 624 threads; idle threads still exit after
+  2 s, so it is reached only under that much waiting load.
+  `WASM_WAIT_RELEASE=off` keeps today's sizes. `WASM_WAIT_RELEASE_AFTER_MS`,
+  `WASM_MAX_PARKED` and `WASM_MAX_PARKED_PER_SERVICE` configure the waits
+  ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)), and
+  a malformed value stops the process at startup.
+- **`pids.max`.** Where the process's cgroup is v2, startup warns when the
+  blocking pool's ceiling, the worker threads and 64 more reach the
+  cgroup's `pids.max`. A deployment that sees it lowers `WASM_MAX_PARKED`
+  or raises the limit.
+- **Metrics.** `cufflink_wasm_wait_release_total`, `cufflink_wasm_parked`,
+  `cufflink_wasm_parked_seconds`, `cufflink_wasm_resume_wait_seconds` and
+  `cufflink_wasm_blocking_threads` ([observability](observability.md)).
+- A guest returning to its slots is granted them ahead of new arrivals.
+  Nothing releases slots yet, so admission is otherwise unchanged.
+
 ## Changes in v0.37.1
 
 No new module-declared feature. A service built for v0.37.0 deploys and

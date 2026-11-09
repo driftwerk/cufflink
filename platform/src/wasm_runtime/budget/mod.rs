@@ -6,6 +6,7 @@ mod hold;
 mod json;
 mod ledger;
 mod pressure;
+mod seat;
 mod slots;
 mod stack;
 
@@ -13,14 +14,15 @@ pub(crate) use caps::{base64_len, IMAGE_MAX_SIDE};
 #[doc(hidden)]
 pub use caps::{s3_host_bytes, IMAGE_BYTES_PER_PIXEL};
 pub use caps::{CapExceeded, HostCaps};
-pub use cgroup::{detect as detect_cgroup, CgroupLimit, LimitSource};
-pub use config::{thread_stack_bytes, BudgetConfig};
+pub use cgroup::{detect as detect_cgroup, pids_max as detect_pids_max, CgroupLimit, LimitSource};
+pub use config::{thread_stack_bytes, BudgetConfig, WaitRelease};
 pub(crate) use hold::{Account, Capped, Drawing, STEP};
 pub use hold::{Capacity, Hold, Meter, Refused};
 pub(crate) use json::stepped;
 pub use json::{ChargedJson, ChargedJsonError, Parsed};
 pub use ledger::Limits;
 pub(crate) use ledger::{Charge, Ledger, Verdict, TABLE_ELEMENT_BYTES};
+pub(crate) use seat::{Gate, Held, Seat, Taken};
 pub(crate) use stack::enter as enter_thread;
 
 use super::{ExecutionError, InvocationKind};
@@ -29,8 +31,10 @@ use crate::policy::record::{LogThrottle, LOG_THROTTLE};
 use crate::policy::PolicyMode;
 use crate::registry::ServiceIdentity;
 use estimates::Estimates;
+use seat::Parking;
 pub(crate) use slots::RouteKey;
-use slots::{RouteSlots, ServiceSlots};
+use slots::{RouteSlots, ServiceSlot, ServiceSlots};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -237,7 +241,7 @@ pub(crate) struct Ticket<'a> {
 }
 
 pub struct Admission {
-    slots: Vec<OwnedSemaphorePermit>,
+    seat: Seat,
     charge: Option<Charge>,
     budget_from: Option<Instant>,
 }
@@ -254,15 +258,15 @@ impl Admission {
         self.budget_from
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<OwnedSemaphorePermit>, Option<Charge>) {
-        (self.slots, self.charge)
+    pub(crate) fn into_parts(self) -> (Seat, Option<Charge>) {
+        (self.seat, self.charge)
     }
 }
 
 impl std::fmt::Debug for Admission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Admission")
-            .field("slots", &self.slots.len())
+            .field("slots", &self.seat.len())
             .field("charged", &self.charge.is_some())
             .finish()
     }
@@ -274,8 +278,9 @@ pub(crate) struct Budget {
     estimates: Estimates,
     routes: RouteSlots,
     services: ServiceSlots,
-    nested: Arc<Semaphore>,
-    background: Arc<Semaphore>,
+    nested: Arc<Gate>,
+    background: Arc<Gate>,
+    parked: Option<Arc<Semaphore>>,
     max_memory: usize,
     wait: Duration,
     retry_after: Duration,
@@ -306,11 +311,17 @@ impl Budget {
                 config.cold_estimate,
             ),
             routes: RouteSlots::default(),
-            services: ServiceSlots::new(config.per_service),
-            nested: Arc::new(Semaphore::new(
-                max_concurrent.saturating_mul(usize::from(MAX_CALL_DEPTH)),
-            )),
-            background: Arc::new(Semaphore::new((max_concurrent / 4 * 3).max(1))),
+            services: ServiceSlots::new(
+                config.per_service,
+                config
+                    .wait_release
+                    .map_or(0, |release| release.max_parked_per_service),
+            ),
+            nested: Gate::new(Pools::of(max_concurrent, config.wait_release).nested),
+            background: Gate::new((max_concurrent / 4 * 3).max(1)),
+            parked: config
+                .wait_release
+                .map(|release| Arc::new(Semaphore::new(release.max_parked))),
             config,
             max_memory,
             wait,
@@ -367,6 +378,7 @@ impl Budget {
         if let Some(ledger) = &self.ledger {
             ledger.publish();
         }
+        metrics::gauge!("cufflink_wasm_blocking_threads").set(blocking_threads() as f64);
     }
 
     pub(crate) fn enforces(&self) -> bool {
@@ -476,7 +488,7 @@ impl Budget {
     pub(crate) async fn admit(
         &self,
         ticket: Ticket<'_>,
-        global: &Arc<Semaphore>,
+        global: &Arc<Gate>,
     ) -> Result<Admission, ExecutionError> {
         let started = Instant::now();
         let until = self.admission_deadline(&ticket);
@@ -511,19 +523,19 @@ impl Budget {
     async fn slot(
         &self,
         ticket: &Ticket<'_>,
-        semaphore: Arc<Semaphore>,
+        gate: &Gate,
         reason: Reason,
         until: Option<Instant>,
         enforced: bool,
     ) -> Result<Option<OwnedSemaphorePermit>, ExecutionError> {
         let waits = enforced && ticket.class != Class::Nested;
         let taken = match (waits, until) {
-            (false, _) => semaphore.try_acquire_owned().ok(),
-            (true, Some(until)) => tokio::time::timeout_at(until, semaphore.acquire_owned())
+            (false, _) => gate.try_take(),
+            (true, Some(until)) => tokio::time::timeout_at(until, gate.admit())
                 .await
                 .ok()
                 .and_then(Result::ok),
-            (true, None) => semaphore.acquire_owned().await.ok(),
+            (true, None) => gate.admit().await.ok(),
         };
         match (taken, enforced) {
             (Some(permit), _) => Ok(Some(permit)),
@@ -545,82 +557,117 @@ impl Budget {
     ) -> Result<Option<OwnedSemaphorePermit>, ExecutionError> {
         match ticket.route {
             Some((key, max)) => {
-                let semaphore = self.routes.semaphore(key, max);
-                self.slot(ticket, semaphore, Reason::RouteConcurrency, until, true)
+                let gate = self.routes.gate(key, max);
+                self.slot(ticket, &gate, Reason::RouteConcurrency, until, true)
                     .await
             }
             None => Ok(None),
         }
     }
 
+    async fn releasable(
+        &self,
+        ticket: &Ticket<'_>,
+        gate: &Arc<Gate>,
+        until: Option<Instant>,
+        enforced: bool,
+    ) -> Result<Option<Taken>, ExecutionError> {
+        Ok(self
+            .slot(ticket, gate, Reason::ServiceConcurrency, until, enforced)
+            .await?
+            .map(|permit| Taken::new(Arc::clone(gate), permit)))
+    }
+
     async fn global_slot(
         &self,
         ticket: &Ticket<'_>,
-        global: &Arc<Semaphore>,
+        global: &Arc<Gate>,
         until: Option<Instant>,
-    ) -> Result<OwnedSemaphorePermit, ExecutionError> {
+    ) -> Result<Taken, ExecutionError> {
         let reason = Reason::ServiceConcurrency;
         match (self.config.enforces(), ticket.class) {
-            (true, Class::Nested) => Arc::clone(&self.nested).try_acquire_owned().map_err(|_| {
-                self.refuse(ticket, reason, PolicyMode::Enforce);
-                self.overloaded(reason, false)
-            }),
+            (true, Class::Nested) => self
+                .nested
+                .try_take()
+                .map(|permit| Taken::new(Arc::clone(&self.nested), permit))
+                .ok_or_else(|| {
+                    self.refuse(ticket, reason, PolicyMode::Enforce);
+                    self.overloaded(reason, false)
+                }),
             (true, _) => self
-                .slot(ticket, Arc::clone(global), reason, until, true)
+                .releasable(ticket, global, until, true)
                 .await?
                 .ok_or_else(|| self.overloaded(reason, false)),
-            (false, _) => Arc::clone(global)
-                .acquire_owned()
+            (false, _) => global
+                .admit()
                 .await
+                .map(|permit| Taken::new(Arc::clone(global), permit))
                 .map_err(|e| ExecutionError::Runtime(format!("executor closed: {e}"))),
+        }
+    }
+
+    fn parking(&self, ticket: &Ticket<'_>, service: &ServiceSlot) -> Result<Parking, Held> {
+        match (ticket.class, ticket.kind, &self.parked) {
+            (Class::Nested | Class::Committed, _, _)
+            | (_, InvocationKind::SseReducer | InvocationKind::OnMigrate, _) => {
+                Err(Held::NotParkable)
+            }
+            (_, _, None) => Err(Held::Disabled),
+            (Class::Interactive | Class::Background, _, Some(global)) => Ok(Parking::new(
+                Arc::clone(global),
+                Arc::clone(&service.parked),
+            )),
         }
     }
 
     async fn take(
         &self,
         ticket: &Ticket<'_>,
-        global: &Arc<Semaphore>,
+        global: &Arc<Gate>,
         until: Option<Instant>,
     ) -> Result<Admission, ExecutionError> {
-        let mode = self.config.mode;
         let enforce = self.config.enforces();
-        let governed = mode != PolicyMode::Off;
-        let reason = Reason::ServiceConcurrency;
+        let governed = self.config.mode != PolicyMode::Off;
         let memory_first = ticket.class == Class::Background;
         let mut charge = match (&self.ledger, memory_first) {
             (Some(ledger), true) => Some(self.reserve(ledger, ticket, until).await?),
             _ => None,
         };
-        let mut slots = Vec::with_capacity(6);
-        slots.extend(self.route_slot(ticket, until).await?);
+        let route = self.route_slot(ticket, until).await?;
+        let service = self.services.of(&ServiceKey::of(ticket.identity));
+        let mut releasable = Vec::with_capacity(5);
         if governed {
-            let service = self.services.of(&ServiceKey::of(ticket.identity));
             let capped = match (ticket.class, ticket.kind) {
                 (Class::Committed, InvocationKind::OnMigrate) => None,
-                (Class::Committed, _) => Some(service.committed),
-                (Class::Background, _) => Some(service.background),
+                (Class::Committed, _) => Some(&service.committed),
+                (Class::Background, _) => Some(&service.background),
                 (Class::Interactive | Class::Nested, _) => None,
             };
             if let Some(capped) = capped {
-                slots.extend(self.slot(ticket, capped, reason, until, enforce).await?);
+                releasable.extend(self.releasable(ticket, capped, until, enforce).await?);
             }
-            slots.extend(
-                self.slot(ticket, service.all, reason, until, enforce)
+            releasable.extend(
+                self.releasable(ticket, &service.all, until, enforce)
                     .await?,
             );
         }
         if enforce && ticket.class == Class::Background {
-            slots.extend(
-                self.slot(ticket, Arc::clone(&self.background), reason, until, true)
+            releasable.extend(
+                self.releasable(ticket, &self.background, until, true)
                     .await?,
             );
         }
-        slots.push(self.global_slot(ticket, global, until).await?);
+        releasable.push(self.global_slot(ticket, global, until).await?);
         if let (Some(ledger), false) = (&self.ledger, memory_first) {
             charge = Some(self.reserve(ledger, ticket, until).await?);
         }
         Ok(Admission {
-            slots,
+            seat: Seat::new(
+                route,
+                releasable,
+                self.parking(ticket, &service),
+                ticket.kind,
+            ),
             charge,
             budget_from: None,
         })
@@ -693,25 +740,85 @@ fn return_large_blocks_to_the_kernel() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn return_large_blocks_to_the_kernel() {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pools {
+    pub blocking: usize,
+    pub nested: usize,
+}
+
+impl Pools {
+    const SPARE_BLOCKING: usize = 64;
+
+    pub fn of(max_concurrent: usize, wait_release: Option<WaitRelease>) -> Self {
+        let in_flight = max_concurrent.saturating_add(WaitRelease::parked(wait_release));
+        let depth = usize::from(MAX_CALL_DEPTH);
+        Self {
+            blocking: in_flight
+                .saturating_mul(1 + depth)
+                .saturating_add(Self::SPARE_BLOCKING),
+            nested: in_flight.saturating_mul(depth),
+        }
+    }
+
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> eyre::Result<Self> {
+        let vars = cufflink_db::Vars(&var);
+        let max_concurrent = vars.positive("WASM_MAX_CONCURRENT", 256usize)?;
+        let per_service = vars
+            .positive(
+                "WASM_MAX_CONCURRENT_PER_SERVICE",
+                BudgetConfig::default().per_service,
+            )?
+            .min(max_concurrent);
+        Ok(Self::of(
+            max_concurrent,
+            WaitRelease::from_vars(&var, max_concurrent, per_service)?,
+        ))
+    }
+
+    pub fn log_startup(&self, pids_max: Option<u64>, workers: usize) {
+        if let Some(pids_max) = cgroup::ceiling_reaches(pids_max, self.blocking, workers) {
+            tracing::warn!(
+                target: "cufflink::wasm::budget",
+                pids_max,
+                blocking = self.blocking,
+                workers,
+                "The blocking pool's ceiling reaches the cgroup's pids.max; lower WASM_MAX_PARKED \
+                 or WASM_MAX_CONCURRENT, or raise the limit"
+            );
+        }
+    }
+}
+
+static RUNTIME_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+fn blocking_threads() -> usize {
+    let workers =
+        tokio::runtime::Handle::try_current().map_or(0, |runtime| runtime.metrics().num_workers());
+    RUNTIME_THREADS
+        .load(Ordering::Relaxed)
+        .saturating_sub(workers)
+}
+
 pub fn runtime() -> eyre::Result<tokio::runtime::Runtime> {
     return_large_blocks_to_the_kernel();
-    let max_concurrent: usize = cufflink_db::env_var("WASM_MAX_CONCURRENT", 256)?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(thread_stack_bytes(cufflink_settings::process_var)?)
         .thread_keep_alive(Duration::from_secs(2))
-        .max_blocking_threads(
-            max_concurrent
-                .saturating_mul(1 + usize::from(MAX_CALL_DEPTH))
-                .saturating_add(64),
-        )
+        .max_blocking_threads(Pools::from_vars(cufflink_settings::process_var)?.blocking)
+        .on_thread_start(|| {
+            RUNTIME_THREADS.fetch_add(1, Ordering::Relaxed);
+        })
+        .on_thread_stop(|| {
+            RUNTIME_THREADS.fetch_sub(1, Ordering::Relaxed);
+        })
         .build()
         .map_err(|e| eyre::eyre!("build the runtime: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sets_mmap_threshold, Class};
+    use super::{sets_mmap_threshold, Class, Pools};
 
     #[test]
     fn the_mmap_threshold_is_set_only_under_a_budget_and_never_over_the_operators() {
@@ -727,6 +834,43 @@ mod tests {
             "glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=4194304"
         )]));
         assert!(with(&[("GLIBC_TUNABLES", "glibc.malloc.arena_max=2")]));
+    }
+
+    #[test]
+    fn the_blocking_and_nested_pools_cover_parked_chains() {
+        let pools = |pairs: &'static [(&'static str, &'static str)]| {
+            Pools::from_vars(cufflink_settings::fixed(pairs)).expect("pools")
+        };
+        assert_eq!(
+            pools(&[]),
+            Pools {
+                blocking: (256 + 256) * 5 + 64,
+                nested: (256 + 256) * 4,
+            }
+        );
+        assert_eq!(
+            pools(&[("WASM_MAX_CONCURRENT", "16"), ("WASM_MAX_PARKED", "8")]),
+            Pools {
+                blocking: (16 + 8) * 5 + 64,
+                nested: (16 + 8) * 4,
+            }
+        );
+        assert_eq!(
+            pools(&[("WASM_WAIT_RELEASE", "off")]),
+            Pools {
+                blocking: 256 * 5 + 64,
+                nested: 256 * 4,
+            },
+            "with releasing off, the sizes are today's"
+        );
+        for (name, value) in [
+            ("WASM_WAIT_RELEASE", "maybe"),
+            ("WASM_MAX_PARKED", "0"),
+            ("WASM_WAIT_RELEASE_AFTER_MS", "soon"),
+        ] {
+            let err = Pools::from_vars(cufflink_settings::fixed(&[(name, value)])).unwrap_err();
+            assert!(err.to_string().contains(name), "{name}: {err}");
+        }
     }
 
     #[test]
