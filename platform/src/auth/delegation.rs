@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 pub const REPLAY_MAX_ENV: &str = "SERVICE_IDENTITY_REPLAY_MAX";
 pub const DEFAULT_REPLAY_MAX: usize = 262_144;
+/// The verifier's skew, plus two replicas each up to that skew from true time.
+const ANY_REPLICA_ACCEPTS_PAST_EXPIRY_SECS: i64 = 3 * CLOCK_SKEW_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DelegationError {
@@ -202,19 +204,17 @@ pub(crate) async fn check(
     seen.first_use(claims.jti, claims.expires_at, now)?;
     match arrival {
         Arrival::Network if redis.is_configured() => {
-            claim(
-                redis,
-                claims.jti,
-                claims
-                    .expires_at
-                    .saturating_add(2 * CLOCK_SKEW_SECS)
-                    .saturating_sub(now)
-                    .max(1),
-            )
-            .await
+            claim(redis, claims.jti, claim_ttl(claims.expires_at, now)).await
         }
         Arrival::Network | Arrival::InProcess => Ok(()),
     }
+}
+
+fn claim_ttl(expires_at: i64, now: i64) -> i64 {
+    expires_at
+        .saturating_add(ANY_REPLICA_ACCEPTS_PAST_EXPIRY_SECS)
+        .saturating_sub(now)
+        .max(1)
 }
 
 async fn claim(redis: &RedisHandle, jti: Uuid, ttl_secs: i64) -> Result<(), DelegationError> {
@@ -546,14 +546,30 @@ pub(crate) mod tests {
             .await
             .expect("a TTL");
         assert!(
-            (36..=40).contains(&ttl),
-            "kept until no replica within the clock skew of this one accepts it: {ttl}"
+            (41..=45).contains(&ttl),
+            "kept until no replica accepts it: {ttl}"
         );
         let fresh = claims(Delegation::of(&user(&acme)));
         assert_eq!(
             check(&second, &redis, &fresh, Arrival::Network, NOW).await,
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_claim_outlives_the_identity_on_every_replica_that_could_accept_it() {
+        let expires_at = NOW + 30;
+        let accepted_until = |clock_offset: i64| expires_at + CLOCK_SKEW_SECS - clock_offset;
+        for claimed_by in [-CLOCK_SKEW_SECS, 0, CLOCK_SKEW_SECS] {
+            let released_at = NOW + claim_ttl(expires_at, NOW + claimed_by);
+            for verified_by in [-CLOCK_SKEW_SECS, 0, CLOCK_SKEW_SECS] {
+                assert!(
+                    released_at >= accepted_until(verified_by),
+                    "claimed {claimed_by} s off true time, verified {verified_by} s off"
+                );
+            }
+        }
+        assert_eq!(claim_ttl(NOW, NOW + 3_600), 1, "never zero or negative");
     }
 
     #[test]
