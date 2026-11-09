@@ -91,40 +91,66 @@ fn parse_limit(text: &str) -> Option<u64> {
     }
 }
 
-fn v2_limit(root: &Path, mount: &Mount, path: &str) -> Option<CgroupLimit> {
+fn lineage(mount: &Mount, path: &str) -> impl Iterator<Item = String> {
     let top = mount.point.trim_end_matches('/').to_string();
-    let mut dir = cgroup_dir(mount, path);
-    if !read(root, &format!("{dir}/cgroup.controllers")).is_some_and(|c| lists_memory(&c)) {
+    std::iter::successors(Some(cgroup_dir(mount, path)), move |dir| {
+        (dir.len() > top.len()).then(|| match dir.rsplit_once('/') {
+            Some((parent, _)) if parent.len() >= top.len() => parent.to_string(),
+            _ => top.clone(),
+        })
+    })
+}
+
+fn v2_limit(root: &Path, mount: &Mount, path: &str) -> Option<CgroupLimit> {
+    let own = cgroup_dir(mount, path);
+    if !read(root, &format!("{own}/cgroup.controllers")).is_some_and(|c| lists_memory(&c)) {
         return None;
     }
-    let mut best: Option<CgroupLimit> = None;
-    loop {
-        for (file, source) in [
-            ("memory.max", LimitSource::Max),
-            ("memory.high", LimitSource::High),
-        ] {
-            let at = format!("{dir}/{file}");
-            if let Some(bytes) = read(root, &at).as_deref().and_then(parse_limit) {
-                if best.as_ref().is_none_or(|best| bytes < best.bytes) {
-                    best = Some(CgroupLimit {
-                        bytes,
-                        source,
-                        file: PathBuf::from(at),
-                        dir: Some(root.join(dir.trim_start_matches('/'))),
-                    });
-                }
-            }
-        }
-        if dir.len() <= top.len() {
-            return best;
-        }
-        dir = dir
-            .rsplit_once('/')
-            .map_or_else(|| top.clone(), |(parent, _)| parent.to_string());
-        if dir.len() < top.len() {
-            dir = top.clone();
-        }
-    }
+    lineage(mount, path)
+        .flat_map(|dir| {
+            [
+                ("memory.max", LimitSource::Max),
+                ("memory.high", LimitSource::High),
+            ]
+            .map(|(file, source)| (dir.clone(), format!("{dir}/{file}"), source))
+        })
+        .filter_map(|(dir, at, source)| {
+            read(root, &at)
+                .as_deref()
+                .and_then(parse_limit)
+                .map(|bytes| CgroupLimit {
+                    bytes,
+                    source,
+                    file: PathBuf::from(at),
+                    dir: Some(root.join(dir.trim_start_matches('/'))),
+                })
+        })
+        .min_by_key(|limit| limit.bytes)
+}
+
+pub fn pids_max(root: &Path) -> Option<u64> {
+    let mounts = mounts(root);
+    let mount = mounts.iter().find(|mount| mount.fstype == "cgroup2")?;
+    let cgroups = read(root, "/proc/self/cgroup")?;
+    lineage(mount, own_cgroup(&cgroups, true)?)
+        .filter_map(|dir| {
+            read(root, &format!("{dir}/pids.max"))
+                .as_deref()
+                .and_then(parse_limit)
+        })
+        .min()
+}
+
+pub(crate) fn ceiling_reaches(
+    pids_max: Option<u64>,
+    blocking: usize,
+    workers: usize,
+) -> Option<u64> {
+    const SPARE_THREADS: usize = 64;
+    let threads = blocking
+        .saturating_add(workers)
+        .saturating_add(SPARE_THREADS);
+    pids_max.filter(|max| u64::try_from(threads).is_ok_and(|threads| threads >= *max))
 }
 
 fn mem_total(root: &Path) -> Option<u64> {
@@ -260,6 +286,31 @@ mod tests {
         ]);
         assert_eq!(detect(unlimited.path()), None);
         assert_eq!(detect(tree(&[]).path()), None, "no cgroup at all");
+    }
+
+    #[test]
+    fn startup_warns_when_the_blocking_ceiling_reaches_pids_max() {
+        let root = tree(&[
+            ("/proc/self/mountinfo", UNIFIED),
+            ("/proc/self/cgroup", "0::/system.slice/app.scope\n"),
+            ("/sys/fs/cgroup/system.slice/pids.max", "4096\n"),
+            ("/sys/fs/cgroup/system.slice/app.scope/pids.max", "max\n"),
+        ]);
+        let pids = pids_max(root.path());
+        assert_eq!(pids, Some(4096), "the parent's limit binds");
+        assert_eq!(ceiling_reaches(pids, 2_624, 8), None);
+        assert_eq!(ceiling_reaches(pids, 4_024, 8), Some(4096));
+        assert_eq!(ceiling_reaches(pids, 4_100, 8), Some(4096));
+        assert_eq!(ceiling_reaches(None, usize::MAX, 8), None);
+
+        std::fs::write(
+            root.path()
+                .join("sys/fs/cgroup/system.slice/app.scope/pids.max"),
+            "1024",
+        )
+        .expect("write");
+        assert_eq!(pids_max(root.path()), Some(1024), "the smallest binds");
+        assert_eq!(pids_max(tree(&[]).path()), None, "no cgroup at all");
     }
 
     #[test]

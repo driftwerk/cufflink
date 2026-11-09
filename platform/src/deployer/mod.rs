@@ -7,5 +7,6 @@ pub(crate) mod module;
 pub(crate) mod native;
 pub(crate) mod pipeline;
 pub(crate) mod schema;
+pub(crate) mod web;
 
 pub use manifest::ServiceManifest;

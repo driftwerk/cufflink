@@ -478,6 +478,13 @@ Rolling a platform back from v0.37.1 to v0.37.0:
 | Database roles verified on `USAGE` of their service's schema alone, because the platform runs no DDL there as them | A tenant under `db_roles: enforce` goes to `warn` first. The older platform requires every bound role to hold `CREATE` on its service's schema as well. Once it runs, apply the `GRANT USAGE, CREATE ON SCHEMA` its `cufflink services db-role verify` prints for each such role, then set `enforce` again, which it refuses while a role is not verified |
 | The database | Nothing: v0.37.1 has no migration |
 
+Rolling a platform back from v0.38.0 to an earlier release:
+
+| What v0.38.0 added | Before rolling the platform back |
+|--------------------|----------------------------------|
+| Web rollbacks that carry the bundle | **Do not `cufflink rollback` a web app on the older platform.** Its rollback creates a version with no bundle and tells no runner. Deploy the earlier commit instead |
+| The database | Nothing: v0.38.0 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -1325,6 +1332,46 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 Unreleased.
 
+No new module-declared feature. A service built for v0.37.1 deploys and
+runs on this platform unchanged. There is no migration.
+
+- **Pool sizes.** With the new `WASM_WAIT_RELEASE` at its default `on`,
+  the blocking pool's ceiling is
+  `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
+  pool is `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 4` permits, room for
+  guests that will wait on an outbound call without their slots
+  ([wait pools](scaling.md#wait-pools)). With the defaults, the
+  ceiling rises from 1 344 to 2 624 threads; idle threads still exit after
+  2 s, so it is reached only under that much waiting load.
+  `WASM_WAIT_RELEASE=off` keeps today's sizes. `WASM_WAIT_RELEASE_AFTER_MS`,
+  `WASM_MAX_PARKED` and `WASM_MAX_PARKED_PER_SERVICE` configure the waits
+  ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)), and
+  a malformed value stops the process at startup.
+- **`pids.max`.** Where the process's cgroup is v2, startup warns when the
+  blocking pool's ceiling, the worker threads and 64 more reach the
+  cgroup's `pids.max`. A deployment that sees it lowers `WASM_MAX_PARKED`
+  or raises the limit.
+- **Metrics.** `cufflink_wasm_wait_release_total`, `cufflink_wasm_parked`,
+  `cufflink_wasm_parked_seconds`, `cufflink_wasm_resume_wait_seconds` and
+  `cufflink_wasm_blocking_threads` ([observability](observability.md)).
+- A guest returning to its slots is granted each one ahead of arrivals
+  that come while it waits for it; an arrival already queued for that slot
+  keeps its place. Nothing releases slots yet, so admission is otherwise
+  unchanged.
+- `cufflink rollback` of a web app switches: the version it activates
+  records the target's bundle, under the key the target records, and the
+  platform publishes `deploy.web` so the runners serve it. A target that
+  records no bundle, or whose bundle is missing from object storage or of
+  another size, is refused with `409` before anything is written; the
+  first refusal names the newest earlier version that has a bundle
+  ([rolling back](deployment.md#web-apps)). Before this release such a
+  rollback activated a version with no bundle and told no runner.
+- The rollback answer gains `artifact_hash`, the bundle's hash for a web
+  app and the binary's for a native service, and, for a web app,
+  `runners_told`. `native_hash` is set for native services alone, as
+  before. The CLI prints `  Bundle:         <sha256>` for a web app.
+- A failed `deploy.web` publish is counted as
+  `cufflink_web_announce_failures_total`.
 - Web runners converge without an event: at start and every
   `WEB_RECONCILE_SECS` (default 30) a runner reads the current deployment
   of the apps it runs, in one query or one runner API call, and switches an

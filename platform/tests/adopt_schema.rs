@@ -303,7 +303,7 @@ async fn what_a_version_adopted_is_kept_with_it() {
                     commit_hash: None,
                     schema_json: Some(&snapshot),
                     schema_hash: "s",
-                    native: None,
+                    artifact: None,
                 },
             )
             .await

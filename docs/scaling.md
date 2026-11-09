@@ -56,6 +56,26 @@ Each replica maintains its own in-memory caches that stay in sync automatically:
 - Budgets do not add up across replicas for a burst routed to one replica:
   that replica waits or answers `503` for what it cannot hold
 
+### Wait pools
+
+The runtime is sized for guests that will wait on an outbound call without
+their execution slots, a capability the host functions do not offer yet.
+`WASM_MAX_PARKED` (default `WASM_MAX_CONCURRENT`) and
+`WASM_MAX_PARKED_PER_SERVICE` (default `2 × WASM_MAX_CONCURRENT_PER_SERVICE`)
+bound them, and `WASM_WAIT_RELEASE=off` turns them off.
+
+- **The derived pools.** With waits on, the blocking pool is
+  `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
+  pool `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 4` permits; with them off,
+  `WASM_MAX_CONCURRENT × 5 + 64` and `WASM_MAX_CONCURRENT × 4`. Idle
+  blocking threads exit after 2 s, and each one that ran a guest is charged
+  its stack in the memory budget.
+- **`pids.max`.** Where the process's cgroup is v2, startup warns when the
+  blocking pool's ceiling, the runtime's worker threads and 64 more reach
+  the smallest `pids.max` of the cgroup and its ancestors. Lower
+  `WASM_MAX_PARKED` or raise the limit. `cufflink_wasm_blocking_threads`
+  shows how many blocking threads are live.
+
 ### Tenant Database Pools
 
 - Each replica maintains its own pool cache (`MAX_TENANT_POOLS`, default 64 tenants; `MAX_CONNS_PER_TENANT`, default 4 connections each)

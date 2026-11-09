@@ -332,7 +332,7 @@ async fn execution_context_joins_tenant_and_deployment() {
             commit_hash: None,
             schema_json: None,
             schema_hash: "",
-            native: None,
+            artifact: None,
         },
     )
     .await

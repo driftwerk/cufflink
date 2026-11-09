@@ -1,7 +1,7 @@
 use crate::errors::{PlatformError, PlatformResult};
 use crate::repo::deploy_jobs::{self, Ending, Finished, Heartbeat, JobStatus};
 use crate::repo::deploy_lock::DeployLock;
-use crate::shutdown::{Shutdown, KILL_MARGIN};
+use crate::shutdown::Shutdown;
 use crate::AppState;
 use deadpool_postgres::Pool;
 use futures_util::FutureExt;
@@ -104,10 +104,7 @@ impl Job {
     async fn heartbeats(&self, last: &Mutex<Heartbeat>) -> Ending {
         let mut beat = tokio::time::interval(HEARTBEAT);
         beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let deadline = async {
-            self.shutdown.cancelled().await;
-            tokio::time::sleep(self.shutdown.remaining().saturating_sub(KILL_MARGIN)).await;
-        };
+        let deadline = self.shutdown.hard_deadline();
         tokio::pin!(deadline);
         loop {
             tokio::select! {

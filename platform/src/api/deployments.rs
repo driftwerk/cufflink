@@ -897,14 +897,19 @@ async fn rollback(
     lock.release().await;
 
     let outcome = rollback_result?;
-    pipeline::after_rollback(&state, &outcome).await?;
+    let runners_told = pipeline::after_rollback(&state, &outcome).await?;
 
     info!(
         "Service '{}' rolled back to v{} (now v{})",
         outcome.manifest.name, outcome.target_version, outcome.new_version
     );
 
-    Ok(Json(json!({
+    let artifact_hash = outcome
+        .deployment
+        .artifact
+        .as_ref()
+        .map(|artifact| &artifact.hash);
+    let mut answer = json!({
         "service_id": service_id.to_string(),
         "name": outcome.manifest.name,
         "rolled_back_to": outcome.target_version,
@@ -914,9 +919,14 @@ async fn rollback(
         "plan": pipeline::deploy_plan(&outcome.schema, &outcome.eventing)?,
         "tenant_slug": user.tenant_slug,
         "wasm_restored": outcome.target_wasm_hash.is_some(),
-        "native_hash": outcome.deployment.artifact.as_ref().map(|artifact| &artifact.hash),
+        "native_hash": artifact_hash.filter(|_| matches!(outcome.manifest.mode, ServiceMode::Native)),
+        "artifact_hash": artifact_hash,
         "rolled_back_from_commit": outcome.target_commit_hash,
-    })))
+    });
+    if let Some(told) = runners_told {
+        answer["runners_told"] = json!(told);
+    }
+    Ok(Json(answer))
 }
 
 async fn seed_default_roles(
