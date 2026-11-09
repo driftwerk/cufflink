@@ -1063,6 +1063,8 @@ gains the key's row. `docs/versions.md` gains:
 
 ## 14. Questions for the maintainer
 
+Decided 2026-11-09: the maintainer accepted every recommended default below.
+
 1. **May `cufflink build --bundle` read the platform's configs?** It would
    need credentials and `--env`, and would make a build depend on the
    platform. *Default: no. A build is given what `Cufflink.toml` declares;
