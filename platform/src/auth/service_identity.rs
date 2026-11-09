@@ -2,15 +2,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 pub const HEADER: &str = "x-cufflink-service-identity";
 pub const MAX_CALL_DEPTH: u8 = 4;
 pub const MAX_LIFETIME_SECS: i64 = 60;
 const VERSION: &str = "cfsi1";
-const CLOCK_SKEW_SECS: i64 = 5;
+pub(crate) const CLOCK_SKEW_SECS: i64 = 5;
 pub(crate) const KEYS_ENV: &str = "CUFFLINK_SERVICE_IDENTITY_KEYS";
 
 pub struct ServiceIdentityKeys {
@@ -123,6 +124,57 @@ pub struct Claims {
     pub depth: u8,
     #[serde(rename = "obo")]
     pub on_behalf_of: Option<String>,
+    #[serde(rename = "act", default, skip_serializing_if = "Option::is_none")]
+    pub acting_for: Option<Delegation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delegation {
+    #[serde(rename = "sub")]
+    pub subject: String,
+    #[serde(rename = "am")]
+    pub method: DelegatedMethod,
+    #[serde(rename = "nm", default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "em", default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(rename = "sa", default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_account: bool,
+    #[serde(rename = "rlm", default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
+    #[serde(rename = "uexp", default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(rename = "tok", default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<DelegatedToken>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "k", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DelegatedMethod {
+    Jwt {},
+    ApiKey {
+        id: Uuid,
+        #[serde(rename = "us", default, skip_serializing_if = "Option::is_none")]
+        user_sub: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegatedToken {
+    #[serde(rename = "pu", default, skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+    #[serde(rename = "rr", default, skip_serializing_if = "Vec::is_empty")]
+    pub realm_roles: Vec<String>,
+    #[serde(rename = "cl", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub claims: BTreeMap<String, Value>,
+}
+
+impl Delegation {
+    fn outlives_its_user(&self) -> bool {
+        matches!(self.method, DelegatedMethod::Jwt {}) && self.expires_at.is_none()
+    }
 }
 
 impl Claims {
@@ -134,14 +186,17 @@ impl Claims {
 }
 
 pub fn mint(keys: &ServiceIdentityKeys, claims: &Claims) -> serde_json::Result<String> {
+    serde_json::to_vec(claims).map(|payload| sign(keys, &payload))
+}
+
+fn sign(keys: &ServiceIdentityKeys, payload: &[u8]) -> String {
     let (kid, key) = &keys.active;
-    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
-    let signed = format!("{VERSION}.{kid}.{payload}");
+    let signed = format!("{VERSION}.{kid}.{}", URL_SAFE_NO_PAD.encode(payload));
     let signature = URL_SAFE_NO_PAD.encode(hmac::sign(
         &ServiceIdentityKeys::hmac_key(key),
         signed.as_bytes(),
     ));
-    Ok(format!("{signed}.{signature}"))
+    format!("{signed}.{signature}")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,6 +313,17 @@ pub fn verify(
         ),
         (claims.path != expected.path, IdentityError::Path),
         (claims.depth > MAX_CALL_DEPTH, IdentityError::Depth),
+        (
+            claims.acting_for.is_some() && claims.depth == 0,
+            IdentityError::Format,
+        ),
+        (
+            claims
+                .acting_for
+                .as_ref()
+                .is_some_and(Delegation::outlives_its_user),
+            IdentityError::Format,
+        ),
     ]
     .into_iter()
     .find_map(|(failed, error)| failed.then_some(error))
@@ -284,6 +350,30 @@ mod tests {
             jti: Uuid::from_u128(4),
             depth: 1,
             on_behalf_of: Some("user-1".into()),
+            acting_for: None,
+        }
+    }
+
+    fn delegated() -> Claims {
+        Claims {
+            acting_for: Some(Delegation {
+                subject: "clara".into(),
+                method: DelegatedMethod::Jwt {},
+                name: Some("Clara Clerk".into()),
+                email: Some("clara@example.com".into()),
+                service_account: false,
+                realm: Some("acme".into()),
+                expires_at: Some(NOW + 300),
+                token: Some(DelegatedToken {
+                    preferred_username: Some("clara".into()),
+                    realm_roles: vec!["loans-officer".into()],
+                    claims: BTreeMap::from([
+                        ("azp".to_string(), Value::from("portal")),
+                        ("exp".to_string(), Value::from(NOW + 300)),
+                    ]),
+                }),
+            }),
+            ..claims()
         }
     }
 
@@ -558,6 +648,261 @@ mod tests {
                 format!("CUFFLINK_SERVICE_IDENTITY_KEYS: {refused}")
             );
         }
+    }
+
+    #[test]
+    fn a_delegated_token_is_signed_and_verifies_for_its_exact_call() {
+        let keys = keys(K1);
+        let token = mint(&keys, &delegated()).expect("mint");
+        assert_eq!(verify(&keys, &token, &expected(), NOW), Ok(delegated()));
+        assert_eq!(
+            verify(
+                &keys,
+                &token,
+                &Expected {
+                    path: "/_fn/other",
+                    ..expected()
+                },
+                NOW
+            ),
+            Err(IdentityError::Path)
+        );
+        let payload = |token: &str| {
+            token
+                .split('.')
+                .nth(2)
+                .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+                .and_then(|json| serde_json::from_slice::<Value>(&json).ok())
+                .expect("payload")
+        };
+        assert_eq!(
+            payload(&token)["act"],
+            serde_json::json!({
+                "sub": "clara",
+                "am": {"k": "jwt"},
+                "nm": "Clara Clerk",
+                "em": "clara@example.com",
+                "rlm": "acme",
+                "uexp": NOW + 300,
+                "tok": {"pu": "clara", "rr": ["loans-officer"], "cl": {"azp": "portal", "exp": NOW + 300}},
+            })
+        );
+        assert!(payload(&mint(&keys, &claims()).expect("mint"))
+            .get("act")
+            .is_none());
+    }
+
+    #[test]
+    fn a_delegated_api_key_keeps_the_user_it_was_minted_for() {
+        let keys = keys(K1);
+        let key = Claims {
+            acting_for: delegated().acting_for.map(|delegation| Delegation {
+                method: DelegatedMethod::ApiKey {
+                    id: Uuid::from_u128(9),
+                    user_sub: Some("clara".into()),
+                },
+                token: None,
+                expires_at: None,
+                ..delegation
+            }),
+            ..claims()
+        };
+        let token = mint(&keys, &key).expect("mint");
+        assert_eq!(verify(&keys, &token, &expected(), NOW), Ok(key));
+    }
+
+    #[test]
+    fn a_jwt_delegation_without_its_users_expiry_is_malformed() {
+        let keys = keys(K1);
+        let unbounded = |method: DelegatedMethod| {
+            let claims = Claims {
+                acting_for: delegated().acting_for.map(|delegation| Delegation {
+                    method,
+                    expires_at: None,
+                    ..delegation
+                }),
+                ..claims()
+            };
+            verify(
+                &keys,
+                &mint(&keys, &claims).expect("mint"),
+                &expected(),
+                NOW,
+            )
+        };
+        assert_eq!(
+            unbounded(DelegatedMethod::Jwt {}),
+            Err(IdentityError::Format)
+        );
+        assert!(
+            unbounded(DelegatedMethod::ApiKey {
+                id: Uuid::from_u128(9),
+                user_sub: None,
+            })
+            .is_ok(),
+            "an API key has no expiry of its own"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_in_a_delegation_is_refused_rather_than_ignored() {
+        let with = |keys: &ServiceIdentityKeys, claims: Claims, pointer: &str| {
+            let mut payload = serde_json::to_value(claims).expect("json");
+            payload
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("an object")
+                .insert("narrows".into(), Value::from("only-reads"));
+            verify(
+                keys,
+                &sign(keys, payload.to_string().as_bytes()),
+                &expected(),
+                NOW,
+            )
+        };
+        let keys = keys(K1);
+        for pointer in ["/act", "/act/am", "/act/tok"] {
+            assert_eq!(
+                with(&keys, delegated(), pointer),
+                Err(IdentityError::Format),
+                "{pointer}"
+            );
+        }
+        let key = Claims {
+            acting_for: delegated().acting_for.map(|delegation| Delegation {
+                method: DelegatedMethod::ApiKey {
+                    id: Uuid::from_u128(9),
+                    user_sub: Some("clara".into()),
+                },
+                ..delegation
+            }),
+            ..claims()
+        };
+        assert_eq!(
+            with(&keys, key, "/act/am"),
+            Err(IdentityError::Format),
+            "an API key's method too"
+        );
+        assert_eq!(
+            with(&keys, delegated(), ""),
+            Ok(delegated()),
+            "the identity's own claims still admit fields a later release adds"
+        );
+    }
+
+    #[test]
+    fn a_delegation_at_depth_zero_is_malformed() {
+        let keys = keys(K1);
+        let at_zero = |claims: Claims| {
+            let token = mint(&keys, &Claims { depth: 0, ..claims }).expect("mint");
+            verify(&keys, &token, &expected(), NOW)
+        };
+        assert_eq!(at_zero(delegated()), Err(IdentityError::Format));
+        assert!(
+            at_zero(claims()).is_ok(),
+            "a service-only identity at depth 0"
+        );
+    }
+
+    #[test]
+    fn a_delegation_swapped_under_the_signature_is_refused() {
+        let keys = keys(K1);
+        let token = mint(&keys, &delegated()).expect("mint");
+        let (signed, signature) = token.rsplit_once('.').expect("signature");
+        let (prefix, _) = signed.rsplit_once('.').expect("payload");
+        let resigned = |claims: &Claims| {
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("json"));
+            format!("{prefix}.{payload}.{signature}")
+        };
+        let swapped = Claims {
+            acting_for: delegated().acting_for.map(|delegation| Delegation {
+                subject: "dana".into(),
+                ..delegation
+            }),
+            ..delegated()
+        };
+        let extended = Claims {
+            acting_for: delegated().acting_for.map(|delegation| Delegation {
+                expires_at: Some(NOW + 86_400),
+                ..delegation
+            }),
+            ..delegated()
+        };
+        for forged in [&swapped, &extended, &claims()] {
+            assert_eq!(
+                verify(&keys, &resigned(forged), &expected(), NOW),
+                Err(IdentityError::Signature)
+            );
+        }
+        let service_only = mint(&keys, &claims()).expect("mint");
+        let (signed, signature) = service_only.rsplit_once('.').expect("signature");
+        let (prefix, _) = signed.rsplit_once('.').expect("payload");
+        let grafted = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&delegated()).expect("json"));
+        assert_eq!(
+            verify(
+                &keys,
+                &format!("{prefix}.{grafted}.{signature}"),
+                &expected(),
+                NOW
+            ),
+            Err(IdentityError::Signature),
+            "a delegation grafted onto a service-only token's signature"
+        );
+    }
+
+    #[test]
+    fn a_verifier_without_the_act_field_reads_a_delegated_token_as_service_only() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct ReleasedClaims {
+            #[serde(rename = "tid")]
+            tenant_id: Uuid,
+            #[serde(rename = "cs")]
+            caller_service: String,
+            #[serde(rename = "csid")]
+            caller_service_id: Uuid,
+            #[serde(rename = "cv")]
+            caller_version: i32,
+            #[serde(rename = "ts")]
+            target_service: String,
+            #[serde(rename = "m")]
+            method: String,
+            #[serde(rename = "p")]
+            path: String,
+            #[serde(rename = "iat")]
+            issued_at: i64,
+            #[serde(rename = "exp")]
+            expires_at: i64,
+            jti: Uuid,
+            #[serde(rename = "d")]
+            depth: u8,
+            #[serde(rename = "obo")]
+            on_behalf_of: Option<String>,
+        }
+        let token = mint(&keys(K1), &delegated()).expect("mint");
+        let read: ReleasedClaims = token
+            .split('.')
+            .nth(2)
+            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+            .and_then(|json| serde_json::from_slice(&json).ok())
+            .expect("an older verifier reads the claims it knows");
+        let claims = claims();
+        assert_eq!(
+            read,
+            ReleasedClaims {
+                tenant_id: claims.tenant_id,
+                caller_service: claims.caller_service,
+                caller_service_id: claims.caller_service_id,
+                caller_version: claims.caller_version,
+                target_service: claims.target_service,
+                method: claims.method,
+                path: claims.path,
+                issued_at: claims.issued_at,
+                expires_at: claims.expires_at,
+                jti: claims.jti,
+                depth: claims.depth,
+                on_behalf_of: claims.on_behalf_of,
+            }
+        );
     }
 
     #[test]

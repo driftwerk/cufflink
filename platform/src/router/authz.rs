@@ -1,5 +1,6 @@
 use crate::auth::binding::bind_principal;
 use crate::auth::columns::{self, ColumnView};
+use crate::auth::delegation::Arrival;
 use crate::auth::grants::{self, has_permission};
 use crate::auth::permissions::{resolve_permissions_cached, ResolvedPermissions};
 use crate::auth::scope::{self, EffectiveScope, RequestedScope, RowPredicate};
@@ -8,7 +9,7 @@ use crate::deployer::manifest::{ColumnDefinition, ServiceManifest, TableDefiniti
 use crate::errors::{PlatformError, PlatformResult};
 use crate::registry::RegisteredService;
 use crate::router::bind::{self, SqlValue};
-use crate::router::postures::{continued_call, ServiceCaller, Target};
+use crate::router::postures::{continued_call, delegated_user, ServiceCaller, Target};
 use crate::router::query::SqlParams;
 use crate::router::strict::split_svc_path;
 use crate::tenant_catalog::TenantEntry;
@@ -26,6 +27,7 @@ use uuid::Uuid;
 pub(crate) struct DataTarget {
     method: Method,
     path: String,
+    arrival: Arrival,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for DataTarget {
@@ -38,6 +40,7 @@ impl<S: Send + Sync> FromRequestParts<S> for DataTarget {
             path: split_svc_path(path)
                 .map_or(path, |(_, _, rest)| rest)
                 .to_string(),
+            arrival: Arrival::of(&parts.extensions),
         })
     }
 }
@@ -86,8 +89,13 @@ pub(crate) async fn resolve_data_route(
             method: &target.method,
             path: &target.path,
         },
-    )?;
-    let principal = bind_principal(state, principal, &tenant, headers)?;
+        target.arrival,
+    )
+    .await?;
+    let principal = match delegated_user(call.as_ref(), &tenant) {
+        Some(delegated) => Some(delegated),
+        None => bind_principal(state, principal, &tenant, headers)?,
+    };
     Ok(DataRoute {
         service,
         tenant,

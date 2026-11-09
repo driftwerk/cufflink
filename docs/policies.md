@@ -194,7 +194,7 @@ is registered for the event.
 |---|---|
 | `v` | `2` |
 | `user_id` | the user an API key was minted for (`POST /api/auth/device/token`), where the legacy record names the tenant's owner as it always did; otherwise the same |
-| `actor` | `{"sub", "kind", "key_id", "azp"}`: who asked, as a `user`, a `service_account`, an `api_key`, a `partner_key`, a `service` (the service whose call the request continues) or `anonymous` |
+| `actor` | `{"sub", "kind", "key_id", "azp"}`: who asked, as a `user`, a `service_account`, an `api_key`, a `partner_key`, a `service` (the service whose call the request continues) or `anonymous`. A service call that carries a delegated user names the user, with `"via"`: the calling service ([service calls](service-calls.md#a-delegated-user)) |
 | `request_id` | the request's `x-request-id` |
 | `scope` | the widest scope the caller's rows were confined to, `null` on a table without scopes |
 | `redacted` | the columns whose values the record does not hold |

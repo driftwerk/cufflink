@@ -1451,6 +1451,16 @@ runs on this platform unchanged. The platform advertises `web_releases`.
   tenant-scoped runner's key check is the same call; its `WEB_POLL_SECS` is
   kept as an alias, read only when `WEB_RECONCILE_SECS` is unset. Runner
   setting only: no platform change, and runners upgrade in any order.
+- A service identity can carry a delegated end user, signed inside it
+  (`act`). The target admits that user as on a direct call (an `api_key`
+  route sets it aside), refuses one whose token has expired or that is used a second time
+  with 401 on every posture, and records the user as the audit actor with
+  the calling service as `actor.via` ([service calls](service-calls.md#a-delegated-user)).
+  Nothing mints one yet; identities without one are byte-for-byte as
+  before. New setting `SERVICE_IDENTITY_REPLAY_MAX`.
+- `docs/service-calls.md` no longer says every replayed identity is
+  refused: an identity is bound to one call and lives at most 60 s, and is
+  single-use only when it carries a delegated user.
 - A web app's replaced process is drained: on a swap it gets no new
   request, may finish the requests the runner forwarded to it within
   `WEB_DRAIN_GRACE_SECS` (default 30, at most 3600), and only then gets

@@ -3,6 +3,7 @@ mod internal;
 mod scoped;
 
 use crate::auth::binding::bind_principal;
+use crate::auth::delegation::Arrival;
 use crate::auth::partner_keys::PartnerPrincipal;
 use crate::auth::permissions::resolve_permissions_cached;
 use crate::auth::scope::EffectiveScope;
@@ -111,6 +112,13 @@ impl PostureGate {
         }
     }
 
+    fn presents(&self, call: Option<ServiceCaller>) -> Option<ServiceCaller> {
+        match self {
+            PostureGate::PartnerKey { .. } => call.map(ServiceCaller::without_delegation),
+            _ => call,
+        }
+    }
+
     fn tolerates_invalid_credential(&self) -> bool {
         matches!(self, PostureGate::Legacy | PostureGate::Public)
     }
@@ -166,30 +174,48 @@ pub(crate) struct Authorized {
     pub call: Option<ServiceCaller>,
 }
 
+pub(crate) struct Presented<'a> {
+    pub headers: &'a HeaderMap,
+    pub arrival: Arrival,
+}
+
 pub(crate) async fn authorize_route(
     state: &Arc<AppState>,
     service: &RegisteredService,
     tenant: &TenantEntry,
-    headers: &HeaderMap,
+    presented: Presented<'_>,
     posture: Option<&RoutePosture>,
     target: &Target<'_>,
 ) -> PlatformResult<Authorized> {
+    let Presented { headers, arrival } = presented;
     let now = chrono::Utc::now().timestamp();
-    let identity = internal::identity(state, service, headers, target, now);
+    let identity = internal::presented(state, service, headers, target, arrival, now).await?;
     match PostureGate::of(posture) {
         PostureGate::ServiceIdentity { callers } => {
             internal::admit(service, target, &callers, identity, now).map(|caller| Authorized {
-                principal: Principal::Service,
+                principal: delegated_user(Some(&caller), tenant)
+                    .map_or(Principal::Service, |user| {
+                        Principal::User(Some(Box::new(user)))
+                    }),
                 call: Some(caller),
             })
         }
         gate => {
-            let call = internal::continued(service, target, identity, now)?;
-            admit_principal(state, service, tenant, headers, gate)
+            let call = gate.presents(internal::continued(service, target, identity, now)?);
+            let delegated = delegated_user(call.as_ref(), tenant);
+            admit_principal(state, service, tenant, headers, delegated, gate)
                 .await
                 .map(|principal| Authorized { principal, call })
         }
     }
+}
+
+pub(crate) fn delegated_user(
+    call: Option<&ServiceCaller>,
+    tenant: &TenantEntry,
+) -> Option<AuthUser> {
+    call.and_then(|call| call.delegated.clone())
+        .map(|delegation| delegation.into_user(&tenant.tenant))
 }
 
 async fn admit_principal(
@@ -197,6 +223,7 @@ async fn admit_principal(
     service: &RegisteredService,
     tenant: &TenantEntry,
     headers: &HeaderMap,
+    delegated: Option<AuthUser>,
     gate: PostureGate,
 ) -> PlatformResult<Principal> {
     match gate {
@@ -213,34 +240,48 @@ async fn admit_principal(
         } => scoped::admit(
             state,
             service,
-            tenant,
-            headers,
+            present(state, tenant, headers, delegated).await,
             &area,
             &operation,
             owner_field.as_deref(),
         )
         .await
         .map(|(user, scope)| Principal::Scoped(Box::new(user), scope)),
-        gate => authorize_user(state, service, tenant, headers, gate)
-            .await
-            .map(|user| Principal::User(user.map(Box::new))),
+        gate => authorize_user(
+            state,
+            service,
+            present(state, tenant, headers, delegated).await,
+            gate,
+        )
+        .await
+        .map(|user| Principal::User(user.map(Box::new))),
+    }
+}
+
+async fn present(
+    state: &Arc<AppState>,
+    tenant: &TenantEntry,
+    headers: &HeaderMap,
+    delegated: Option<AuthUser>,
+) -> PlatformResult<Option<AuthUser>> {
+    match delegated {
+        Some(user) => Ok(Some(user)),
+        None => match authenticate(headers, state).await {
+            AuthOutcome::Absent => Ok(None),
+            AuthOutcome::Present(result) => {
+                result.and_then(|user| bind_principal(state, Some(*user), tenant, headers))
+            }
+        },
     }
 }
 
 async fn authorize_user(
     state: &Arc<AppState>,
     service: &RegisteredService,
-    tenant: &TenantEntry,
-    headers: &HeaderMap,
+    presented: PlatformResult<Option<AuthUser>>,
     gate: PostureGate,
 ) -> PlatformResult<Option<AuthUser>> {
-    let bound = match authenticate(headers, state).await {
-        AuthOutcome::Absent => Ok(None),
-        AuthOutcome::Present(result) => {
-            result.and_then(|user| bind_principal(state, Some(*user), tenant, headers))
-        }
-    };
-    let principal = gate.admit(bound)?;
+    let principal = gate.admit(presented)?;
 
     if matches!(gate, PostureGate::Legacy) {
         metrics::counter!(
@@ -271,6 +312,52 @@ async fn authorize_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_api_key_route_sets_the_delegated_user_aside_and_says_so() {
+        let acme = crate::tenant_catalog::tests::tenant("acme", Some("acme"));
+        let delegated = ServiceCaller {
+            service: "catalog-service".into(),
+            on_behalf_of: Some("clara".into()),
+            depth: 1,
+            remaining: std::time::Duration::from_secs(5),
+            delegated: crate::auth::service_identity::Delegation::of(
+                &crate::auth::delegation::tests::user(&acme),
+            ),
+        };
+        let presented = |gate: PostureGate| {
+            gate.presents(Some(delegated.clone())).map(|call| {
+                (
+                    call.to_json().get("delegated").cloned(),
+                    call.calling().delegated,
+                )
+            })
+        };
+        assert_eq!(
+            presented(PostureGate::PartnerKey {
+                scope: "loans:ingest".into()
+            }),
+            Some((None, false)),
+            "the guest and the audit see no delegated user"
+        );
+        for gate in [
+            PostureGate::Legacy,
+            PostureGate::Public,
+            PostureGate::RequirePrincipal,
+            PostureGate::RequirePermission {
+                area: "loans".into(),
+                operation: "approve".into(),
+            },
+            PostureGate::Scoped {
+                area: "loans".into(),
+                operation: "view".into(),
+                owner_field: None,
+            },
+        ] {
+            assert_eq!(presented(gate), Some((Some(Value::Bool(true)), true)));
+        }
+        assert!(PostureGate::Public.presents(None).is_none());
+    }
 
     #[test]
     fn gate_maps_each_posture() {

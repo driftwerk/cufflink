@@ -4,29 +4,22 @@ use crate::auth::AuthUser;
 use crate::deployer::manifest::{ColumnDefinition, ServiceManifest};
 use crate::errors::{PlatformError, PlatformResult};
 use crate::registry::RegisteredService;
-use crate::tenant_catalog::TenantEntry;
 use crate::AppState;
-use axum::http::HeaderMap;
 use std::sync::Arc;
 
 pub(crate) async fn admit(
     state: &Arc<AppState>,
     service: &RegisteredService,
-    tenant: &TenantEntry,
-    headers: &HeaderMap,
+    presented: PlatformResult<Option<AuthUser>>,
     area: &str,
     operation: &str,
     owner_field: Option<&str>,
 ) -> PlatformResult<(AuthUser, EffectiveScope)> {
-    let user = authorize_user(
-        state,
-        service,
-        tenant,
-        headers,
-        PostureGate::RequirePrincipal,
-    )
-    .await?
-    .ok_or_else(|| PlatformError::Unauthorized("Authentication required for this route".into()))?;
+    let user = authorize_user(state, service, presented, PostureGate::RequirePrincipal)
+        .await?
+        .ok_or_else(|| {
+            PlatformError::Unauthorized("Authentication required for this route".into())
+        })?;
     let target = scope::Target {
         area,
         owner_column: owner_field,

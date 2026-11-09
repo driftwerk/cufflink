@@ -921,7 +921,7 @@ pub(crate) fn outlet_of<'a>(
         tenant,
         service,
         Target {
-            calling: asked.call.map(|call| call.service.as_str()),
+            calling: asked.call.map(ServiceCaller::calling),
             request_id: crate::middleware::request_id::request_id(asked.headers),
             redact: &table.audit_redact,
             ..Target::of(
@@ -2630,6 +2630,7 @@ mod wrap_hook_request_tests {
             on_behalf_of: None,
             depth: 3,
             remaining: std::time::Duration::from_secs(9),
+            delegated: None,
         };
         let wrapped = hook_json(
             json!({"hook": "before_create"}),

@@ -87,6 +87,7 @@ fn call(
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(peer)| *peer),
+        arrival: crate::auth::delegation::Arrival::of(&parts.extensions),
         uri: parts.uri,
         query,
         headers: parts.headers,
