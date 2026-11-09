@@ -18,6 +18,7 @@ mod artifact;
 mod child_env;
 mod coalescer;
 mod config;
+mod converge;
 mod event;
 mod host;
 mod process_manager;
@@ -27,6 +28,7 @@ mod warmer;
 
 use apps::Apps;
 use config::{Scope, WebRunnerConfig};
+use converge::Converger;
 use process_manager::ProcessManager;
 use source::{Shared, Source, TenantScoped};
 use warmer::LazyWarmer;
@@ -88,6 +90,23 @@ async fn main() -> eyre::Result<()> {
     ));
 
     let warmer = Arc::new(LazyWarmer::new(apps.clone()));
+    let converger = Arc::new(Converger::new(apps.clone(), warmer.clone()));
+    if config.reconcile.poll_ignored {
+        warn!(
+            every = config.reconcile.every.as_secs(),
+            "WEB_POLL_SECS is ignored: WEB_RECONCILE_SECS is set"
+        );
+    }
+    shutdown.spawn(
+        "web_converge",
+        converger.clone().converging(shutdown.token()),
+    );
+    shutdown.spawn(
+        "web_reconcile",
+        converger
+            .clone()
+            .reconciling(config.reconcile.every, shutdown.token()),
+    );
 
     let (deploys, undeploys) = source.subjects();
     let nats_sub = nats.subscribe(deploys.clone()).await?;
@@ -97,7 +116,7 @@ async fn main() -> eyre::Result<()> {
         handle_deploy_events(
             nats_sub,
             deploys,
-            apps.clone(),
+            converger,
             shutdown.token(),
             listening.clone(),
         ),
@@ -107,12 +126,6 @@ async fn main() -> eyre::Result<()> {
         "undeploy_events",
         handle_undeploy_events(nats_unsub, undeploys, apps.clone(), shutdown.token()),
     );
-    if let Source::TenantScoped(_) = source.as_ref() {
-        shutdown.spawn(
-            "runner_key",
-            apps::watch_key(apps.clone(), shutdown.token()),
-        );
-    }
 
     let proxy_state = Arc::new(proxy::ProxyState::new(
         process_manager.clone(),
@@ -234,18 +247,14 @@ async fn source(
             tenant,
             platform_url,
             runner_key,
-            poll_every,
         } => {
             info!(tenant = %tenant.slug, platform = %platform_url, "Reading the tenant's apps from the runner API");
-            Ok(Source::TenantScoped(TenantScoped::new(
-                RunnerApi::new(
-                    platform_url,
-                    runner_key.clone(),
-                    tenant.clone(),
-                    config.artifact_caps.download(),
-                )?,
-                *poll_every,
-            )))
+            Ok(Source::TenantScoped(TenantScoped::new(RunnerApi::new(
+                platform_url,
+                runner_key.clone(),
+                tenant.clone(),
+                config.artifact_caps.download(),
+            )?)))
         }
     }
 }
@@ -261,7 +270,7 @@ impl Drop for Listening {
 async fn handle_deploy_events(
     mut sub: async_nats::Subscriber,
     subject: String,
-    apps: Arc<Apps>,
+    converger: Arc<Converger>,
     token: CancellationToken,
     listening: Arc<AtomicBool>,
 ) {
@@ -279,8 +288,8 @@ async fn handle_deploy_events(
                 continue;
             }
         };
-        match apps.source.announced(&payload).await {
-            Ok(deployment) => apps.deploy(&deployment).await,
+        match converger.announce(&payload) {
+            Ok((tenant, service)) => info!(tenant, service, "Received deploy event"),
             Err(reason) => warn!(subject = %msg.subject, reason, "Refusing a deploy event"),
         }
     }

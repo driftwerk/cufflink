@@ -1,8 +1,7 @@
 use crate::artifact::ArtifactStore;
 use crate::process_manager::{DeployOutcome, Halt, ProcessManager, Release, Replaced};
-use crate::source::{Source, Standing, WebDeployment};
+use crate::source::{Source, WebDeployment};
 use cufflink_shutdown::Shutdown;
-use cufflink_supervisor::runner_api::key_refused;
 use cufflink_supervisor::{locked, ChildStop, Stop};
 use cufflink_types::runner::is_sha256;
 use eyre::WrapErr;
@@ -11,8 +10,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::time::MissedTickBehavior;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -202,15 +199,24 @@ impl Apps {
         ran
     }
 
-    pub async fn deploy(self: &Arc<Self>, deployment: &WebDeployment) {
+    pub fn outdated<'a>(&self, deployment: &'a WebDeployment) -> Option<&'a str> {
+        let sha256 = Self::recorded_hash(deployment).ok().flatten()?;
+        let release = self
+            .process_manager
+            .release(&deployment.tenant, &deployment.service)?;
+        (release.dir != self.content_dir(deployment, sha256)).then_some(sha256)
+    }
+
+    pub async fn deploy(self: &Arc<Self>, deployment: &WebDeployment) -> Option<Ran> {
         let (tenant, service, version) = (
             deployment.tenant.as_str(),
             deployment.service.as_str(),
             deployment.version,
         );
-        info!(tenant, service, version, "Received deploy event");
+        info!(tenant, service, version, "Deploying");
         self.process_manager.forget_exits(tenant, service);
-        match self.run(deployment).await {
+        let ran = self.run(deployment).await;
+        match &ran {
             Ok(Ran::AlreadyRunning) => {
                 info!(tenant, service, version, "The app already runs this bundle")
             }
@@ -222,6 +228,7 @@ impl Apps {
                 error!(tenant, service, version, error = %format!("{e:#}"), "Deploy failed; the running one is unchanged")
             }
         }
+        ran.ok()
     }
 
     fn drain(self: &Arc<Self>, deployment: &WebDeployment, replaced: Replaced) {
@@ -381,38 +388,8 @@ async fn remove_dir(dir: &Path) {
     }
 }
 
-pub async fn watch_key(apps: Arc<Apps>, stop: CancellationToken) {
-    let Source::TenantScoped(scoped) = apps.source.as_ref() else {
-        return;
-    };
-    let mut ticks = tokio::time::interval(scoped.poll_every);
-    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            () = stop.cancelled() => return,
-            _ = ticks.tick() => {}
-        }
-        match scoped.api.web().await {
-            Ok(_) => {
-                if scoped.stand(Standing::Accepted) {
-                    info!(tenant = %scoped.tenant(), "The platform accepts the runner key");
-                }
-            }
-            Err(e) if key_refused(&e) => {
-                if scoped.stand(Standing::Refused) {
-                    error!(tenant = %scoped.tenant(), error = %e, "The runner key is not this runner's; stopping every app of the tenant until a key the platform accepts is in place");
-                }
-                apps.retire_tenant(scoped.tenant()).await;
-            }
-            Err(e) => {
-                warn!(tenant = %scoped.tenant(), error = %format!("{e:#}"), "Cannot reach the runner API; the apps keep running as they are");
-            }
-        }
-    }
-}
-
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::artifact::tests::tarball;
     use crate::artifact::ArchiveCaps;
@@ -427,20 +404,26 @@ mod tests {
 
     const SERVICE_ID: Uuid = Uuid::from_u128(7);
 
+    pub(crate) fn next_bundle(marker: &str, next: &str) -> Vec<u8> {
+        tarball(&[
+            (".next/BUILD_ID", marker),
+            ("node_modules/next/package.json", "{}"),
+            ("node_modules/next/dist/bin/next", next),
+        ])
+    }
+
     fn server(marker: &str, prelude: &str) -> Vec<u8> {
-        let next = format!(
-            r#"{prelude}const [, , , , port, , host] = process.argv;
+        next_bundle(
+            marker,
+            &format!(
+                r#"{prelude}const [, , , , port, , host] = process.argv;
 require("http").createServer((req, res) => {{
   const wait = Number(new URL(req.url, "http://app").searchParams.get("wait") ?? 0);
   setTimeout(() => res.end("{marker}"), wait);
 }}).listen(Number(port), host);
 "#
-        );
-        tarball(&[
-            (".next/BUILD_ID", marker),
-            ("node_modules/next/package.json", "{}"),
-            ("node_modules/next/dist/bin/next", &next),
-        ])
+            ),
+        )
     }
 
     fn bundle(marker: &str) -> Vec<u8> {
