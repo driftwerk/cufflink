@@ -3,7 +3,7 @@ use super::publish::max_payload;
 use super::route::{audit_subject, legacy_audit_subject, webhook_subject};
 use super::seal::{OutboxSeal, NO_KEY};
 use super::writer::{OutboxKind, OutboxRow, OutboxWriter};
-use crate::audit::{self, Actor, AuditRecord, Read};
+use crate::audit::{self, Actor, AuditRecord, Calling, Read};
 use crate::auth::scope::EffectiveScope;
 use crate::auth::AuthUser;
 use crate::db_roles::enqueue;
@@ -59,7 +59,7 @@ pub struct Target<'a> {
     pub service: &'a str,
     pub table: &'a str,
     pub caller: &'a Option<AuthUser>,
-    pub calling: Option<&'a str>,
+    pub calling: Option<Calling<'a>>,
     pub request_id: Option<&'a str>,
     pub redact: &'a [String],
 }
@@ -114,8 +114,10 @@ impl<'a> Target<'a> {
     }
 
     fn actor(&self) -> Actor {
-        self.calling
-            .map_or_else(|| Actor::of(self.caller), Actor::service)
+        self.calling.map_or_else(
+            || Actor::of(self.caller),
+            |calling| Actor::called(calling, self.caller),
+        )
     }
 
     fn record(&self, action: &str, at: DateTime<Utc>) -> AuditRecord {
@@ -711,7 +713,10 @@ mod tests {
     fn what_a_table_redacts_is_in_no_record_and_in_the_event() {
         let (nobody, redact) = (None, vec!["dob".to_string()]);
         let target = Target {
-            calling: Some("books"),
+            calling: Some(Calling {
+                service: "books",
+                delegated: false,
+            }),
             request_id: Some("req-7"),
             redact: &redact,
             ..Target::of("harbor", Uuid::nil(), "loans", "loans", &nobody)
@@ -735,6 +740,30 @@ mod tests {
         assert_eq!(
             durable["actor"],
             json!({"sub": "books", "kind": "service", "key_id": null, "azp": null})
+        );
+    }
+
+    #[test]
+    fn a_delegated_write_is_recorded_as_the_user_via_the_calling_service() {
+        let tenant = crate::tenant_catalog::tests::tenant("harbor", Some("harbor"));
+        let clara = Some(crate::auth::binding::tests::jwt_user(
+            &tenant,
+            "harbor",
+            "portal",
+            &[],
+        ));
+        let target = Target {
+            calling: Some(Calling {
+                service: "catalog-service",
+                delegated: true,
+            }),
+            ..Target::of("harbor", Uuid::nil(), "loans", "loans", &clara)
+        };
+        let durable = json_of(&emission_of(&target, None).durable);
+        assert_eq!(durable["user_id"], "user-1");
+        assert_eq!(
+            durable["actor"],
+            json!({"sub": "user-1", "kind": "user", "key_id": null, "azp": "portal", "via": "catalog-service"})
         );
     }
 

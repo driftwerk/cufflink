@@ -63,6 +63,7 @@ pub struct AppState {
     pub sse_limiter: router::sse::SseLimiter,
     pub egress: egress::EgressGuard,
     pub service_identity: std::sync::Arc<auth::service_identity::ServiceIdentityKeys>,
+    pub seen_identities: auth::delegation::SeenIdentities,
     pub svc_service: wasm_runtime::host::LocalDispatch,
     pub partner_keys: auth::partner_keys::PartnerKeyCache,
     pub adopted: schema_manager::adopt::AdoptedSchemas,
@@ -132,6 +133,9 @@ impl AppState {
             webhooks: webhooks::Webhooks::new(&config.webhook_delivery),
             sse_limiter: router::sse::SseLimiter::new(config.sse_max_streams_per_principal),
             sql_parser: std::sync::Arc::new(sql_parser::SqlParser::new(config.sql_parse.clone())),
+            seen_identities: auth::delegation::SeenIdentities::new(
+                config.service_identity_replay_max,
+            ),
             secrets,
             egress: egress::EgressGuard::new(
                 config.egress_max_response_bytes,

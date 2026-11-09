@@ -62,6 +62,7 @@ fn token_for(tenant_id: uuid::Uuid, path: &str, depth: u8, lifetime: i64) -> Str
             jti: uuid::Uuid::new_v4(),
             depth,
             on_behalf_of: None,
+            acting_for: None,
         },
     )
     .expect("token")

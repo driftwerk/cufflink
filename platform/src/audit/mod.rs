@@ -106,6 +106,13 @@ pub struct Actor {
     pub kind: ActorKind,
     pub key_id: Option<Uuid>,
     pub azp: Option<String>,
+    pub via: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Calling<'a> {
+    pub service: &'a str,
+    pub delegated: bool,
 }
 
 impl Actor {
@@ -115,6 +122,7 @@ impl Actor {
             kind: ActorKind::Anonymous,
             key_id: None,
             azp: None,
+            via: None,
         }
     }
 
@@ -124,6 +132,7 @@ impl Actor {
             kind: ActorKind::Service,
             key_id: None,
             azp: None,
+            via: None,
         }
     }
 
@@ -133,6 +142,17 @@ impl Actor {
             kind: ActorKind::PartnerKey,
             key_id: Some(key_id),
             azp: None,
+            via: None,
+        }
+    }
+
+    pub fn called(calling: Calling<'_>, caller: &Option<AuthUser>) -> Self {
+        match (calling.delegated, caller) {
+            (true, Some(_)) => Self {
+                via: Some(calling.service.to_string()),
+                ..Self::of(caller)
+            },
+            _ => Self::service(calling.service),
         }
     }
 
@@ -146,6 +166,7 @@ impl Actor {
                 kind: ActorKind::ApiKey,
                 key_id: Some(*id),
                 azp: None,
+                via: None,
             },
             AuthMethod::Jwt => Self {
                 sub: user.subject.clone(),
@@ -160,17 +181,25 @@ impl Actor {
                     .as_ref()
                     .and_then(|token| token.claims.get("azp")?.as_str())
                     .map(str::to_string),
+                via: None,
             },
         }
     }
 
     fn to_json(&self) -> Value {
-        json!({
+        let actor = json!({
             "sub": self.sub,
             "kind": self.kind.as_str(),
             "key_id": self.key_id,
             "azp": self.azp,
-        })
+        });
+        match (&self.via, actor) {
+            (Some(via), Value::Object(mut fields)) => {
+                fields.insert("via".to_string(), json!(via));
+                Value::Object(fields)
+            }
+            (_, actor) => actor,
+        }
     }
 }
 
@@ -658,6 +687,7 @@ pub(crate) mod tests {
                 kind: ActorKind::User,
                 key_id: None,
                 azp: Some("portal".into()),
+                via: None,
             },
             request_id: Some("req-1".into()),
             redacted: Vec::new(),
@@ -845,6 +875,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_delegated_call_names_the_user_via_the_calling_service() {
+        let t = tenant("default", Some("orchard"));
+        let user = Some(jwt_user(&t, "orchard", "portal", &[]));
+        let via = |delegated| Calling {
+            service: "catalog-service",
+            delegated,
+        };
+        let delegated = Actor::called(via(true), &user);
+        assert_eq!(
+            delegated,
+            Actor {
+                via: Some("catalog-service".into()),
+                ..Actor::of(&user)
+            }
+        );
+        assert_eq!(
+            delegated.to_json(),
+            json!({"sub": "user-1", "kind": "user", "key_id": null, "azp": "portal", "via": "catalog-service"})
+        );
+        assert_eq!(
+            Actor::called(via(false), &user),
+            Actor::service("catalog-service")
+        );
+        assert_eq!(
+            Actor::called(via(true), &None),
+            Actor::service("catalog-service"),
+            "a route that set the delegation aside records the service"
+        );
+        assert!(Actor::service("catalog-service")
+            .to_json()
+            .get("via")
+            .is_none());
+    }
+
+    #[test]
     fn a_caller_is_who_its_credential_says() {
         let t = tenant("default", Some("orchard"));
         let user = jwt_user(&t, "orchard", "portal", &[]);
@@ -867,6 +932,7 @@ pub(crate) mod tests {
             kind,
             key_id: key_id.map(Uuid::from_u128),
             azp: azp.map(str::to_string),
+            via: None,
         };
         let azp = user
             .token_info

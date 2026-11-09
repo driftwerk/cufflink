@@ -35,3 +35,11 @@ cufflink_fn::handler!(whoami, |req: Request| {
 cufflink_fn::handler!(spin, |_req: Request| loop {
     std::hint::spin_loop();
 });
+
+cufflink_fn::handler!(principal, |req: Request| {
+    Response::json(&json!({
+        "sub": req.auth().map(|auth| auth.sub.as_str()),
+        "permissions": req.auth().map(|auth| auth.permissions.as_slice()),
+        "service": req.caller().map(|caller| caller.service.as_str()),
+    }))
+});

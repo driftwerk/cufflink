@@ -1,5 +1,6 @@
 use super::{block_on_within, clamp_to_budget, read_guest_bytes, wrap, HostIoError, HostState};
 use crate::app::routes::SvcService;
+use crate::auth::delegation::MintedHere;
 use crate::auth::service_identity::{self, Claims, MAX_CALL_DEPTH};
 use crate::egress::{EgressError, EgressGuard, EgressTarget, OutboundRequest};
 use crate::policy::{Denied, PolicyKey};
@@ -265,6 +266,7 @@ fn claims(
         jti: Uuid::new_v4(),
         depth: next_depth(caller.depth)?,
         on_behalf_of: caller.on_behalf_of.clone(),
+        acting_for: None,
     })
 }
 
@@ -370,6 +372,7 @@ async fn send_local(
     request
         .extensions_mut()
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    request.extensions_mut().insert(MintedHere);
     let span = request_span(request.method(), request.uri().path(), request.headers());
     let (response, _) = resolving(service.oneshot(request))
         .instrument(span.clone())

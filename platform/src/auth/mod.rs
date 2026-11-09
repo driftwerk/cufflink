@@ -1,6 +1,7 @@
 pub mod audience;
 pub mod binding;
 pub(crate) mod columns;
+pub mod delegation;
 pub mod extractor;
 pub(crate) mod grants;
 pub mod issuer;

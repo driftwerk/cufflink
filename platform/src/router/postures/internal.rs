@@ -1,6 +1,9 @@
 use super::Target;
-use crate::auth::service_identity::{self, Claims, Expected, IdentityError};
+use crate::audit::Calling;
+use crate::auth::delegation::{self, Arrival, DelegationError, SeenIdentities};
+use crate::auth::service_identity::{self, Claims, Delegation, Expected, IdentityError};
 use crate::errors::{PlatformError, PlatformResult};
+use crate::redis_conn::RedisHandle;
 use crate::registry::RegisteredService;
 use crate::AppState;
 use axum::http::HeaderMap;
@@ -14,6 +17,7 @@ pub(crate) struct ServiceCaller {
     pub on_behalf_of: Option<String>,
     pub depth: u8,
     pub remaining: Duration,
+    pub delegated: Option<Delegation>,
 }
 
 impl ServiceCaller {
@@ -24,19 +28,41 @@ impl ServiceCaller {
             on_behalf_of: claims.on_behalf_of,
             depth: claims.depth,
             remaining,
+            delegated: claims.acting_for,
+        }
+    }
+
+    pub(crate) fn without_delegation(self) -> Self {
+        Self {
+            delegated: None,
+            ..self
         }
     }
 
     pub(crate) fn to_json(&self) -> Value {
-        json!({
+        let caller = json!({
             "service": self.service,
             "on_behalf_of": self.on_behalf_of,
             "depth": self.depth,
-        })
+        });
+        match (self.delegated.is_some(), caller) {
+            (true, Value::Object(mut fields)) => {
+                fields.insert("delegated".into(), Value::Bool(true));
+                Value::Object(fields)
+            }
+            (_, caller) => caller,
+        }
+    }
+
+    pub(crate) fn calling(&self) -> Calling<'_> {
+        Calling {
+            service: &self.service,
+            delegated: self.delegated.is_some(),
+        }
     }
 }
 
-pub(crate) fn identity(
+fn identity(
     state: &AppState,
     service: &RegisteredService,
     headers: &HeaderMap,
@@ -85,25 +111,61 @@ pub(crate) fn continued(
     }
 }
 
-pub(crate) fn continued_call(
+pub(crate) async fn presented(
     state: &AppState,
     service: &RegisteredService,
     headers: &HeaderMap,
     target: &Target<'_>,
-) -> PlatformResult<Option<ServiceCaller>> {
-    let now = chrono::Utc::now().timestamp();
-    continued(
+    arrival: Arrival,
+    now: i64,
+) -> PlatformResult<Option<Result<Claims, IdentityError>>> {
+    delegated(
+        &state.seen_identities,
+        &state.redis,
         service,
         target,
         identity(state, service, headers, target, now),
+        arrival,
         now,
     )
+    .await
+}
+
+async fn delegated(
+    seen: &SeenIdentities,
+    redis: &RedisHandle,
+    service: &RegisteredService,
+    target: &Target<'_>,
+    identity: Option<Result<Claims, IdentityError>>,
+    arrival: Arrival,
+    now: i64,
+) -> PlatformResult<Option<Result<Claims, IdentityError>>> {
+    match identity {
+        Some(Ok(claims)) => delegation::check(seen, redis, &claims, arrival, now)
+            .await
+            .map(|()| Some(Ok(claims)))
+            .map_err(|error| refuse(service, target, Refusal::Delegation(error))),
+        other => Ok(other),
+    }
+}
+
+pub(crate) async fn continued_call(
+    state: &AppState,
+    service: &RegisteredService,
+    headers: &HeaderMap,
+    target: &Target<'_>,
+    arrival: Arrival,
+) -> PlatformResult<Option<ServiceCaller>> {
+    let now = chrono::Utc::now().timestamp();
+    let identity = presented(state, service, headers, target, arrival, now).await?;
+    continued(service, target, identity, now)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Refusal {
     Missing,
     Invalid(IdentityError),
+    Delegation(DelegationError),
     NotListed(String),
     BudgetSpent,
 }
@@ -151,6 +213,7 @@ fn refuse(service: &RegisteredService, target: &Target<'_>, refusal: Refusal) ->
     let reason = match &refusal {
         Refusal::Missing => "missing",
         Refusal::Invalid(error) => error.reason(),
+        Refusal::Delegation(error) => error.reason(),
         Refusal::NotListed(_) => "caller",
         Refusal::BudgetSpent => "budget",
     };
@@ -167,6 +230,9 @@ fn refuse(service: &RegisteredService, target: &Target<'_>, refusal: Refusal) ->
         }
         Refusal::BudgetSpent => {
             PlatformError::GatewayTimeout("The calling service's time budget is spent".into())
+        }
+        Refusal::Delegation(error) => {
+            PlatformError::Unauthorized(format!("The delegated caller is not accepted: {error}"))
         }
         Refusal::Missing | Refusal::Invalid(_) => PlatformError::Unauthorized(
             "This route accepts only calls from the tenant's services".into(),
@@ -195,6 +261,7 @@ mod tests {
             jti: Uuid::nil(),
             depth: 2,
             on_behalf_of: Some("kc-user-1".into()),
+            acting_for: None,
         }
     }
 
@@ -279,6 +346,112 @@ mod tests {
             decide(&["pricing".to_string()], Some(Ok(spent)), NOW),
             Err(Refusal::BudgetSpent)
         );
+    }
+
+    fn delegated_claims(expires_at: Option<i64>) -> Claims {
+        let acme = crate::tenant_catalog::tests::tenant("acme", Some("acme"));
+        Claims {
+            jti: Uuid::new_v4(),
+            acting_for: Delegation::of(&crate::auth::delegation::tests::user(&acme)).map(
+                |delegation| Delegation {
+                    expires_at,
+                    ..delegation
+                },
+            ),
+            ..claims("pricing")
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_delegation_is_refused_on_a_public_route_too() {
+        let target = Target {
+            method: &axum::http::Method::POST,
+            path: "/_fn/reprice",
+        };
+        let (seen, redis) = (SeenIdentities::new(8), RedisHandle::disabled());
+        let refused = delegated(
+            &seen,
+            &redis,
+            &service(),
+            &target,
+            Some(Ok(delegated_claims(Some(NOW - 6)))),
+            Arrival::InProcess,
+            NOW,
+        )
+        .await
+        .expect_err("refused before any posture is consulted");
+        assert!(
+            matches!(refused, PlatformError::Unauthorized(_)),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_delegation_is_refused_and_an_invalid_identity_is_left_to_the_posture() {
+        let target = Target {
+            method: &axum::http::Method::POST,
+            path: "/_fn/reprice",
+        };
+        let (seen, redis, service) = (
+            &SeenIdentities::new(8),
+            &RedisHandle::disabled(),
+            &service(),
+        );
+        let target = &target;
+        let once = delegated_claims(Some(NOW + 300));
+        let check = move |identity| {
+            delegated(
+                seen,
+                redis,
+                service,
+                target,
+                identity,
+                Arrival::Network,
+                NOW,
+            )
+        };
+        assert_eq!(
+            check(Some(Ok(once.clone()))).await.expect("first use"),
+            Some(Ok(once.clone()))
+        );
+        assert!(matches!(
+            check(Some(Ok(once))).await,
+            Err(PlatformError::Unauthorized(_))
+        ));
+        for passed in [None, Some(Err(IdentityError::Signature))] {
+            assert_eq!(check(passed.clone()).await.expect("passed on"), passed);
+        }
+        let service_only = claims("pricing");
+        for _ in 0..2 {
+            assert!(
+                check(Some(Ok(service_only.clone()))).await.is_ok(),
+                "service-only identities are not single-use"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delegated_caller_is_marked_in_the_request_and_others_are_unchanged() {
+        let call = decide(
+            &["*".to_string()],
+            Some(Ok(delegated_claims(Some(NOW + 300)))),
+            NOW,
+        )
+        .expect("admitted");
+        assert_eq!(
+            call.to_json(),
+            json!({"service": "pricing", "on_behalf_of": "kc-user-1", "depth": 2, "delegated": true})
+        );
+        assert_eq!(
+            call.calling(),
+            Calling {
+                service: "pricing",
+                delegated: true
+            }
+        );
+        let plain = decide(&["*".to_string()], Some(Ok(claims("pricing"))), NOW).expect("call");
+        assert!(plain.to_json().get("delegated").is_none());
+        assert!(!plain.calling().delegated);
     }
 
     #[test]
