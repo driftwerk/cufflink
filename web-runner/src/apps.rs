@@ -882,6 +882,36 @@ require("http").createServer((req, res) => {{
     }
 
     #[tokio::test]
+    async fn a_refused_key_kills_a_draining_process_at_once() {
+        if !node_available().await {
+            return;
+        }
+        let w = draining_world(
+            21120..=21122,
+            Draining {
+                grace: Duration::from_secs(60),
+                stop_timeout: Duration::from_secs(60),
+            },
+        );
+        w.started(&w.uploaded(1, stubborn("one"), true).await).await;
+        let old = w.leased();
+        let old_port = old.port;
+        let request = in_flight(old, Duration::from_secs(30));
+        settle().await;
+        w.started(&w.uploaded(2, stubborn("two"), true).await).await;
+        let new_port = w.leased().port;
+        w.apps.retire_tenant("acme").await;
+        let cut = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("killed, not drained nor sent SIGTERM and waited on")
+            .expect("joined");
+        assert!(cut.is_err(), "the request in flight is cut: {cut:?}");
+        stopped(old_port).await;
+        stopped(new_port).await;
+        gone(&w.root.path().join("acme")).await;
+    }
+
+    #[tokio::test]
     async fn the_replaced_directory_stays_until_its_process_has_exited() {
         if !node_available().await {
             return;
