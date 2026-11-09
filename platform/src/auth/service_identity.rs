@@ -171,6 +171,12 @@ pub struct DelegatedToken {
     pub claims: BTreeMap<String, Value>,
 }
 
+impl Delegation {
+    fn outlives_its_user(&self) -> bool {
+        matches!(self.method, DelegatedMethod::Jwt {}) && self.expires_at.is_none()
+    }
+}
+
 impl Claims {
     pub fn remaining_budget(&self, now: i64) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -309,6 +315,13 @@ pub fn verify(
         (claims.depth > MAX_CALL_DEPTH, IdentityError::Depth),
         (
             claims.acting_for.is_some() && claims.depth == 0,
+            IdentityError::Format,
+        ),
+        (
+            claims
+                .acting_for
+                .as_ref()
+                .is_some_and(Delegation::outlives_its_user),
             IdentityError::Format,
         ),
     ]
@@ -696,6 +709,39 @@ mod tests {
         };
         let token = mint(&keys, &key).expect("mint");
         assert_eq!(verify(&keys, &token, &expected(), NOW), Ok(key));
+    }
+
+    #[test]
+    fn a_jwt_delegation_without_its_users_expiry_is_malformed() {
+        let keys = keys(K1);
+        let unbounded = |method: DelegatedMethod| {
+            let claims = Claims {
+                acting_for: delegated().acting_for.map(|delegation| Delegation {
+                    method,
+                    expires_at: None,
+                    ..delegation
+                }),
+                ..claims()
+            };
+            verify(
+                &keys,
+                &mint(&keys, &claims).expect("mint"),
+                &expected(),
+                NOW,
+            )
+        };
+        assert_eq!(
+            unbounded(DelegatedMethod::Jwt {}),
+            Err(IdentityError::Format)
+        );
+        assert!(
+            unbounded(DelegatedMethod::ApiKey {
+                id: Uuid::from_u128(9),
+                user_sub: None,
+            })
+            .is_ok(),
+            "an API key has no expiry of its own"
+        );
     }
 
     #[test]
