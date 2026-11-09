@@ -1051,6 +1051,8 @@ PRs 1, 2 and 5 can be reviewed in parallel. PR 4 follows PR 3.
 
 ## 13. Questions for the maintainer
 
+Decided 2026-11-09: the maintainer accepted every recommended default below.
+
 | # | Question | Proposed default |
 |---|----------|------------------|
 | 1 | Should a web deploy with no `web_artifact` (every older CLI) still be accepted in this release? | Yes, with a warning and `cufflink_web_legacy_deploys_total`. Refuse it (`422`, naming the CLI version) from the next minor release |
