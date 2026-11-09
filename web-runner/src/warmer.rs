@@ -1,14 +1,12 @@
 use crate::apps::{Apps, Ran};
 use crate::coalescer::Coalescer;
-use crate::source::Unread;
+use crate::source::{AppKey, Unread};
 use cufflink_supervisor::runner_api::key_refused;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-
-type AppKey = (String, String);
 
 const COLD_START_BACKOFF: Duration = Duration::from_secs(30);
 const UNKNOWN_APP_TTL: Duration = Duration::from_secs(10);
@@ -44,6 +42,10 @@ impl Recent {
                 .saturating_sub(now.saturating_duration_since(*at));
             (!left.is_zero()).then_some((*outcome, left))
         })
+    }
+
+    fn forget(&self, key: &AppKey) {
+        self.entries().remove(key);
     }
 
     fn record(&self, key: AppKey, result: &Result<(), WarmError>, now: Instant) {
@@ -122,6 +124,10 @@ impl LazyWarmer {
         }
     }
 
+    pub fn forget(&self, key: &AppKey) {
+        self.recent.forget(key);
+    }
+
     pub fn serves(&self, tenant: &str) -> bool {
         self.apps.source.serves(tenant)
     }
@@ -182,7 +188,7 @@ async fn do_warmup(apps: &Arc<Apps>, tenant: &str, service: &str) -> Result<(), 
                 service: service.to_string(),
             })
         }
-        Err(Unread::KeyRefused) => return Err(WarmError::KeyRefused),
+        Err(Unread::KeyRefused(_)) => return Err(WarmError::KeyRefused),
         Err(Unread::Failed(e)) => return Err(e.wrap_err("lookup").into()),
     };
     match apps.run(&deployment).await? {
@@ -247,6 +253,17 @@ mod tests {
         assert_eq!(recent.holding(&key("web"), now + COLD_START_BACKOFF), None);
         recent.record(key("web"), &Ok(()), later);
         assert_eq!(recent.holding(&key("web"), later), None);
+    }
+
+    #[test]
+    fn a_forgotten_app_is_asked_for_again() {
+        let recent = Recent::default();
+        let now = Instant::now();
+        recent.record(key("web"), &failed(), now);
+        recent.record(key("ghost"), &unknown(), now);
+        recent.forget(&key("ghost"));
+        assert_eq!(recent.holding(&key("ghost"), now), None);
+        assert!(recent.holding(&key("web"), now).is_some(), "only that app");
     }
 
     #[test]

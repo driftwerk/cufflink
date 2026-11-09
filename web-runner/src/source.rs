@@ -7,9 +7,10 @@ use cufflink_types::runner::WebApp;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub type AppKey = (String, String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebDeployment {
@@ -19,6 +20,12 @@ pub struct WebDeployment {
     pub version: i32,
     pub sha256: Option<String>,
     pub bundle: Bundle,
+}
+
+impl WebDeployment {
+    pub fn key(&self) -> AppKey {
+        (self.tenant.clone(), self.service.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,15 +50,13 @@ pub struct Shared {
 
 pub struct TenantScoped {
     pub api: RunnerApi,
-    pub poll_every: Duration,
     standing: Mutex<Standing>,
 }
 
 impl TenantScoped {
-    pub fn new(api: RunnerApi, poll_every: Duration) -> Self {
+    pub fn new(api: RunnerApi) -> Self {
         Self {
             api,
-            poll_every,
             standing: Mutex::new(Standing::Unread),
         }
     }
@@ -96,14 +101,14 @@ pub enum Source {
 
 #[derive(Debug)]
 pub enum Unread {
-    KeyRefused,
+    KeyRefused(eyre::Report),
     Failed(eyre::Report),
 }
 
 impl From<eyre::Report> for Unread {
     fn from(error: eyre::Report) -> Self {
         match key_refused(&error) {
-            true => Unread::KeyRefused,
+            true => Unread::KeyRefused(error),
             false => Unread::Failed(error),
         }
     }
@@ -149,7 +154,10 @@ impl Source {
         service: &str,
     ) -> Result<Option<WebDeployment>, Unread> {
         match self {
-            Source::Shared(shared) => shared.current(tenant, service).await.map_err(Unread::from),
+            Source::Shared(shared) => Ok(shared
+                .currents(&[(tenant.to_string(), service.to_string())])
+                .await?
+                .pop()),
             Source::TenantScoped(scoped) if scoped.tenant() == tenant => scoped
                 .api
                 .web()
@@ -164,21 +172,41 @@ impl Source {
         }
     }
 
-    pub async fn announced(&self, payload: &Value) -> Result<WebDeployment, String> {
+    pub async fn currents(&self, apps: &[AppKey]) -> Result<Vec<WebDeployment>, Unread> {
+        match self {
+            Source::Shared(_) if apps.is_empty() => Ok(Vec::new()),
+            Source::Shared(shared) => shared.currents(apps).await.map_err(Unread::from),
+            Source::TenantScoped(scoped) => Ok(scoped
+                .api
+                .web()
+                .await?
+                .apps
+                .into_iter()
+                .filter(|app| {
+                    apps.iter().any(|(tenant, service)| {
+                        tenant == scoped.tenant() && *service == app.service_name
+                    })
+                })
+                .filter_map(|app| {
+                    scoped
+                        .deployment(app)
+                        .inspect_err(
+                            |e| warn!(error = %e, "Skipping an app the runner API cannot serve"),
+                        )
+                        .ok()
+                })
+                .collect()),
+        }
+    }
+
+    pub fn announced(&self, payload: &Value) -> Result<AppKey, String> {
         let (tenant, service) = event::target(payload).map_err(str::to_string)?;
         match self {
             Source::TenantScoped(scoped) if scoped.tenant() != tenant => Err(format!(
                 "the event is of tenant '{tenant}', not WEB_TENANT '{}'",
                 scoped.tenant()
             )),
-            Source::Shared(_) | Source::TenantScoped(_) => {
-                match self.current(&tenant, &service).await {
-                    Ok(Some(deployment)) => Ok(deployment),
-                    Ok(None) => Err(format!("{tenant}/{service} has no web deployment to run")),
-                    Err(Unread::KeyRefused) => Err("the platform refuses the runner key".into()),
-                    Err(Unread::Failed(e)) => Err(format!("{e:#}")),
-                }
-            }
+            Source::Shared(_) | Source::TenantScoped(_) => Ok((tenant, service)),
         }
     }
 
@@ -217,34 +245,38 @@ impl Source {
 }
 
 impl Shared {
-    async fn current(&self, tenant: &str, service: &str) -> eyre::Result<Option<WebDeployment>> {
-        let row = self
+    async fn currents(&self, apps: &[AppKey]) -> eyre::Result<Vec<WebDeployment>> {
+        let (tenants, services): (Vec<&str>, Vec<&str>) = apps
+            .iter()
+            .map(|(tenant, service)| (tenant.as_str(), service.as_str()))
+            .unzip();
+        let rows = self
             .pool
             .get()
             .await?
-            .query_opt(
-                "SELECT d.artifact_s3_key, d.version, d.service_id, d.artifact_hash
-                 FROM deployments d
-                 JOIN services s ON s.id = d.service_id
-                 JOIN tenants t ON t.id = s.tenant_id
+            .query(
+                "SELECT t.slug, s.name, d.artifact_s3_key, d.version, d.service_id, d.artifact_hash
+                 FROM unnest($1::text[], $2::text[]) AS app(tenant, service)
+                 JOIN tenants t ON t.slug = app.tenant
+                 JOIN services s ON s.tenant_id = t.id AND s.name = app.service
+                 JOIN deployments d ON d.service_id = s.id AND d.version = s.current_version
                  WHERE d.artifact_s3_key IS NOT NULL
                    AND d.manifest->>'mode' = 'web'
-                   AND d.status = 'active'
-                   AND d.version = s.current_version
-                   AND t.slug = $1
-                   AND s.name = $2
-                 LIMIT 1",
-                &[&tenant, &service],
+                   AND d.status = 'active'",
+                &[&tenants, &services],
             )
             .await?;
-        Ok(row.map(|row| WebDeployment {
-            tenant: tenant.to_string(),
-            service: service.to_string(),
-            bundle: Bundle::Object(row.get(0)),
-            version: row.get(1),
-            service_id: row.get(2),
-            sha256: row.get(3),
-        }))
+        Ok(rows
+            .into_iter()
+            .map(|row| WebDeployment {
+                tenant: row.get(0),
+                service: row.get(1),
+                bundle: Bundle::Object(row.get(2)),
+                version: row.get(3),
+                service_id: row.get(4),
+                sha256: row.get(5),
+            })
+            .collect())
     }
 
     async fn download(&self, key: &str) -> eyre::Result<Vec<u8>> {
@@ -300,11 +332,14 @@ pub(crate) mod tests {
                 },
             )
             .expect("a client"),
-            Duration::from_secs(30),
         ))
     }
 
-    fn shared_at(database_url: &str, storage: Arc<dyn ObjectStorage>, max_bytes: u64) -> Source {
+    pub(crate) fn shared_at(
+        database_url: &str,
+        storage: Arc<dyn ObjectStorage>,
+        max_bytes: u64,
+    ) -> Source {
         let pool = cufflink_db::build_pool(database_url, 1).expect("a pool");
         Source::Shared(Shared {
             secrets: SecretBox::new(
@@ -351,7 +386,6 @@ pub(crate) mod tests {
                 "version": 1,
                 "s3_key": "web/x/v1.tar.gz",
             }))
-            .await
             .expect_err("another tenant's");
         assert_eq!(
             refused,
@@ -412,20 +446,38 @@ pub(crate) mod tests {
                    "service_id": Uuid::from_u128(7), "artifact_hash": "a".repeat(64),
                    "s3_key": "web/another-service/v1.tar.gz"}),
         ] {
+            let (tenant, service) = source.announced(&forged).expect("a target");
             assert_eq!(
-                source.announced(&forged).await,
-                Ok(recorded.clone()),
+                source
+                    .current(&tenant, &service)
+                    .await
+                    .map_err(|e| format!("{e:?}")),
+                Ok(Some(recorded.clone())),
                 "{forged}"
             );
         }
         assert_eq!(
             source
-                .announced(&json!({"tenant_slug": tenant.slug, "service_name": "other"}))
-                .await,
-            Err(format!(
-                "{}/other has no web deployment to run",
-                tenant.slug
-            ))
+                .current(&tenant.slug, "other")
+                .await
+                .map_err(|e| format!("{e:?}")),
+            Ok(None)
+        );
+        assert_eq!(
+            source
+                .currents(&[
+                    (tenant.slug.clone(), "other".into()),
+                    (tenant.slug.clone(), "site".into()),
+                    ("globex".into(), "site".into()),
+                ])
+                .await
+                .map_err(|e| format!("{e:?}")),
+            Ok(vec![recorded]),
+            "one read answers every app that has a bundle at its current version"
+        );
+        assert_eq!(
+            source.currents(&[]).await.map_err(|e| format!("{e:?}")),
+            Ok(Vec::new())
         );
     }
 
