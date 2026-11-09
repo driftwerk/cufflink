@@ -35,6 +35,7 @@ pub mod tenant_buckets;
 pub mod tenants;
 pub mod test;
 pub mod version;
+pub(crate) mod web_release;
 pub mod workspace;
 
 pub(crate) async fn json_answer(

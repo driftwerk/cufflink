@@ -5,7 +5,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 fn seconds(retention: Duration) -> i64 {
-    i64::try_from(retention.as_secs()).unwrap_or(i64::MAX)
+    let bounded = retention
+        .as_secs()
+        .min(crate::config::MAX_WEB_UPLOAD_RETENTION_SECS);
+    i64::try_from(bounded).unwrap_or(i64::MAX)
 }
 
 pub async fn record(
@@ -246,5 +249,29 @@ mod tests {
             .await
             .expect("swept")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_longest_retention_reads_and_sweeps_without_overflowing() {
+        let Some((_db, pool, site, _)) = migrated().await else {
+            return;
+        };
+        let client = pool.get().await.expect("checkout");
+        let upload = bundle(site, 0x05, 50);
+        record(&client, site, &upload, "ci")
+            .await
+            .expect("recorded");
+        for retention in [
+            Duration::from_secs(crate::config::MAX_WEB_UPLOAD_RETENTION_SECS),
+            Duration::MAX,
+        ] {
+            assert!(holds(&client, &upload.s3_key, retention)
+                .await
+                .expect("read"));
+            assert!(expired(&client, site, retention)
+                .await
+                .expect("swept")
+                .is_empty());
+        }
     }
 }

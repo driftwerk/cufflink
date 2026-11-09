@@ -34,6 +34,35 @@ impl Stored {
     }
 }
 
+pub(crate) fn upload_result(stored: &PlatformResult<(Artifact, Stored)>) -> &'static str {
+    match stored {
+        Ok((_, stored)) => stored.as_str(),
+        Err(
+            PlatformError::NotFound(_)
+            | PlatformError::BadRequest(_)
+            | PlatformError::Unauthorized(_)
+            | PlatformError::Forbidden(_)
+            | PlatformError::Conflict(_)
+            | PlatformError::Validation(_)
+            | PlatformError::PayloadTooLarge(_)
+            | PlatformError::DestructiveChanges(_)
+            | PlatformError::SerdeJson(_),
+        ) => "refused",
+        Err(
+            PlatformError::TooManyRequests(_)
+            | PlatformError::Unavailable(_)
+            | PlatformError::RetryLater { .. }
+            | PlatformError::GatewayTimeout(_)
+            | PlatformError::SchemaMigration(_)
+            | PlatformError::Internal(_)
+            | PlatformError::Database(_)
+            | PlatformError::DatabaseOp { .. }
+            | PlatformError::Pool(_)
+            | PlatformError::Eyre(_),
+        ) => "error",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Legacy {
     Fill,
@@ -474,6 +503,27 @@ mod tests {
                 refusal,
                 "{upload:?} stored at {stored:?}"
             );
+        }
+    }
+
+    #[test]
+    fn an_upload_the_platform_failed_to_store_is_counted_apart_from_a_refused_one() {
+        let stored = |stored: Stored| Ok((bundle(5), stored));
+        assert_eq!(upload_result(&stored(Stored::Uploaded)), "uploaded");
+        assert_eq!(upload_result(&stored(Stored::Present)), "present");
+        for refused in [
+            PlatformError::BadRequest("the bundle is empty".into()),
+            PlatformError::Conflict("service 'site' is not a web app".into()),
+            PlatformError::Validation("the bundle's SHA-256 is …".into()),
+        ] {
+            assert_eq!(upload_result(&Err(refused)), "refused");
+        }
+        for failed in [
+            PlatformError::Internal("Failed to store web/…".into()),
+            PlatformError::Unavailable("object storage".into()),
+            PlatformError::Pool(deadpool_postgres::PoolError::Closed),
+        ] {
+            assert_eq!(upload_result(&Err(failed)), "error");
         }
     }
 
