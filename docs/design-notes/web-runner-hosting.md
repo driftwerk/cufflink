@@ -1125,6 +1125,8 @@ section of `docs/versions.md`.
 
 ## 14. Questions for the maintainer
 
+Decided 2026-11-09: the maintainer accepted every recommended default below.
+
 | # | Question | Proposed default |
 |---|----------|------------------|
 | 1 | Should hostnames be claimed within admin-granted domains, unique on the platform, with retired grants held until released (section 2.1.3)? | Yes |
