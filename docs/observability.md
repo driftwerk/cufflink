@@ -419,6 +419,11 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_wasm_estimate_bytes` | histogram | `kind` | Memory reserved at admission |
 | `cufflink_wasm_admission_oldest_wait_seconds` | gauge | `class` | Age of the oldest invocation waiting for memory; for `background`, starvation shows here |
 | `cufflink_wasm_capacity_retries_total` | counter | `kind` | Subscriptions and worker after-hooks run again in place after a mid-run capacity denial |
+| `cufflink_wasm_wait_release_total` | counter | `kind`, `result` (`parked`, `answered_first`, `held_pool_full`, `held_service_pool_full`, `held_transaction`, `held_not_parkable`, `held_disabled`) | Outbound calls marked to release their slots, and what each did: gave its slots back, answered within `WASM_WAIT_RELEASE_AFTER_MS`, or held them for the reason named ([wait pools](scaling.md#wait-pools)) |
+| `cufflink_wasm_parked` | gauge | `kind` | Guests waiting without their slots now |
+| `cufflink_wasm_parked_seconds` | histogram | `kind` | Time a guest waited without its slots |
+| `cufflink_wasm_resume_wait_seconds` | histogram | `kind`, `result` (`resumed`, `deadline`, `cancelled`, `shutdown`) | From a waiting guest's answer to its slots retaken, or to the end that stopped it |
+| `cufflink_wasm_blocking_threads` | gauge | — | Live blocking threads of the runtime, counted from its thread start and stop hooks less its worker threads; set at scrape |
 | `cufflink_wasm_job_deferrals_total` | counter | `result` (`deferred`, `counted`) | Jobs put off for capacity, and those whose deferrals ran out and counted as a failed attempt |
 | `cufflink_pump_admission_wait_seconds` | histogram | `kind` | A consumer's wait for room in the budget before it fetches |
 | `cufflink_process_memory_limit_bytes` | gauge | `source` (`max`, `high`, `v1`) | The cgroup limit the budget was derived from |
@@ -522,6 +527,9 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `cufflink_web_runner_child_exits_total` | counter | `reason` | App processes that exited, and why |
+| `cufflink_web_runner_drains_total` | counter | `outcome` (`drained`, `grace_elapsed`, `shutdown`, `undeployed`) | Replaced processes stopped: once their requests ended; at the end of `WEB_DRAIN_GRACE_SECS` with requests still running; by the runner's shutdown; by an undeploy or a refused key |
+| `cufflink_web_runner_drain_seconds` | histogram | — | From a process being replaced to its being stopped |
+| `cufflink_web_runner_draining` | gauge | — | Replaced processes still finishing their requests |
 
 ### Extension runner
 

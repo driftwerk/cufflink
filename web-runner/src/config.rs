@@ -9,6 +9,8 @@ use cufflink_supervisor::{ChildSettings, EnvMode};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
+const DRAIN_GRACE_CEILING: Duration = Duration::from_secs(3600);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     Shared {
@@ -91,6 +93,7 @@ pub struct WebRunnerConfig {
     pub hostname_format: HostnameFormat,
     pub shutdown_grace: Duration,
     pub child_stop_timeout: Duration,
+    pub drain_grace: Duration,
     pub reconcile: Reconcile,
     pub env_mode: EnvMode,
     pub children: ChildSettings,
@@ -121,6 +124,7 @@ impl WebRunnerConfig {
             hostname_format: or("CUFFLINK_HOSTNAME_FORMAT", "flat").parse()?,
             shutdown_grace: secs("SHUTDOWN_GRACE_SECS", 45)?,
             child_stop_timeout: secs("WEB_CHILD_STOP_TIMEOUT_SECS", 10)?,
+            drain_grace: secs("WEB_DRAIN_GRACE_SECS", 30).and_then(drain_grace)?,
             reconcile,
             env_mode: env_mode(vars.get(WEB_ENV.passthrough).as_deref())?,
             children: ChildSettings::from_vars(&vars)?,
@@ -134,6 +138,17 @@ impl WebRunnerConfig {
                 .filter(|token| !token.trim().is_empty()),
         })
     }
+}
+
+fn drain_grace(grace: Duration) -> eyre::Result<Duration> {
+    (grace <= DRAIN_GRACE_CEILING)
+        .then_some(grace)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "WEB_DRAIN_GRACE_SECS must be at most {}",
+                DRAIN_GRACE_CEILING.as_secs()
+            )
+        })
 }
 
 fn app_ports(raw: Option<&str>, runner_port: u16) -> eyre::Result<RangeInclusive<u16>> {
@@ -185,6 +200,7 @@ mod tests {
         assert_eq!(config.hostname_format, HostnameFormat::Flat);
         assert_eq!(config.shutdown_grace, Duration::from_secs(45));
         assert_eq!(config.child_stop_timeout, Duration::from_secs(10));
+        assert_eq!(config.drain_grace, Duration::from_secs(30));
         assert_eq!(
             config.reconcile,
             Reconcile {
@@ -210,6 +226,7 @@ mod tests {
             ("RUNNER_PORT", "70000"),
             ("SHUTDOWN_GRACE_SECS", "soon"),
             ("WEB_ARTIFACT_MAX_BYTES", "-1"),
+            ("WEB_DRAIN_GRACE_SECS", "-1"),
         ] {
             assert!(
                 WebRunnerConfig::load(cufflink_settings::fixed(&[
@@ -221,6 +238,29 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_drain_grace_above_an_hour_is_refused() {
+        let load = |grace: &str| {
+            WebRunnerConfig::load(cufflink_settings::fixed(&[
+                ("DATABASE_URL", "postgres://platform"),
+                ("CUFFLINK_BASE_DOMAIN", "example.com"),
+                ("WEB_DRAIN_GRACE_SECS", grace),
+            ]))
+        };
+        assert_eq!(
+            load("3601").expect_err("above an hour").to_string(),
+            "WEB_DRAIN_GRACE_SECS must be at most 3600"
+        );
+        assert_eq!(
+            load("3600").expect("an hour").drain_grace,
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            load("0").expect("killed at once").drain_grace,
+            Duration::ZERO
+        );
     }
 
     #[test]

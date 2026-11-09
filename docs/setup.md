@@ -456,7 +456,7 @@ Every guest execution runs under one deadline: the caller's timeout, the epoch i
 | `WASM_MAX_TABLES` / `WASM_MAX_TABLE_ELEMENTS` / `WASM_MAX_INSTANCES` | `8` / `1000000` / `1` | Table and instance caps; a Rust `cdylib` guest needs one table and instantiates nothing |
 | `WASM_MAX_GUEST_LEN_MB` | `64` | Largest pointer/length pair a guest may hand a host function; a negative or larger length returns `-1` and counts `limit="length"` |
 | `WASM_MAX_RESPONSE_MB` | `64` | Largest handler response; beyond it the call fails with a 500 rather than allocating. Under `enforce` a subscription, schedule or job is settled by the `__status` and `__delivery` of such an answer |
-| `WASM_MAX_CONCURRENT` | `256` | Guest executions in flight at once; queueing for a slot counts against the handler's budget. Background work may hold 75 % of them under `enforce`, and a service's own limit is `WASM_MAX_CONCURRENT_PER_SERVICE`. The blocking pool is sized `WASM_MAX_CONCURRENT × 5 + 64` threads, so a chain of service calls never waits for a thread its callers hold |
+| `WASM_MAX_CONCURRENT` | `256` | Guest executions in flight at once; queueing for a slot counts against the handler's budget. Background work may hold 75 % of them under `enforce`, and a service's own limit is `WASM_MAX_CONCURRENT_PER_SERVICE`. The blocking pool is sized `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads (`WASM_MAX_CONCURRENT × 5 + 64` with `WASM_WAIT_RELEASE=off`), so a chain of service calls never waits for a thread its callers hold |
 | `WASM_MAX_OPEN_TX` | `2` | Interactive `db_v2` transactions one invocation may hold open ([db-v2](db-v2.md)) |
 | `WASM_MEMORY_BUDGET_MODE` | `warn` | The guest memory budget: `off` admits as before this release, `warn` measures the ledger, shares and per-service slots and counts and logs what `enforce` would refuse or deny without refusing anything, `enforce` makes routes and hooks wait briefly for room and answers `503` with `Retry-After` when there is none; a service call never waits, and is answered `503` at once, as is a request whose body cannot be held with the budget full. Process-wide, not a tenant policy |
 | `WASM_MEMORY_BUDGET_MB` | derived | The budget. When unset: the process's cgroup limit (the smallest `memory.max` or `memory.high` of its cgroup v2 and its ancestors, or cgroup v1's `hierarchical_memory_limit`) less the host reserve. With no limit (no cgroup, macOS) the budget is off, logged once. `0` refuses startup; a derived budget of nothing turns it off with a warning |
@@ -468,6 +468,10 @@ Every guest execution runs under one deadline: the caller's timeout, the epoch i
 | `WASM_MEMORY_COLD_ESTIMATE_MB` | `32` | What a handler with no measurement reserves at admission; a measured one reserves the largest of its last 16 peaks |
 | `WASM_ESTIMATE_MAX_AGE_SECS` / `WASM_ESTIMATE_MAP_MAX` | `600` / `4096` | Age past which a peak is forgotten, and handlers remembered |
 | `WASM_MAX_CONCURRENT_PER_SERVICE` | `32` | Invocations of one tenant's service in flight at once (at most `WASM_MAX_CONCURRENT`); an in-process after-hook may hold half of them. Enforced under `enforce`, counted under `warn` |
+| `WASM_WAIT_RELEASE` | `on` | Sizes the runtime for guests that wait on an outbound call without their slots ([wait pools](scaling.md#wait-pools)); no host function releases slots yet. `off` sizes the blocking and nested pools as before |
+| `WASM_WAIT_RELEASE_AFTER_MS` | `50` | How long such a call will run before its guest gives back its slots |
+| `WASM_MAX_PARKED` | `WASM_MAX_CONCURRENT` | Guests that may wait without their slots at once, per process. Grows the blocking pool and the nested pool by as many top-level guests |
+| `WASM_MAX_PARKED_PER_SERVICE` | `2 × WASM_MAX_CONCURRENT_PER_SERVICE` | Guests of one tenant's service that may wait without their slots at once |
 | `WASM_MEMORY_JOB_FLOOR_MB` | `32` | Under `enforce`, room the background share must have before the long-jobs and after-hook consumers fetch, since one durable carries every handler |
 | `WASM_BACKGROUND_AGING_SECS` | `30` | A subscription or job waiting for memory longer than this is granted before routes, so a steady flow of small requests cannot starve it |
 | `WASM_CAPACITY_RETRIES` / `WASM_CAPACITY_RETRIES_JOB` | `3` / `10` | Under `enforce`, a subscription or worker after-hook denied memory mid-run is run again in place up to `WASM_CAPACITY_RETRIES` times, then naked with a delay; a job is put off with a delay, its attempts unchanged, up to `WASM_CAPACITY_RETRIES_JOB` times in a row, then counted as a `capacity` failure, retried as a crash is |
@@ -583,7 +587,8 @@ A `JOB_*` value the worker cannot use (not a number, a `JOB_LEASE_SECS` below `3
 | `CUFFLINK_PUBLIC_SCHEME` | `https` | `http` only for a local stack without TLS |
 | `CUFFLINK_HOSTNAME_FORMAT` | `flat` | `flat` → `{service}--{tenant}.{base}`; `hierarchical` → nested labels under the base domain |
 | `SHUTDOWN_GRACE_SECS` | `45` | Grace from SIGTERM to exit: proxied requests finish, then every Next.js child is stopped, then NATS and telemetry flush |
-| `WEB_CHILD_STOP_TIMEOUT_SECS` | `10` | How long a child gets between SIGTERM and SIGKILL at shutdown |
+| `WEB_CHILD_STOP_TIMEOUT_SECS` | `10` | How long a child gets between SIGTERM and SIGKILL, at shutdown and when a replaced child has drained |
+| `WEB_DRAIN_GRACE_SECS` | `30` | How long a replaced child may finish the requests it was given before SIGTERM; `0` kills it at once; above `3600` is refused at startup ([draining](deployment.md#web-runner)) |
 | `STORAGE_BACKEND`, `S3_*`, `GCS_BUCKET` | *(required without `WEB_TENANT`)* | Object storage holding the web artifacts |
 | `RUST_LOG` | `info,cufflink_web_runner=debug` | Log filter |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | OTLP/HTTP trace and log export |

@@ -4,6 +4,7 @@ use super::ledger::Limits;
 use crate::policy::PolicyMode;
 use cufflink_db::Vars;
 use eyre::{eyre, Result};
+use std::str::FromStr;
 use std::time::Duration;
 
 const MIB: usize = 1024 * 1024;
@@ -28,6 +29,55 @@ pub struct BudgetConfig {
     pub pressure_gate: bool,
     pub thread_stack: usize,
     pub caps: HostCaps,
+    pub wait_release: Option<WaitRelease>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitRelease {
+    pub after: Duration,
+    pub max_parked: usize,
+    pub max_parked_per_service: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl FromStr for Switch {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "on" => Ok(Switch::On),
+            "off" => Ok(Switch::Off),
+            other => Err(format!("expected on or off, not {other:?}")),
+        }
+    }
+}
+
+impl WaitRelease {
+    pub fn from_vars(
+        var: impl Fn(&str) -> Option<String>,
+        max_concurrent: usize,
+        per_service: usize,
+    ) -> Result<Option<Self>> {
+        let vars = Vars(var);
+        match vars.parsed("WASM_WAIT_RELEASE", Switch::On)? {
+            Switch::Off => Ok(None),
+            Switch::On => Ok(Some(Self {
+                after: Duration::from_millis(vars.positive("WASM_WAIT_RELEASE_AFTER_MS", 50u64)?),
+                max_parked: vars.positive("WASM_MAX_PARKED", max_concurrent)?,
+                max_parked_per_service: vars
+                    .positive("WASM_MAX_PARKED_PER_SERVICE", per_service.saturating_mul(2))?,
+            })),
+        }
+    }
+
+    pub fn parked(wait_release: Option<Self>) -> usize {
+        wait_release.map_or(0, |release| release.max_parked)
+    }
 }
 
 impl Default for BudgetConfig {
@@ -49,6 +99,11 @@ impl Default for BudgetConfig {
             pressure_gate: true,
             thread_stack: 2048 * 1024,
             caps: HostCaps::default(),
+            wait_release: Some(WaitRelease {
+                after: Duration::from_millis(50),
+                max_parked: 256,
+                max_parked_per_service: 64,
+            }),
         }
     }
 }
@@ -111,7 +166,11 @@ impl BudgetConfig {
                 reserve / MIB
             ));
         }
+        let per_service = vars
+            .positive("WASM_MAX_CONCURRENT_PER_SERVICE", defaults.per_service)?
+            .min(max_concurrent);
         Ok(Self {
+            wait_release: WaitRelease::from_vars(&vars.0, max_concurrent, per_service)?,
             limits: budget
                 .filter(|_| mode != PolicyMode::Off)
                 .map(|budget| Limits {
@@ -124,9 +183,7 @@ impl BudgetConfig {
             mode,
             limit,
             reserve,
-            per_service: vars
-                .positive("WASM_MAX_CONCURRENT_PER_SERVICE", defaults.per_service)?
-                .min(max_concurrent),
+            per_service,
             cold_estimate: vars.positive("WASM_MEMORY_COLD_ESTIMATE_MB", 32usize)? * MIB,
             estimate_max_age: Duration::from_secs(
                 vars.positive("WASM_ESTIMATE_MAX_AGE_SECS", 600u64)?,
@@ -324,6 +381,46 @@ mod tests {
         .expect("config");
         assert_eq!(enforce.clamped_memory_cap(512 * MIB), 512 * MIB / 100 * 50);
         assert_eq!(enforce.clamped_memory_cap(64 * MIB), 64 * MIB);
+    }
+
+    #[test]
+    fn waits_release_by_default_with_pools_from_the_slot_limits() {
+        let on = config(&[("WASM_MAX_CONCURRENT_PER_SERVICE", "8")], None).expect("config");
+        assert_eq!(
+            on.wait_release,
+            Some(WaitRelease {
+                after: Duration::from_millis(50),
+                max_parked: 256,
+                max_parked_per_service: 16,
+            })
+        );
+        let set = config(
+            &[
+                ("WASM_WAIT_RELEASE_AFTER_MS", "20"),
+                ("WASM_MAX_PARKED", "32"),
+                ("WASM_MAX_PARKED_PER_SERVICE", "4"),
+            ],
+            None,
+        )
+        .expect("config");
+        assert_eq!(
+            set.wait_release,
+            Some(WaitRelease {
+                after: Duration::from_millis(20),
+                max_parked: 32,
+                max_parked_per_service: 4,
+            })
+        );
+        let off = config(&[("WASM_WAIT_RELEASE", "off")], None).expect("config");
+        assert_eq!(off.wait_release, None);
+        assert_eq!(off.per_service, 32);
+        for (name, value) in [
+            ("WASM_WAIT_RELEASE", "yes"),
+            ("WASM_MAX_PARKED_PER_SERVICE", "0"),
+        ] {
+            let err = config(&[(name, value)], None).unwrap_err();
+            assert!(err.to_string().contains(name), "{name}: {err}");
+        }
     }
 
     #[test]

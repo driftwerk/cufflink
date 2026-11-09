@@ -1388,6 +1388,29 @@ runs on this platform unchanged. The platform advertises `web_releases`.
   `cufflink_web_uploads_total{result}`; a release's audit row carries
   `artifact_hash`.
 
+- **Pool sizes.** With the new `WASM_WAIT_RELEASE` at its default `on`,
+  the blocking pool's ceiling is
+  `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
+  pool is `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 4` permits, room for
+  guests that will wait on an outbound call without their slots
+  ([wait pools](scaling.md#wait-pools)). With the defaults, the
+  ceiling rises from 1 344 to 2 624 threads; idle threads still exit after
+  2 s, so it is reached only under that much waiting load.
+  `WASM_WAIT_RELEASE=off` keeps today's sizes. `WASM_WAIT_RELEASE_AFTER_MS`,
+  `WASM_MAX_PARKED` and `WASM_MAX_PARKED_PER_SERVICE` configure the waits
+  ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)), and
+  a malformed value stops the process at startup.
+- **`pids.max`.** Where the process's cgroup is v2, startup warns when the
+  blocking pool's ceiling, the worker threads and 64 more reach the
+  cgroup's `pids.max`. A deployment that sees it lowers `WASM_MAX_PARKED`
+  or raises the limit.
+- **Metrics.** `cufflink_wasm_wait_release_total`, `cufflink_wasm_parked`,
+  `cufflink_wasm_parked_seconds`, `cufflink_wasm_resume_wait_seconds` and
+  `cufflink_wasm_blocking_threads` ([observability](observability.md)).
+- A guest returning to its slots is granted each one ahead of arrivals
+  that come while it waits for it; an arrival already queued for that slot
+  keeps its place. Nothing releases slots yet, so admission is otherwise
+  unchanged.
 - `cufflink rollback` of a web app switches: the version it activates
   records the target's bundle, under the key the target records, and the
   platform publishes `deploy.web` so the runners serve it. A target that
@@ -1416,6 +1439,16 @@ runs on this platform unchanged. The platform advertises `web_releases`.
   tenant-scoped runner's key check is the same call; its `WEB_POLL_SECS` is
   kept as an alias, read only when `WEB_RECONCILE_SECS` is unset. Runner
   setting only: no platform change, and runners upgrade in any order.
+- A web app's replaced process is drained: on a swap it gets no new
+  request, may finish the requests the runner forwarded to it within
+  `WEB_DRAIN_GRACE_SECS` (default 30, at most 3600), and only then gets
+  SIGTERM, then SIGKILL after `WEB_CHILD_STOP_TIMEOUT_SECS`
+  ([draining](deployment.md#web-runner)). `WEB_DRAIN_GRACE_SECS=0` kills it
+  at once, as before. Its directory is kept until it has exited. New
+  metrics: `cufflink_web_runner_drains_total{outcome}`,
+  `cufflink_web_runner_drain_seconds`, `cufflink_web_runner_draining`.
+  Runner setting only: no platform change, and runners upgrade in any
+  order.
 
 Migration `V9__web_uploads.sql` adds the `web_uploads` table.
 

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tracing::info;
 use uuid::Uuid;
 use wasmtime::*;
@@ -113,6 +113,11 @@ impl WasmLimits {
         let max_response_bytes =
             env_var("WASM_MAX_RESPONSE_MB", defaults.max_response_bytes / MIB)? * MIB;
         budget.log_startup(max_memory_bytes, max_response_bytes);
+        budget::Pools::of(max_concurrent, budget.wait_release).log_startup(
+            budget::detect_pids_max(std::path::Path::new("/")),
+            tokio::runtime::Handle::try_current()
+                .map_or(0, |runtime| runtime.metrics().num_workers()),
+        );
         let limits = Self {
             max_memory_bytes: budget.clamped_memory_cap(max_memory_bytes),
             max_tables: env_var("WASM_MAX_TABLES", defaults.max_tables)?,
@@ -171,8 +176,8 @@ impl WasmLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-enum Interrupt {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Interrupt {
     #[error("deadline exceeded")]
     Deadline,
     #[error("platform shutting down")]
@@ -349,7 +354,7 @@ pub struct WasmEngine {
     linker: Arc<Linker<HostState>>,
     host_fn_names: Arc<HashSet<&'static str>>,
     limits: Arc<WasmLimits>,
-    permits: Arc<Semaphore>,
+    permits: Arc<budget::Gate>,
     copies: Arc<Mutex<()>>,
     budget: Arc<budget::Budget>,
     modules: Arc<ModuleCache>,
@@ -382,7 +387,7 @@ impl WasmEngine {
             engine,
             linker: Arc::new(linker),
             host_fn_names: Arc::new(host_fn_names),
-            permits: Arc::new(Semaphore::new(limits.max_concurrent)),
+            permits: budget::Gate::new(limits.max_concurrent),
             copies: Arc::default(),
             budget: Arc::new(memory_budget),
             modules: Arc::new(ModuleCache::new(limits.module_cache_max)),
@@ -860,16 +865,6 @@ impl WasmEngine {
         self.budget.capacity_retries_job()
     }
 
-    async fn hard_deadline(&self) {
-        self.shutdown.cancelled().await;
-        tokio::time::sleep(
-            self.shutdown
-                .remaining()
-                .saturating_sub(crate::shutdown::KILL_MARGIN),
-        )
-        .await;
-    }
-
     async fn admit(
         &self,
         inv: &Invocation,
@@ -890,7 +885,7 @@ impl WasmEngine {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ExecutionError::Cancelled),
-            _ = self.hard_deadline(), if self.budget.waits_outside_budget(inv.class, inv.kind) => {
+            _ = self.shutdown.hard_deadline(), if self.budget.waits_outside_budget(inv.class, inv.kind) => {
                 Err(ExecutionError::NotStarted)
             }
             admitted = admitted => admitted,
@@ -928,7 +923,7 @@ impl WasmEngine {
                 let placed = tokio::select! {
                     biased;
                     () = output.hold.make_room(room) => true,
-                    () = self.hard_deadline() => false,
+                    () = self.shutdown.hard_deadline() => false,
                 };
                 match placed {
                     true => Ok(output),
@@ -1026,7 +1021,7 @@ impl WasmEngine {
         deadline: Instant,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<GuestOutput, ExecutionError> {
-        let (_slots, charge) = admission.into_parts();
+        let (_seat, charge) = admission.into_parts();
         let mut copying = None;
         let _span = scoped_span!(
             "wasm_handler",
@@ -1911,10 +1906,7 @@ pub(crate) mod tests {
         );
         assert!(started.elapsed() < Duration::from_millis(400));
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            engine.permits.available_permits(),
-            engine.limits.max_concurrent
-        );
+        assert_eq!(engine.permits.available(), engine.limits.max_concurrent);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1950,10 +1942,7 @@ pub(crate) mod tests {
         assert!(matches!(err, ExecutionError::Cancelled), "{err}");
         assert_eq!(err.label(), "cancelled");
         assert!(cancelled.elapsed() < Duration::from_secs(2));
-        assert_eq!(
-            engine.permits.available_permits(),
-            engine.limits.max_concurrent
-        );
+        assert_eq!(engine.permits.available(), engine.limits.max_concurrent);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1968,10 +1957,7 @@ pub(crate) mod tests {
         });
         let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
         let state = AppState::minimal(engine.clone()).await;
-        let _held = Arc::clone(&engine.permits)
-            .acquire_owned()
-            .await
-            .expect("the only permit");
+        let _held = engine.permits.admit().await.expect("the only permit");
         let started = Instant::now();
         let err = engine
             .run_text(
@@ -2000,10 +1986,7 @@ pub(crate) mod tests {
         });
         let (_, compiled) = install(&engine, &guest("h", "(call $respond_ok)"));
         let state = AppState::minimal(engine.clone()).await;
-        let held = Arc::clone(&engine.permits)
-            .acquire_owned()
-            .await
-            .expect("the only permit");
+        let held = engine.permits.admit().await.expect("the only permit");
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
         let queued = |cancel| Invocation {
