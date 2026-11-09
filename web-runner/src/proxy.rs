@@ -1,15 +1,18 @@
 use crate::host::{parse_host, HostnameFormat};
-use crate::process_manager::ProcessManager;
+use crate::process_manager::{Entered, Lease, ProcessManager};
 use crate::warmer::{LazyWarmer, WarmError};
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
 };
+use http_body::{Frame, SizeHint};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 const TENANT_HEADER: &str = "x-tenant-slug";
 
@@ -70,11 +73,11 @@ pub async fn host_proxy_handler(
             .into_response();
     }
 
-    let port = match state.process_manager.get_port(&tenant, &service) {
-        Some(p) => p,
+    let Lease { port, entered } = match state.process_manager.lease(&tenant, &service) {
+        Some(lease) => lease,
         None => match state.warmer.ensure_warm(&tenant, &service).await {
-            Ok(()) => match state.process_manager.get_port(&tenant, &service) {
-                Some(p) => p,
+            Ok(()) => match state.process_manager.lease(&tenant, &service) {
+                Some(lease) => lease,
                 None => {
                     return (
                         StatusCode::BAD_GATEWAY,
@@ -134,11 +137,48 @@ pub async fn host_proxy_handler(
     match state.http_client.request(downstream_req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let body = Body::new(http_body_util::BodyExt::map_err(body, |e| {
-                std::io::Error::other(e.to_string())
-            }));
-            Response::from_parts(parts, body)
+            let body =
+                http_body_util::BodyExt::map_err(body, |e| std::io::Error::other(e.to_string()));
+            Response::from_parts(
+                parts,
+                Body::new(Counted {
+                    body,
+                    entered: Some(entered),
+                }),
+            )
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response(),
+    }
+}
+
+struct Counted<B> {
+    body: B,
+    entered: Option<Entered>,
+}
+
+impl<B> http_body::Body for Counted<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.entered = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
     }
 }

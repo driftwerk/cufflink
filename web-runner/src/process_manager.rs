@@ -2,28 +2,143 @@ use crate::child_env::ChildIdentity;
 use crate::host::{compose_public_url, HostnameFormat};
 use cufflink_shutdown::Shutdown;
 use cufflink_supervisor::{
-    child_env, output_event, runner_env, ChildSettings, ChildTelemetry, EnvMode, Exit, Launch,
-    OutputLevel, Runner, StartError, Stop, Stream, Supervisor, Unready,
+    child_env, locked, output_event, runner_env, ChildSettings, ChildStop, ChildTelemetry, EnvMode,
+    Exit, Launch, OutputLevel, Runner, StartError, Stop, Stream, Supervised, Supervisor, Unready,
 };
 use cufflink_telemetry::{Component, Scope};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 pub enum DeployOutcome {
-    Success { port: u16 },
-    HealthCheckFailed { port: u16, error: String },
+    Success {
+        port: u16,
+        replaced: Option<Replaced>,
+    },
+    HealthCheckFailed {
+        port: u16,
+        error: String,
+    },
 }
 
 type AppKey = (String, String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+struct Gate {
+    open: bool,
+    requests: usize,
+}
+
+#[derive(Debug)]
+pub struct InFlight(watch::Sender<Gate>);
+
+#[derive(Debug)]
+pub struct Entered(Arc<InFlight>);
+
+impl InFlight {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(watch::Sender::new(Gate {
+            open: true,
+            requests: 0,
+        })))
+    }
+
+    pub fn enter(self: &Arc<Self>) -> Option<Entered> {
+        self.0
+            .send_if_modified(|gate| {
+                gate.requests += usize::from(gate.open);
+                gate.open
+            })
+            .then(|| Entered(self.clone()))
+    }
+
+    pub fn close(&self) -> usize {
+        let mut requests = 0;
+        self.0.send_modify(|gate| {
+            gate.open = false;
+            requests = gate.requests;
+        });
+        requests
+    }
+
+    pub async fn idle(&self) {
+        let _ = self
+            .0
+            .subscribe()
+            .wait_for(|gate| !gate.open && gate.requests == 0)
+            .await;
+    }
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        self.0
+             .0
+            .send_modify(|gate| gate.requests = gate.requests.saturating_sub(1));
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Release {
     pub version: i32,
     pub dir: PathBuf,
+    pub in_flight: Arc<InFlight>,
+}
+
+impl Release {
+    pub fn new(version: i32, dir: PathBuf) -> Self {
+        Self {
+            version,
+            dir,
+            in_flight: InFlight::new(),
+        }
+    }
+}
+
+impl PartialEq for Release {
+    fn eq(&self, other: &Self) -> bool {
+        (self.version, &self.dir) == (other.version, &other.dir)
+    }
+}
+
+impl Eq for Release {}
+
+#[derive(Debug)]
+pub struct Lease {
+    pub port: u16,
+    pub entered: Entered,
+}
+
+#[derive(Debug)]
+pub struct Replaced {
+    id: u64,
+    pub release: Release,
+    pub port: u16,
+    taken: CancellationToken,
+}
+
+impl Replaced {
+    pub async fn taken(&self) {
+        self.taken.cancelled().await;
+    }
+}
+
+struct DrainingChild {
+    key: AppKey,
+    child: Supervised<WebApps>,
+    taken: CancellationToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Halt {
+    Stopped(Option<ChildStop>),
+    Taken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +234,8 @@ impl Runner for WebApps {
 
 pub struct ProcessManager {
     apps: Supervisor<WebApps>,
+    draining: Mutex<HashMap<u64, DrainingChild>>,
+    drains: AtomicU64,
     base_domain: String,
     public_scheme: String,
     hostname_format: HostnameFormat,
@@ -144,6 +261,8 @@ impl ProcessManager {
                 PortAllocator::new(ports),
                 shutdown,
             ),
+            draining: Mutex::default(),
+            drains: AtomicU64::new(0),
             base_domain,
             public_scheme,
             hostname_format,
@@ -218,8 +337,9 @@ impl ProcessManager {
             "Prepared the app's environment"
         );
 
+        let key = (tenant_slug.to_string(), service_name.to_string());
         let launch = Launch {
-            key: (tenant_slug.to_string(), service_name.to_string()),
+            key: key.clone(),
             endpoint: port,
             info: release,
             program: "node".into(),
@@ -238,7 +358,7 @@ impl ProcessManager {
         };
         match self.apps.start(launch, wait_for_ready(port, 30)).await {
             Ok((replaced, ())) => {
-                if let Some(old) = replaced {
+                let replaced = replaced.map(|old| {
                     info!(
                         tenant = %tenant_slug,
                         service = %service_name,
@@ -246,10 +366,10 @@ impl ProcessManager {
                         old_port = old.endpoint,
                         new_version = version,
                         new_port = port,
-                        "Replacing old process with new (zero-downtime)"
+                        "Replacing old process with new; the old one drains"
                     );
-                    let _ = old.stop(Stop::Kill).await;
-                }
+                    self.set_draining(key, old)
+                });
                 info!(
                     tenant = %tenant_slug,
                     service = %service_name,
@@ -257,7 +377,7 @@ impl ProcessManager {
                     port = port,
                     "Deploy successful"
                 );
-                Ok(DeployOutcome::Success { port })
+                Ok(DeployOutcome::Success { port, replaced })
             }
             Err(StartError::Spawn(e)) => eyre::bail!(
                 "Failed to spawn Node.js process for {}/{}: {}",
@@ -292,6 +412,56 @@ impl ProcessManager {
         }
     }
 
+    fn set_draining(&self, key: AppKey, old: Supervised<WebApps>) -> Replaced {
+        let (id, taken) = (
+            self.drains.fetch_add(1, Ordering::Relaxed),
+            CancellationToken::new(),
+        );
+        let replaced = Replaced {
+            id,
+            release: old.info.clone(),
+            port: old.endpoint,
+            taken: taken.clone(),
+        };
+        locked(&self.draining).insert(
+            id,
+            DrainingChild {
+                key,
+                child: old,
+                taken,
+            },
+        );
+        replaced
+    }
+
+    pub async fn stop_replaced(&self, replaced: &Replaced, how: Stop) -> Halt {
+        let draining = locked(&self.draining).remove(&replaced.id);
+        match draining {
+            Some(draining) => Halt::Stopped(draining.child.stop(how).await),
+            None => Halt::Taken,
+        }
+    }
+
+    pub fn lease(&self, tenant_slug: &str, service_name: &str) -> Option<Lease> {
+        let key = (tenant_slug.to_string(), service_name.to_string());
+        let mut closed: Option<Arc<InFlight>> = None;
+        loop {
+            let (port, in_flight) = self
+                .apps
+                .view(&key, |app| (app.endpoint, app.info.in_flight.clone()))?;
+            if closed
+                .as_ref()
+                .is_some_and(|closed| Arc::ptr_eq(closed, &in_flight))
+            {
+                return None;
+            }
+            match in_flight.enter() {
+                Some(entered) => return Some(Lease { port, entered }),
+                None => closed = Some(in_flight),
+            }
+        }
+    }
+
     pub fn get_port(&self, tenant_slug: &str, service_name: &str) -> Option<u16> {
         self.apps
             .endpoint(&(tenant_slug.to_string(), service_name.to_string()))
@@ -321,27 +491,76 @@ impl ProcessManager {
         })
     }
 
+    pub fn services(&self, tenant_slug: &str) -> BTreeSet<String> {
+        let draining: Vec<AppKey> = locked(&self.draining)
+            .values()
+            .map(|draining| draining.key.clone())
+            .collect();
+        self.apps
+            .list(|key, _| key.clone())
+            .into_iter()
+            .chain(draining)
+            .filter(|(tenant, _)| tenant == tenant_slug)
+            .map(|(_, service)| service)
+            .collect()
+    }
+
+    fn take_draining(
+        &self,
+        wanted: impl Fn(&AppKey) -> bool,
+    ) -> Vec<(AppKey, Supervised<WebApps>)> {
+        let mut draining = locked(&self.draining);
+        let ids: Vec<u64> = draining
+            .iter()
+            .filter(|(_, draining)| wanted(&draining.key))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.iter()
+            .filter_map(|id| draining.remove(id))
+            .map(|draining| {
+                draining.taken.cancel();
+                (draining.key, draining.child)
+            })
+            .collect()
+    }
+
     pub async fn stop(&self, tenant_slug: &str, service_name: &str) -> bool {
         let key = (tenant_slug.to_string(), service_name.to_string());
-        if let Some(app) = self.apps.remove(&key) {
-            info!(
-                "Stopping web app {}/{} v{} (port {})",
-                tenant_slug, service_name, app.info.version, app.endpoint
-            );
-            let _ = app.stop(Stop::Kill).await;
-            true
-        } else {
+        let apps: Vec<Supervised<WebApps>> = self
+            .apps
+            .remove(&key)
+            .into_iter()
+            .chain(
+                self.take_draining(|draining| *draining == key)
+                    .into_iter()
+                    .map(|(_, app)| app),
+            )
+            .collect();
+        if apps.is_empty() {
             info!(
                 "No running process found for {}/{}",
                 tenant_slug, service_name
             );
-            false
+            return false;
         }
+        let stops = apps.into_iter().map(|app| {
+            info!(
+                "Stopping web app {}/{} v{} (port {})",
+                tenant_slug, service_name, app.info.version, app.endpoint
+            );
+            app.stop(Stop::Kill)
+        });
+        futures_util::future::join_all(stops).await;
+        true
     }
 
     pub async fn shutdown_all(&self, stop_timeout: Duration) {
-        let apps = self.apps.close();
-        let stops = apps.into_iter().map(|((tenant, service), app)| async move {
+        let apps = self
+            .apps
+            .close()
+            .into_iter()
+            .chain(self.take_draining(|_| true));
+        let stops = apps.map(|((tenant, service), app)| async move {
             let (version, port) = (app.info.version, app.endpoint);
             let outcome = app.stop(Stop::Terminate(stop_timeout)).await;
             info!(
@@ -451,6 +670,94 @@ pub(crate) mod tests {
         assert_eq!(ports.allocate(), Some(3201));
     }
 
+    #[tokio::test]
+    async fn a_closed_gate_admits_no_request_and_is_idle_when_the_last_ends() {
+        let gate = InFlight::new();
+        let short = Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(short, gate.idle()).await.is_err(),
+            "an open gate is never idle"
+        );
+        let (first, second) = (gate.enter().expect("open"), gate.enter().expect("open"));
+        assert_eq!(gate.close(), 2, "the requests it waits for");
+        assert!(gate.enter().is_none(), "a closed gate admits no request");
+        drop(first);
+        assert!(
+            tokio::time::timeout(short, gate.idle()).await.is_err(),
+            "a request still runs"
+        );
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), gate.idle())
+            .await
+            .expect("idle once the last request ends");
+    }
+
+    #[tokio::test]
+    async fn a_lease_taken_across_a_swap_reaches_the_new_process() {
+        if !node_available().await {
+            return;
+        }
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let manager = ProcessManager::new(
+            3291..=3292,
+            "example.com".into(),
+            "https".into(),
+            HostnameFormat::Flat,
+            crate::child_env::env_mode(None).expect("the built-in allowlist"),
+            ChildSettings::default(),
+            Shutdown::new(Duration::from_secs(5)),
+        );
+        let deploy = |version, dir| {
+            manager.deploy("acme", "site", Release::new(version, dir), HashMap::new())
+        };
+        assert!(matches!(
+            deploy(1, fake_next_app(&root.path().join("one"))).await,
+            Ok(DeployOutcome::Success {
+                port: 3291,
+                replaced: None
+            })
+        ));
+        let before = manager.lease("acme", "site").expect("a lease");
+        let Ok(DeployOutcome::Success {
+            port: 3292,
+            replaced: Some(replaced),
+        }) = deploy(2, fake_next_app(&root.path().join("two"))).await
+        else {
+            panic!("the second release replaces the first");
+        };
+        assert_eq!(replaced.port, 3291);
+        assert_eq!(replaced.release.in_flight.close(), 1);
+        assert_eq!(
+            manager.lease("acme", "site").map(|lease| lease.port),
+            Some(3292),
+            "a closed gate sends the request to its successor"
+        );
+        assert_eq!(before.port, 3291, "one taken before keeps its process");
+        drop(before);
+        tokio::time::timeout(Duration::from_secs(1), replaced.release.in_flight.idle())
+            .await
+            .expect("idle");
+
+        manager
+            .release("acme", "site")
+            .expect("runs")
+            .in_flight
+            .close();
+        assert!(
+            manager.lease("acme", "site").is_none(),
+            "a closed gate with no successor is refused, not retried"
+        );
+        assert_eq!(
+            manager.stop_replaced(&replaced, Stop::Kill).await,
+            Halt::Stopped(Some(ChildStop::Killed))
+        );
+        assert_eq!(
+            manager.stop_replaced(&replaced, Stop::Kill).await,
+            Halt::Taken
+        );
+        manager.shutdown_all(Duration::from_secs(2)).await;
+    }
+
     pub(crate) async fn node_available() -> bool {
         let available = Command::new("node").arg("--version").output().await.is_ok();
         assert!(
@@ -486,15 +793,7 @@ pub(crate) mod tests {
         );
         let started = Instant::now();
         let outcome = manager
-            .deploy(
-                "acme",
-                "web",
-                Release {
-                    version: 1,
-                    dir: app_dir,
-                },
-                HashMap::new(),
-            )
+            .deploy("acme", "web", Release::new(1, app_dir), HashMap::new())
             .await
             .expect("deploy");
         assert!(
@@ -549,10 +848,7 @@ require("http").createServer((req, res) => {
             },
             Shutdown::new(Duration::from_secs(5)),
         );
-        let release = Release {
-            version: 3,
-            dir: fake_next_app(root.path()),
-        };
+        let release = Release::new(3, fake_next_app(root.path()));
         let outcome = manager
             .deploy("acme", "portal", release, HashMap::new())
             .await
@@ -611,20 +907,14 @@ require("http").createServer((req, res) => {
             .deploy(
                 "preview-pr-7",
                 "portal",
-                Release {
-                    version: 3,
-                    dir: app_dir.clone(),
-                },
+                Release::new(3, app_dir.clone()),
                 configs,
             )
             .await
             .expect("deploy");
         assert_eq!(
             manager.release("preview-pr-7", "portal"),
-            Some(Release {
-                version: 3,
-                dir: app_dir
-            })
+            Some(Release::new(3, app_dir))
         );
         assert!(matches!(outcome, DeployOutcome::Success { .. }));
         let served: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/"))

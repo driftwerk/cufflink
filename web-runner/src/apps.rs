@@ -1,21 +1,20 @@
 use crate::artifact::ArtifactStore;
-use crate::process_manager::{DeployOutcome, ProcessManager, Release};
+use crate::process_manager::{DeployOutcome, Halt, ProcessManager, Release, Replaced};
 use crate::source::{Source, Standing, WebDeployment};
-use cufflink_supervisor::locked;
+use cufflink_shutdown::Shutdown;
 use cufflink_supervisor::runner_api::key_refused;
+use cufflink_supervisor::{locked, ChildStop, Stop};
 use cufflink_types::runner::is_sha256;
 use eyre::WrapErr;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-const OLD_VERSION_KEPT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct Holds(Mutex<HashMap<PathBuf, usize>>);
@@ -54,12 +53,39 @@ pub enum Ran {
     Unhealthy { port: u16, error: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Draining {
+    pub grace: Duration,
+    pub stop_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    Drained,
+    GraceElapsed,
+    Shutdown,
+    Undeployed,
+}
+
+impl Drain {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::GraceElapsed => "grace_elapsed",
+            Self::Shutdown => "shutdown",
+            Self::Undeployed => "undeployed",
+        }
+    }
+}
+
 pub struct Apps {
     pub source: Arc<Source>,
     artifacts: ArtifactStore,
     pub process_manager: Arc<ProcessManager>,
     apps_dir: PathBuf,
     holds: Arc<Holds>,
+    shutdown: Shutdown,
+    draining: Draining,
 }
 
 impl Apps {
@@ -68,6 +94,8 @@ impl Apps {
         artifacts: ArtifactStore,
         process_manager: Arc<ProcessManager>,
         apps_dir: PathBuf,
+        shutdown: Shutdown,
+        draining: Draining,
     ) -> Self {
         Self {
             source,
@@ -75,6 +103,8 @@ impl Apps {
             process_manager,
             apps_dir,
             holds: Arc::default(),
+            shutdown,
+            draining,
         }
     }
 
@@ -153,24 +183,23 @@ impl Apps {
         if self.runs_from(deployment, &installed.dir) {
             return Ok(Ran::AlreadyRunning);
         }
-        let replaced = self.process_manager.release(tenant, service);
-        let release = Release {
-            version: deployment.version,
-            dir: installed.dir.clone(),
-        };
+        let release = Release::new(deployment.version, installed.dir.clone());
         let outcome = self
             .process_manager
             .deploy(tenant, service, release, environment)
             .await;
         drop(installed);
-        if let (Ok(DeployOutcome::Success { .. }), Some(replaced)) = (&outcome, replaced) {
-            self.drain(deployment, replaced.dir);
-        }
-        self.prune(tenant, service).await;
-        Ok(match outcome.wrap_err("spawn")? {
-            DeployOutcome::Success { port } => Ran::Started { port },
+        let ran = outcome.wrap_err("spawn").map(|outcome| match outcome {
+            DeployOutcome::Success { port, replaced } => {
+                if let Some(replaced) = replaced {
+                    self.drain(deployment, replaced);
+                }
+                Ran::Started { port }
+            }
             DeployOutcome::HealthCheckFailed { port, error } => Ran::Unhealthy { port, error },
-        })
+        });
+        self.prune(tenant, service).await;
+        ran
     }
 
     pub async fn deploy(self: &Arc<Self>, deployment: &WebDeployment) {
@@ -195,14 +224,62 @@ impl Apps {
         }
     }
 
-    fn drain(self: &Arc<Self>, deployment: &WebDeployment, dir: PathBuf) {
-        let (apps, held) = (self.clone(), self.holds.hold(dir));
-        let (tenant, service) = (deployment.tenant.clone(), deployment.service.clone());
-        tokio::spawn(async move {
-            tokio::time::sleep(OLD_VERSION_KEPT).await;
+    fn drain(self: &Arc<Self>, deployment: &WebDeployment, replaced: Replaced) {
+        let (apps, held) = (self.clone(), self.holds.hold(replaced.release.dir.clone()));
+        let (tenant, service, version) = (
+            deployment.tenant.clone(),
+            deployment.service.clone(),
+            deployment.version,
+        );
+        self.shutdown.spawn("web_drain", async move {
+            metrics::gauge!("cufflink_web_runner_draining").increment(1.0);
+            let started = Instant::now();
+            let requests = replaced.release.in_flight.close();
+            let (drained, stopped) = apps.drained(&replaced).await;
+            let elapsed = started.elapsed();
+            metrics::gauge!("cufflink_web_runner_draining").decrement(1.0);
+            metrics::counter!("cufflink_web_runner_drains_total", "outcome" => drained.as_str())
+                .increment(1);
+            metrics::histogram!("cufflink_web_runner_drain_seconds").record(elapsed.as_secs_f64());
+            info!(
+                tenant = %tenant,
+                service = %service,
+                old_version = replaced.release.version,
+                old_port = replaced.port,
+                new_version = version,
+                requests,
+                outcome = drained.as_str(),
+                stopped = ?stopped,
+                ?elapsed,
+                "The replaced process is stopped"
+            );
             drop(held);
             apps.prune(&tenant, &service).await;
         });
+    }
+
+    async fn drained(&self, replaced: &Replaced) -> (Drain, Option<ChildStop>) {
+        let Draining {
+            grace,
+            stop_timeout,
+        } = self.draining;
+        let idle = tokio::select! {
+            idle = tokio::time::timeout(grace, replaced.release.in_flight.idle()) => idle.is_ok(),
+            () = replaced.taken() => false,
+        };
+        let how = match grace.is_zero() {
+            true => Stop::Kill,
+            false => Stop::Terminate(stop_timeout),
+        };
+        match (
+            self.process_manager.stop_replaced(replaced, how).await,
+            idle,
+        ) {
+            (Halt::Stopped(stopped), true) => (Drain::Drained, stopped),
+            (Halt::Stopped(stopped), false) => (Drain::GraceElapsed, stopped),
+            (Halt::Taken, _) if self.shutdown.is_triggered() => (Drain::Shutdown, None),
+            (Halt::Taken, _) => (Drain::Undeployed, None),
+        }
     }
 
     async fn prune(&self, tenant: &str, service: &str) {
@@ -246,14 +323,7 @@ impl Apps {
     }
 
     pub async fn retire_tenant(&self, tenant: &str) {
-        let running: Vec<String> = self
-            .process_manager
-            .list()
-            .into_iter()
-            .filter(|app| app.tenant == tenant)
-            .map(|app| app.service)
-            .collect();
-        for service in running {
+        for service in self.process_manager.services(tenant) {
             self.process_manager.stop(tenant, &service).await;
         }
         remove_dir(&self.apps_dir.join(tenant)).await;
@@ -348,6 +418,7 @@ mod tests {
     use crate::artifact::ArchiveCaps;
     use crate::host::HostnameFormat;
     use crate::process_manager::tests::node_available;
+    use crate::process_manager::Lease;
     use crate::source::tests::shared;
     use crate::source::Bundle;
     use cufflink_shutdown::Shutdown;
@@ -356,10 +427,14 @@ mod tests {
 
     const SERVICE_ID: Uuid = Uuid::from_u128(7);
 
-    fn bundle(marker: &str) -> Vec<u8> {
+    fn server(marker: &str, prelude: &str) -> Vec<u8> {
         let next = format!(
-            "const [, , , , port, , host] = process.argv;\n\
-             require(\"http\").createServer((req, res) => res.end(\"{marker}\")).listen(Number(port), host);\n"
+            r#"{prelude}const [, , , , port, , host] = process.argv;
+require("http").createServer((req, res) => {{
+  const wait = Number(new URL(req.url, "http://app").searchParams.get("wait") ?? 0);
+  setTimeout(() => res.end("{marker}"), wait);
+}}).listen(Number(port), host);
+"#
         );
         tarball(&[
             (".next/BUILD_ID", marker),
@@ -368,13 +443,32 @@ mod tests {
         ])
     }
 
+    fn bundle(marker: &str) -> Vec<u8> {
+        server(marker, "")
+    }
+
+    fn stubborn(marker: &str) -> Vec<u8> {
+        server(marker, "process.on(\"SIGTERM\", () => {});\n")
+    }
+
+    const DRAINING: Draining = Draining {
+        grace: Duration::from_secs(30),
+        stop_timeout: Duration::from_secs(2),
+    };
+
     struct World {
         apps: Arc<Apps>,
         storage: Arc<dyn ObjectStorage>,
+        shutdown: Shutdown,
         root: TempDir,
     }
 
     fn world(ports: std::ops::RangeInclusive<u16>) -> World {
+        draining_world(ports, DRAINING)
+    }
+
+    fn draining_world(ports: std::ops::RangeInclusive<u16>, draining: Draining) -> World {
+        let shutdown = Shutdown::new(Duration::from_secs(5));
         let root = TempDir::new().expect("apps dir");
         let storage = cufflink_storage::in_memory("platform");
         let caps = ArchiveCaps {
@@ -391,13 +485,16 @@ mod tests {
                 HostnameFormat::Flat,
                 crate::child_env::env_mode(None).expect("the built-in allowlist"),
                 cufflink_supervisor::ChildSettings::default(),
-                Shutdown::new(Duration::from_secs(5)),
+                shutdown.clone(),
             )),
             root.path().to_path_buf(),
+            shutdown.clone(),
+            draining,
         ));
         World {
             apps,
             storage,
+            shutdown,
             root,
         }
     }
@@ -429,6 +526,24 @@ mod tests {
 
         fn service_dir(&self) -> PathBuf {
             self.root.path().join("acme").join("site")
+        }
+
+        async fn started(&self, deployment: &WebDeployment) -> Release {
+            assert!(matches!(
+                self.apps.run(deployment).await.expect("started"),
+                Ran::Started { .. }
+            ));
+            self.apps
+                .process_manager
+                .release("acme", "site")
+                .expect("runs")
+        }
+
+        fn leased(&self) -> Lease {
+            self.apps
+                .process_manager
+                .lease("acme", "site")
+                .expect("a running app")
         }
 
         fn kept(&self) -> Vec<String> {
@@ -587,26 +702,219 @@ mod tests {
             "the same process, of the same version"
         );
 
-        let second = w.uploaded(3, bundle("three"), true).await;
-        assert!(matches!(
-            w.apps.run(&second).await.expect("started"),
-            Ran::Started { .. }
-        ));
-        let replacing = w
-            .apps
-            .process_manager
-            .release("acme", "site")
-            .expect("runs");
+        let replacing = w.started(&w.uploaded(3, bundle("three"), true).await).await;
         assert_ne!(replacing.dir, running.dir);
-        assert!(running.dir.is_dir(), "kept while requests to it drain");
-        tokio::time::timeout(OLD_VERSION_KEPT * 3, async {
-            while running.dir.exists() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+        gone(&running.dir).await;
+        assert!(replacing.dir.is_dir());
+        w.apps
+            .process_manager
+            .shutdown_all(Duration::from_secs(2))
+            .await;
+    }
+
+    async fn answer(port: u16, wait: Duration) -> reqwest::Result<String> {
+        reqwest::get(format!(
+            "http://127.0.0.1:{port}/?wait={}",
+            wait.as_millis()
+        ))
+        .await?
+        .text()
+        .await
+    }
+
+    fn in_flight(lease: Lease, wait: Duration) -> tokio::task::JoinHandle<reqwest::Result<String>> {
+        tokio::spawn(async move {
+            let answered = answer(lease.port, wait).await;
+            drop(lease.entered);
+            answered
+        })
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    async fn stopped(port: u16) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while answer(port, Duration::ZERO).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("pruned once drained");
-        assert!(replacing.dir.is_dir());
+        .expect("the process stopped");
+    }
+
+    async fn gone(dir: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while dir.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("pruned once its process exited");
+    }
+
+    #[tokio::test]
+    async fn the_replaced_process_finishes_its_request_in_flight_before_it_is_stopped() {
+        if !node_available().await {
+            return;
+        }
+        let w = world(21105..=21107);
+        w.started(&w.uploaded(1, bundle("one"), true).await).await;
+        let old = w.leased();
+        let old_port = old.port;
+        let request = in_flight(old, Duration::from_secs(2));
+        settle().await;
+        w.started(&w.uploaded(2, bundle("two"), true).await).await;
+        let new = w.leased();
+        assert_ne!(
+            new.port, old_port,
+            "a request after the swap goes to the new process"
+        );
+        assert_eq!(
+            answer(new.port, Duration::ZERO)
+                .await
+                .expect("the new process"),
+            "two"
+        );
+        drop(new);
+        assert_eq!(
+            request.await.expect("joined").expect("answered in full"),
+            "one",
+            "by the process it was given to"
+        );
+        stopped(old_port).await;
+        w.apps
+            .process_manager
+            .shutdown_all(Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_request_past_the_grace_is_cut_and_the_process_stopped() {
+        if !node_available().await {
+            return;
+        }
+        let w = draining_world(
+            21108..=21110,
+            Draining {
+                grace: Duration::from_secs(1),
+                stop_timeout: Duration::from_secs(1),
+            },
+        );
+        w.started(&w.uploaded(1, bundle("one"), true).await).await;
+        let old = w.leased();
+        let old_port = old.port;
+        let request = in_flight(old, Duration::from_secs(20));
+        settle().await;
+        w.started(&w.uploaded(2, bundle("two"), true).await).await;
+        let cut = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("cut within the grace and the stop timeout")
+            .expect("joined");
+        assert!(cut.is_err(), "the request past the grace is cut: {cut:?}");
+        stopped(old_port).await;
+        w.apps
+            .process_manager
+            .shutdown_all(Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_zero_grace_kills_the_replaced_process_at_once() {
+        if !node_available().await {
+            return;
+        }
+        let w = draining_world(
+            21111..=21113,
+            Draining {
+                grace: Duration::ZERO,
+                stop_timeout: Duration::from_secs(30),
+            },
+        );
+        w.started(&w.uploaded(1, stubborn("one"), true).await).await;
+        let old = w.leased();
+        let old_port = old.port;
+        let request = in_flight(old, Duration::from_secs(20));
+        settle().await;
+        w.started(&w.uploaded(2, bundle("two"), true).await).await;
+        let cut = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("killed, not sent SIGTERM and waited on")
+            .expect("joined");
+        assert!(cut.is_err(), "the request in flight is cut: {cut:?}");
+        stopped(old_port).await;
+        w.apps
+            .process_manager
+            .shutdown_all(Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_a_drained_process_after_the_http_phase() {
+        if !node_available().await {
+            return;
+        }
+        let w = draining_world(
+            21114..=21116,
+            Draining {
+                grace: Duration::from_secs(60),
+                stop_timeout: Duration::from_secs(2),
+            },
+        );
+        w.started(&w.uploaded(1, bundle("one"), true).await).await;
+        let (old, streaming) = (w.leased(), w.leased());
+        let old_port = old.port;
+        let request = in_flight(old, Duration::from_secs(1));
+        settle().await;
+        w.started(&w.uploaded(2, bundle("two"), true).await).await;
+        let new_port = w.leased().port;
+        w.shutdown.trigger();
+        assert_eq!(
+            request.await.expect("joined").expect("answered in full"),
+            "one",
+            "a shutdown leaves a drained process serving until its children are stopped"
+        );
+        assert_eq!(
+            answer(old_port, Duration::ZERO).await.expect("still runs"),
+            "one"
+        );
+        w.apps
+            .process_manager
+            .shutdown_all(Duration::from_secs(2))
+            .await;
+        stopped(old_port).await;
+        stopped(new_port).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), w.shutdown.drain_tasks())
+                .await
+                .expect("the drain task ends once its process is taken"),
+            cufflink_shutdown::DrainOutcome::Completed
+        );
+        drop(streaming);
+    }
+
+    #[tokio::test]
+    async fn the_replaced_directory_stays_until_its_process_has_exited() {
+        if !node_available().await {
+            return;
+        }
+        let w = world(21117..=21119);
+        let running = w.started(&w.uploaded(1, bundle("one"), true).await).await;
+        let old = w.leased();
+        w.started(&w.uploaded(2, bundle("two"), true).await).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(running.dir.is_dir(), "kept while its process serves");
+        assert_eq!(
+            answer(old.port, Duration::ZERO)
+                .await
+                .expect("still serves"),
+            "one"
+        );
+        let old_port = old.port;
+        drop(old);
+        stopped(old_port).await;
+        gone(&running.dir).await;
         w.apps
             .process_manager
             .shutdown_all(Duration::from_secs(2))

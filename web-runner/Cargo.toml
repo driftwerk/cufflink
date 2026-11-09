@@ -39,6 +39,7 @@ flate2 = "1"
 tar = "0.4.46"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body = "1"
 http-body-util = "0.1"
 futures-util = { workspace = true }
 reqwest = { workspace = true }

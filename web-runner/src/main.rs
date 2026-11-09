@@ -80,6 +80,11 @@ async fn main() -> eyre::Result<()> {
         artifact::ArtifactStore::new(config.artifact_caps),
         process_manager.clone(),
         apps_dir,
+        shutdown.clone(),
+        apps::Draining {
+            grace: config.drain_grace,
+            stop_timeout: config.child_stop_timeout,
+        },
     ));
 
     let warmer = Arc::new(LazyWarmer::new(apps.clone()));

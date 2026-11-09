@@ -1321,6 +1321,21 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.38.0
+
+Unreleased.
+
+- A web app's replaced process is drained: on a swap it gets no new
+  request, may finish the requests the runner forwarded to it within
+  `WEB_DRAIN_GRACE_SECS` (default 30, at most 3600), and only then gets
+  SIGTERM, then SIGKILL after `WEB_CHILD_STOP_TIMEOUT_SECS`
+  ([draining](deployment.md#web-runner)). `WEB_DRAIN_GRACE_SECS=0` kills it
+  at once, as before. Its directory is kept until it has exited. New
+  metrics: `cufflink_web_runner_drains_total{outcome}`,
+  `cufflink_web_runner_drain_seconds`, `cufflink_web_runner_draining`.
+  Runner setting only: no platform change, and runners upgrade in any
+  order.
+
 ## Changes in v0.37.1
 
 No new module-declared feature. A service built for v0.37.0 deploys and

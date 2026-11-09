@@ -581,7 +581,8 @@ A `JOB_*` value the worker cannot use (not a number, a `JOB_LEASE_SECS` below `3
 | `CUFFLINK_PUBLIC_SCHEME` | `https` | `http` only for a local stack without TLS |
 | `CUFFLINK_HOSTNAME_FORMAT` | `flat` | `flat` → `{service}--{tenant}.{base}`; `hierarchical` → nested labels under the base domain |
 | `SHUTDOWN_GRACE_SECS` | `45` | Grace from SIGTERM to exit: proxied requests finish, then every Next.js child is stopped, then NATS and telemetry flush |
-| `WEB_CHILD_STOP_TIMEOUT_SECS` | `10` | How long a child gets between SIGTERM and SIGKILL at shutdown |
+| `WEB_CHILD_STOP_TIMEOUT_SECS` | `10` | How long a child gets between SIGTERM and SIGKILL, at shutdown and when a replaced child has drained |
+| `WEB_DRAIN_GRACE_SECS` | `30` | How long a replaced child may finish the requests it was given before SIGTERM; `0` kills it at once; above `3600` is refused at startup ([draining](deployment.md#web-runner)) |
 | `STORAGE_BACKEND`, `S3_*`, `GCS_BUCKET` | *(required without `WEB_TENANT`)* | Object storage holding the web artifacts |
 | `RUST_LOG` | `info,cufflink_web_runner=debug` | Log filter |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | OTLP/HTTP trace and log export |
