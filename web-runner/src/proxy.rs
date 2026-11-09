@@ -1,15 +1,18 @@
 use crate::host::{parse_host, HostnameFormat};
-use crate::process_manager::ProcessManager;
+use crate::process_manager::{Entered, Lease, ProcessManager};
 use crate::warmer::{LazyWarmer, WarmError};
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
 };
+use http_body::{Frame, SizeHint};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 const TENANT_HEADER: &str = "x-tenant-slug";
 
@@ -70,11 +73,11 @@ pub async fn host_proxy_handler(
             .into_response();
     }
 
-    let port = match state.process_manager.get_port(&tenant, &service) {
-        Some(p) => p,
+    let Lease { port, entered } = match state.process_manager.lease(&tenant, &service) {
+        Some(lease) => lease,
         None => match state.warmer.ensure_warm(&tenant, &service).await {
-            Ok(()) => match state.process_manager.get_port(&tenant, &service) {
-                Some(p) => p,
+            Ok(()) => match state.process_manager.lease(&tenant, &service) {
+                Some(lease) => lease,
                 None => {
                     return (
                         StatusCode::BAD_GATEWAY,
@@ -134,11 +137,95 @@ pub async fn host_proxy_handler(
     match state.http_client.request(downstream_req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let body = Body::new(http_body_util::BodyExt::map_err(body, |e| {
-                std::io::Error::other(e.to_string())
-            }));
-            Response::from_parts(parts, body)
+            let body =
+                http_body_util::BodyExt::map_err(body, |e| std::io::Error::other(e.to_string()));
+            Response::from_parts(
+                parts,
+                Body::new(Counted {
+                    body,
+                    entered: Some(entered),
+                }),
+            )
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response(),
+    }
+}
+
+struct Counted<B> {
+    body: B,
+    entered: Option<Entered>,
+}
+
+impl<B> http_body::Body for Counted<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.entered = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_manager::InFlight;
+    use http_body_util::{BodyExt, Full, StreamBody};
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    async fn idle_within(in_flight: &InFlight, within: Duration) -> bool {
+        tokio::time::timeout(within, in_flight.idle()).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_request_counts_until_its_body_ends() {
+        let in_flight = InFlight::new();
+        let mut body = Counted {
+            body: Full::new(Bytes::from_static(b"done")),
+            entered: in_flight.enter(),
+        };
+        assert_eq!(in_flight.close(), 1);
+        assert!(!idle_within(&in_flight, Duration::from_millis(100)).await);
+        while body.frame().await.is_some() {}
+        assert!(
+            idle_within(&in_flight, Duration::from_secs(1)).await,
+            "a body read to its end no longer counts, though not yet dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_client_goes_away_no_longer_counts() {
+        let in_flight = InFlight::new();
+        let streaming = Counted {
+            body: StreamBody::new(futures_util::stream::pending::<
+                Result<Frame<Bytes>, Infallible>,
+            >()),
+            entered: in_flight.enter(),
+        };
+        assert_eq!(in_flight.close(), 1);
+        assert!(
+            !idle_within(&in_flight, Duration::from_millis(100)).await,
+            "a stream still being sent counts"
+        );
+        drop(streaming);
+        assert!(idle_within(&in_flight, Duration::from_secs(1)).await);
     }
 }

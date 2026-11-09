@@ -1386,6 +1386,16 @@ runs on this platform unchanged. There is no migration.
   tenant-scoped runner's key check is the same call; its `WEB_POLL_SECS` is
   kept as an alias, read only when `WEB_RECONCILE_SECS` is unset. Runner
   setting only: no platform change, and runners upgrade in any order.
+- A web app's replaced process is drained: on a swap it gets no new
+  request, may finish the requests the runner forwarded to it within
+  `WEB_DRAIN_GRACE_SECS` (default 30, at most 3600), and only then gets
+  SIGTERM, then SIGKILL after `WEB_CHILD_STOP_TIMEOUT_SECS`
+  ([draining](deployment.md#web-runner)). `WEB_DRAIN_GRACE_SECS=0` kills it
+  at once, as before. Its directory is kept until it has exited. New
+  metrics: `cufflink_web_runner_drains_total{outcome}`,
+  `cufflink_web_runner_drain_seconds`, `cufflink_web_runner_draining`.
+  Runner setting only: no platform change, and runners upgrade in any
+  order.
 
 ## Changes in v0.37.1
 

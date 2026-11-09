@@ -525,6 +525,9 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `cufflink_web_runner_child_exits_total` | counter | `reason` | App processes that exited, and why |
+| `cufflink_web_runner_drains_total` | counter | `outcome` (`drained`, `grace_elapsed`, `shutdown`, `undeployed`) | Replaced processes stopped: once their requests ended; at the end of `WEB_DRAIN_GRACE_SECS` with requests still running; by the runner's shutdown; by an undeploy or a refused key |
+| `cufflink_web_runner_drain_seconds` | histogram | — | From a process being replaced to its being stopped |
+| `cufflink_web_runner_draining` | gauge | — | Replaced processes still finishing their requests |
 
 ### Extension runner
 

@@ -870,8 +870,24 @@ read the file once, as they start.
   The app's configs are read before anything is downloaded, and the process
   it replaces keeps its own directory, so a deploy that fails at any step
   leaves the running app as it was. A directory no process runs from is
-  removed once nothing is installing or starting from it, 5 s after its
-  process was replaced, with the directories of earlier releases.
+  removed once nothing is installing or starting from it and the process
+  it replaced has exited, with the directories of earlier releases.
+- **Draining.** Once a new process of an app passes its health check, every
+  new request goes to it, and the process it replaced gets none. The runner
+  counts the requests it forwarded to each process, until their response
+  body ends or their client goes away, and lets the replaced one finish
+  them for up to `WEB_DRAIN_GRACE_SECS` (default 30, at most 3600). Only
+  then is it sent SIGTERM, and SIGKILL after `WEB_CHILD_STOP_TIMEOUT_SECS`
+  (default 10). A request still running at the end of the grace, a
+  server-sent event stream for example, is cut. `WEB_DRAIN_GRACE_SECS=0`
+  kills the replaced process at once, as before this release. A new process
+  that fails its health check replaces nothing, so nothing is drained. An
+  undeploy, and a tenant-scoped runner's refused key, still stop the app's
+  processes at once, those draining included. At shutdown, the runner
+  first lets its proxied requests finish, those to a draining process
+  included, then stops every process with SIGTERM. Each drain is logged with
+  the old and new version, the requests it waited for and its outcome
+  (`cufflink_web_runner_drains_total{outcome}`).
 - **Rollbacks.** A rollback activates a version that records the target's
   bundle and publishes `deploy.web` as a deploy does ([rolling
   back](#web-apps)).
