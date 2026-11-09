@@ -336,6 +336,12 @@ platform's `S3_ENDPOINT`. The design is
 
 Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 
+## Features added in v0.38.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `web_releases` | `cufflink deploy` of a web app, from a CLI of v0.38.0; never demanded by a manifest | a web app reserved, uploaded by content and released in one deploy that names its bundle, rollbacks that carry the bundle, and releases skipped by content ([web releases](deployment.md#web-releases)) |
+
 ## Features added in v0.37.0
 
 | Feature | Needed when | Provides |
@@ -398,6 +404,19 @@ bundle as it deploys sources, and rolls back by commit, though the version
 that platform activates reports no commit. A deploy from a bundle
 negotiates as `← bundle from cufflink v<cli> (needs …)`: a bundle says
 which CLI built it, not which SDK.
+
+A web app is released with its bundle from v0.38.0 on (`web_releases`):
+
+| CLI | Platform | Outcome |
+|-----|----------|---------|
+| new | new | reserve, upload by content, release ([web releases](deployment.md#web-releases)) |
+| new | older | refused before building, naming `web_releases`. An older platform would also refuse the release itself with a `422` for the unknown `web_artifact` |
+| older | new | works as before, but safer: the deploy that registers the app before its build is accepted with a warning and skipped by its manifest alone, and its upload never replaces a recorded bundle, releasing new content as a new version. A failed build after a changed `package.json` version can still leave a version with no bundle. Upgrade the CLI with the platform |
+| older | older | as before |
+
+The web runner is independent of both: a runner of any release reads the
+content keys as it reads the earlier ones, since they are opaque, and
+switches on the events of releases and rollbacks alike.
 
 ## Rolling a platform back
 
@@ -482,8 +501,11 @@ Rolling a platform back from v0.38.0 to an earlier release:
 
 | What v0.38.0 added | Before rolling the platform back |
 |--------------------|----------------------------------|
+| Web bundles by content | Nothing to undo. The older platform reads the recorded keys as they are, and its runners serve them |
 | Web rollbacks that carry the bundle | **Do not `cufflink rollback` a web app on the older platform.** Its rollback creates a version with no bundle and tells no runner. Deploy the earlier commit instead |
-| The database | Nothing: v0.38.0 has no migration |
+| Web releases (`web_releases`) | Pin the CLI to the older release for web deploys. A CLI of v0.38.0 refuses to deploy a web app there |
+| Unreleased uploads | Nothing. They stay in storage, unread, until the platform is back (`WEB_UPLOAD_RETENTION_SECS`) or the service is deleted |
+| The database | Nothing: `V9__web_uploads` only adds a table the older binary does not read |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
@@ -508,7 +530,7 @@ Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
 `V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
-v0.35.0, `V8__tenant_buckets` on v0.36.0): expected and harmless, as migrations are
+v0.35.0, `V8__tenant_buckets` on v0.36.0, `V9__web_uploads` on v0.38.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist
@@ -1331,8 +1353,36 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 ## Changes in v0.38.0
 
 No new module-declared feature. A service built for v0.37.1 deploys and
-runs on this platform unchanged. There is no migration and no new
-environment variable.
+runs on this platform unchanged. The platform advertises `web_releases`.
+
+- A web app is released with its bundle: a version exists only once its
+  bundle is stored, so a failed build or upload leaves the running version
+  as it was. New routes reserve the app (`POST /api/services/web`) and
+  upload its bundle by content
+  (`PUT /api/services/{id}/web/artifacts/{sha256}`), and a deploy names the
+  uploaded bundle in `web_artifact`, which the version records in the
+  transaction that activates it. The answer adds `web_artifact` and
+  `runners_told` ([web releases](deployment.md#web-releases)).
+- Versions by content: a new bundle is a new version whatever
+  `package.json` says, and the same bundle and manifest are skipped, the
+  runners told again. Bundles are stored as
+  `web/{service_id}/{sha256}.tar.gz` and never rewritten; keys recorded by
+  earlier releases keep working.
+- A web deploy that names no bundle, as earlier CLIs send, is accepted
+  with a warning and counted as `cufflink_web_legacy_deploys_total`. The
+  upload route of earlier CLIs stores by content, and never replaces a
+  recorded bundle: it fills a version that has none, or releases a new
+  version. Its answer adds `version` and `released`.
+- Pruning or deleting a version removes its web bundle once no retained
+  version and no recent upload holds it; deleting a web app or its tenant
+  removes every object under `web/{service_id}/`. An upload no version
+  records is removed after `WEB_UPLOAD_RETENTION_SECS` (default 86 400, at
+  least 3 600).
+- Uploads are audited as `web.upload` and counted as
+  `cufflink_web_uploads_total{result}`; a release's audit row carries
+  `artifact_hash`.
+
+Migration `V9__web_uploads.sql` adds the `web_uploads` table.
 
 - `cufflink rollback` of a web app switches: the version it activates
   records the target's bundle, under the key the target records, and the

@@ -5,6 +5,7 @@ use super::module::{
 };
 use super::native::NativeBinary;
 use super::schema;
+use super::web::WebArtifactRef;
 use crate::auth::AuthUser;
 use crate::deployer::manifest::ServiceManifest;
 use crate::errors::{PlatformError, PlatformResult};
@@ -59,6 +60,7 @@ pub(crate) struct DeployContext<'a> {
     pub wasm_bytes: Option<&'a [u8]>,
     pub wasm_hash: Option<&'a str>,
     pub native: Option<&'a NativeBinary>,
+    pub web_artifact: Option<&'a WebArtifactRef>,
     pub commit_hash: Option<&'a str>,
     pub actor: &'a str,
     pub schema: schema::Options,
@@ -69,12 +71,32 @@ impl<'a> DeployContext<'a> {
         self.wasm_bytes.zip(self.wasm_hash)
     }
 
-    fn code_hash(&self) -> Option<&str> {
-        code_hash(
-            &self.manifest.mode,
-            self.wasm_hash,
-            self.native.map(|binary| binary.hash.as_str()),
-        )
+    fn code(&self) -> Code<'_> {
+        Code {
+            wasm: self.wasm_hash,
+            artifact: self
+                .native
+                .map(|binary| binary.hash.as_str())
+                .or(self.web_artifact.map(|bundle| bundle.sha256.as_str())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Code<'a> {
+    wasm: Option<&'a str>,
+    artifact: Option<&'a str>,
+}
+
+impl<'a> Code<'a> {
+    fn of(deployment: &'a Deployment) -> Self {
+        Code {
+            wasm: deployment.wasm_hash.as_deref(),
+            artifact: deployment
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.hash.as_str()),
+        }
     }
 }
 
@@ -118,16 +140,22 @@ pub(crate) async fn admit_calls(
     Ok(registrations)
 }
 
-fn code_hash<'a>(
-    mode: &ServiceMode,
-    wasm_hash: Option<&'a str>,
-    native_hash: Option<&'a str>,
-) -> Option<&'a str> {
+fn code_hash<'a>(mode: &ServiceMode, code: Code<'a>) -> Option<&'a str> {
     match mode {
-        ServiceMode::Native => native_hash,
-        ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container | ServiceMode::Web => {
-            wasm_hash
-        }
+        ServiceMode::Native | ServiceMode::Web => code.artifact,
+        ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => code.wasm,
+    }
+}
+
+fn compared_code_hashes<'a>(
+    mode: &ServiceMode,
+    running: Code<'a>,
+    new: Code<'a>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let new_hash = code_hash(mode, new);
+    match (mode, new_hash) {
+        (ServiceMode::Web, None) => (None, None),
+        _ => (code_hash(mode, running), new_hash),
     }
 }
 
@@ -158,20 +186,18 @@ pub(crate) async fn run_locked(
         running.map(Deployment::mode).transpose()?.as_ref(),
         &manifest.mode,
     )?;
+    let bundle = match ctx.web_artifact {
+        Some(wanted) => Some(super::web::claim(state, &ctx.identity, wanted).await?),
+        None => None,
+    };
     if let Some(latest) = running {
-        let latest_code_hash = code_hash(
-            &manifest.mode,
-            latest.wasm_hash.as_deref(),
-            latest
-                .artifact
-                .as_ref()
-                .map(|artifact| artifact.hash.as_str()),
-        );
+        let (latest_code_hash, new_code_hash) =
+            compared_code_hashes(&manifest.mode, Code::of(latest), ctx.code());
         if should_skip_deploy(
             &latest.manifest_hash,
             ctx.manifest_hash,
             latest_code_hash,
-            ctx.code_hash(),
+            new_code_hash,
         ) {
             info!(
                 "Service '{}' manifest and code unchanged (hash: {}), skipping deploy",
@@ -198,6 +224,7 @@ pub(crate) async fn run_locked(
                     announce(state, service.id, None).await;
                 }
             }
+            sweep_web(ctx).await;
             return Ok(DeployOutcome::Skipped {
                 service,
                 latest: latest.clone(),
@@ -212,7 +239,17 @@ pub(crate) async fn run_locked(
                 eventing: EventingPlan::default(),
             })
         }
-        ServiceMode::Web => activate_in_runner(ctx, service, new_version, None).await,
+        ServiceMode::Web => {
+            let outcome = activate_in_runner(
+                ctx,
+                service,
+                new_version,
+                bundle.as_ref().map(VersionArtifact::Web),
+            )
+            .await?;
+            sweep_web(ctx).await;
+            Ok(outcome)
+        }
         ServiceMode::Native => {
             let binary = ctx.native.ok_or_else(super::native::missing)?;
             let artifact = super::native::store(state, service.id, binary, uploads).await?;
@@ -226,6 +263,12 @@ pub(crate) async fn run_locked(
         ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => {
             run_on_platform(ctx, service, new_version, uploads).await
         }
+    }
+}
+
+async fn sweep_web(ctx: &DeployContext<'_>) {
+    if matches!(ctx.manifest.mode, ServiceMode::Web) && !ctx.schema.plan_only {
+        super::web::sweep(ctx.state, ctx.identity.service_id).await;
     }
 }
 
@@ -320,7 +363,7 @@ async fn run_on_platform(
 pub(crate) async fn after_release(
     ctx: &DeployContext<'_>,
     outcome: &DeployOutcome,
-) -> PlatformResult<()> {
+) -> PlatformResult<Option<bool>> {
     let (state, manifest) = (ctx.state, ctx.manifest);
     if manifest.mode.runs_on_platform() {
         crate::db_roles::provision::after_deploy(
@@ -331,11 +374,15 @@ pub(crate) async fn after_release(
         .await;
     }
     match outcome {
-        DeployOutcome::Planned { .. } => Ok(()),
-        DeployOutcome::Skipped { .. } if manifest.subscriptions.is_empty() => Ok(()),
+        DeployOutcome::Planned { .. } => Ok(None),
+        DeployOutcome::Skipped { latest, .. } if matches!(manifest.mode, ServiceMode::Web) => {
+            Ok(super::web::announce(state, &ctx.identity, latest).await)
+        }
+        DeployOutcome::Skipped { .. } if manifest.subscriptions.is_empty() => Ok(None),
         DeployOutcome::Skipped { .. } => {
             eventing::after_activation(state, manifest, &ctx.identity, &EventingPlan::skipped())
                 .await
+                .map(|()| None)
         }
         DeployOutcome::Deployed {
             deployment,
@@ -349,13 +396,17 @@ pub(crate) async fn after_release(
             )
             .await;
             match manifest.mode {
-                ServiceMode::Web => Ok(()),
+                ServiceMode::Web => {
+                    Ok(super::web::announce(state, &ctx.identity, deployment).await)
+                }
                 ServiceMode::Native => {
                     super::native::announce(state, &ctx.identity, deployment, manifest).await;
-                    Ok(())
+                    Ok(None)
                 }
                 ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => {
-                    eventing::after_activation(state, manifest, &ctx.identity, eventing).await
+                    eventing::after_activation(state, manifest, &ctx.identity, eventing)
+                        .await
+                        .map(|()| None)
                 }
             }
         }
@@ -472,6 +523,7 @@ pub(crate) async fn rollback_locked(
                 },
             )
             .await?;
+            super::web::sweep(state, service_id).await;
             (
                 schema::SchemaReport::default(),
                 EventingPlan::default(),
@@ -562,9 +614,9 @@ pub(crate) async fn after_rollback(
             .await;
             Ok(None)
         }
-        ServiceMode::Web => Ok(Some(
-            super::web::announce(state, &outcome.identity, &outcome.deployment).await,
-        )),
+        ServiceMode::Web => {
+            Ok(super::web::announce(state, &outcome.identity, &outcome.deployment).await)
+        }
         ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container => eventing::after_rollback(
             state,
             &outcome.manifest,
@@ -717,17 +769,71 @@ mod tests {
         assert!(!should_skip_deploy("m1", "m1", Some("w1"), None));
     }
 
-    fn skipped(
-        mode: &ServiceMode,
-        running: (&str, Option<&str>, Option<&str>),
-        new: (&str, Option<&str>, Option<&str>),
-    ) -> bool {
-        should_skip_deploy(
-            running.0,
-            new.0,
-            code_hash(mode, running.1, running.2),
-            code_hash(mode, new.1, new.2),
-        )
+    type Deployed = (&'static str, Option<&'static str>, Option<&'static str>);
+
+    fn skipped(mode: &ServiceMode, running: Deployed, new: Deployed) -> bool {
+        let code = |(_, wasm, artifact): Deployed| Code { wasm, artifact };
+        let (running_hash, new_hash) = compared_code_hashes(mode, code(running), code(new));
+        should_skip_deploy(running.0, new.0, running_hash, new_hash)
+    }
+
+    const BUNDLE: &str = "3f9a";
+
+    #[test]
+    fn a_web_apps_code_hash_is_its_bundle_hash() {
+        let code = Code {
+            wasm: Some("module"),
+            artifact: Some(BUNDLE),
+        };
+        assert_eq!(code_hash(&ServiceMode::Web, code), Some(BUNDLE));
+        assert_eq!(code_hash(&ServiceMode::Native, code), Some(BUNDLE));
+        for mode in [ServiceMode::Crud, ServiceMode::Wasm, ServiceMode::Container] {
+            assert_eq!(code_hash(&mode, code), Some("module"), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_bundle_and_manifest_is_skipped() {
+        assert!(skipped(
+            &ServiceMode::Web,
+            ("m", None, Some(BUNDLE)),
+            ("m", None, Some(BUNDLE))
+        ));
+    }
+
+    #[test]
+    fn a_legacy_web_deploy_with_an_unchanged_manifest_is_still_skipped() {
+        let web = ServiceMode::Web;
+        assert!(skipped(&web, ("m", None, Some(BUNDLE)), ("m", None, None)));
+        assert!(skipped(&web, ("m", None, None), ("m", None, None)));
+        assert!(!skipped(
+            &web,
+            ("m", None, Some(BUNDLE)),
+            ("m2", None, None)
+        ));
+    }
+
+    #[test]
+    fn a_new_bundle_under_the_same_package_version_is_a_new_version() {
+        let web = ServiceMode::Web;
+        assert!(!skipped(
+            &web,
+            ("m", None, Some(BUNDLE)),
+            ("m", None, Some("b7c1"))
+        ));
+        assert!(
+            !skipped(&web, ("m", None, None), ("m", None, Some(BUNDLE))),
+            "a version an older CLI left without a bundle is replaced by one that has it"
+        );
+    }
+
+    #[test]
+    fn the_same_bundle_under_a_new_package_version_is_a_new_version() {
+        assert!(!skipped(
+            &ServiceMode::Web,
+            ("m", None, Some(BUNDLE)),
+            ("m2", None, Some(BUNDLE))
+        ));
     }
 
     #[test]

@@ -24,5 +24,6 @@ pub mod tenant_policies;
 pub mod tenant_streams;
 pub mod tenants;
 pub mod wasm_jobs;
+pub mod web_uploads;
 pub mod webhook_deliveries;
 pub mod webhooks;

@@ -363,18 +363,7 @@ pub async fn delete_tenant(
         crate::deployer::native::announce_removal(&state, &slug, service.id, &service.name).await;
     }
     for service_id in service_ids {
-        crate::deployer::native::delete_objects(&state, service_id).await;
-    }
-
-    if let Some(ref storage) = state.storage {
-        for artifact in &web_artifacts {
-            if let Err(e) = storage.delete(&artifact.artifact_s3_key).await {
-                warn!(
-                    "Failed to delete S3 artifact {} for tenant teardown: {}",
-                    artifact.artifact_s3_key, e
-                );
-            }
-        }
+        crate::deployer::artifacts::delete_objects(&state, service_id).await;
     }
 
     let database = state

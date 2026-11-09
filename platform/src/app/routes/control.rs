@@ -259,9 +259,14 @@ pub(in crate::app) fn routes() -> Router<Arc<AppState>> {
             "/api/services/{id}/files/{file_id}",
             delete(api::files::delete_file),
         )
+        .route("/api/services/web", post(api::web::reserve_web_app))
         .route(
             "/api/services/{id}/web",
             post(api::web::upload_web_artifact),
+        )
+        .route(
+            "/api/services/{id}/web/artifacts/{sha256}",
+            put(api::web::upload_web_bundle),
         )
         .route("/api/services/{id}/web/status", get(api::web::web_status))
         .route("/api/services/{id}/wasm", post(api::wasm::upload_wasm))
