@@ -1336,7 +1336,7 @@ Unreleased.
   and the reconcile share one queue, so two starts of an app never overlap
   and a burst of events runs one deploy of the newest version. A deploy
   event clears the app's remembered failed cold start and unknown host. A
-  tenant-scoped runner's key check is the same call; `WEB_POLL_SECS` is
+  tenant-scoped runner's key check is the same call; its `WEB_POLL_SECS` is
   kept as an alias, read only when `WEB_RECONCILE_SECS` is unset. Runner
   setting only: no platform change, and runners upgrade in any order.
 

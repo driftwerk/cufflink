@@ -566,6 +566,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_it_cannot_read_leaves_the_running_app_as_it_is() {
+        let Some(w) = world(21216..=21217).await else {
+            return;
+        };
+        w.start(1, serving("one", &w.log)).await;
+        w.release(2, Some(serving("two", &w.log))).await;
+        w.execute("ALTER TABLE deployments RENAME TO deployments_away", &[])
+            .await;
+        w.converger.reconcile().await;
+        assert_eq!(w.queued(), []);
+        w.converger.announce(&w.event()).expect("an event");
+        w.drain().await;
+        assert_eq!((w.running(), w.starts()), (Some(1), vec!["one".into()]));
+        w.stop().await;
+    }
+
+    #[tokio::test]
     async fn a_deploy_event_clears_the_warmers_not_found_entry() {
         let Some(w) = world(21214..=21215).await else {
             return;
