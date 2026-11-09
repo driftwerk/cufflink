@@ -74,6 +74,11 @@ slots only while it computes.
   slots, as does every call while a wait pool is full or under
   `WASM_WAIT_RELEASE=off`. `cufflink_wasm_wait_release_total` counts each
   reason.
+- **A service call to its own service.** The callee is admitted as the
+  call is sent, before its caller parks, and a nested callee only tries
+  for its slots. So releasing does not let a service reach itself when its
+  slots are full: the callee is refused at once with 503, as it is when
+  the call holds.
 - **The wait pools.** At most `WASM_MAX_PARKED` (default
   `WASM_MAX_CONCURRENT`) guests are parked per process, and at most
   `WASM_MAX_PARKED_PER_SERVICE` (default

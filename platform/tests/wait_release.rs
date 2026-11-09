@@ -522,3 +522,34 @@ async fn a_service_call_parks_its_caller_and_a_nested_callee_never_parks() {
     assert_eq!(answer.body["status"], 200, "{}", answer.body);
     assert_eq!(stack.released("parked").await, 1.0);
 }
+
+#[tokio::test]
+async fn a_self_call_with_one_slot_is_refused_at_once_and_never_deadlocks() {
+    let Some(stack) = stack(&[("WASM_MAX_CONCURRENT_PER_SERVICE", "1")], &[CATALOG]).await else {
+        return;
+    };
+    let call = json!({
+        "host": "service_call",
+        "request": {
+            "service": CATALOG,
+            "method": "POST",
+            "path": "/compute",
+            "headers": {"content-type": "application/json"},
+            "body_b64": STANDARD.encode("{}"),
+            "wait": "release",
+        },
+    });
+    let answer = tokio::time::timeout(SOON, stack.send(CATALOG, "relay", call))
+        .await
+        .expect("the self-call ends")
+        .expect("joined");
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(
+        answer.body["status"], 503,
+        "the nested callee only tries for the slot its caller still holds: {}",
+        answer.body
+    );
+    assert_eq!(stack.released("answered_first").await, 1.0);
+    assert_eq!(stack.released("parked").await, 0.0);
+    assert_eq!(stack.compute(CATALOG).await.status, 200);
+}
