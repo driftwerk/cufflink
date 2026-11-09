@@ -831,6 +831,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arrivals_held_behind_a_resume_keep_their_order_whatever_order_they_wake_in() {
+        let gate = Gate::new(1);
+        let running_guest = gate.try_take().expect("the running guest's slot");
+        let mut first = pin!(gate.admit());
+        let mut second = pin!(gate.admit());
+        assert!(poll!(first.as_mut()).is_pending());
+        assert!(poll!(second.as_mut()).is_pending());
+
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked(&[&gate], InvocationKind::Route).resume(by(
+            Duration::from_secs(5),
+            &cancel,
+            &shutdown
+        )));
+        assert!(poll!(resume.as_mut()).is_pending());
+        drop(running_guest);
+        assert!(poll!(first.as_mut()).is_pending(), "the head steps back");
+        let Poll::Ready(Ok(retaken)) = poll!(resume.as_mut()) else {
+            panic!("the slot the head gave back goes to the resume, not the arrival behind it");
+        };
+
+        drop(retaken);
+        assert!(
+            poll!(second.as_mut()).is_pending(),
+            "the later arrival does not overtake the earlier one by waking first"
+        );
+        assert!(matches!(poll!(first.as_mut()), Poll::Ready(Ok(_))));
+    }
+
+    #[tokio::test]
     async fn resumes_take_freed_slots_in_their_own_order() {
         let gate = Gate::new(1);
         let running_guest = gate.try_take().expect("the running guest's slot");
