@@ -61,7 +61,7 @@ impl Delegation {
     pub fn of(user: &AuthUser) -> Option<Self> {
         let (method, expires_at) = match &user.auth_method {
             AuthMethod::Jwt => (
-                DelegatedMethod::Jwt,
+                DelegatedMethod::Jwt {},
                 Some(
                     user.token_info
                         .as_ref()?
@@ -114,7 +114,7 @@ impl Delegation {
             tenant_id: tenant.id,
             tenant_slug: tenant.slug.clone(),
             auth_method: match self.method {
-                DelegatedMethod::Jwt => AuthMethod::Jwt,
+                DelegatedMethod::Jwt {} => AuthMethod::Jwt,
                 DelegatedMethod::ApiKey { id, user_sub } => AuthMethod::ApiKey { id, user_sub },
             },
             token_info,

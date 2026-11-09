@@ -129,6 +129,7 @@ pub struct Claims {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Delegation {
     #[serde(rename = "sub")]
     pub subject: String,
@@ -149,9 +150,9 @@ pub struct Delegation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "k", rename_all = "snake_case")]
+#[serde(tag = "k", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DelegatedMethod {
-    Jwt,
+    Jwt {},
     ApiKey {
         id: Uuid,
         #[serde(rename = "us", default, skip_serializing_if = "Option::is_none")]
@@ -160,6 +161,7 @@ pub enum DelegatedMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegatedToken {
     #[serde(rename = "pu", default, skip_serializing_if = "Option::is_none")]
     pub preferred_username: Option<String>,
@@ -178,14 +180,17 @@ impl Claims {
 }
 
 pub fn mint(keys: &ServiceIdentityKeys, claims: &Claims) -> serde_json::Result<String> {
+    serde_json::to_vec(claims).map(|payload| sign(keys, &payload))
+}
+
+fn sign(keys: &ServiceIdentityKeys, payload: &[u8]) -> String {
     let (kid, key) = &keys.active;
-    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
-    let signed = format!("{VERSION}.{kid}.{payload}");
+    let signed = format!("{VERSION}.{kid}.{}", URL_SAFE_NO_PAD.encode(payload));
     let signature = URL_SAFE_NO_PAD.encode(hmac::sign(
         &ServiceIdentityKeys::hmac_key(key),
         signed.as_bytes(),
     ));
-    Ok(format!("{signed}.{signature}"))
+    format!("{signed}.{signature}")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -340,7 +345,7 @@ mod tests {
         Claims {
             acting_for: Some(Delegation {
                 subject: "clara".into(),
-                method: DelegatedMethod::Jwt,
+                method: DelegatedMethod::Jwt {},
                 name: Some("Clara Clerk".into()),
                 email: Some("clara@example.com".into()),
                 service_account: false,
@@ -691,6 +696,52 @@ mod tests {
         };
         let token = mint(&keys, &key).expect("mint");
         assert_eq!(verify(&keys, &token, &expected(), NOW), Ok(key));
+    }
+
+    #[test]
+    fn an_unknown_field_in_a_delegation_is_refused_rather_than_ignored() {
+        let with = |keys: &ServiceIdentityKeys, claims: Claims, pointer: &str| {
+            let mut payload = serde_json::to_value(claims).expect("json");
+            payload
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("an object")
+                .insert("narrows".into(), Value::from("only-reads"));
+            verify(
+                keys,
+                &sign(keys, payload.to_string().as_bytes()),
+                &expected(),
+                NOW,
+            )
+        };
+        let keys = keys(K1);
+        for pointer in ["/act", "/act/am", "/act/tok"] {
+            assert_eq!(
+                with(&keys, delegated(), pointer),
+                Err(IdentityError::Format),
+                "{pointer}"
+            );
+        }
+        let key = Claims {
+            acting_for: delegated().acting_for.map(|delegation| Delegation {
+                method: DelegatedMethod::ApiKey {
+                    id: Uuid::from_u128(9),
+                    user_sub: Some("clara".into()),
+                },
+                ..delegation
+            }),
+            ..claims()
+        };
+        assert_eq!(
+            with(&keys, key, "/act/am"),
+            Err(IdentityError::Format),
+            "an API key's method too"
+        );
+        assert_eq!(
+            with(&keys, delegated(), ""),
+            Ok(delegated()),
+            "the identity's own claims still admit fields a later release adds"
+        );
     }
 
     #[test]

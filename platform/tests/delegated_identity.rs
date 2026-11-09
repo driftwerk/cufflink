@@ -61,7 +61,7 @@ fn manifest() -> Value {
 fn delegation(subject: &str, expires_at: i64) -> Delegation {
     Delegation {
         subject: subject.into(),
-        method: DelegatedMethod::Jwt,
+        method: DelegatedMethod::Jwt {},
         name: Some(format!("{subject} at acme")),
         email: Some(format!("{subject}@example.com")),
         service_account: false,
