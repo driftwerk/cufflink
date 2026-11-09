@@ -216,7 +216,7 @@ beside the one `CUFFLINK_RUNNER_KEY_FILE` names and renamed over it, as a
 Kubernetes secret mount does, so the runner never reads half a key), and
 revoke the old key only once the runner uses the new one. A web runner
 that asked with the old key just before it was revoked stops its apps and
-serves again at its next poll, within one `WEB_POLL_SECS`. A runner whose
+serves again at its next reconcile, within one `WEB_RECONCILE_SECS`. A runner whose
 key the platform refuses, or answers for another tenant, stops everything
 it runs and stays unready until a key the platform accepts is in place,
 since a refused key means the key was revoked or its tenant deleted, and a
