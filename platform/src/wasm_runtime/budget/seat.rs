@@ -434,7 +434,7 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Admission, Budget, BudgetConfig, Class, RouteKey, ServiceSlot, Ticket, WaitRelease,
+        Admission, Budget, BudgetConfig, Class, Limits, RouteKey, ServiceSlot, Ticket, WaitRelease,
     };
     use super::testing::quiet;
     use super::*;
@@ -947,6 +947,63 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(started.elapsed(), WAIT, "refused at its admission deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_behind_an_arrival_waiting_for_the_parked_guests_memory_waits_out_its_deadline(
+    ) {
+        const MIB: usize = 1024 * 1024;
+        let budget = Budget::new(
+            BudgetConfig {
+                mode: PolicyMode::Enforce,
+                per_service: 1,
+                limits: Some(Limits {
+                    budget: 12 * MIB,
+                    admit: 12 * MIB,
+                    service: 12 * MIB,
+                    background: 12 * MIB,
+                    overrun: 12 * MIB,
+                }),
+                cold_estimate: 8 * MIB,
+                thread_stack: MIB,
+                ..BudgetConfig::default()
+            },
+            4,
+            usize::MAX,
+            WAIT,
+            Duration::from_secs(1),
+        );
+        let global = Gate::new(4);
+        let loans = identity("loan-service");
+        let (mut parking, charge) = budget
+            .admit(route(&loans), &global)
+            .await
+            .expect("admitted")
+            .into_parts();
+        assert!(charge.is_some(), "the parked guest keeps its memory charge");
+        let parked = released(&mut parking).park().expect("parked");
+
+        let started = tokio::time::Instant::now();
+        let mut arrival = pin!(budget.admit(route(&loans), &global));
+        assert!(
+            poll!(arrival.as_mut()).is_pending(),
+            "the arrival takes the released service slot, then waits for memory"
+        );
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked.resume(by(Duration::from_secs(5), &cancel, &shutdown)));
+        assert!(poll!(resume.as_mut()).is_pending());
+
+        let refused = arrival.await;
+        assert!(
+            matches!(refused, Err(ExecutionError::Overloaded { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(started.elapsed(), WAIT, "refused at its admission deadline");
+        assert!(
+            matches!(poll!(resume.as_mut()), Poll::Ready(Ok(_))),
+            "only then does the resume get the slot back"
+        );
+        drop(charge);
     }
 
     #[tokio::test]
