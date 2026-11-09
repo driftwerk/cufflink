@@ -398,7 +398,7 @@ labelled, and `execute` moves them into `HostState` instead of a local.
 pub(crate) struct Seat {
     route: Option<OwnedSemaphorePermit>,
     releasable: Vec<Taken>,
-    parking: Option<Parking>,
+    parking: Result<Parking, Held>,
 }
 
 struct Taken {
@@ -419,9 +419,9 @@ pub(crate) struct Parked {
     since: Instant,
 }
 
-impl Seat {
+impl Lent {
     pub(crate) fn park(&mut self) -> Result<Parked, Held> {
-        let parking = self.parking.as_ref().ok_or(Held::NotParkable)?;
+        let parking = self.parking.as_ref().map_err(|held| *held)?;
         let global = Arc::clone(&parking.global)
             .try_acquire_owned()
             .map_err(|_| Held::PoolFull)?;
@@ -434,65 +434,115 @@ impl Seat {
             .collect();
         Ok(Parked { gates, _global: global, _service: service, since: Instant::now() })
     }
-
-    fn restore(&mut self, retaken: Vec<Taken>) {
-        self.releasable = retaken;
-    }
 }
 ```
 
 - **The pieces.**
   - `Gate` wraps each releasable semaphore (section 2.5).
-  - `Held` is the reason a call did not park: `NotParkable`, `PoolFull`,
-    `ServicePoolFull`, `Transaction` or `Disabled`.
-  - `parking` is `None` for every case in section 2.3 that is known at
-    admission: class, kind, and the operator's switch.
+  - `Held` (`Copy`) is the reason a call did not park: `NotRequested`,
+    `NotParkable`, `PoolFull`, `ServicePoolFull`, `Transaction` or
+    `Disabled`. `Held::count` counts every reason except `NotRequested`.
+  - The seat's `parking` is `Err(NotParkable)` or `Err(Disabled)` for every
+    case in section 2.3 that is known at admission: class, kind, and the
+    operator's switch.
 - **The admission order.** `Budget::take` builds the seat in its current
   order. `Parked::gates` keeps that order, so a resume takes them in the
   same order as admission, and two resumes cannot deadlock against each
   other.
 - **The wait helper.** It is the one place that parks. It replaces
-  `block_on_within` in the two host functions:
+  `block_on_within` in the two host functions.
+  - Both build their outbound future from a shared borrow of the state:
+    - `fetch_v2(state: &HostState, …)` runs inside `exchange`'s
+      `FnOnce(&HostState, Request)` (`host/util.rs:16`);
+    - `service_call` calls `call(caller.data(), …)`.
+  - A `&mut` seat borrowed across that future would conflict with them. So
+    the host function first takes the releasable permits out of the seat by
+    value (`Seat::lend`), and only then borrows the state.
+  - The helper owns what it may release, and the host function puts back
+    what was retaken after `block_on` returns.
+  - No interior mutability is needed.
 
 ```rust
+// platform/src/wasm_runtime/budget/seat.rs
+pub(crate) struct Lent {
+    releasable: Vec<Taken>,
+    parking: Result<Parking, Held>,
+}
+
+impl Seat {
+    pub(crate) fn lend(&mut self, wait: Wait, transaction_open: bool) -> Lent {
+        let parking = match (wait, transaction_open) {
+            (Wait::Hold, _) => Err(Held::NotRequested),
+            (Wait::Release, true) => Err(Held::Transaction),
+            (Wait::Release, false) => self.parking.clone(),
+        };
+        Lent { releasable: std::mem::take(&mut self.releasable), parking }
+    }
+
+    pub(crate) fn restore(&mut self, retaken: Vec<Taken>) {
+        self.releasable = retaken;
+    }
+}
+
 // platform/src/wasm_runtime/host/mod.rs
+pub(crate) struct Waiting {
+    pub timeout: Duration,
+    pub threshold: Duration,
+    pub until: Instant,
+    pub cancel: CancellationToken,
+}
+
 pub(crate) fn block_on_released<T, E>(
-    state: &mut HostState,
-    wait: Wait,
-    timeout: Duration,
+    mut lent: Lent,
+    waiting: Waiting,
     fut: impl Future<Output = Result<T, E>>,
-) -> wasmtime::Result<Result<T, HostIoError<E>>> {
-    let cancel = state.cancel.clone();
-    let until = state.deadline;
-    let parkable = matches!(wait, Wait::Release) && !state.db.has_open_transaction();
-    let threshold = state.limits.wait_release_after;
-    let seat = &mut state.seat;
+) -> Result<(Result<T, HostIoError<E>>, Vec<Taken>), Interrupt> {
     block_on(async {
-        let call = bounded(timeout, &cancel, fut);
+        let call = bounded(waiting.timeout, &waiting.cancel, fut);
         tokio::pin!(call);
-        let parked = match parkable {
-            false => None,
-            true => tokio::select! {
+        let parked = match lent.parking {
+            Err(Held::NotRequested) => None,
+            _ => tokio::select! {
                 biased;
-                ended = &mut call => return Ok(ended),
-                () = tokio::time::sleep(threshold) => seat.park().map_err(Held::count).ok(),
+                ended = &mut call => return Ok((ended, lent.releasable)),
+                () = tokio::time::sleep(waiting.threshold) => lent.park().map_err(Held::count).ok(),
             },
         };
         let ended = call.await;
         match parked {
-            None => Ok(ended),
+            None => Ok((ended, lent.releasable)),
             Some(parked) => parked
-                .resume(until, &cancel)
+                .resume(waiting.until, &waiting.cancel)
                 .await
-                .map(|retaken| {
-                    seat.restore(retaken);
-                    ended
-                })
-                .map_err(wasmtime::Error::from),
+                .map(|retaken| (ended, retaken)),
         }
     })
 }
 ```
+
+  At a call site, for example `service_call`:
+
+```rust
+let lent = caller.data_mut().lend(request.wait);
+let state = caller.data();
+let released = block_on_released(lent, state.waiting(timeout), call(state, request, timeout, &resolved));
+let (outcome, retaken) = released?;
+caller.data_mut().seat.restore(retaken);
+```
+
+  - `http_fetch_v2` uses a new `exchange_released`, next to `exchange`
+    (`host/util.rs:11`):
+    1. it reads and parses the request;
+    2. it takes `lend(request.wait)` through `data_mut`;
+    3. it runs the handler with `&HostState`;
+    4. it restores the seat and answers.
+
+    `exchange` itself is unchanged for every other host function.
+  - `HostState::lend` passes `self.db.has_open_transaction()` to
+    `Seat::lend`.
+  - `Lent::park` (above) works on the lent permits only. A call that
+    answers within the threshold counts nothing, whatever its `Held`
+    reason.
 
 - **The helpers it uses.**
   - `bounded` is today's `block_on_within` body, without its `block_on`.
@@ -506,8 +556,9 @@ pub(crate) fn block_on_released<T, E>(
     `classify` already maps each to its `ExecutionError`
     (`mod.rs:1206`). The guest never runs another instruction without its
     slots.
-  - The two host functions change from returning `i32` to returning
-    `wasmtime::Result<i32>`. `func_wrap` accepts both, and the guest-facing
+  - The `?` on `released` returns the `Interrupt` from the host function.
+    The two host functions therefore change from returning `i32` to
+    returning `wasmtime::Result<i32>`. `func_wrap` accepts both, and the guest-facing
     signature is unchanged.
 - **Memory.** The memory charge is untouched throughout. The guest's
   `GuestLimits`, linear memory and response reservation stay where they
@@ -863,8 +914,13 @@ enum Identity {
    as_caller for loan-service")`.
 3. `uexp` is more than a second away. Otherwise: `Denied("the caller's token
    has expired")`.
-4. The serialised delegation fits `MAX_DELEGATION_BYTES` (6 KiB). Otherwise:
-   `Denied("the caller's identity is too large to forward")`.
+4. After minting, the whole token fits `MAX_IDENTITY_BYTES` (7 680 bytes).
+   Otherwise: `Denied("the caller's identity is too large to forward")`.
+
+   The cap applies to the minted token, not to the delegation. The header
+   carries every claim, the `cfsi1.kid.` prefix and the 43-character
+   signature, and `path`, whose length the guest chooses, is one of those
+   claims. So only a check on the minted token bounds the header.
 
 It then mints the identity with the delegation and the shortened lifetime.
 `on_behalf_of` keeps its meaning and value.
@@ -921,16 +977,28 @@ pub struct DelegatedToken {
 - **`DelegatedToken.claims` is the whole `TokenInfo.claims`.** The target
   guest's `auth.claims` is therefore identical to a direct call's, so no
   handler has to learn a subset.
-  - A token whose delegation would pass 6 KiB is refused rather than cut.
+  - A delegated identity whose minted token would pass
+    `MAX_IDENTITY_BYTES` (7 680 bytes, below the 8 KiB a header value can
+    safely carry) is refused rather than cut.
+  - In practice, the delegation's JSON gets roughly 5 KiB once base64 (4/3)
+    and the other claims are counted.
   - Section 12, question 4, asks whether to carry a subset instead.
-  - The 6 KiB keeps the whole identity header below 8 KiB after base64.
-- **The verify checks.** `verify` keeps its checks. It adds two, in the same
-  `find_map` list:
-  - `uexp` past, giving `IdentityError::DelegationExpired`
+- **The verify checks.** `verify` stays a pure function of the token, the
+  expected call and the time. It keeps its checks and adds one, in the same
+  `find_map` list: a delegation present with `depth == 0` gives
+  `IdentityError::Format`. A depth of 0 cannot come from a call.
+- **The delegation checks.** The user's expiry and single use are checked
+  after `verify`, by `internal::delegated(claims, now, seen)`. It is called
+  where `ServiceCaller` is built, in `internal::continued` and
+  `internal::admit`:
+  - `uexp` past gives `Refusal::Delegation(DelegationError::Expired)`
     (`delegation_expired`);
-  - a delegation present with `depth == 0`, giving `IdentityError::Format`.
+  - a second use gives `Replayed`, `ReplayCapacity` or `ReplayUnavailable`
+    (section 3.7).
 
-  A depth of 0 cannot come from a call.
+  Unlike an invalid identity, which `continued` ignores on lenient postures
+  today, a refused delegation answers 401 on **every** posture (section
+  3.8).
 
 ### 3.5 Target side
 
@@ -1024,14 +1092,25 @@ pub(crate) struct SeenIdentities {
 }
 
 impl SeenIdentities {
-    pub(crate) fn first_use(&self, jti: Uuid, expires_at: i64, now: i64) -> Result<(), IdentityError>;
+    pub(crate) fn first_use(&self, jti: Uuid, expires_at: i64, now: i64) -> Result<(), DelegationError>;
 }
 ```
 
+- **Where it runs.** `first_use` runs exactly once per request, inside
+  `internal::delegated`, and never inside `verify`, which unit tests and
+  the token's own checks call freely.
+  - A request reaches it from exactly one site: `authorize_route`
+    (`router/postures/mod.rs:178`) for custom routes, or
+    `resolve_data_route` (`router/authz.rs:81`) for CRUD, GraphQL and data
+    streams. Each handler calls exactly one of them once.
+  - `send_http` sends through `EgressGuard::send`, which does not retry, so
+    a worker's delegated call is sent once. A retry added there later must
+    mint a fresh identity per attempt. The test
+    `a_delegated_call_is_verified_once_and_sent_once` pins both.
 - **How it decides.** `first_use` prunes entries past
   `expires_at + CLOCK_SKEW_SECS`. It then inserts the `jti`, or refuses it:
-  - `IdentityError::Replayed` (`replayed`) when the `jti` is present;
-  - `IdentityError::ReplayCapacity` (`replay_capacity`) when the set is at
+  - `DelegationError::Replayed` (`replayed`) when the `jti` is present;
+  - `DelegationError::ReplayCapacity` (`replay_capacity`) when the set is at
     `SERVICE_IDENTITY_REPLAY_MAX` (262 144) after pruning.
 - **Memory.** Entries live at most 65 s, so the default bounds the set near
   13 MiB and admits about 4 000 delegated calls a second per replica.
@@ -1068,7 +1147,7 @@ On the caller, every refusal is a `CallError`, never a trap:
 | No verified principal (anonymous, partner key, subscription, schedule, job, after-hook) | `Denied` | `denied` |
 | The route does not declare `as_caller` for the target | `Denied` | `denied` |
 | The user's token expires within a second | `Denied` | `denied` |
-| The delegation passes 6 KiB | `Denied` | `denied` |
+| The minted token passes `MAX_IDENTITY_BYTES` | `Denied` | `denied` |
 | Depth exceeded | `DepthExceeded` | `depth_exceeded` |
 | Budget spent | `Timeout` | `timeout` |
 
@@ -1081,13 +1160,28 @@ On the target, a refusal is an HTTP answer the caller reads as a
 
 | Event | Status | `cufflink_service_identity_rejected_total{reason}` |
 |-------|--------|---------------------------------------------------|
-| Delegation expired | 401 | `delegation_expired` |
-| Replayed, or the seen-set is full, or Redis is unreachable | 401 | `replayed`, `replay_capacity`, `replay_unavailable` |
+| Delegation expired, on any posture | 401 | `delegation_expired` |
+| Replayed, or the seen-set is full, or Redis is unreachable, on any posture | 401 | `replayed`, `replay_capacity`, `replay_unavailable` |
+| An identity that fails `verify` (signature, binding, lifetime) | Unchanged: 401 on `internal`; ignored on other postures, which then run as for a request without one | unchanged reasons |
 | The user lacks the permission | 403 | not counted (an authorisation answer) |
 | A target replica too old to read `act` | 401 on `auth`, `perm`, `owner` and `scoped` routes; `internal` and `public` routes run with no user | not counted |
 
 The last row is the fail-closed behaviour of a mixed-version fleet
 (section 6).
+
+**A refused delegation answers 401 on every posture.** This is a deliberate
+departure from today's rule that `continued` ignores an invalid identity
+outside `internal` routes.
+
+- The identity verified, so the platform knows the call was made to act as
+  a user.
+- Running it anonymously on a `public` or legacy route would answer a
+  question the caller did not ask: data shaped for no user, under the
+  user's name in the caller's logic.
+
+An identity whose signature or binding fails is still treated as today,
+because nothing in it can be trusted, not even the claim that it was
+delegated.
 
 ### 3.9 Metrics and logs
 
@@ -1220,7 +1314,7 @@ impl<'a> ServiceCall<'a> {
 
 - The blocking pool and the nested pool are derived (section 2.6) and have
   no variable of their own.
-- `MAX_DELEGATION_BYTES` (6 KiB) is a constant, because the header limit it
+- `MAX_IDENTITY_BYTES` (7 680) is a constant, because the header limit it
   protects is not configurable.
 - A worker-only process reads the same variables.
 
@@ -1282,7 +1376,6 @@ Every fixture uses the repository's invented names: tenants `acme` and
 - `a_token_is_signed_as_every_release_signs_it` (unchanged, and it must
   still pass)
 - `a_delegated_token_is_signed_and_verifies_for_its_exact_call`
-- `a_delegation_past_its_users_expiry_is_refused`
 - `a_delegation_at_depth_zero_is_malformed`
 - `a_verifier_without_the_act_field_reads_a_delegated_token_as_service_only`,
   which deserialises into a copy of today's `Claims`
@@ -1290,10 +1383,14 @@ Every fixture uses the repository's invented names: tenants `acme` and
 `platform/src/auth/delegation.rs`:
 
 - `platform_admin_and_deploy_authority_are_never_delegated`
+- `a_delegation_past_its_users_expiry_is_refused_after_verify`
 - `partner_keys_and_anonymous_callers_have_no_delegation`
 - `a_grant_on_a_delegated_route_keeps_the_user_expiry_it_arrived_with`
 - `an_identity_never_outlives_the_users_token`
-- `a_delegation_past_six_kib_is_not_minted`
+- `an_identity_past_max_identity_bytes_is_not_minted`, including one made
+  too long only by its path
+- `a_delegated_call_is_verified_once_and_sent_once`
+- `an_expired_delegation_is_refused_on_a_public_route_too`
 - `a_replayed_jti_is_refused_and_an_expired_one_is_forgotten`
 - `a_full_seen_set_refuses_rather_than_forgets`
 
@@ -1540,7 +1637,7 @@ Each question has a recommended default, which the design above assumes.
    - The alternative, plain FIFO, is simpler. But it lets a burst of new
      arrivals hold a partly-run guest, with its memory and thread, for up
      to their 1 s each.
-4. **A user whose token claims pass 6 KiB.**
+4. **A user whose token claims make the identity pass `MAX_IDENTITY_BYTES`.**
    - *Default: refuse the delegation* (`Denied`), so `auth.claims` is
      always identical to a direct call's.
    - The alternative carries only the named fields and drops `claims`.
