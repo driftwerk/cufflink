@@ -440,6 +440,10 @@ async fn a_guest_that_cannot_resume_before_its_deadline_ends_deadline_exceeded()
     upstream.open();
     let ended = proxy.await.expect("joined");
     assert_eq!(ended.status, 500, "{}", ended.body);
+    assert_eq!(
+        ended.body,
+        json!({"error": "WASM execution timed out after 2s"})
+    );
     assert_eq!(upstream.arrived(), 1, "the upstream call was made once");
     assert_eq!(
         stack
