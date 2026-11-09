@@ -341,6 +341,7 @@ Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
 | `web_releases` | `cufflink deploy` of a web app, from a CLI of v0.38.0; never demanded by a manifest | a web app reserved, uploaded by content and released in one deploy that names its bundle, rollbacks that carry the bundle, and releases skipped by content ([web releases](deployment.md#web-releases)) |
+| `wait_release` | a guest's `http_fetch_v2` or `service_call` request says `"wait": "release"` | a guest that gives back its execution slots while its call is outstanding, and takes them back before it continues ([wait pools](scaling.md#wait-pools)) |
 
 ## Features added in v0.37.0
 
@@ -509,6 +510,7 @@ Rolling a platform back from v0.38.0 to an earlier release:
 | Web rollbacks that carry the bundle | **Do not `cufflink rollback` a web app on the older platform.** Its rollback creates a version with no bundle and tells no runner. Deploy the earlier commit instead |
 | Web releases (`web_releases`) | Pin the CLI to the older release for web deploys. A CLI of v0.38.0 refuses to deploy a web app there |
 | Unreleased uploads | Nothing. They stay in storage, unread, until the platform is back (`WEB_UPLOAD_RETENTION_SECS`) or the service is deleted |
+| Released waits (`wait_release`) | Roll back first every service whose calls ask for it: the older platform refuses such a request as malformed |
 | The database | Nothing: `V9__web_uploads` only adds a table the older binary does not read |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
@@ -1359,7 +1361,8 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 Unreleased.
 
 No new module-declared feature. A service built for v0.37.1 deploys and
-runs on this platform unchanged. The platform advertises `web_releases`.
+runs on this platform unchanged. The platform advertises `web_releases`
+and `wait_release`.
 
 - A web app is released with its bundle: a version exists only once its
   bundle is stored, so a failed build or upload leaves the running version
@@ -1387,30 +1390,6 @@ runs on this platform unchanged. The platform advertises `web_releases`.
 - Uploads are audited as `web.upload` and counted as
   `cufflink_web_uploads_total{result}`; a release's audit row carries
   `artifact_hash`.
-
-- **Pool sizes.** With the new `WASM_WAIT_RELEASE` at its default `on`,
-  the blocking pool's ceiling is
-  `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
-  pool is `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 4` permits, room for
-  guests that will wait on an outbound call without their slots
-  ([wait pools](scaling.md#wait-pools)). With the defaults, the
-  ceiling rises from 1 344 to 2 624 threads; idle threads still exit after
-  2 s, so it is reached only under that much waiting load.
-  `WASM_WAIT_RELEASE=off` keeps today's sizes. `WASM_WAIT_RELEASE_AFTER_MS`,
-  `WASM_MAX_PARKED` and `WASM_MAX_PARKED_PER_SERVICE` configure the waits
-  ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)), and
-  a malformed value stops the process at startup.
-- **`pids.max`.** Where the process's cgroup is v2, startup warns when the
-  blocking pool's ceiling, the worker threads and 64 more reach the
-  cgroup's `pids.max`. A deployment that sees it lowers `WASM_MAX_PARKED`
-  or raises the limit.
-- **Metrics.** `cufflink_wasm_wait_release_total`, `cufflink_wasm_parked`,
-  `cufflink_wasm_parked_seconds`, `cufflink_wasm_resume_wait_seconds` and
-  `cufflink_wasm_blocking_threads` ([observability](observability.md)).
-- A guest returning to its slots is granted each one ahead of arrivals
-  that come while it waits for it; an arrival already queued for that slot
-  keeps its place. Nothing releases slots yet, so admission is otherwise
-  unchanged.
 - `cufflink rollback` of a web app switches: the version it activates
   records the target's bundle, under the key the target records, and the
   platform publishes `deploy.web` so the runners serve it. A target that
@@ -1439,6 +1418,43 @@ runs on this platform unchanged. The platform advertises `web_releases`.
   tenant-scoped runner's key check is the same call; its `WEB_POLL_SECS` is
   kept as an alias, read only when `WEB_RECONCILE_SECS` is unset. Runner
   setting only: no platform change, and runners upgrade in any order.
+- **Waits that release slots.** `http_fetch_v2` and `service_call` accept
+  `"wait": "release"` (platform feature `wait_release`). A call still
+  outstanding after `WASM_WAIT_RELEASE_AFTER_MS` gives back the guest's
+  service slot, class cap, background cap and global slot, and takes them
+  back before the host function returns. The guest keeps its memory, its
+  thread, its route slot and its database connections. A call from a
+  nested or committed invocation or an SSE reducer, inside an open
+  guest-owned transaction, or that finds a wait pool full holds its slots
+  as before. A guest that cannot take its slots back by its deadline ends
+  `DeadlineExceeded`, and the call's effects stand
+  ([wait pools](scaling.md#wait-pools)). Requests without the field are
+  answered and admitted exactly as before.
+- **Resumes first.** A guest taking its slots back is granted each one
+  ahead of every arrival waiting for it, including arrivals queued before
+  it. Arrivals keep their order among themselves and resumes theirs, and
+  an arrival held behind resumes is refused at its admission deadline. Under
+  `warn`, a slot admission only tried for is only tried for again; a guest
+  that finds it taken goes on without it, counted as a `warn` refusal.
+- **Pool sizes.** With the new `WASM_WAIT_RELEASE` at its default `on`,
+  the blocking pool's ceiling is
+  `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
+  pool is `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 4` permits, room for
+  the guests that wait without their slots. With the defaults, the
+  ceiling rises from 1 344 to 2 624 threads; idle threads still exit after
+  2 s, so it is reached only under that much waiting load.
+  `WASM_WAIT_RELEASE=off` holds every call's slots and keeps today's
+  sizes. `WASM_WAIT_RELEASE_AFTER_MS`, `WASM_MAX_PARKED` and
+  `WASM_MAX_PARKED_PER_SERVICE` configure the waits
+  ([setup](setup.md#wasm-runtime-limits-platformsrcwasm_runtimemodrs)), and
+  a malformed value stops the process at startup.
+- **`pids.max`.** Where the process's cgroup is v2, startup warns when the
+  blocking pool's ceiling, the worker threads and 64 more reach the
+  cgroup's `pids.max`. A deployment that sees it lowers `WASM_MAX_PARKED`
+  or raises the limit.
+- **Metrics.** `cufflink_wasm_wait_release_total`, `cufflink_wasm_parked`,
+  `cufflink_wasm_parked_seconds`, `cufflink_wasm_resume_wait_seconds` and
+  `cufflink_wasm_blocking_threads` ([observability](observability.md)).
 - A service identity can carry a delegated end user, signed inside it
   (`act`). The target admits that user as on a direct call (an `api_key`
   route sets it aside), refuses one whose token has expired or that is used a second time

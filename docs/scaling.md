@@ -58,11 +58,38 @@ Each replica maintains its own in-memory caches that stay in sync automatically:
 
 ### Wait pools
 
-The runtime is sized for guests that will wait on an outbound call without
-their execution slots, a capability the host functions do not offer yet.
-`WASM_MAX_PARKED` (default `WASM_MAX_CONCURRENT`) and
-`WASM_MAX_PARKED_PER_SERVICE` (default `2 × WASM_MAX_CONCURRENT_PER_SERVICE`)
-bound them, and `WASM_WAIT_RELEASE=off` turns them off.
+A guest's outbound HTTP request (`http_fetch_v2`) or service call can ask
+to give back its execution slots while it waits (`"wait": "release"`). If
+the call is still outstanding after `WASM_WAIT_RELEASE_AFTER_MS` (50 ms),
+the guest parks: its service slot, its committed or background cap, the
+background global cap and its global slot go back, and other guests run in
+them. When the answer arrives, the guest takes them back, in the order it
+was admitted, before it sees the answer. A proxy-shaped service then holds
+slots only while it computes.
+
+- **What a parked guest keeps.** Its memory charge, its blocking thread,
+  its route slot (`max_concurrent`) and any database connection.
+- **What never parks.** A nested callee, an after-hook, `on_migrate`, an
+  SSE reducer and a guest with an open guest-owned transaction hold their
+  slots, as does every call while a wait pool is full or under
+  `WASM_WAIT_RELEASE=off`. `cufflink_wasm_wait_release_total` counts each
+  reason.
+- **The wait pools.** At most `WASM_MAX_PARKED` (default
+  `WASM_MAX_CONCURRENT`) guests are parked per process, and at most
+  `WASM_MAX_PARKED_PER_SERVICE` (default
+  `2 × WASM_MAX_CONCURRENT_PER_SERVICE`) of one service, so one
+  proxy-shaped service cannot take the whole pool.
+- **Resumes first.** A resuming guest has partly run, so it is granted each
+  slot ahead of every arrival waiting for that slot, even arrivals queued
+  before it. Arrivals keep their order, and one held behind resumes is
+  refused at its admission deadline, as one held behind running guests is.
+  At most `WASM_MAX_PARKED` guests resume at once, so resumes cannot hold
+  arrivals back without bound. Under `warn`, a slot admission only tried
+  for is only tried for again on resume.
+- **A resume past the deadline.** A guest that cannot take its slots back
+  by its invocation's deadline ends `DeadlineExceeded`; the call it made
+  has finished and its effects stand. It is logged at `warn` and counted as
+  `cufflink_wasm_resume_wait_seconds{result="deadline"}`.
 
 - **The derived pools.** With waits on, the blocking pool is
   `(WASM_MAX_CONCURRENT + WASM_MAX_PARKED) × 5 + 64` threads and the nested
@@ -75,6 +102,11 @@ bound them, and `WASM_WAIT_RELEASE=off` turns them off.
   the smallest `pids.max` of the cgroup and its ancestors. Lower
   `WASM_MAX_PARKED` or raise the limit. `cufflink_wasm_blocking_threads`
   shows how many blocking threads are live.
+- **When to lower `WASM_MAX_PARKED`.** When the `pids.max` warning
+  appears, or when `cufflink_wasm_blocking_threads` under parked load
+  nears the process's thread limit. Each parked guest also keeps its
+  memory charge and its thread's stack, so under `enforce` the memory
+  budget bounds parked guests by what they hold.
 
 ### Tenant Database Pools
 

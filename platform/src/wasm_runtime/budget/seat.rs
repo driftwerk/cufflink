@@ -148,7 +148,6 @@ fn released(kind: InvocationKind, result: &'static str) {
     .increment(1);
 }
 
-#[derive(Clone)]
 pub(crate) struct Whose {
     service: ServiceKey,
     handler: Arc<str>,
@@ -156,12 +155,12 @@ pub(crate) struct Whose {
 }
 
 impl Whose {
-    pub(crate) fn new(service: ServiceKey, handler: &str, class: Class) -> Self {
-        Self {
+    pub(crate) fn new(service: ServiceKey, handler: &str, class: Class) -> Arc<Self> {
+        Arc::new(Self {
             service,
             handler: handler.into(),
             class,
-        }
+        })
     }
 
     fn missed(&self) {
@@ -181,14 +180,14 @@ impl Whose {
 pub(crate) struct Parking {
     global: Arc<Semaphore>,
     service: Arc<Semaphore>,
-    warned: Option<Whose>,
+    warned: Option<Arc<Whose>>,
 }
 
 impl Parking {
     pub(crate) fn new(
         global: Arc<Semaphore>,
         service: Arc<Semaphore>,
-        warned: Option<Whose>,
+        warned: Option<Arc<Whose>>,
     ) -> Self {
         Self {
             global,
@@ -298,7 +297,16 @@ impl Lent {
         })
     }
 
-    fn reserve(&self) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit, Option<Whose>), Held> {
+    fn reserve(
+        &self,
+    ) -> Result<
+        (
+            OwnedSemaphorePermit,
+            OwnedSemaphorePermit,
+            Option<Arc<Whose>>,
+        ),
+        Held,
+    > {
         let parking = self.parking.as_ref().map_err(|held| *held)?;
         let global = Arc::clone(&parking.global)
             .try_acquire_owned()
@@ -318,7 +326,7 @@ pub(crate) struct ResumeBy<'a> {
 
 pub(crate) struct Parked {
     gates: Vec<(Arc<Gate>, Taking)>,
-    warned: Option<Whose>,
+    warned: Option<Arc<Whose>>,
     kind: InvocationKind,
     since: Instant,
     _parked: GaugeGuard,
@@ -350,7 +358,7 @@ impl Parked {
         let kind = self.kind.label();
         metrics::histogram!("cufflink_wasm_parked_seconds", "kind" => kind)
             .record(answered.duration_since(self.since).as_secs_f64());
-        let warned = self.warned.as_ref();
+        let warned = self.warned.as_deref();
         let retaking = futures_util::stream::iter(self.gates)
             .then(|(gate, taking)| retake(gate, taking, warned))
             .try_collect::<Vec<_>>();

@@ -31,7 +31,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::OwnedSemaphorePermit;
 use tracing::info;
 
 const HANDLER_BUDGET: Duration = Duration::from_secs(30);
@@ -239,22 +238,25 @@ async fn dispatch(state: &Arc<AppState>, call: CustomCall) -> Result<Response, R
     let here = route.job.is_none()
         && wasm_engine.admits_before_running()
         && !state.config.is_worker_routed(&service.name, &route.handler);
-    let admitted = match here {
-        true => Admitted::Here(
-            wasm_engine
-                .admit_route(&compiled, &identity, route_admission())
-                .await
-                .map_err(|e| map_execution_error("WASM", e))?,
+    let (_route_slot, admission) = match here {
+        true => (
+            None,
+            Some(
+                wasm_engine
+                    .admit_route(&compiled, &identity, route_admission())
+                    .await
+                    .map_err(|e| map_execution_error("WASM", e))?,
+            ),
         ),
-        false if route.job.is_some() => Admitted::Elsewhere(None),
-        false => Admitted::Elsewhere(
+        false if route.job.is_some() => (None, None),
+        false => (
             wasm_engine
                 .route_slot(&identity, route_admission())
                 .await
                 .map_err(|e| map_execution_error("WASM", e))?,
+            None,
         ),
     };
-    let (_route_slot, admission) = admitted.into_parts();
 
     let mut tree = raw.sibling();
     let body_value = parse_body(&body, &mut tree)
@@ -450,20 +452,6 @@ async fn module(
                 "WASM binary for {} v{} is missing from storage — service is broken until rolled back or redeployed",
                 service.name, service.version
             )))
-        }
-    }
-}
-
-enum Admitted {
-    Here(Admission),
-    Elsewhere(Option<OwnedSemaphorePermit>),
-}
-
-impl Admitted {
-    fn into_parts(self) -> (Option<OwnedSemaphorePermit>, Option<Admission>) {
-        match self {
-            Admitted::Here(admission) => (None, Some(admission)),
-            Admitted::Elsewhere(route_slot) => (route_slot, None),
         }
     }
 }

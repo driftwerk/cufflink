@@ -469,8 +469,8 @@ Every guest execution runs under one deadline: the caller's timeout, the epoch i
 | `WASM_MEMORY_COLD_ESTIMATE_MB` | `32` | What a handler with no measurement reserves at admission; a measured one reserves the largest of its last 16 peaks |
 | `WASM_ESTIMATE_MAX_AGE_SECS` / `WASM_ESTIMATE_MAP_MAX` | `600` / `4096` | Age past which a peak is forgotten, and handlers remembered |
 | `WASM_MAX_CONCURRENT_PER_SERVICE` | `32` | Invocations of one tenant's service in flight at once (at most `WASM_MAX_CONCURRENT`); an in-process after-hook may hold half of them. Enforced under `enforce`, counted under `warn` |
-| `WASM_WAIT_RELEASE` | `on` | Sizes the runtime for guests that wait on an outbound call without their slots ([wait pools](scaling.md#wait-pools)); no host function releases slots yet. `off` sizes the blocking and nested pools as before |
-| `WASM_WAIT_RELEASE_AFTER_MS` | `50` | How long such a call will run before its guest gives back its slots |
+| `WASM_WAIT_RELEASE` | `on` | Lets an outbound call that asks for it give back its guest's slots while it waits, and sizes the runtime for those guests ([wait pools](scaling.md#wait-pools)). `off` holds every call's slots and sizes the blocking and nested pools as before |
+| `WASM_WAIT_RELEASE_AFTER_MS` | `50` | How long such a call runs before its guest gives back its slots; a call answered sooner releases nothing |
 | `WASM_MAX_PARKED` | `WASM_MAX_CONCURRENT` | Guests that may wait without their slots at once, per process. Grows the blocking pool and the nested pool by as many top-level guests |
 | `WASM_MAX_PARKED_PER_SERVICE` | `2 × WASM_MAX_CONCURRENT_PER_SERVICE` | Guests of one tenant's service that may wait without their slots at once |
 | `WASM_MEMORY_JOB_FLOOR_MB` | `32` | Under `enforce`, room the background share must have before the long-jobs and after-hook consumers fetch, since one durable carries every handler |
