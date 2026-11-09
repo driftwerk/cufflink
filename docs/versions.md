@@ -336,19 +336,19 @@ platform's `S3_ENDPOINT`. The design is
 
 Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 
-## Features added in v0.38.0
-
-| Feature | Needed when | Provides |
-|---------|-------------|----------|
-| `web_releases` | `cufflink deploy` of a web app, from a CLI of v0.38.0; never demanded by a manifest | a web app reserved, uploaded by content and released in one deploy that names its bundle, rollbacks that carry the bundle, and releases skipped by content ([web releases](deployment.md#web-releases)) |
-| `wait_release` | a guest's `http_fetch_v2` or `service_call` request says `"wait": "release"` | a guest that gives back its execution slots while its call is outstanding, and takes them back before it continues ([wait pools](scaling.md#wait-pools)) |
-
 ## Features added in v0.37.0
 
 | Feature | Needed when | Provides |
 |---------|-------------|----------|
 | `guest_statement_timeout` | the guest enables `cufflink-fn/guest-statement-timeout` | a transaction's own `statement_timeout`, bounded by the invocation's remaining budget ([db_v2](db-v2.md#a-statement-timeout-of-the-guests-own)) |
 | `sql_parse` | the guest enables `cufflink-fn/sql-parse` | PostgreSQL's parse tree of a statement, from parser processes beside the platform; advertised while one answers ([design](design-notes/sql-parse.md)) |
+
+## Features added in v0.38.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `web_releases` | `cufflink deploy` of a web app, from a CLI of v0.38.0; never demanded by a manifest | a web app reserved, uploaded by content and released in one deploy that names its bundle, rollbacks that carry the bundle, and releases skipped by content ([web releases](deployment.md#web-releases)) |
+| `wait_release` | never demanded: a guest asks for it in the raw `http_fetch_v2` or `service_call` request, `"wait": "release"`, which no `cufflink-fn` function sends yet | a guest that gives back its execution slots while its call is outstanding, and takes them back before it continues ([wait pools](scaling.md#wait-pools)) |
 
 ## Changes in v0.33.0
 
@@ -498,16 +498,19 @@ Rolling a platform back from v0.37.1 to v0.37.0:
 | Database roles verified on `USAGE` of their service's schema alone, because the platform runs no DDL there as them | A tenant under `db_roles: enforce` goes to `warn` first. The older platform requires every bound role to hold `CREATE` on its service's schema as well. Once it runs, apply the `GRANT USAGE, CREATE ON SCHEMA` its `cufflink services db-role verify` prints for each such role, then set `enforce` again, which it refuses while a role is not verified |
 | The database | Nothing: v0.37.1 has no migration |
 
-Rolling a platform back from v0.38.0 to an earlier release:
+Rolling a platform back from v0.38.0 to v0.37.1:
 
-| What v0.38.0 added | Before rolling the platform back |
-|--------------------|----------------------------------|
-| Web bundles by content | Nothing to undo. The older platform reads the recorded keys as they are, and its runners serve them |
-| Web rollbacks that carry the bundle | **Do not `cufflink rollback` a web app on the older platform.** Its rollback creates a version with no bundle and tells no runner. Deploy the earlier commit instead |
-| Web releases (`web_releases`) | Pin the CLI to the older release for web deploys. A CLI of v0.38.0 refuses to deploy a web app there |
-| Unreleased uploads | Nothing. They stay in storage, unread, until the platform is back (`WEB_UPLOAD_RETENTION_SECS`) or the service is deleted |
-| Released waits (`wait_release`) | Roll back first every service whose calls ask for it: the older platform refuses such a request as malformed |
-| The database | Nothing: `V9__web_uploads` only adds a table the older binary does not read |
+| What v0.38.0 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Services whose `http_fetch_v2` or `service_call` requests say `"wait": "release"` (`wait_release`) | **Roll each back first, to a version that does not send the field.** v0.37.1 refuses such a request as malformed, so the call fails, on every v0.37.1 replica while replicas of both releases run. Nothing names these services: the field is in the call, not the manifest, so `cufflink services list --features` does not list it and no deploy refuses it, and `cufflink_wasm_wait_release_total` carries no service label. Find them in their source |
+| The wait-release settings (`WASM_WAIT_RELEASE`, `WASM_WAIT_RELEASE_AFTER_MS`, `WASM_MAX_PARKED`, `WASM_MAX_PARKED_PER_SERVICE`) | Nothing: v0.37.1 ignores them, holds every call's slots, and sizes its blocking pool `WASM_MAX_CONCURRENT × 5 + 64` threads and its nested pool `WASM_MAX_CONCURRENT × 4` permits again |
+| Web releases (`web_releases`) | Pin the CLI to v0.37.1 for web deploys: a CLI of v0.38.0 refuses to deploy a web app there. While replicas of both releases run, a release that reaches a v0.37.1 replica is refused with a `422` naming `web_artifact`, and nothing is released |
+| Web bundles recorded by content (`web/{service_id}/{sha256}.tar.gz`) | Nothing to undo. v0.37.1 reads the recorded keys as they are, and runners of either release serve them. Its own deploys store under `web/{service_id}/v{version}.tar.gz` again |
+| Web rollbacks that carry the bundle | **Do not `cufflink rollback` a web app on v0.37.1.** Its rollback creates a version with no bundle and tells no runner. Deploy the earlier commit instead |
+| Uploads no version records (`web_uploads`) | Nothing. v0.37.1 neither reads nor removes them, so they stay in storage until the platform is back and `WEB_UPLOAD_RETENTION_SECS` has passed. Deleting a web app or its tenant on v0.37.1 removes their rows, through the table's foreign key, but not their objects: delete web apps only once the platform is back, or remove what is left under `web/{service_id}/` from object storage |
+| Web runners that drain and converge (`WEB_DRAIN_GRACE_SECS`, `WEB_RECONCILE_SECS`) | Nothing: these are runner settings, and runners of v0.38.0 run against v0.37.1 unchanged. A runner rolled back to v0.37.1 ignores both: it stops a replaced process at once and switches an app only on a deploy event (a tenant-scoped one still checks its key every `WEB_POLL_SECS`) |
+| Delegated end users in service identities (`act`, `SERVICE_IDENTITY_REPLAY_MAX`) | Nothing: nothing in this release mints one, so no such identity exists. v0.37.1 does not read the claim and ignores the setting |
+| The database | Nothing: `V9__web_uploads` only adds a table v0.37.1 does not read |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
@@ -545,8 +548,7 @@ additive and the older binary does not abort on a newer schema. It serves `_fn`,
    test pins it to the workspace versions).
 2. `cargo publish --dry-run -p cufflink-types -p cufflink-model -p cufflink-migrate -p cufflink-pgcodec
    -p cufflink-sql-parse -p cufflink-fn -p cufflink-sdk-macros -p cufflink -p cufflink-cli
-   -p cufflink-nats -p cufflink-native` on a clean tree. `cufflink-sql-parse`'s first
-   release is a new crate on crates.io, so step 3 applies to it.
+   -p cufflink-nats -p cufflink-native` on a clean tree.
 3. A crate crates.io has never had is published only by a token with the
    `publish-new` scope whose crate pattern covers its name: check
    `CARGO_REGISTRY_TOKEN` before tagging a release that adds one, and add
@@ -1354,11 +1356,20 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.38.0
 
-Unreleased.
-
-No new module-declared feature. A service built for v0.37.1 deploys and
-runs on this platform unchanged. The platform advertises `web_releases`
-and `wait_release`.
+Web apps released with their bundle, recorded by content and rolled back
+with it; web runners that converge without an event and drain a replaced
+process; guest calls that give back their execution slots while they wait;
+and a delegated end user inside a service identity. No new module-declared
+feature: a service built for v0.37.1 deploys and runs on this platform
+unchanged, and the platform advertises two new features, `web_releases`
+and `wait_release` ([features](#features-added-in-v0380)). Migration
+`V9__web_uploads` adds the `web_uploads` table. New environment variables:
+`WEB_UPLOAD_RETENTION_SECS` and `SERVICE_IDENTITY_REPLAY_MAX` on the
+platform; `WASM_WAIT_RELEASE`, `WASM_WAIT_RELEASE_AFTER_MS`,
+`WASM_MAX_PARKED` and `WASM_MAX_PARKED_PER_SERVICE` on the platform and
+the worker; `WEB_RECONCILE_SECS` and `WEB_DRAIN_GRACE_SECS` on the web
+runner. A CLI of this release deploys a web app only to a platform of this
+release ([CLI, SDK and platform together](#cli-sdk-and-platform-together)).
 
 - A web app is released with its bundle: a version exists only once its
   bundle is stored, so a failed build or upload leaves the running version
@@ -1394,14 +1405,13 @@ and `wait_release`.
   SHA-256 unless the running version already records it, and releases it
   in one deploy naming it in `web_artifact`. A release the platform refuses
   with `409` (the bundle not uploaded or no longer stored, or another
-  deploy holding the lock) is uploaded and released once more. The CLI checks that the answer names the bundle it
-  sent, prints `Released site v8 (bundle 3f9a…)` or that the running
-  version already runs it, and warns when the runners were not told. A
+  deploy holding the lock) is uploaded and released once more. The CLI
+  checks that the answer names the bundle it sent, prints
+  `Released site v8 (bundle 3f9a…)` or that the running version already
+  runs it, and warns when the runners were not told. A
   failed build or upload, or a refused release, says that nothing was
   released and which version still runs
   ([web releases](deployment.md#web-releases)).
-  A CLI of this release cannot deploy a web app to an earlier platform: pin
-  the CLI to the earlier release for that.
 - `cufflink rollback` of a web app switches: the version it activates
   records the target's bundle, under the key the target records, and the
   platform publishes `deploy.web` so the runners serve it. A target that
@@ -1441,7 +1451,8 @@ and `wait_release`.
   as before. A guest that cannot take its slots back by its deadline ends
   `DeadlineExceeded`, and the call's effects stand
   ([wait pools](scaling.md#wait-pools)). Requests without the field are
-  answered and admitted exactly as before.
+  answered and admitted exactly as before. `cufflink-fn` does not send the
+  field yet: a guest asks for it only in the raw host-call request.
 - **Resumes first.** A guest taking its slots back is granted each one
   ahead of every arrival waiting for it, including arrivals queued before
   it. Arrivals keep their order among themselves and resumes theirs, and
@@ -1469,11 +1480,12 @@ and `wait_release`.
   `cufflink_wasm_blocking_threads` ([observability](observability.md)).
 - A service identity can carry a delegated end user, signed inside it
   (`act`). The target admits that user as on a direct call (an `api_key`
-  route sets it aside), refuses one whose token has expired or that is used a second time
-  with 401 on every posture, and records the user as the audit actor with
-  the calling service as `actor.via` ([service calls](service-calls.md#a-delegated-user)).
-  Nothing mints one yet; identities without one are byte-for-byte as
-  before. New setting `SERVICE_IDENTITY_REPLAY_MAX`.
+  route sets it aside), refuses one whose token has expired or that is
+  used a second time with 401 on every posture, and records the user as
+  the audit actor with the calling service as `actor.via`
+  ([service calls](service-calls.md#a-delegated-user)). Nothing mints one
+  yet; identities without one are byte-for-byte as before. New setting
+  `SERVICE_IDENTITY_REPLAY_MAX`.
 - `docs/service-calls.md` no longer says every replayed identity is
   refused: an identity is bound to one call and lives at most 60 s, and is
   single-use only when it carries a delegated user.
@@ -1488,7 +1500,21 @@ and `wait_release`.
   Runner setting only: no platform change, and runners upgrade in any
   order.
 
-Migration `V9__web_uploads.sql` adds the `web_uploads` table.
+Known limitations, for later releases:
+
+- `cufflink-fn` has no builder for `"wait": "release"` yet: a guest opts in
+  only by sending the field in its raw `http_fetch_v2` or `service_call`
+  request. A parked guest keeps its memory charge, so under `enforce` a full
+  memory budget can hold a resume until an arrival's admission deadline,
+  and a service call to the caller's own service cannot park when that
+  service has no free slot ([wait pools](scaling.md#wait-pools)).
+- A web bundle upload is at most 250 MiB, is held whole in memory by the
+  CLI and by the platform, and must finish within the CLI's 120 s request
+  limit. The bundle's tarball is not built deterministically, so a rebuild
+  of unchanged sources is usually uploaded and released again rather than
+  skipped.
+- A web runner always connects to NATS, though its reconcile alone would
+  converge it.
 
 ## Changes in v0.37.1
 

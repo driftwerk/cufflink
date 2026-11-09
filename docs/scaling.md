@@ -65,7 +65,9 @@ the guest parks: its service slot, its committed or background cap, the
 background global cap and its global slot go back, and other guests run in
 them. When the answer arrives, the guest takes them back, in the order it
 was admitted, before it sees the answer. A proxy-shaped service then holds
-slots only while it computes.
+slots only while it computes. `cufflink-fn`'s HTTP requests and
+`http::call_service` do not set the field yet, so a guest asks for it only
+by writing the host call's request JSON itself.
 
 - **What a parked guest keeps.** Its memory charge, its blocking thread,
   its route slot (`max_concurrent`) and any database connection.
