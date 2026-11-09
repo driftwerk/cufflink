@@ -1382,8 +1382,6 @@ runs on this platform unchanged. The platform advertises `web_releases`.
   `cufflink_web_uploads_total{result}`; a release's audit row carries
   `artifact_hash`.
 
-Migration `V9__web_uploads.sql` adds the `web_uploads` table.
-
 - `cufflink rollback` of a web app switches: the version it activates
   records the target's bundle, under the key the target records, and the
   platform publishes `deploy.web` so the runners serve it. A target that
@@ -1398,6 +1396,8 @@ Migration `V9__web_uploads.sql` adds the `web_uploads` table.
   before. The CLI prints `  Bundle:         <sha256>` for a web app.
 - A failed `deploy.web` publish is counted as
   `cufflink_web_announce_failures_total`.
+
+Migration `V9__web_uploads.sql` adds the `web_uploads` table.
 
 ## Changes in v0.37.1
 
