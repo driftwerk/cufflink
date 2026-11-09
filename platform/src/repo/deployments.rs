@@ -47,6 +47,20 @@ pub struct NativeVersion<'a> {
     pub actor: &'a str,
 }
 
+pub enum VersionArtifact<'a> {
+    Native(NativeVersion<'a>),
+    Web(&'a Artifact),
+}
+
+impl VersionArtifact<'_> {
+    fn artifact(&self) -> &Artifact {
+        match self {
+            VersionArtifact::Native(native) => native.artifact,
+            VersionArtifact::Web(artifact) => artifact,
+        }
+    }
+}
+
 pub struct ActivateVersion<'a> {
     pub service_id: Uuid,
     pub version: i32,
@@ -56,7 +70,7 @@ pub struct ActivateVersion<'a> {
     pub commit_hash: Option<&'a str>,
     pub schema_json: Option<&'a Value>,
     pub schema_hash: &'a str,
-    pub native: Option<NativeVersion<'a>>,
+    pub artifact: Option<VersionArtifact<'a>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,7 +157,7 @@ pub async fn activate_version(
         .get(0);
     readmit(&tx, tenant_id, req.manifest).await?;
     let schema_hash = req.schema_json.map(|_| req.schema_hash);
-    let artifact = req.native.as_ref().map(|native| native.artifact);
+    let artifact = req.artifact.as_ref().map(VersionArtifact::artifact);
     let row = tx
         .query_one(
             "INSERT INTO deployments (service_id, version, manifest_hash, manifest, wasm_hash, commit_hash,
@@ -176,7 +190,7 @@ pub async fn activate_version(
             ],
         )
         .await?;
-    if let Some(native) = &req.native {
+    if let Some(VersionArtifact::Native(native)) = &req.artifact {
         crate::repo::extensions::replace_native(
             &tx,
             tenant_id,
@@ -475,6 +489,139 @@ mod tests {
             schema_hash: None,
             artifact: None,
         }
+    }
+
+    async fn activated(
+        pool: &deadpool_postgres::Pool,
+        service_id: Uuid,
+        manifest: &ServiceManifest,
+        artifact: Option<VersionArtifact<'_>>,
+    ) -> Deployment {
+        activate_version(
+            pool,
+            ActivateVersion {
+                service_id,
+                version: 1,
+                manifest_hash: "m1",
+                manifest,
+                wasm_hash: None,
+                commit_hash: None,
+                schema_json: None,
+                schema_hash: "s1",
+                artifact,
+            },
+        )
+        .await
+        .expect("activated")
+    }
+
+    async fn migrated() -> Option<(
+        cufflink_testkit::TestDb,
+        cufflink_testkit::Tenant,
+        deadpool_postgres::Pool,
+    )> {
+        let infra = cufflink_testkit::infra().await?;
+        let mut db = infra.create_migrated_database().await;
+        let tenant = db.mint_tenant().await;
+        let pool = cufflink_db::build_pool(&db.url, 2).expect("pool");
+        Some((db, tenant, pool))
+    }
+
+    async fn service(pool: &deadpool_postgres::Pool, tenant_id: Uuid, name: &str) -> Uuid {
+        crate::repo::services::find_or_create(
+            pool,
+            tenant_id,
+            name,
+            name,
+            crate::repo::services::Status::Active,
+        )
+        .await
+        .expect("service")
+        .id
+    }
+
+    fn manifest(name: &str, mode: ServiceMode, provides: &str) -> ServiceManifest {
+        ServiceManifest {
+            name: name.into(),
+            mode,
+            provides: vec![cufflink_types::ProvidedExtension {
+                name: provides.into(),
+                callers: vec!["*".into()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn extensions_of(pool: &deadpool_postgres::Pool, service_id: Uuid) -> i64 {
+        pool.get()
+            .await
+            .expect("checkout")
+            .query_one(
+                "SELECT count(*) FROM tenant_extensions WHERE service_id = $1",
+                &[&service_id],
+            )
+            .await
+            .expect("count")
+            .get(0)
+    }
+
+    #[tokio::test]
+    async fn a_web_version_records_its_bundle_in_the_activating_transaction() {
+        let Some((_db, tenant, pool)) = migrated().await else {
+            return;
+        };
+        let site = service(&pool, tenant.id, "site").await;
+        let bundle = Artifact {
+            s3_key: format!("web/{site}/{}.tar.gz", "3f".repeat(32)),
+            hash: "3f".repeat(32),
+            size: 41,
+        };
+        let web = ServiceManifest {
+            name: "site".into(),
+            mode: ServiceMode::Web,
+            ..Default::default()
+        };
+        let deployment = activated(&pool, site, &web, Some(VersionArtifact::Web(&bundle))).await;
+        assert_eq!(deployment.artifact.as_ref(), Some(&bundle));
+        let current = current(&pool, site).await.expect("read").expect("current");
+        assert_eq!((current.version, current.artifact), (1, Some(bundle)));
+    }
+
+    #[tokio::test]
+    async fn only_a_native_version_replaces_its_extensions() {
+        let Some((_db, tenant, pool)) = migrated().await else {
+            return;
+        };
+        let (native, site) = (
+            service(&pool, tenant.id, "ext-token").await,
+            service(&pool, tenant.id, "site").await,
+        );
+        let artifact = |prefix: &str, service_id: Uuid| Artifact {
+            s3_key: format!("{prefix}/{service_id}/ab"),
+            hash: "ab".into(),
+            size: 9,
+        };
+        let binary = artifact("native", native);
+        activated(
+            &pool,
+            native,
+            &manifest("ext-token", ServiceMode::Native, "acme.token"),
+            Some(VersionArtifact::Native(NativeVersion {
+                artifact: &binary,
+                actor: "ops",
+            })),
+        )
+        .await;
+        let bundle = artifact("web", site);
+        activated(
+            &pool,
+            site,
+            &manifest("site", ServiceMode::Web, "acme.site"),
+            Some(VersionArtifact::Web(&bundle)),
+        )
+        .await;
+        assert_eq!(extensions_of(&pool, native).await, 1);
+        assert_eq!(extensions_of(&pool, site).await, 0);
     }
 
     #[test]

@@ -28,10 +28,7 @@ pub async fn upload_web_artifact(
 
     super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
 
-    let storage = state
-        .storage
-        .as_ref()
-        .ok_or_else(|| PlatformError::Internal("S3 storage not configured".into()))?;
+    let storage = crate::deployer::web::storage(&state)?;
 
     let service = crate::repo::services::get_by_id(&state.platform_db, service_id)
         .await?
@@ -65,24 +62,10 @@ pub async fn upload_web_artifact(
         )
         .await?;
 
-    let event_payload = json!({
-        "service_id": service_id.to_string(),
-        "service_name": service.name,
-        "version": service.current_version,
-        "s3_key": s3_key,
-        "artifact_hash": artifact_hash,
-        "tenant_slug": user.tenant_slug,
-    });
-    let subject = format!("deploy.web.{}.{}", user.tenant_slug, service.name);
-    if let Err(e) = crate::nats_conn::publish_bounded(
-        &state.nats,
-        subject,
-        None,
-        event_payload.to_string().into(),
-    )
-    .await
+    if let Some(current) = crate::repo::deployments::current(&state.platform_db, service_id).await?
     {
-        tracing::warn!("Failed to publish web deploy event: {}", e);
+        crate::deployer::web::announce(&state, &service.identity(&user.tenant_slug), &current)
+            .await;
     }
 
     info!(

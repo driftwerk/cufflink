@@ -100,7 +100,7 @@ pub(crate) async fn activate_module(
                     .await?,
             ),
             schema_hash: &manifest.schema_hash()?,
-            native: None,
+            artifact: None,
         },
     )
     .await?;

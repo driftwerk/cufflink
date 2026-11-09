@@ -357,6 +357,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_deployments_total` | counter | `result` (`attempted`, `success`, `failed`, `rejected`, `skipped`), `mode` | Deployment outcomes |
 | `cufflink_deployment_wasm_missing_total` | counter | — | Deploys of a handler-bearing service that arrived without a WASM binary |
 | `cufflink_deploy_import_rejected_total` | counter | — | Deploys refused (422) because the module imports a host function this platform does not provide |
+| `cufflink_web_announce_failures_total` | counter | — | `deploy.web` events the platform could not publish after a web app's rollback or bundle upload; the runners serve the version once they next read it |
 | `cufflink_deploy_lock_dropped_total` | counter | — | Deploy locks released by closing their session (an error, a cancelled request or a failed unlock) rather than by an unlock |
 | `cufflink_deploy_jobs` | gauge | `status` (`queued`, `running`, `succeeded`, `failed`) | Deploys that run beyond their request (`POST /api/services/deploy?async=true`), by state, as this replica last counted them |
 | `cufflink_sql_migrations_applied_total` | counter | `tenant`, `service` | SQL migrations deploys applied, those of a deploy that failed after them included |
