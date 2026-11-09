@@ -1390,8 +1390,8 @@ runs on this platform unchanged. The platform advertises `web_releases`.
   the app's checks, reserves the app, builds the bundle, uploads it by its
   SHA-256 unless the running version already records it, and releases it
   in one deploy naming it in `web_artifact`. A release the platform refuses
-  with `409` (the bundle not uploaded, or no longer stored) is uploaded and
-  released once more. The CLI checks that the answer names the bundle it
+  with `409` (the bundle not uploaded or no longer stored, or another
+  deploy holding the lock) is uploaded and released once more. The CLI checks that the answer names the bundle it
   sent, prints `Released site v8 (bundle 3f9a…)` or that the running
   version already runs it, and warns when the runners were not told. A
   failed build or upload, or a refused release, says that nothing was

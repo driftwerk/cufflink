@@ -113,14 +113,19 @@ impl WebApp<'_> {
     async fn sent(
         &self,
         request: reqwest::RequestBuilder,
+        unanswered: impl FnOnce() -> String,
     ) -> eyre::Result<(StatusCode, Result<Value, String>)> {
-        let answer = request.send().await?;
-        let status = answer.status();
-        if status.is_success() {
-            Ok((status, Ok(answer.json().await?)))
-        } else {
-            Ok((status, Err(answer.text().await.unwrap_or_default())))
+        let answered = async {
+            let answer = request.send().await?;
+            let status = answer.status();
+            if status.is_success() {
+                Ok((status, Ok(answer.json().await?)))
+            } else {
+                Ok((status, Err(answer.text().await.unwrap_or_default())))
+            }
         }
+        .await;
+        answered.map_err(|lost: reqwest::Error| eyre::Report::new(lost).wrap_err(unanswered()))
     }
 
     async fn reserve(&self) -> eyre::Result<Reserved> {
@@ -128,7 +133,15 @@ impl WebApp<'_> {
             .config
             .auth_request(self.client, Method::POST, &self.url("/api/services/web"))
             .json(&json!({ "name": self.name }));
-        let reserved = match self.sent(request).await? {
+        let reserved = match self
+            .sent(request, || {
+                format!(
+                    "Reserving {} got no answer; nothing was released",
+                    self.name
+                )
+            })
+            .await?
+        {
             (_, Ok(body)) => body,
             (status, Err(body)) => eyre::bail!(
                 "Reserving {} failed ({status}): {body}{}; nothing was released",
@@ -150,7 +163,13 @@ impl WebApp<'_> {
             Method::GET,
             &self.url(&format!("/api/services/{service_id}/web/status")),
         );
-        match self.sent(request).await? {
+        let unanswered = || {
+            format!(
+                "Reading what {} runs got no answer; nothing was released",
+                self.name
+            )
+        };
+        match self.sent(request, unanswered).await? {
             (_, Ok(status)) => Ok(Reserved::of(service_id, &status)),
             (status, Err(body)) => eyre::bail!(
                 "Reading what {} runs failed ({status}): {body}; nothing was released",
@@ -173,7 +192,14 @@ impl WebApp<'_> {
             )
             .header("Content-Type", "application/gzip")
             .body(bundle.bytes.clone());
-        match self.sent(request).await? {
+        let unanswered = || {
+            format!(
+                "Uploading bundle {} got no answer; {}",
+                bundle.sha256,
+                reserved.unreleased(self.name)
+            )
+        };
+        match self.sent(request, unanswered).await? {
             (_, Ok(body)) if body["stored"].as_str() == Some("present") => {
                 println!("  Already stored");
                 Ok(())
@@ -203,13 +229,17 @@ impl WebApp<'_> {
         let sent =
             self.config
                 .auth_request(self.client, Method::POST, &self.url("/api/services/deploy"));
-        let answered = self.sent(sent.json(request)).await.map_err(|lost| {
-            lost.wrap_err(format!("the release got no answer; {}", self.unsure()))
-        })?;
+        let answered = self
+            .sent(sent.json(request), || {
+                format!("the release got no answer; {}", self.unsure())
+            })
+            .await?;
         match answered {
             (_, Ok(body)) => Ok(Release::Answered(body)),
             (StatusCode::CONFLICT, Err(body)) => Ok(Release::NotClaimed(body)),
-            (StatusCode::UNPROCESSABLE_ENTITY, Err(body)) if body.contains("web_artifact") => {
+            (StatusCode::UNPROCESSABLE_ENTITY, Err(body))
+                if body.contains("unknown field `web_artifact`") =>
+            {
                 eyre::bail!(
                     "an older platform replica refused the release; {}. Is a platform \
                      upgrade in progress? Deploy again once it has finished",
@@ -402,7 +432,14 @@ mod tests {
         answers: Vec<(u16, Value)>,
         build: eyre::Result<Vec<u8>>,
     ) -> (eyre::Result<()>, Asked, Option<(String, usize)>) {
-        let (config, asked) = answering(answers.into_iter().map(Some).collect()).await;
+        deployed_or_lost(answers.into_iter().map(Some).collect(), build).await
+    }
+
+    async fn deployed_or_lost(
+        answers: Vec<Option<(u16, Value)>>,
+        build: eyre::Result<Vec<u8>>,
+    ) -> (eyre::Result<()>, Asked, Option<(String, usize)>) {
+        let (config, asked) = answering(answers).await;
         let client = config.http_client();
         let app = WebApp {
             config: &config,
@@ -627,24 +664,17 @@ mod tests {
             "{failed}"
         );
 
-        let (config, _) = answering(
-            [reserved(), running(1, None), stored("uploaded")]
-                .into_iter()
-                .map(Some)
-                .chain([None])
-                .collect(),
+        let (ended, _, _) = deployed_or_lost(
+            vec![
+                Some(reserved()),
+                Some(running(1, None)),
+                Some(stored("uploaded")),
+                None,
+            ],
+            Ok(BUNDLE.to_vec()),
         )
         .await;
-        let client = config.http_client();
-        let app = WebApp {
-            config: &config,
-            client: &client,
-            name: "site",
-        };
-        let lost = app
-            .deploy(request(), async |_: &str| Ok(BUNDLE.to_vec()))
-            .await
-            .expect_err("no answer");
+        let lost = ended.expect_err("no answer");
         assert!(
             lost.to_string()
                 .starts_with("the release got no answer; site may or may not have been released"),
@@ -653,17 +683,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_platform_without_the_reserve_route_is_named_as_one_being_upgraded() {
-        let (ended, asked, built) = deployed(vec![(405, Value::Null)], Ok(BUNDLE.to_vec())).await;
+    async fn a_release_refused_for_another_reason_releases_nothing() {
+        for (status, refusal) in [
+            (403, "Forbidden: deploy needs the deploy role"),
+            (422, "web_artifact.size: invalid type: string, expected u64"),
+        ] {
+            let (ended, asked, _) = deployed(
+                vec![
+                    reserved(),
+                    running(7, Some(&"3f".repeat(32))),
+                    stored("uploaded"),
+                    refused(status, refusal),
+                ],
+                Ok(BUNDLE.to_vec()),
+            )
+            .await;
 
-        let failed = ended.expect_err("refused").to_string();
+            let failed = ended.expect_err("refused").to_string();
+            assert!(
+                failed.starts_with(&format!("Releasing site failed ({status} ")),
+                "{failed}"
+            );
+            assert!(failed.contains(refusal), "{failed}");
+            assert!(
+                failed
+                    .ends_with("; nothing was released; site still runs v7 (bundle 3f3f3f3f3f3f)"),
+                "{failed}"
+            );
+            assert_eq!(asked.requests(), [RESERVE, STATUS, &upload(), RELEASE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_reservation_or_upload_releases_nothing() {
+        let (ended, asked, built) = deployed_or_lost(vec![None], Ok(BUNDLE.to_vec())).await;
+        let lost = format!("{:#}", ended.expect_err("no answer"));
         assert!(
-            failed.contains("is a platform upgrade in progress?)"),
-            "{failed}"
+            lost.starts_with("Reserving site got no answer; nothing was released: "),
+            "{lost}"
         );
-        assert!(failed.ends_with("; nothing was released"), "{failed}");
         assert_eq!(asked.requests(), [RESERVE]);
         assert_eq!(built, None, "nothing is built");
+
+        let (ended, asked, _) = deployed_or_lost(
+            vec![
+                Some(reserved()),
+                Some(running(7, Some(&"3f".repeat(32)))),
+                None,
+            ],
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        assert_eq!(
+            ended.expect_err("no answer").to_string(),
+            format!(
+                "Uploading bundle {} got no answer; nothing was released; site still runs v7 \
+                 (bundle 3f3f3f3f3f3f)",
+                sha()
+            )
+        );
+        assert_eq!(asked.requests(), [RESERVE, STATUS, &upload()]);
+    }
+
+    #[tokio::test]
+    async fn a_platform_without_the_reserve_route_is_named_as_one_being_upgraded() {
+        for status in [404, 405] {
+            let (ended, asked, built) =
+                deployed(vec![(status, Value::Null)], Ok(BUNDLE.to_vec())).await;
+
+            let failed = ended.expect_err("refused").to_string();
+            assert!(
+                failed.contains("is a platform upgrade in progress?)"),
+                "{failed}"
+            );
+            assert!(failed.ends_with("; nothing was released"), "{failed}");
+            assert_eq!(asked.requests(), [RESERVE]);
+            assert_eq!(built, None, "nothing is built");
+        }
     }
 
     fn answer(answer: Value) -> eyre::Result<Vec<String>> {
