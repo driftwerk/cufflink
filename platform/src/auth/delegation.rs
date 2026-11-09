@@ -207,7 +207,7 @@ pub(crate) async fn check(
                 claims.jti,
                 claims
                     .expires_at
-                    .saturating_add(CLOCK_SKEW_SECS)
+                    .saturating_add(2 * CLOCK_SKEW_SECS)
                     .saturating_sub(now)
                     .max(1),
             )
@@ -546,8 +546,8 @@ pub(crate) mod tests {
             .await
             .expect("a TTL");
         assert!(
-            (1..=35).contains(&ttl),
-            "kept until the identity expires: {ttl}"
+            (36..=40).contains(&ttl),
+            "kept until no replica within the clock skew of this one accepts it: {ttl}"
         );
         let fresh = claims(Delegation::of(&user(&acme)));
         assert_eq!(
