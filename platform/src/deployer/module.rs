@@ -127,7 +127,7 @@ pub(crate) fn fail_after_schema() -> PlatformResult<()> {
 pub(crate) async fn cleanup_orphans(state: &Arc<AppState>, stored: Option<Stored>, context: &str) {
     match stored {
         None => {}
-        Some(Stored::Object(key)) => super::native::remove_orphan(state, &key, context).await,
+        Some(Stored::Object(key)) => super::artifacts::remove_orphan(state, &key, context).await,
         Some(Stored::Module {
             service_id,
             version,

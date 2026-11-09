@@ -188,6 +188,7 @@ impl Converger {
 mod tests {
     use super::*;
     use crate::apps::tests::next_bundle;
+    use crate::apps::Draining;
     use crate::artifact::{ArchiveCaps, ArtifactStore};
     use crate::host::HostnameFormat;
     use crate::process_manager::tests::node_available;
@@ -293,6 +294,7 @@ mod tests {
             max_entries: 100,
             max_bytes: 1 << 20,
         };
+        let shutdown = Shutdown::new(Duration::from_secs(5));
         let apps = Arc::new(Apps::new(
             Arc::new(shared_at(&db.url, storage.clone(), caps.max_bytes)),
             ArtifactStore::new(caps),
@@ -303,9 +305,14 @@ mod tests {
                 HostnameFormat::Flat,
                 crate::child_env::env_mode(None).expect("the built-in allowlist"),
                 cufflink_supervisor::ChildSettings::default(),
-                Shutdown::new(Duration::from_secs(5)),
+                shutdown.clone(),
             )),
             root.path().join("apps"),
+            shutdown,
+            Draining {
+                grace: Duration::from_secs(30),
+                stop_timeout: Duration::from_secs(2),
+            },
         ));
         let warmer = Arc::new(LazyWarmer::new(apps.clone()));
         Some(World {
@@ -469,6 +476,44 @@ mod tests {
             [],
             "an app that runs its current bundle is left alone"
         );
+        w.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_switch_drains_the_replaced_process() {
+        let Some(w) = world(21218..=21220).await else {
+            return;
+        };
+        w.start(1, serving("one", &w.log)).await;
+        let lease = w
+            .apps
+            .process_manager
+            .lease(&w.tenant, "site")
+            .expect("a lease");
+        w.release(2, Some(serving("two", &w.log))).await;
+        w.converger.reconcile().await;
+        w.drain().await;
+        assert_eq!(w.running(), Some(2));
+        let answer = |port: u16| async move {
+            reqwest::get(format!("http://127.0.0.1:{port}/"))
+                .await?
+                .text()
+                .await
+        };
+        assert_eq!(
+            answer(lease.port).await.expect("still serves"),
+            "one",
+            "the replaced process serves the request it was given"
+        );
+        let old_port = lease.port;
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while answer(old_port).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("stopped once its last request ended");
         w.stop().await;
     }
 

@@ -498,7 +498,7 @@ mod tests {
                 size_bytes: 1,
             }
             .object_key(),
-            crate::api::web::artifact_key(service, 3),
+            crate::deployer::web::object_key(service, "ab12"),
             crate::api::files::storage_key(service, other, "png"),
             crate::api::backup::export_key(service, other),
             crate::api::backup::restore_key(service, other),

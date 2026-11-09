@@ -9,6 +9,7 @@ use crate::deployer::schema::{Options, Progress, SchemaReport};
 use crate::deployer::validator::{
     module_features, validate_manifest, validate_platform_requirements,
 };
+use crate::deployer::web::{self, WebArtifactRef};
 use crate::errors::{PlatformError, PlatformResult};
 use crate::registry::ServiceIdentity;
 use crate::repo::deploy_jobs::JobStatus;
@@ -46,6 +47,8 @@ pub struct DeployRequest {
     pub wasm_base64: Option<String>,
     #[serde(default)]
     pub native_base64: Option<String>,
+    #[serde(default)]
+    pub web_artifact: Option<WebArtifactRef>,
     #[serde(default)]
     pub cli_version: Option<String>,
     #[serde(default)]
@@ -145,6 +148,7 @@ struct Admitted {
     wasm_bytes: Option<Vec<u8>>,
     wasm_hash: Option<String>,
     native: Option<NativeBinary>,
+    web_artifact: Option<WebArtifactRef>,
     commit_hash: Option<String>,
     allow_destructive: bool,
     accept_drift: bool,
@@ -170,6 +174,16 @@ impl Admitted {
         self.native.as_ref().map(|binary| binary.hash.as_str())
     }
 
+    fn web_artifact_hash(&self) -> Option<&str> {
+        self.web_artifact
+            .as_ref()
+            .map(|bundle| bundle.sha256.as_str())
+    }
+
+    fn registers_before_building(&self) -> bool {
+        matches!(self.manifest.mode, ServiceMode::Web) && self.web_artifact.is_none()
+    }
+
     fn options(&self, plan_only: bool, progress: Progress) -> Options {
         Options {
             allow_destructive: self.allow_destructive,
@@ -186,6 +200,7 @@ impl Admitted {
             "manifest_hash": self.manifest_hash,
             "wasm_hash": self.wasm_hash,
             "native_hash": self.native_hash(),
+            "web_artifact_hash": self.web_artifact_hash(),
             "commit_hash": self.commit_hash,
             "allow_destructive": self.allow_destructive,
             "accept_drift": self.accept_drift,
@@ -239,6 +254,10 @@ async fn admit(
     if native.is_some() {
         native::storage(state)?;
     }
+    let web_artifact = admit_web_artifact(&manifest.mode, req.web_artifact)?;
+    if web_artifact.is_some() {
+        web::storage(state)?;
+    }
     let wasm_bytes = decode_wasm_payload(req.wasm_base64.as_deref())?;
     require_platform_features(state, &manifest, wasm_bytes.as_deref())?;
     pipeline::admit(state, &manifest, user.tenant_id, &user.tenant_slug).await?;
@@ -274,12 +293,58 @@ async fn admit(
         manifest,
         wasm_bytes,
         native,
+        web_artifact,
         commit_hash: req.commit_hash,
         allow_destructive: req.allow_destructive,
         accept_drift: req.accept_drift,
         purge: req.purge,
         inactive,
     })
+}
+
+fn admit_web_artifact(
+    mode: &ServiceMode,
+    web_artifact: Option<WebArtifactRef>,
+) -> PlatformResult<Option<WebArtifactRef>> {
+    match (mode, web_artifact) {
+        (ServiceMode::Web, Some(bundle)) => {
+            web::require_sha256(&bundle.sha256)?;
+            Ok(Some(bundle))
+        }
+        (
+            ServiceMode::Crud | ServiceMode::Wasm | ServiceMode::Container | ServiceMode::Native,
+            Some(_),
+        ) => Err(PlatformError::BadRequest(
+            "web_artifact is accepted only with mode: web".into(),
+        )),
+        (_, None) => Ok(None),
+    }
+}
+
+const LEGACY_WEB_DEPLOY: &str = "this CLI registers a web app before building it; a build or \
+     upload that fails then leaves a version with no bundle. Upgrade the CLI, which releases \
+     the app with its bundle in one deploy";
+
+fn with_web_release(
+    mut answer: Value,
+    admitted: &Admitted,
+    current: &crate::repo::deployments::Deployment,
+    runners_told: Option<bool>,
+) -> Value {
+    if !matches!(admitted.manifest.mode, ServiceMode::Web) {
+        return answer;
+    }
+    answer["web_artifact"] = json!(current.artifact.as_ref().map(|bundle| json!({
+        "sha256": bundle.hash,
+        "size": bundle.size,
+    })));
+    if let Some(told) = runners_told {
+        answer["runners_told"] = json!(told);
+    }
+    if admitted.registers_before_building() {
+        answer["warnings"] = json!([LEGACY_WEB_DEPLOY]);
+    }
+    answer
 }
 
 async fn plan(
@@ -313,6 +378,7 @@ async fn plan(
         wasm_bytes: admitted.wasm_bytes.as_deref(),
         wasm_hash,
         native: admitted.native.as_ref(),
+        web_artifact: admitted.web_artifact.as_ref(),
         commit_hash: None,
         actor: &user.subject,
         schema: admitted.options(true, Progress::default()),
@@ -451,22 +517,29 @@ async fn perform(
         wasm_bytes,
         wasm_hash,
         native: admitted.native.as_ref(),
+        web_artifact: admitted.web_artifact.as_ref(),
         commit_hash,
         actor: &user.subject,
         schema: admitted.options(false, progress.clone()),
     };
+    if admitted.registers_before_building() {
+        metrics::counter!("cufflink_web_legacy_deploys_total").increment(1);
+    }
     let outcome = pipeline::run_locked(&ctx, &uploads).await;
     if outcome.is_err() {
         cleanup_orphans(&state, uploads.take(), "deploy").await;
     }
     lock.release().await;
 
-    if let Ok(outcome) = &outcome {
-        if matches!(outcome, DeployOutcome::Deployed { .. }) {
-            progress.phase("activated", json!({})).await;
+    let runners_told = match &outcome {
+        Ok(outcome) => {
+            if matches!(outcome, DeployOutcome::Deployed { .. }) {
+                progress.phase("activated", json!({})).await;
+            }
+            pipeline::after_release(&ctx, outcome).await?
         }
-        pipeline::after_release(&ctx, outcome).await?;
-    }
+        Err(_) => None,
+    };
 
     let (service, new_version, schema, deployment, eventing) = match outcome {
         Ok(DeployOutcome::Skipped { service, latest }) => {
@@ -481,7 +554,7 @@ async fn perform(
             )
             .increment(1);
 
-            return Ok(json!({
+            let answer = json!({
                 "service_id": service.id.to_string(),
                 "name": manifest.name,
                 "version": service.current_version,
@@ -495,7 +568,8 @@ async fn perform(
                 "skipped": true,
                 "message": "No changes detected, deploy skipped",
                 "api_version": DEPLOY_API_VERSION,
-            }));
+            });
+            return Ok(with_web_release(answer, &admitted, &latest, runners_told));
         }
         Ok(DeployOutcome::Deployed {
             service,
@@ -539,9 +613,11 @@ async fn perform(
         action: "deploy",
         resource_type: "service",
         resource_id: Some(&service.id.to_string()),
-        details: Some(
-            json!({ "version": new_version, "schema_changes": schema.schema_changes.len() }),
-        ),
+        details: Some(json!({
+            "version": new_version,
+            "schema_changes": schema.schema_changes.len(),
+            "artifact_hash": deployment.artifact.as_ref().map(|artifact| &artifact.hash),
+        })),
         ip_address: None,
     })
     .await;
@@ -553,7 +629,7 @@ async fn perform(
     )
     .increment(1);
 
-    Ok(json!({
+    let answer = json!({
         "service_id": service.id.to_string(),
         "name": manifest.name,
         "version": new_version,
@@ -567,7 +643,13 @@ async fn perform(
         "status": service.status,
         "api_version": DEPLOY_API_VERSION,
         "plan": pipeline::deploy_plan(&schema, &eventing)?,
-    }))
+    });
+    Ok(with_web_release(
+        answer,
+        &admitted,
+        &deployment,
+        runners_told,
+    ))
 }
 
 pub(crate) fn require_platform_features(
@@ -617,8 +699,8 @@ async fn delete_version(state: &AppState, service_id: Uuid, version: i32) -> Pla
         }
     }
     drop(client);
-    if let Some(key) = deleted.native_key {
-        native::remove_orphan(state, &key, "deployment delete").await;
+    if let Some(key) = deleted.artifact_key {
+        crate::deployer::artifacts::remove_orphan(state, &key, "deployment delete").await;
     }
     Ok(true)
 }
@@ -740,6 +822,7 @@ async fn remove_deployment(
                 version, service.name
             )));
         }
+        web::sweep(&state, service.id).await;
         Ok::<_, PlatformError>(json!({
             "service_id": service.id.to_string(),
             "name": service.name,
@@ -802,6 +885,7 @@ async fn prune(
                 deleted_versions.push(*version);
             }
         }
+        web::sweep(&state, service.id).await;
 
         Ok::<_, PlatformError>(json!({
             "service_id": service.id.to_string(),
@@ -1257,6 +1341,147 @@ mod tests {
             r.is_err(),
             "expected deny_unknown_fields to reject the payload; got {:?}",
             r.map(|_| "Ok").map_err(|e| e.to_string())
+        );
+    }
+
+    const SHA: &str = "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a";
+
+    fn bundle(sha256: &str) -> WebArtifactRef {
+        WebArtifactRef {
+            sha256: sha256.into(),
+            size: 41,
+        }
+    }
+
+    fn bad_request(refused: PlatformError) -> String {
+        match refused {
+            PlatformError::BadRequest(text) => text,
+            other => panic!("a 400, not {other}"),
+        }
+    }
+
+    #[test]
+    fn a_web_artifact_on_another_mode_is_refused() {
+        for mode in [
+            ServiceMode::Crud,
+            ServiceMode::Wasm,
+            ServiceMode::Container,
+            ServiceMode::Native,
+        ] {
+            assert_eq!(
+                bad_request(admit_web_artifact(&mode, Some(bundle(SHA))).expect_err("refused")),
+                "web_artifact is accepted only with mode: web",
+                "{mode:?}"
+            );
+            assert_eq!(admit_web_artifact(&mode, None).expect("none"), None);
+        }
+        assert_eq!(
+            admit_web_artifact(&ServiceMode::Web, Some(bundle(SHA))).expect("a web bundle"),
+            Some(bundle(SHA))
+        );
+        let request: DeployRequest = serde_json::from_value(json!({
+            "manifest": {"name": "site", "mode": "web", "tables": []},
+            "web_artifact": {"sha256": SHA, "size": 41},
+        }))
+        .expect("a release");
+        assert_eq!(request.web_artifact, Some(bundle(SHA)));
+        assert!(serde_json::from_value::<DeployRequest>(json!({
+            "manifest": {"name": "site", "mode": "web", "tables": []},
+            "web_artifact": {"sha256": SHA, "size": 41, "key": "web/x"},
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn a_malformed_bundle_hash_is_refused() {
+        for malformed in [
+            "",
+            "3f9a",
+            &SHA.to_uppercase(),
+            &format!("{}g", &SHA[..63]),
+            &format!("{SHA}0"),
+        ] {
+            let refused = admit_web_artifact(&ServiceMode::Web, Some(bundle(malformed)))
+                .expect_err("malformed");
+            assert!(
+                bad_request(refused).contains("is not a bundle's SHA-256"),
+                "{malformed}"
+            );
+        }
+    }
+
+    fn admitted(web_artifact: Option<WebArtifactRef>) -> Admitted {
+        let manifest = ServiceManifest {
+            name: "site".into(),
+            mode: ServiceMode::Web,
+            ..Default::default()
+        };
+        Admitted {
+            manifest_hash: deploy_hash(&manifest).expect("hash"),
+            manifest,
+            wasm_bytes: None,
+            wasm_hash: None,
+            native: None,
+            web_artifact,
+            commit_hash: None,
+            allow_destructive: false,
+            accept_drift: false,
+            purge: false,
+            inactive: false,
+        }
+    }
+
+    fn version(
+        artifact: Option<crate::repo::deployments::Artifact>,
+    ) -> crate::repo::deployments::Deployment {
+        crate::repo::deployments::Deployment {
+            id: Uuid::nil(),
+            service_id: Uuid::nil(),
+            version: 7,
+            manifest_hash: "m".into(),
+            manifest: json!({"name": "site", "mode": "web"}),
+            wasm_hash: None,
+            status: "active".into(),
+            deployed_at: chrono::Utc::now(),
+            commit_hash: None,
+            schema_hash: None,
+            artifact,
+        }
+    }
+
+    #[test]
+    fn a_web_deploy_without_its_bundle_is_accepted_with_a_warning() {
+        let legacy = with_web_release(json!({"version": 7}), &admitted(None), &version(None), None);
+        assert_eq!(
+            legacy,
+            json!({"version": 7, "web_artifact": null, "warnings": [LEGACY_WEB_DEPLOY]})
+        );
+        assert!(admitted(None).registers_before_building());
+        assert_eq!(
+            admitted(None).request(Status::Active)["web_artifact_hash"],
+            Value::Null
+        );
+
+        let recorded = crate::repo::deployments::Artifact {
+            s3_key: format!("web/{}/{SHA}.tar.gz", Uuid::nil()),
+            hash: SHA.into(),
+            size: 41,
+        };
+        let released = admitted(Some(bundle(SHA)));
+        assert!(!released.registers_before_building());
+        assert_eq!(released.request(Status::Active)["web_artifact_hash"], SHA);
+        assert_eq!(
+            with_web_release(
+                json!({"version": 7}),
+                &released,
+                &version(Some(recorded)),
+                Some(false)
+            ),
+            json!({
+                "version": 7,
+                "web_artifact": {"sha256": SHA, "size": 41},
+                "runners_told": false,
+            })
         );
     }
 }

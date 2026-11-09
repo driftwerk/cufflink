@@ -357,7 +357,9 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_deployments_total` | counter | `result` (`attempted`, `success`, `failed`, `rejected`, `skipped`), `mode` | Deployment outcomes |
 | `cufflink_deployment_wasm_missing_total` | counter | — | Deploys of a handler-bearing service that arrived without a WASM binary |
 | `cufflink_deploy_import_rejected_total` | counter | — | Deploys refused (422) because the module imports a host function this platform does not provide |
-| `cufflink_web_announce_failures_total` | counter | — | `deploy.web` events the platform could not publish after a web app's rollback or bundle upload; the runners serve the version once they next read it |
+| `cufflink_web_announce_failures_total` | counter | — | `deploy.web` events the platform could not publish after a web app's release, skipped release, rollback or legacy upload; the runners serve the version once they next read it |
+| `cufflink_web_uploads_total` | counter | `result` (`uploaded`, `present`, `refused`) | Web bundles uploaded by content: stored, already stored at that size, or refused (a malformed hash, bytes that are not that hash, a service of another mode) |
+| `cufflink_web_legacy_deploys_total` | counter | — | Web deploys that named no bundle (`web_artifact`), as CLIs older than v0.38.0 send: the CLIs to upgrade |
 | `cufflink_deploy_lock_dropped_total` | counter | — | Deploy locks released by closing their session (an error, a cancelled request or a failed unlock) rather than by an unlock |
 | `cufflink_deploy_jobs` | gauge | `status` (`queued`, `running`, `succeeded`, `failed`) | Deploys that run beyond their request (`POST /api/services/deploy?async=true`), by state, as this replica last counted them |
 | `cufflink_sql_migrations_applied_total` | counter | `tenant`, `service` | SQL migrations deploys applied, those of a deploy that failed after them included |
@@ -525,6 +527,9 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `cufflink_web_runner_child_exits_total` | counter | `reason` | App processes that exited, and why |
+| `cufflink_web_runner_drains_total` | counter | `outcome` (`drained`, `grace_elapsed`, `shutdown`, `undeployed`) | Replaced processes stopped: once their requests ended; at the end of `WEB_DRAIN_GRACE_SECS` with requests still running; by the runner's shutdown; by an undeploy or a refused key |
+| `cufflink_web_runner_drain_seconds` | histogram | — | From a process being replaced to its being stopped |
+| `cufflink_web_runner_draining` | gauge | — | Replaced processes still finishing their requests |
 
 ### Extension runner
 

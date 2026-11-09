@@ -317,6 +317,7 @@ A setting that carries a secret can be given as a file instead: `<name>_FILE` na
 | `WORKER_ROUTES` | *(unset)* | JSON map `{"service": ["handler", ...]}` of handlers to dispatch to NATS workers instead of running in-process (see [WASM Workers](wasm-workers.md)) |
 | `PLATFORM_SQL_MAX_ROWS` | `100000` | Row cap for `POST /api/services/{id}/query` (`cufflink sql`) |
 | `PLATFORM_SQL_TIMEOUT_SECS` | `30` | Statement timeout for the same endpoint |
+| `WEB_UPLOAD_RETENTION_SECS` | `86400` | How long a web bundle uploaded but recorded by no version is kept; the next release, rollback, prune or version delete of its service removes it, with its object, once older. At least `3600`, so a release never finds the bundle it just uploaded removed ([web releases](deployment.md#web-releases)) |
 | `CUFFLINK_DEFAULT_KC_OPS_CLIENT_ID` | *(unset)* | Keycloak confidential client used for admin-API calls (role assignment, user search, logout) when a tenant has no ops client of its own |
 | `CUFFLINK_DEFAULT_KC_OPS_CLIENT_SECRET` | *(unset)* | Its secret |
 | `CUFFLINK_SERVICE_ACCOUNT_CLIENTS` | *(unset)* | Comma-separated Keycloak client IDs (matched on `azp`) treated as service accounts on every tenant, bypassing per-user RBAC, while a tenant's `service_accounts` policy is `off` or `warn`. The default ops client is always included. Prefer each tenant's `service_account_clients`. Never list human-login clients |
@@ -587,7 +588,8 @@ A `JOB_*` value the worker cannot use (not a number, a `JOB_LEASE_SECS` below `3
 | `CUFFLINK_PUBLIC_SCHEME` | `https` | `http` only for a local stack without TLS |
 | `CUFFLINK_HOSTNAME_FORMAT` | `flat` | `flat` → `{service}--{tenant}.{base}`; `hierarchical` → nested labels under the base domain |
 | `SHUTDOWN_GRACE_SECS` | `45` | Grace from SIGTERM to exit: proxied requests finish, then every Next.js child is stopped, then NATS and telemetry flush |
-| `WEB_CHILD_STOP_TIMEOUT_SECS` | `10` | How long a child gets between SIGTERM and SIGKILL at shutdown |
+| `WEB_CHILD_STOP_TIMEOUT_SECS` | `10` | How long a child gets between SIGTERM and SIGKILL, at shutdown and when a replaced child has drained |
+| `WEB_DRAIN_GRACE_SECS` | `30` | How long a replaced child may finish the requests it was given before SIGTERM; `0` kills it at once; above `3600` is refused at startup ([draining](deployment.md#web-runner)) |
 | `STORAGE_BACKEND`, `S3_*`, `GCS_BUCKET` | *(required without `WEB_TENANT`)* | Object storage holding the web artifacts |
 | `RUST_LOG` | `info,cufflink_web_runner=debug` | Log filter |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | OTLP/HTTP trace and log export |
@@ -839,14 +841,16 @@ counted in `cufflink_runner_api_requests_total`.
 | PATCH | `/api/services/{id}/status` | Enable/disable (`active` / `inactive`); a native one whatever `CUFFLINK_EXTENSIONS` is |
 | GET | `/api/services/{id}/permission-areas` | Permission areas declared by the service |
 | GET | `/api/services/{id}/openapi.json` | Generated OpenAPI spec |
-| POST | `/api/services/deploy` | Deploy a manifest (WASM bundled as `wasm_base64`; a `mode: native` service's binary as `native_base64`, 403 while `CUFFLINK_EXTENSIONS=false`). Query: `plan=true` (say what it would do), `async=true` (answer 202 and run on; `GET /api/deploys/{id}` follows it), `inactive=true` ([start nothing](deployment.md#deploying-a-service-inactive); 409 for an active service, 422 for `mode: web`). The answer carries the service's `status` |
+| POST | `/api/services/web` | Reserve a web app: create the service when it is new, and no version ([web releases](deployment.md#web-releases)) |
+| POST | `/api/services/deploy` | Deploy a manifest (WASM bundled as `wasm_base64`; a `mode: native` service's binary as `native_base64`, 403 while `CUFFLINK_EXTENSIONS=false`; a web app's uploaded bundle named by `web_artifact`). Query: `plan=true` (say what it would do), `async=true` (answer 202 and run on; `GET /api/deploys/{id}` follows it), `inactive=true` ([start nothing](deployment.md#deploying-a-service-inactive); 409 for an active service, 422 for `mode: web`). The answer carries the service's `status` |
 | GET | `/api/services/{id}/deployments` | Deployment history |
 | POST | `/api/services/{id}/deployments/prune` | Delete old deployments |
 | DELETE | `/api/services/{id}/deployments/{version}` | Delete one deployment |
 | POST | `/api/services/{id}/rollback` | Roll back |
 | POST | `/api/services/{id}/wasm` | Upload a WASM module |
 | GET | `/api/services/{id}/wasm/status` | WASM runtime status |
-| POST | `/api/services/{id}/web` | Upload a web app artifact |
+| PUT | `/api/services/{id}/web/artifacts/{sha256}` | Upload a web app's bundle by content; releases nothing |
+| POST | `/api/services/{id}/web` | Upload a web app artifact (CLIs older than v0.38.0): stored by content, it fills a current version with no bundle or releases a new version, and never rewrites a recorded bundle |
 | GET | `/api/services/{id}/web/status` | Web app status |
 
 ### Data, backup, logs

@@ -173,18 +173,16 @@ impl<R: Runner> Supervisor<R> {
         }
     }
 
+    pub fn view<T>(&self, key: &R::Key, view: impl FnOnce(&Supervised<R>) -> T) -> Option<T> {
+        locked(&self.table).running.get(key).map(view)
+    }
+
     pub fn endpoint(&self, key: &R::Key) -> Option<R::Endpoint> {
-        locked(&self.table)
-            .running
-            .get(key)
-            .map(|child| child.endpoint.clone())
+        self.view(key, |child| child.endpoint.clone())
     }
 
     pub fn info(&self, key: &R::Key) -> Option<R::Info> {
-        locked(&self.table)
-            .running
-            .get(key)
-            .map(|child| child.info.clone())
+        self.view(key, |child| child.info.clone())
     }
 
     pub fn list<T>(&self, view: impl Fn(&R::Key, &Supervised<R>) -> T) -> Vec<T> {

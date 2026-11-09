@@ -864,14 +864,34 @@ read the file once, as they start.
   a directory of that name holds that service's bundle of that content and
   is used again without checking it. A bundle uploaded before bundles were
   hashed is downloaded at each start and named by the hash of what
-  arrived. A deploy of a bundle the app already runs changes nothing; a
-  bundle of other content uploaded again under the same version runs in
-  its place.
+  arrived. A deploy of a bundle the app already runs changes nothing. From
+  v0.38.0 the platform stores a bundle under its content,
+  `web/{service id}/{sha256}.tar.gz`, and never rewrites it, so no upload
+  changes the bundle a version records: new content is always a new
+  version ([web releases](#web-releases)). Keys recorded before v0.38.0
+  (`v{n}.tar.gz`) keep working, as every reader takes the key from the
+  version.
   The app's configs are read before anything is downloaded, and the process
   it replaces keeps its own directory, so a deploy that fails at any step
   leaves the running app as it was. A directory no process runs from is
-  removed once nothing is installing or starting from it, 5 s after its
-  process was replaced, with the directories of earlier releases.
+  removed once nothing is installing or starting from it and the process
+  it replaced has exited, with the directories of earlier releases.
+- **Draining.** Once a new process of an app passes its health check, every
+  new request goes to it, and the process it replaced gets none. The runner
+  counts the requests it forwarded to each process, until their response
+  body ends or their client goes away, and lets the replaced one finish
+  them for up to `WEB_DRAIN_GRACE_SECS` (default 30, at most 3600). Only
+  then is it sent SIGTERM, and SIGKILL after `WEB_CHILD_STOP_TIMEOUT_SECS`
+  (default 10). A request still running at the end of the grace, a
+  server-sent event stream for example, is cut. `WEB_DRAIN_GRACE_SECS=0`
+  kills the replaced process at once, as before this release. A new process
+  that fails its health check replaces nothing, so nothing is drained. An
+  undeploy, and a tenant-scoped runner's refused key, still stop the app's
+  processes at once, those draining included. At shutdown, the runner
+  first lets its proxied requests finish, those to a draining process
+  included, then stops every process with SIGTERM. Each drain is logged with
+  the old and new version, the requests it waited for and its outcome
+  (`cufflink_web_runner_drains_total{outcome}`).
 - **Rollbacks.** A rollback activates a version that records the target's
   bundle and publishes `deploy.web` as a deploy does ([rolling
   back](#web-apps)).
@@ -911,6 +931,60 @@ read the file once, as they start.
   and are not served without the token. `/health` stays where it was.
   Every other path, `/ready`, `/status` and `/metrics` included, reaches the
   app.
+
+### Web releases
+
+From v0.38.0 (feature `web_releases`) a web app is released in four
+steps, and only the last one changes what runs:
+
+1. **Reserve.** `POST /api/services/web` with `{"name": "site"}` creates
+   the service when it is new, and no version. It answers `service_id`,
+   `name`, `current_version` and `created`, and `409` when the service
+   exists in another mode. Config sync and the build's configs use the
+   reserved `service_id`.
+2. **Build.** As before.
+3. **Upload.** `PUT /api/services/{id}/web/artifacts/{sha256}` with the
+   gzip tarball stores it by content and records it as an upload of the
+   service. It changes no version and tells no runner. The body must hash
+   to the path (`422` otherwise, and nothing is stored); `{sha256}` is 64
+   lowercase hex digits (`400`). An object of that size already stored is
+   not written again (`"stored": "present"` rather than `"uploaded"`).
+   Audited as `web.upload`.
+4. **Release.** `POST /api/services/deploy` with the manifest and
+   `"web_artifact": {"sha256": "…", "size": 41234567}`. Under the
+   service's deploy lock the platform finds the upload, checks that it and
+   its object have that size (`409` `bundle … of site was not uploaded, or
+   is no longer stored; upload it again` otherwise, and the running version
+   is unchanged), and records the bundle in the transaction that activates
+   the version. The answer adds `web_artifact`, the bundle the current
+   version records, and `runners_told`.
+
+A release is skipped when its manifest and its bundle are both those of
+the running version, and the runners are told again, so a retried release
+also repairs a runner that missed the first event. Any other release is a
+new version, whatever `package.json`'s `version` says. A web deploy that
+names no `web_artifact`, as a CLI older than v0.38.0 sends, is still
+accepted and skipped by its manifest alone, with a warning in `warnings`
+and `cufflink_web_legacy_deploys_total` counted.
+
+The upload route of earlier releases, `POST /api/services/{id}/web`, stays
+for older CLIs. It stores the bundle by content and, under the deploy lock:
+
+| The current version | The route |
+|---|---|
+| records no bundle | records this bundle on that version, then tells the runners |
+| records this bundle | changes nothing, and tells the runners |
+| records another bundle | activates a new version with the current version's manifest and commit and this bundle, then tells the runners. The running version's row and object are never touched |
+
+Its answer adds `version`, the version that now records the bundle, and
+`released`, whether the call changed what runs.
+
+An upload no version records is removed, with its object, once older than
+`WEB_UPLOAD_RETENTION_SECS` (default 86 400, at least 3 600), by the next
+release, rollback, prune or version delete of its service. Pruning or
+deleting a version removes its bundle once no retained version and no
+recent upload holds it, and deleting the app, or its tenant, removes every
+object under `web/{service id}/`.
 
 ### Tenant-scoped web runner
 

@@ -23,7 +23,7 @@ pub(crate) struct NativeBinary {
     pub hash: String,
 }
 
-fn object_prefix(service_id: Uuid) -> String {
+pub(crate) fn object_prefix(service_id: Uuid) -> String {
     format!("native/{service_id}")
 }
 
@@ -205,34 +205,6 @@ pub(crate) async fn restore(state: &AppState, target: &Deployment) -> PlatformRe
     }
 }
 
-pub(crate) async fn remove_orphan(state: &AppState, key: &str, context: &str) {
-    let Some(storage) = state.storage.as_ref() else {
-        return;
-    };
-    let recorded = match state.platform_db.get().await {
-        Ok(client) => crate::repo::deployments::records_artifact(&client, key).await,
-        Err(e) => Err(e.into()),
-    };
-    match recorded {
-        Ok(true) => {}
-        Ok(false) => {
-            warn!(
-                key,
-                context, "Removing a native binary no deployment records"
-            );
-            if let Err(e) = storage.delete(key).await {
-                warn!(key, context, error = %e, "Could not remove the native binary");
-            }
-        }
-        Err(e) => warn!(
-            key,
-            context,
-            error = %e,
-            "Could not tell whether a deployment records the native binary; leaving it"
-        ),
-    }
-}
-
 fn deployed(
     identity: &ServiceIdentity,
     deployment: &Deployment,
@@ -294,15 +266,6 @@ pub(crate) async fn announce_removal(
         }),
     )
     .await;
-}
-
-pub(crate) async fn delete_objects(state: &AppState, service_id: Uuid) {
-    if let Some(storage) = state.storage.as_ref() {
-        let prefix = object_prefix(service_id);
-        if let Err(e) = storage.delete_prefix(&prefix).await {
-            warn!(prefix = %prefix, error = %e, "Failed to delete a native service's binaries");
-        }
-    }
 }
 
 #[cfg(test)]

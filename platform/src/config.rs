@@ -71,9 +71,12 @@ pub struct PlatformConfig {
     pub service_identity_replay_max: usize,
     pub extensions: crate::extensions::ExtensionsConfig,
     pub sql_parse: crate::sql_parser::SqlParseSettings,
+    pub web_upload_retention: Duration,
 }
 
 const MIN_CACHE_SIGNING_KEY_BYTES: usize = 16;
+const DEFAULT_WEB_UPLOAD_RETENTION_SECS: u64 = 86_400;
+const MIN_WEB_UPLOAD_RETENTION_SECS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunEnv {
@@ -273,6 +276,7 @@ impl PlatformConfig {
             )?,
             extensions: crate::extensions::ExtensionsConfig::from_env()?,
             sql_parse: crate::sql_parser::SqlParseSettings::from_vars(&vars)?,
+            web_upload_retention: web_upload_retention(vars("WEB_UPLOAD_RETENTION_SECS"))?,
         })
     }
 
@@ -343,6 +347,7 @@ impl PlatformConfig {
             service_identity_replay_max: crate::auth::delegation::DEFAULT_REPLAY_MAX,
             extensions: Default::default(),
             sql_parse: Default::default(),
+            web_upload_retention: Duration::from_secs(DEFAULT_WEB_UPLOAD_RETENTION_SECS),
         }
     }
 
@@ -398,6 +403,22 @@ fn positive(name: &str, default: usize) -> Result<usize> {
 fn admin_api_key_ttl(raw: Option<String>) -> Result<Option<chrono::Duration>> {
     let days: u32 = cufflink_db::parse_var("CUFFLINK_ADMIN_API_KEY_TTL_DAYS", raw, 90)?;
     Ok((days > 0).then(|| chrono::Duration::days(i64::from(days))))
+}
+
+fn web_upload_retention(raw: Option<String>) -> Result<Duration> {
+    let secs: u64 = parse_var(
+        "WEB_UPLOAD_RETENTION_SECS",
+        raw,
+        DEFAULT_WEB_UPLOAD_RETENTION_SECS,
+    )?;
+    if secs < MIN_WEB_UPLOAD_RETENTION_SECS {
+        return Err(eyre!(
+            "WEB_UPLOAD_RETENTION_SECS is {secs}; it must be at least \
+             {MIN_WEB_UPLOAD_RETENTION_SECS}, so a release never finds the bundle it just \
+             uploaded removed"
+        ));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_worker_routes(raw: Option<&str>) -> Result<HashMap<String, Vec<String>>> {
@@ -735,6 +756,24 @@ mod tests {
     }
 
     #[test]
+    fn an_unreleased_upload_is_kept_at_least_an_hour() {
+        assert_eq!(
+            web_upload_retention(None).expect("default"),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            web_upload_retention(Some("3600".into())).expect("an hour"),
+            Duration::from_secs(3_600)
+        );
+        let refused = web_upload_retention(Some("3599".into())).expect_err("under an hour");
+        assert!(
+            refused.to_string().contains("must be at least 3600"),
+            "{refused}"
+        );
+        assert!(web_upload_retention(Some("soon".into())).is_err());
+    }
+
+    #[test]
     fn load_refuses_a_malformed_policy_default() {
         with_env(
             &[
@@ -1025,9 +1064,11 @@ mod tests {
                 ("CACHE_MGET_MAX_BYTES", None),
                 ("TENANT_DATABASE_URL", None),
                 ("TENANT_DB_POOLER", None),
+                ("WEB_UPLOAD_RETENTION_SECS", None),
             ],
             || {
                 let config = PlatformConfig::load(env).expect("defaults load");
+                assert_eq!(config.web_upload_retention, Duration::from_secs(86_400));
                 assert_eq!(config.max_open_tx, 2);
                 assert_eq!(
                     config.cache,

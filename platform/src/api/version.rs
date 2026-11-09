@@ -12,7 +12,7 @@ const BASE_FEATURES: &[&str] = &[
     "tenant_policies",
 ];
 
-const SUBSYSTEM_FEATURES: [&[&str]; 14] = [
+const SUBSYSTEM_FEATURES: [&[&str]; 15] = [
     crate::router::custom::FEATURES,
     crate::auth::scope::FEATURES,
     crate::auth::columns::FEATURES,
@@ -25,6 +25,7 @@ const SUBSYSTEM_FEATURES: [&[&str]; 14] = [
     crate::schema_manager::FEATURES,
     crate::tenant_sessions::FEATURES,
     crate::deployer::native::FEATURES,
+    crate::deployer::web::FEATURES,
     crate::api::deployments::FEATURES,
     crate::api::config::FEATURES,
 ];
