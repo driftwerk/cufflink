@@ -124,6 +124,11 @@ const GUESTS: &[Guest] = &[
         features: &["db-v2"],
     },
     Guest {
+        name: "wait-release",
+        source: "wait_release",
+        features: &[],
+    },
+    Guest {
         name: "library-example",
         source: "library_example",
         features: &[
