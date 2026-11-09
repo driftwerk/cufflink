@@ -53,7 +53,8 @@ expired or too-deep identity answers 401, an unlisted caller 403, each
 counted in `cufflink_service_identity_rejected_total{reason}`. Bearer
 tokens and API keys are never consulted. An identity is bound to one
 tenant, service, method and path and lives at most 60 s; it is single-use
-only when it carries a delegated user ([below](#a-delegated-user)). The guest sees who called:
+only when it carries a delegated user ([below](#a-delegated-user)). The
+guest sees who called:
 
 ```rust
 if let Some(caller) = req.caller() {
@@ -76,16 +77,17 @@ are left out of the OpenAPI document.
 ### A delegated user
 
 An identity can carry, signed inside it, the end user the calling platform
-verified on its own inbound request. The target then admits that user on
-every posture exactly as on a direct call: `authenticated`, `owner` and
+verified on its own inbound request. The target then admits that user
+exactly as on a direct call: `authenticated`, `owner` and
 `permission` routes admit them, `permission` and `scoped` routes resolve the
 user's own grants, CRUD tables apply `auth_required`, `owner_field` and
 `permission_area` to them, and an `internal` route sees them in `req.auth()`
 beside the calling service in `req.caller()`. An `api_key` route ignores
-the user: only a partner key passes it. The user never has platform-admin
-or deploy authority on the target. The request's `caller` object gains
-`"delegated": true`, and the audit record names the user as actor with the
-calling service as `actor.via`.
+the user: only a partner key passes it, and its audit record names the
+calling service. A credential header beside the identity is ignored. The
+user never has platform-admin or deploy authority on the target. The
+request's `caller` object gains `"delegated": true`, and the audit record
+names the user as actor with the calling service as `actor.via`.
 
 Such an identity is refused with 401 on every posture, not only on
 `internal` routes:
@@ -98,12 +100,15 @@ Such an identity is refused with 401 on every posture, not only on
   (`replay_capacity`). An identity that arrives over the network, as a
   worker's calls do, is also claimed in Redis when the platform has one,
   so a replay to another replica is refused too; a claim that cannot reach
-  Redis is refused (`replay_unavailable`).
+  Redis is refused (`replay_unavailable`). Without Redis, each replica
+  refuses only the replays it sees itself.
 
 An identity whose signature or binding fails is still treated as above:
 nothing in it is trusted, not even the user it names. A platform older than
-this one ignores the user and sees a service-only identity, so a mixed
-fleet only ever refuses a delegated call.
+this one ignores the user and sees a service-only identity: routes that
+need a user answer 401, and `internal` and `public` routes run without one.
+A mixed fleet therefore never grants the user's authority where it cannot
+check it.
 
 ## The namespaced cache
 
