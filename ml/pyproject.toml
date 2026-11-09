@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Train and export small text classifiers for the cufflink-model crate"
 license = "MIT OR Apache-2.0"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26", "scikit-learn>=1.5"]
+dependencies = ["numpy>=1.26", "scikit-learn>=1.9.1"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
