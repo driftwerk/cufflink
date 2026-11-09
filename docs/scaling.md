@@ -111,7 +111,10 @@ slots only while it computes.
   appears, or when `cufflink_wasm_blocking_threads` under parked load
   nears the process's thread limit. Each parked guest also keeps its
   memory charge and its thread's stack, so under `enforce` the memory
-  budget bounds parked guests by what they hold.
+  budget bounds parked guests by what they hold. An interactive arrival
+  takes its slots before its memory, so when parked guests fill the
+  budget it can hold a slot a resume needs until its admission deadline
+  refuses it.
 
 ### Tenant Database Pools
 
