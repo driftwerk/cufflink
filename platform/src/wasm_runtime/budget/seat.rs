@@ -1,8 +1,5 @@
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the host's released waits park and resume seats")
-)]
-
+use super::{Class, Reason, Refusal, ServiceKey};
+use crate::policy::PolicyMode;
 use crate::shutdown::Shutdown;
 use crate::wasm_runtime::{Interrupt, InvocationKind};
 use cufflink_telemetry::GaugeGuard;
@@ -10,14 +7,15 @@ use cufflink_types::host::wait::Wait;
 use futures_util::{StreamExt, TryStreamExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore};
+use std::time::{Duration, Instant};
+use tokio::sync::{AcquireError, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Gate {
     slots: Arc<Semaphore>,
     resuming: AtomicUsize,
-    resumed: Notify,
+    changed: Notify,
+    arrivals: Mutex<()>,
 }
 
 struct Resuming<'a>(&'a Gate);
@@ -25,6 +23,7 @@ struct Resuming<'a>(&'a Gate);
 impl<'a> Resuming<'a> {
     fn on(gate: &'a Gate) -> Self {
         gate.resuming.fetch_add(1, Ordering::AcqRel);
+        gate.changed.notify_waiters();
         Self(gate)
     }
 }
@@ -32,7 +31,7 @@ impl<'a> Resuming<'a> {
 impl Drop for Resuming<'_> {
     fn drop(&mut self) {
         if self.0.resuming.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.resumed.notify_waiters();
+            self.0.changed.notify_waiters();
         }
     }
 }
@@ -42,7 +41,8 @@ impl Gate {
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(permits)),
             resuming: AtomicUsize::new(0),
-            resumed: Notify::new(),
+            changed: Notify::new(),
+            arrivals: Mutex::new(()),
         })
     }
 
@@ -55,16 +55,21 @@ impl Gate {
     }
 
     pub(crate) async fn admit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        let _turn = self.arrivals.lock().await;
         loop {
-            let resumed = self.resumed.notified();
-            tokio::pin!(resumed);
-            resumed.as_mut().enable();
-            if self.resuming.load(Ordering::Acquire) == 0 {
-                break;
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.resuming.load(Ordering::Acquire) > 0 {
+                changed.await;
+                continue;
             }
-            resumed.await;
+            tokio::select! {
+                biased;
+                () = &mut changed => {}
+                permit = Arc::clone(&self.slots).acquire_owned() => return permit,
+            }
         }
-        Arc::clone(&self.slots).acquire_owned().await
     }
 
     async fn resume(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
@@ -73,15 +78,32 @@ impl Gate {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Taking {
+    Waited,
+    Tried,
+}
+
+impl Taking {
+    pub(crate) fn of(enforced: bool, class: Class) -> Self {
+        match enforced && class != Class::Nested {
+            true => Taking::Waited,
+            false => Taking::Tried,
+        }
+    }
+}
+
 pub(crate) struct Taken {
     gate: Arc<Gate>,
+    taking: Taking,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Taken {
-    pub(crate) fn new(gate: Arc<Gate>, permit: OwnedSemaphorePermit) -> Self {
+    pub(crate) fn new(gate: Arc<Gate>, taking: Taking, permit: OwnedSemaphorePermit) -> Self {
         Self {
             gate,
+            taking,
             _permit: permit,
         }
     }
@@ -126,15 +148,52 @@ fn released(kind: InvocationKind, result: &'static str) {
     .increment(1);
 }
 
+pub(crate) struct Whose {
+    service: ServiceKey,
+    handler: Arc<str>,
+    class: Class,
+}
+
+impl Whose {
+    pub(crate) fn new(service: ServiceKey, handler: &str, class: Class) -> Arc<Self> {
+        Arc::new(Self {
+            service,
+            handler: handler.into(),
+            class,
+        })
+    }
+
+    fn missed(&self) {
+        Refusal {
+            tenant: &self.service.tenant,
+            service: &self.service.service,
+            handler: &self.handler,
+            class: self.class,
+            reason: Reason::ServiceConcurrency,
+            mode: PolicyMode::Warn,
+        }
+        .record(None);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Parking {
     global: Arc<Semaphore>,
     service: Arc<Semaphore>,
+    warned: Option<Arc<Whose>>,
 }
 
 impl Parking {
-    pub(crate) fn new(global: Arc<Semaphore>, service: Arc<Semaphore>) -> Self {
-        Self { global, service }
+    pub(crate) fn new(
+        global: Arc<Semaphore>,
+        service: Arc<Semaphore>,
+        warned: Option<Arc<Whose>>,
+    ) -> Self {
+        Self {
+            global,
+            service,
+            warned,
+        }
     }
 }
 
@@ -143,6 +202,7 @@ pub(crate) struct Seat {
     releasable: Vec<Taken>,
     parking: Result<Parking, Held>,
     kind: InvocationKind,
+    after: Duration,
 }
 
 impl Seat {
@@ -151,12 +211,14 @@ impl Seat {
         releasable: Vec<Taken>,
         parking: Result<Parking, Held>,
         kind: InvocationKind,
+        after: Duration,
     ) -> Self {
         Self {
             route,
             releasable,
             parking,
             kind,
+            after,
         }
     }
 
@@ -174,6 +236,7 @@ impl Seat {
             releasable: std::mem::take(&mut self.releasable),
             parking,
             kind: self.kind,
+            after: self.after,
         }
     }
 
@@ -186,11 +249,16 @@ pub(crate) struct Lent {
     releasable: Vec<Taken>,
     parking: Result<Parking, Held>,
     kind: InvocationKind,
+    after: Duration,
 }
 
 impl Lent {
     pub(crate) fn requested(&self) -> bool {
         self.parking.as_ref().err() != Some(&Held::NotRequested)
+    }
+
+    pub(crate) fn after(&self) -> Duration {
+        self.after
     }
 
     pub(crate) fn answered_first(self) -> Vec<Taken> {
@@ -205,7 +273,7 @@ impl Lent {
     }
 
     pub(crate) fn park(&mut self) -> Result<Parked, Held> {
-        let (global, service) = self.reserve().map_err(|held| held.count(self.kind))?;
+        let (global, service, warned) = self.reserve().map_err(|held| held.count(self.kind))?;
         released(self.kind, "parked");
         tracing::debug!(
             target: "cufflink::wasm::budget",
@@ -216,8 +284,9 @@ impl Lent {
         Ok(Parked {
             gates: std::mem::take(&mut self.releasable)
                 .into_iter()
-                .map(|taken| taken.gate)
+                .map(|taken| (taken.gate, taken.taking))
                 .collect(),
+            warned,
             kind: self.kind,
             since: Instant::now(),
             _parked: GaugeGuard::enter(
@@ -228,7 +297,16 @@ impl Lent {
         })
     }
 
-    fn reserve(&self) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), Held> {
+    fn reserve(
+        &self,
+    ) -> Result<
+        (
+            OwnedSemaphorePermit,
+            OwnedSemaphorePermit,
+            Option<Arc<Whose>>,
+        ),
+        Held,
+    > {
         let parking = self.parking.as_ref().map_err(|held| *held)?;
         let global = Arc::clone(&parking.global)
             .try_acquire_owned()
@@ -236,7 +314,7 @@ impl Lent {
         let service = Arc::clone(&parking.service)
             .try_acquire_owned()
             .map_err(|_| Held::ServicePoolFull)?;
-        Ok((global, service))
+        Ok((global, service, parking.warned.clone()))
     }
 }
 
@@ -247,12 +325,31 @@ pub(crate) struct ResumeBy<'a> {
 }
 
 pub(crate) struct Parked {
-    gates: Vec<Arc<Gate>>,
+    gates: Vec<(Arc<Gate>, Taking)>,
+    warned: Option<Arc<Whose>>,
     kind: InvocationKind,
     since: Instant,
     _parked: GaugeGuard,
     _global: OwnedSemaphorePermit,
     _service: OwnedSemaphorePermit,
+}
+
+async fn retake(
+    gate: Arc<Gate>,
+    taking: Taking,
+    warned: Option<&Whose>,
+) -> Result<Option<Taken>, AcquireError> {
+    let permit = match taking {
+        Taking::Waited => Some(gate.resume().await?),
+        Taking::Tried => {
+            let permit = gate.try_take();
+            if let (None, Some(warned)) = (&permit, warned) {
+                warned.missed();
+            }
+            permit
+        }
+    };
+    Ok(permit.map(|permit| Taken::new(gate, taking, permit)))
 }
 
 impl Parked {
@@ -261,15 +358,18 @@ impl Parked {
         let kind = self.kind.label();
         metrics::histogram!("cufflink_wasm_parked_seconds", "kind" => kind)
             .record(answered.duration_since(self.since).as_secs_f64());
-        let retake = futures_util::stream::iter(self.gates)
-            .then(|gate| async move { gate.resume().await.map(|permit| Taken::new(gate, permit)) })
+        let warned = self.warned.as_deref();
+        let retaking = futures_util::stream::iter(self.gates)
+            .then(|(gate, taking)| retake(gate, taking, warned))
             .try_collect::<Vec<_>>();
         let resumed = tokio::select! {
             biased;
             () = by.cancel.cancelled() => Err(Interrupt::Cancelled),
             () = by.shutdown.hard_deadline() => Err(Interrupt::Shutdown),
             () = tokio::time::sleep_until(by.until.into()) => Err(Interrupt::Deadline),
-            retaken = retake => retaken.map_err(|_closed| Interrupt::Shutdown),
+            retaken = retaking => retaken
+                .map(|retaken| retaken.into_iter().flatten().collect())
+                .map_err(|_closed| Interrupt::Shutdown),
         };
         let result = match &resumed {
             Ok(_) => "resumed",
@@ -283,18 +383,67 @@ impl Parked {
             "result" => result,
         )
         .record(answered.elapsed().as_secs_f64());
+        if resumed.as_ref().err() == Some(&Interrupt::Deadline) {
+            tracing::warn!(
+                target: "cufflink::wasm::budget",
+                kind,
+                parked_ms = answered.duration_since(self.since).as_millis() as u64,
+                "A guest could not take its slots back before its deadline"
+            );
+        }
         resumed
     }
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub(crate) fn lone(gate: &Arc<Gate>, pools: Option<(usize, usize)>, after: Duration) -> Seat {
+        let parking = pools
+            .map(|(global, service)| {
+                Parking::new(
+                    Arc::new(Semaphore::new(global)),
+                    Arc::new(Semaphore::new(service)),
+                    None,
+                )
+            })
+            .ok_or(Held::Disabled);
+        let taken = Taken::new(
+            Arc::clone(gate),
+            Taking::Waited,
+            gate.try_take().expect("a free slot"),
+        );
+        Seat::new(None, vec![taken], parking, InvocationKind::Route, after)
+    }
+
+    pub(crate) fn pools(seat: &Seat) -> (usize, usize) {
+        seat.parking.as_ref().map_or((0, 0), |parking| {
+            (
+                parking.global.available_permits(),
+                parking.service.available_permits(),
+            )
+        })
+    }
+
+    pub(crate) fn quiet(gate: &Gate) -> bool {
+        gate.resuming.load(Ordering::Acquire) == 0
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::super::{Admission, Budget, BudgetConfig, Class, RouteKey, Ticket, WaitRelease};
+    use super::super::{
+        Admission, Budget, BudgetConfig, Class, Limits, RouteKey, ServiceSlot, Ticket, WaitRelease,
+    };
+    use super::testing::quiet;
     use super::*;
     use crate::policy::PolicyMode;
     use crate::registry::ServiceIdentity;
     use crate::wasm_runtime::ExecutionError;
-    use std::time::Duration;
+    use futures_util::poll;
+    use std::pin::pin;
+    use std::task::Poll;
     use uuid::Uuid;
 
     const WAIT: Duration = Duration::from_millis(100);
@@ -309,10 +458,10 @@ mod tests {
         }
     }
 
-    fn budget(max_parked: usize, max_parked_per_service: usize) -> Budget {
+    fn budget_in(mode: PolicyMode, max_parked: usize, max_parked_per_service: usize) -> Budget {
         Budget::new(
             BudgetConfig {
-                mode: PolicyMode::Enforce,
+                mode,
                 per_service: 2,
                 wait_release: Some(WaitRelease {
                     after: Duration::from_millis(50),
@@ -328,6 +477,10 @@ mod tests {
         )
     }
 
+    fn budget(max_parked: usize, max_parked_per_service: usize) -> Budget {
+        budget_in(PolicyMode::Enforce, max_parked, max_parked_per_service)
+    }
+
     fn ticket<'a>(identity: &'a ServiceIdentity, class: Class, kind: InvocationKind) -> Ticket<'a> {
         Ticket {
             class,
@@ -340,9 +493,17 @@ mod tests {
         }
     }
 
+    fn route(identity: &ServiceIdentity) -> Ticket<'_> {
+        ticket(identity, Class::Interactive, InvocationKind::Route)
+    }
+
     async fn seat(budget: &Budget, global: &Arc<Gate>, ticket: Ticket<'_>) -> Seat {
         let admission: Admission = budget.admit(ticket, global).await.expect("admitted");
         admission.into_parts().0
+    }
+
+    fn slots(budget: &Budget, identity: &ServiceIdentity) -> ServiceSlot {
+        budget.services.of(&ServiceKey::of(identity))
     }
 
     fn released(seat: &mut Seat) -> Lent {
@@ -361,8 +522,31 @@ mod tests {
         }
     }
 
-    fn quiet(gate: &Gate) -> bool {
-        gate.resuming.load(Ordering::Acquire) == 0
+    fn running() -> Shutdown {
+        Shutdown::new(Duration::from_secs(30))
+    }
+
+    fn pool_permit() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a wait pool permit")
+    }
+
+    fn parked(gates: &[&Arc<Gate>], kind: InvocationKind) -> Parked {
+        Parked {
+            gates: gates
+                .iter()
+                .map(|gate| (Arc::clone(gate), Taking::Waited))
+                .collect(),
+            warned: None,
+            kind,
+            since: Instant::now(),
+            _parked: GaugeGuard::enter(
+                metrics::gauge!("cufflink_wasm_parked", "kind" => kind.label()),
+            ),
+            _global: pool_permit(),
+            _service: pool_permit(),
+        }
     }
 
     #[tokio::test]
@@ -370,7 +554,7 @@ mod tests {
         let budget = budget(4, 4);
         let global = Gate::new(4);
         let loans = identity("loan-service");
-        let route = RouteKey {
+        let key = RouteKey {
             service_id: loans.service_id,
             version: 1,
             index: 0,
@@ -379,58 +563,39 @@ mod tests {
             &budget,
             &global,
             Ticket {
-                route: Some((route, 1)),
-                ..ticket(&loans, Class::Interactive, InvocationKind::Route)
+                route: Some((key, 1)),
+                ..route(&loans)
             },
         )
         .await;
-        let service = budget.services.of(&super::super::ServiceKey::of(&loans));
-        let route_gate = budget.routes.gate(route, 1);
-        assert_eq!(
+        let service = slots(&budget, &loans);
+        let route_gate = budget.routes.gate(key, 1);
+        let held = || {
             (
                 service.all.available(),
                 global.available(),
-                route_gate.available()
-            ),
-            (1, 3, 0)
-        );
+                route_gate.available(),
+            )
+        };
+        assert_eq!(held(), (1, 3, 0));
 
         let mut lent = released(&mut seat);
         let parked = lent.park().expect("parked");
         assert_eq!(
-            (
-                service.all.available(),
-                global.available(),
-                route_gate.available()
-            ),
+            held(),
             (2, 4, 0),
             "the service and global slots go back, the route slot stays held"
         );
 
-        let shutdown = Shutdown::new(Duration::from_secs(30));
-        let cancel = CancellationToken::new();
+        let (cancel, shutdown) = (CancellationToken::new(), running());
         let retaken = parked
             .resume(by(Duration::from_secs(1), &cancel, &shutdown))
             .await
             .expect("resumed");
         seat.restore(retaken);
-        assert_eq!(
-            (
-                service.all.available(),
-                global.available(),
-                route_gate.available()
-            ),
-            (1, 3, 0)
-        );
+        assert_eq!(held(), (1, 3, 0));
         drop(seat);
-        assert_eq!(
-            (
-                service.all.available(),
-                global.available(),
-                route_gate.available()
-            ),
-            (2, 4, 1)
-        );
+        assert_eq!(held(), (2, 4, 1));
     }
 
     #[tokio::test]
@@ -439,13 +604,16 @@ mod tests {
         let lent = |pool: usize, service: usize| Lent {
             releasable: vec![Taken::new(
                 Arc::clone(&global),
+                Taking::Waited,
                 global.try_take().expect("slot"),
             )],
             parking: Ok(Parking::new(
                 Arc::new(Semaphore::new(pool)),
                 Arc::new(Semaphore::new(service)),
+                None,
             )),
             kind: InvocationKind::Route,
+            after: WAIT,
         };
 
         let mut no_pool = lent(0, 1);
@@ -476,12 +644,7 @@ mod tests {
         let budget = budget(4, 4);
         let global = Gate::new(4);
         let loans = identity("loan-service");
-        let mut seat = seat(
-            &budget,
-            &global,
-            ticket(&loans, Class::Interactive, InvocationKind::Route),
-        )
-        .await;
+        let mut seat = seat(&budget, &global, route(&loans)).await;
         let held = seat.lend(Wait::Hold, false);
         assert!(!held.requested());
         seat.restore(held.answered_first());
@@ -501,7 +664,6 @@ mod tests {
         let global = Gate::new(4);
         let catalog = identity("catalog-service");
         let loans = identity("loan-service");
-        let route = |identity| ticket(identity, Class::Interactive, InvocationKind::Route);
 
         let mut first = seat(&budget, &global, route(&catalog)).await;
         let mut second = seat(&budget, &global, route(&catalog)).await;
@@ -514,6 +676,24 @@ mod tests {
         );
         let elsewhere = released(&mut other).park().expect("another service parks");
         drop((parked, elsewhere));
+    }
+
+    #[tokio::test]
+    async fn a_full_global_wait_pool_holds_every_service() {
+        let budget = budget(1, 4);
+        let global = Gate::new(4);
+        let catalog = identity("catalog-service");
+        let loans = identity("loan-service");
+        let mut first = seat(&budget, &global, route(&catalog)).await;
+        let mut other = seat(&budget, &global, route(&loans)).await;
+
+        let parked = released(&mut first).park().expect("the first parks");
+        assert_eq!(released(&mut other).park().err(), Some(Held::PoolFull));
+        drop(parked);
+        assert!(
+            released(&mut other).park().is_ok(),
+            "a resumed guest's wait permit goes back to the pool"
+        );
     }
 
     #[tokio::test]
@@ -535,12 +715,7 @@ mod tests {
             );
         }
 
-        let mut route = seat(
-            &budget,
-            &global,
-            ticket(&loans, Class::Interactive, InvocationKind::Route),
-        )
-        .await;
+        let mut route = seat(&budget, &global, route(&loans)).await;
         assert_eq!(
             route.lend(Wait::Hold, false).park().err(),
             Some(Held::NotRequested)
@@ -582,21 +757,15 @@ mod tests {
             ticket(&loans, Class::Background, InvocationKind::Job),
         )
         .await;
-        let service = budget.services.of(&super::super::ServiceKey::of(&loans));
+        let service = slots(&budget, &loans);
         let parked = released(&mut seat).park().expect("parked");
         let class_cap = (0..service.background.available())
             .filter_map(|_| service.background.try_take())
             .collect::<Vec<_>>();
 
-        let shutdown = Shutdown::new(Duration::from_secs(30));
-        let cancel = CancellationToken::new();
-        let resuming = tokio::spawn(async move {
-            parked
-                .resume(by(Duration::from_secs(5), &cancel, &shutdown))
-                .await
-                .map(|retaken| retaken.len())
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resuming = pin!(parked.resume(by(Duration::from_secs(5), &cancel, &shutdown)));
+        assert!(poll!(resuming.as_mut()).is_pending());
         assert_eq!(
             (
                 service.all.available(),
@@ -609,109 +778,232 @@ mod tests {
         assert!(!quiet(&service.background));
 
         drop(class_cap);
-        let retaken = resuming.await.expect("joined").expect("resumed");
-        assert_eq!(retaken, 4, "class cap, service, background cap and global");
+        let Poll::Ready(Ok(retaken)) = poll!(resuming.as_mut()) else {
+            panic!("the resume takes every slot once the class cap is free");
+        };
+        assert_eq!(
+            retaken.len(),
+            4,
+            "class cap, service, background cap and global"
+        );
         assert!(quiet(&service.background));
     }
 
     #[tokio::test]
-    async fn a_resume_is_granted_before_new_interactive_work() {
+    async fn a_resume_is_granted_before_arrivals_already_queued() {
         let gate = Gate::new(1);
-        let parked = Parked {
-            gates: vec![Arc::clone(&gate)],
-            kind: InvocationKind::Route,
-            since: Instant::now(),
-            _parked: GaugeGuard::enter(metrics::gauge!("cufflink_wasm_parked", "kind" => "route")),
-            _global: Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .expect("pool"),
-            _service: Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .expect("pool"),
-        };
-        let running = gate.try_take().expect("the running guest's slot");
+        let running_guest = gate.try_take().expect("the running guest's slot");
+        let mut first = pin!(gate.admit());
+        let mut second = pin!(gate.admit());
+        assert!(poll!(first.as_mut()).is_pending(), "queued for the slot");
+        assert!(poll!(second.as_mut()).is_pending(), "queued behind it");
 
-        let shutdown = Shutdown::new(Duration::from_secs(30));
-        let cancel = CancellationToken::new();
-        let resume = tokio::spawn(async move {
-            parked
-                .resume(by(Duration::from_secs(5), &cancel, &shutdown))
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let arrival = tokio::spawn({
-            let gate = Arc::clone(&gate);
-            async move { gate.admit().await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked(&[&gate], InvocationKind::Route).resume(by(
+            Duration::from_secs(5),
+            &cancel,
+            &shutdown
+        )));
+        assert!(poll!(resume.as_mut()).is_pending());
 
-        drop(running);
-        let retaken = resume
-            .await
-            .expect("joined")
-            .expect("the resume is granted");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(running_guest);
         assert!(
-            !arrival.is_finished(),
-            "the arrival waits behind the resume"
+            poll!(first.as_mut()).is_pending(),
+            "the arrival at the head of the queue steps back for the resume"
         );
+        assert!(poll!(second.as_mut()).is_pending());
+        let Poll::Ready(Ok(retaken)) = poll!(resume.as_mut()) else {
+            panic!("the freed slot goes to the resume");
+        };
+        assert!(quiet(&gate));
+        assert!(poll!(first.as_mut()).is_pending());
 
         drop(retaken);
-        let admitted = tokio::time::timeout(Duration::from_secs(1), arrival)
-            .await
-            .expect("admitted once the resumed guest finishes")
-            .expect("joined");
-        assert!(admitted.is_ok());
+        let Poll::Ready(Ok(admitted)) = poll!(first.as_mut()) else {
+            panic!("the first arrival is admitted once the resumed guest finishes");
+        };
+        assert!(
+            poll!(second.as_mut()).is_pending(),
+            "arrivals keep their order"
+        );
+        drop(admitted);
+        assert!(matches!(poll!(second.as_mut()), Poll::Ready(Ok(_))));
     }
 
     #[tokio::test]
+    async fn arrivals_held_behind_a_resume_keep_their_order_whatever_order_they_wake_in() {
+        let gate = Gate::new(1);
+        let running_guest = gate.try_take().expect("the running guest's slot");
+        let mut first = pin!(gate.admit());
+        let mut second = pin!(gate.admit());
+        assert!(poll!(first.as_mut()).is_pending());
+        assert!(poll!(second.as_mut()).is_pending());
+
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked(&[&gate], InvocationKind::Route).resume(by(
+            Duration::from_secs(5),
+            &cancel,
+            &shutdown
+        )));
+        assert!(poll!(resume.as_mut()).is_pending());
+        drop(running_guest);
+        assert!(poll!(first.as_mut()).is_pending(), "the head steps back");
+        let Poll::Ready(Ok(retaken)) = poll!(resume.as_mut()) else {
+            panic!("the slot the head gave back goes to the resume, not the arrival behind it");
+        };
+
+        drop(retaken);
+        assert!(
+            poll!(second.as_mut()).is_pending(),
+            "the later arrival does not overtake the earlier one by waking first"
+        );
+        assert!(matches!(poll!(first.as_mut()), Poll::Ready(Ok(_))));
+    }
+
+    #[tokio::test]
+    async fn a_slot_already_handed_to_the_head_arrival_still_goes_to_the_resume() {
+        for _ in 0..64 {
+            let gate = Gate::new(1);
+            let running_guest = gate.try_take().expect("the running guest's slot");
+            let mut arrival = pin!(gate.admit());
+            assert!(poll!(arrival.as_mut()).is_pending());
+            let (cancel, shutdown) = (CancellationToken::new(), running());
+            let mut resume = pin!(parked(&[&gate], InvocationKind::Route).resume(by(
+                Duration::from_secs(5),
+                &cancel,
+                &shutdown
+            )));
+            assert!(poll!(resume.as_mut()).is_pending());
+            drop(running_guest);
+            assert!(
+                poll!(arrival.as_mut()).is_pending(),
+                "the resume's notice wins over the slot handed to the arrival"
+            );
+            assert!(matches!(poll!(resume.as_mut()), Poll::Ready(Ok(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn resumes_take_freed_slots_in_their_own_order() {
+        let gate = Gate::new(1);
+        let running_guest = gate.try_take().expect("the running guest's slot");
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut earlier = pin!(parked(&[&gate], InvocationKind::Route).resume(by(
+            Duration::from_secs(5),
+            &cancel,
+            &shutdown
+        )));
+        let mut later = pin!(parked(&[&gate], InvocationKind::Job).resume(by(
+            Duration::from_secs(5),
+            &cancel,
+            &shutdown
+        )));
+        assert!(poll!(earlier.as_mut()).is_pending());
+        assert!(poll!(later.as_mut()).is_pending());
+        let mut arrival = pin!(gate.admit());
+        assert!(poll!(arrival.as_mut()).is_pending());
+
+        drop(running_guest);
+        let Poll::Ready(Ok(first)) = poll!(earlier.as_mut()) else {
+            panic!("the earlier resume is granted first");
+        };
+        assert!(poll!(later.as_mut()).is_pending());
+        drop(first);
+        assert!(poll!(arrival.as_mut()).is_pending(), "a resume still waits");
+        let Poll::Ready(Ok(second)) = poll!(later.as_mut()) else {
+            panic!("then the later one");
+        };
+        drop(second);
+        assert!(matches!(poll!(arrival.as_mut()), Poll::Ready(Ok(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn new_work_held_behind_resumes_is_refused_at_its_admission_deadline() {
-        let budget = Arc::new(budget(4, 4));
+        let budget = budget(4, 4);
         let global = Gate::new(4);
-        let loans = Arc::new(identity("loan-service"));
-        let route = || ticket(&loans, Class::Interactive, InvocationKind::Route);
-        let mut parking = seat(&budget, &global, route()).await;
+        let loans = identity("loan-service");
+        let mut parking = seat(&budget, &global, route(&loans)).await;
         let parked = released(&mut parking).park().expect("parked");
-        let (running, _other) = (
-            seat(&budget, &global, route()).await,
-            seat(&budget, &global, route()).await,
+        let running_guests = (
+            seat(&budget, &global, route(&loans)).await,
+            seat(&budget, &global, route(&loans)).await,
         );
 
-        let shutdown = Shutdown::new(Duration::from_secs(30));
-        let cancel = CancellationToken::new();
-        let resume = tokio::spawn(async move {
-            parked
-                .resume(by(Duration::from_secs(5), &cancel, &shutdown))
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked.resume(by(Duration::from_secs(5), &cancel, &shutdown)));
+        assert!(poll!(resume.as_mut()).is_pending());
 
-        let started = std::time::Instant::now();
-        let arrival = tokio::spawn({
-            let (budget, global, loans) =
-                (Arc::clone(&budget), Arc::clone(&global), Arc::clone(&loans));
-            async move {
-                budget
-                    .admit(
-                        ticket(&loans, Class::Interactive, InvocationKind::Route),
-                        &global,
-                    )
-                    .await
-                    .map(drop)
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        drop(running);
-        let resumed = resume.await.expect("joined");
-        assert!(resumed.is_ok(), "the freed slot goes to the resume");
+        let started = tokio::time::Instant::now();
+        let mut arrival = pin!(budget.admit(route(&loans), &global));
+        assert!(poll!(arrival.as_mut()).is_pending());
+        drop(running_guests.0);
+        let Poll::Ready(Ok(_resumed)) = poll!(resume.as_mut()) else {
+            panic!("the freed slot goes to the resume");
+        };
 
-        let refused = arrival.await.expect("joined");
+        let refused = arrival.await;
         assert!(
             matches!(refused, Err(ExecutionError::Overloaded { .. })),
             "{refused:?}"
         );
-        let waited = started.elapsed();
-        assert!(waited >= WAIT && waited < WAIT * 5, "{waited:?}");
+        assert_eq!(started.elapsed(), WAIT, "refused at its admission deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_behind_an_arrival_waiting_for_the_parked_guests_memory_waits_out_its_deadline(
+    ) {
+        const MIB: usize = 1024 * 1024;
+        let budget = Budget::new(
+            BudgetConfig {
+                mode: PolicyMode::Enforce,
+                per_service: 1,
+                limits: Some(Limits {
+                    budget: 12 * MIB,
+                    admit: 12 * MIB,
+                    service: 12 * MIB,
+                    background: 12 * MIB,
+                    overrun: 12 * MIB,
+                }),
+                cold_estimate: 8 * MIB,
+                thread_stack: MIB,
+                ..BudgetConfig::default()
+            },
+            4,
+            usize::MAX,
+            WAIT,
+            Duration::from_secs(1),
+        );
+        let global = Gate::new(4);
+        let loans = identity("loan-service");
+        let (mut parking, charge) = budget
+            .admit(route(&loans), &global)
+            .await
+            .expect("admitted")
+            .into_parts();
+        assert!(charge.is_some(), "the parked guest keeps its memory charge");
+        let parked = released(&mut parking).park().expect("parked");
+
+        let started = tokio::time::Instant::now();
+        let mut arrival = pin!(budget.admit(route(&loans), &global));
+        assert!(
+            poll!(arrival.as_mut()).is_pending(),
+            "the arrival takes the released service slot, then waits for memory"
+        );
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked.resume(by(Duration::from_secs(5), &cancel, &shutdown)));
+        assert!(poll!(resume.as_mut()).is_pending());
+
+        let refused = arrival.await;
+        assert!(
+            matches!(refused, Err(ExecutionError::Overloaded { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(started.elapsed(), WAIT, "refused at its admission deadline");
+        assert!(
+            matches!(poll!(resume.as_mut()), Poll::Ready(Ok(_))),
+            "only then does the resume get the slot back"
+        );
+        drop(charge);
     }
 
     #[tokio::test]
@@ -719,17 +1011,15 @@ mod tests {
         let budget = budget(4, 4);
         let global = Gate::new(4);
         let loans = identity("loan-service");
-        let route = || ticket(&loans, Class::Interactive, InvocationKind::Route);
-        let mut parking = seat(&budget, &global, route()).await;
+        let mut parking = seat(&budget, &global, route(&loans)).await;
         let parked = released(&mut parking).park().expect("parked");
-        let service = budget.services.of(&super::super::ServiceKey::of(&loans));
-        let running = (
-            seat(&budget, &global, route()).await,
-            seat(&budget, &global, route()).await,
+        let service = slots(&budget, &loans);
+        let running_guests = (
+            seat(&budget, &global, route(&loans)).await,
+            seat(&budget, &global, route(&loans)).await,
         );
 
-        let shutdown = Shutdown::new(Duration::from_secs(30));
-        let cancel = CancellationToken::new();
+        let (cancel, shutdown) = (CancellationToken::new(), running());
         let ended = parked
             .resume(by(Duration::from_millis(50), &cancel, &shutdown))
             .await
@@ -738,8 +1028,8 @@ mod tests {
         assert!(quiet(&service.all) && quiet(&global));
         assert_eq!(global.available(), 2, "the prefix it retook is given back");
 
-        drop(running);
-        let arrival = tokio::time::timeout(WAIT, budget.admit(route(), &global)).await;
+        drop(running_guests);
+        let arrival = tokio::time::timeout(WAIT, budget.admit(route(&loans), &global)).await;
         assert!(
             matches!(arrival, Ok(Ok(_))),
             "a new arrival is admitted at once"
@@ -750,48 +1040,78 @@ mod tests {
     async fn a_cancelled_resume_releases_the_slots_it_retook() {
         let first = Gate::new(1);
         let second = Gate::new(1);
-        let parked = Parked {
-            gates: vec![Arc::clone(&first), Arc::clone(&second)],
-            kind: InvocationKind::Job,
-            since: Instant::now(),
-            _parked: GaugeGuard::enter(metrics::gauge!("cufflink_wasm_parked", "kind" => "job")),
-            _global: Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .expect("pool"),
-            _service: Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .expect("pool"),
-        };
         let held = second.try_take().expect("held by a running guest");
 
-        let shutdown = Shutdown::new(Duration::from_secs(30));
-        let cancel = CancellationToken::new();
-        let resume = tokio::spawn({
-            let cancel = cancel.clone();
-            async move {
-                parked
-                    .resume(by(Duration::from_secs(5), &cancel, &shutdown))
-                    .await
-                    .map(|retaken| retaken.len())
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let mut resume = pin!(parked(&[&first, &second], InvocationKind::Job).resume(by(
+            Duration::from_secs(5),
+            &cancel,
+            &shutdown
+        )));
+        assert!(poll!(resume.as_mut()).is_pending());
         assert_eq!(first.available(), 0, "the first slot is retaken");
         cancel.cancel();
-        assert_eq!(resume.await.expect("joined"), Err(Interrupt::Cancelled));
+        assert_eq!(
+            poll!(resume.as_mut()).map(|ended| ended.map(|retaken| retaken.len())),
+            Poll::Ready(Err(Interrupt::Cancelled))
+        );
         assert_eq!(first.available(), 1);
         assert!(quiet(&first) && quiet(&second));
         drop(held);
         assert!(second.admit().await.is_ok());
     }
+
+    #[tokio::test]
+    async fn under_warn_a_resume_never_waits_for_a_slot_admission_only_tried() {
+        let budget = budget_in(PolicyMode::Warn, 4, 4);
+        let global = Gate::new(4);
+        let loans = identity("loan-service");
+        let mut parking = seat(&budget, &global, route(&loans)).await;
+        let parked = released(&mut parking).park().expect("parked");
+        let service = slots(&budget, &loans);
+        let running_guests = (
+            seat(&budget, &global, route(&loans)).await,
+            seat(&budget, &global, route(&loans)).await,
+        );
+        assert_eq!(service.all.available(), 0);
+
+        let recorder = cufflink_telemetry::metrics_builder()
+            .expect("builder")
+            .build_recorder();
+        let handle = recorder.handle();
+        let recording = metrics::set_default_local_recorder(&recorder);
+        let (cancel, shutdown) = (CancellationToken::new(), running());
+        let retaken = tokio::time::timeout(
+            WAIT,
+            parked.resume(by(Duration::from_secs(5), &cancel, &shutdown)),
+        )
+        .await
+        .expect("a warn-mode resume does not wait for the service slot")
+        .expect("resumed");
+        drop(recording);
+        assert_eq!(retaken.len(), 1, "the global slot, waited for at admission");
+        assert_eq!(global.available(), 1);
+        assert!(quiet(&service.all));
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(
+                |line| line.starts_with("cufflink_wasm_admission_refused_total{")
+                    && line.contains(r#"mode="warn""#)
+                    && line.contains(r#"reason="service_concurrency""#)
+                    && line.ends_with(" 1")
+            ),
+            "the slot it went on without is counted as a warn-mode arrival's is: {rendered}"
+        );
+        drop((running_guests, retaken));
+    }
+
     #[tokio::test]
     async fn a_released_call_is_counted_once_by_what_it_did() {
         let budget = budget(4, 1);
         let global = Gate::new(4);
         let loans = identity("loan-service");
-        let route = || ticket(&loans, Class::Interactive, InvocationKind::Route);
-        let mut first = seat(&budget, &global, route()).await;
-        let mut second = seat(&budget, &global, route()).await;
+        let mut first = seat(&budget, &global, route(&loans)).await;
+        let mut second = seat(&budget, &global, route(&loans)).await;
         let catalog = identity("catalog-service");
         let mut reducer = seat(
             &budget,
@@ -860,27 +1180,17 @@ mod tests {
     async fn a_resume_at_the_shutdown_hard_deadline_holds_nothing() {
         let first = Gate::new(1);
         let second = Gate::new(1);
-        let parked = Parked {
-            gates: vec![Arc::clone(&first), Arc::clone(&second)],
-            kind: InvocationKind::Subscription,
-            since: Instant::now(),
-            _parked: GaugeGuard::enter(
-                metrics::gauge!("cufflink_wasm_parked", "kind" => "subscription"),
-            ),
-            _global: Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .expect("pool"),
-            _service: Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .expect("pool"),
-        };
         let held = second.try_take().expect("held by a running guest");
         let shutdown = Shutdown::new(crate::shutdown::KILL_MARGIN);
         shutdown.trigger();
         let cancel = CancellationToken::new();
         let ended = tokio::time::timeout(
             Duration::from_secs(1),
-            parked.resume(by(Duration::from_secs(30), &cancel, &shutdown)),
+            parked(&[&first, &second], InvocationKind::Subscription).resume(by(
+                Duration::from_secs(30),
+                &cancel,
+                &shutdown,
+            )),
         )
         .await
         .expect("the hard deadline ends the resume")

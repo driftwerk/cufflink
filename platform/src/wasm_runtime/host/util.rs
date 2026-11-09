@@ -1,17 +1,44 @@
 use super::{
     block_on_bounded, copy_host_response, read_guest_bytes, read_guest_string, wrap, HostIoError,
-    HostState,
+    HostState, Lent, Released,
 };
+use crate::wasm_runtime::Interrupt;
+use cufflink_types::host::wait::Wait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::time::{Duration, Instant};
 use wasmtime::{Caller, Linker};
+
+fn exchanged<Request, Response, Stop>(
+    caller: &mut Caller<'_, HostState>,
+    host_fn: &'static str,
+    (ptr, len): (i32, i32),
+    malformed: impl FnOnce(String) -> Response,
+    handle: impl FnOnce(&mut Caller<'_, HostState>, Request) -> Result<Response, Stop>,
+) -> Result<i32, Stop>
+where
+    Request: DeserializeOwned,
+    Response: Serialize,
+{
+    caller.data_mut().clear_host_response();
+    let bytes = match read_guest_bytes(caller, host_fn, ptr, len) {
+        Ok(bytes) => bytes,
+        Err(err) => return Ok(err.code()),
+    };
+    let response = match serde_json::from_slice::<Request>(&bytes) {
+        Ok(request) => handle(caller, request)?,
+        Err(e) => malformed(format!("malformed {host_fn} request: {e}")),
+    };
+    drop(bytes);
+    Ok(caller.data_mut().respond_json(host_fn, &response))
+}
 
 pub(super) fn exchange<Request, Response>(
     caller: &mut Caller<'_, HostState>,
     host_fn: &'static str,
-    (ptr, len): (i32, i32),
+    request: (i32, i32),
     malformed: impl FnOnce(String) -> Response,
     handle: impl FnOnce(&HostState, Request) -> Response,
 ) -> i32
@@ -19,14 +46,33 @@ where
     Request: DeserializeOwned,
     Response: Serialize,
 {
-    caller.data_mut().clear_host_response();
-    let bytes = host_try!(read_guest_bytes(caller, host_fn, ptr, len));
-    let response = match serde_json::from_slice::<Request>(&bytes) {
-        Ok(request) => handle(caller.data(), request),
-        Err(e) => malformed(format!("malformed {host_fn} request: {e}")),
-    };
-    drop(bytes);
-    caller.data_mut().respond_json(host_fn, &response)
+    match exchanged(caller, host_fn, request, malformed, |caller, request| {
+        Ok::<_, Infallible>(handle(caller.data(), request))
+    }) {
+        Ok(rc) => rc,
+        Err(never) => match never {},
+    }
+}
+
+pub(super) fn exchange_released<Request, Response>(
+    caller: &mut Caller<'_, HostState>,
+    host_fn: &'static str,
+    request: (i32, i32),
+    malformed: impl FnOnce(String) -> Response,
+    wait: impl FnOnce(&Request) -> Wait,
+    handle: impl FnOnce(&HostState, Request, Lent) -> Released<Response>,
+) -> wasmtime::Result<i32>
+where
+    Request: DeserializeOwned,
+    Response: Serialize,
+{
+    exchanged(caller, host_fn, request, malformed, |caller, request| {
+        let lent = caller.data_mut().lend(wait(&request));
+        let (response, retaken) = handle(caller.data(), request, lent)?;
+        caller.data_mut().restore(retaken);
+        Ok::<_, Interrupt>(response)
+    })
+    .map_err(wasmtime::Error::from)
 }
 
 pub(super) fn ended<E>(ended: HostIoError<E>, waited: impl FnOnce(String) -> E) -> E {

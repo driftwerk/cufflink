@@ -10,6 +10,22 @@ use std::time::Duration;
 const MIB: usize = 1024 * 1024;
 const MIN_RESERVE: usize = 256 * MIB;
 const MIN_THREAD_STACK_KB: usize = 1024;
+pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 256;
+const DEFAULT_PER_SERVICE: usize = 32;
+const DEFAULT_WAIT_RELEASE_AFTER: Duration = Duration::from_millis(50);
+
+pub fn max_concurrent(var: impl Fn(&str) -> Option<String>) -> Result<usize> {
+    Vars(var).positive("WASM_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT)
+}
+
+fn per_service(
+    vars: &Vars<impl Fn(&str) -> Option<String>>,
+    max_concurrent: usize,
+) -> Result<usize> {
+    Ok(vars
+        .positive("WASM_MAX_CONCURRENT_PER_SERVICE", DEFAULT_PER_SERVICE)?
+        .min(max_concurrent))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetConfig {
@@ -61,18 +77,26 @@ impl WaitRelease {
     pub fn from_vars(
         var: impl Fn(&str) -> Option<String>,
         max_concurrent: usize,
-        per_service: usize,
     ) -> Result<Option<Self>> {
         let vars = Vars(var);
         match vars.parsed("WASM_WAIT_RELEASE", Switch::On)? {
             Switch::Off => Ok(None),
             Switch::On => Ok(Some(Self {
-                after: Duration::from_millis(vars.positive("WASM_WAIT_RELEASE_AFTER_MS", 50u64)?),
+                after: Duration::from_millis(vars.positive(
+                    "WASM_WAIT_RELEASE_AFTER_MS",
+                    DEFAULT_WAIT_RELEASE_AFTER.as_millis() as u64,
+                )?),
                 max_parked: vars.positive("WASM_MAX_PARKED", max_concurrent)?,
-                max_parked_per_service: vars
-                    .positive("WASM_MAX_PARKED_PER_SERVICE", per_service.saturating_mul(2))?,
+                max_parked_per_service: vars.positive(
+                    "WASM_MAX_PARKED_PER_SERVICE",
+                    per_service(&vars, max_concurrent)?.saturating_mul(2),
+                )?,
             })),
         }
+    }
+
+    pub fn after(wait_release: Option<Self>) -> Duration {
+        wait_release.map_or(DEFAULT_WAIT_RELEASE_AFTER, |release| release.after)
     }
 
     pub fn parked(wait_release: Option<Self>) -> usize {
@@ -87,7 +111,7 @@ impl Default for BudgetConfig {
             limits: None,
             limit: None,
             reserve: 0,
-            per_service: 32,
+            per_service: DEFAULT_PER_SERVICE,
             cold_estimate: 32 * MIB,
             estimate_max_age: Duration::from_secs(600),
             estimate_map_max: 4096,
@@ -100,9 +124,9 @@ impl Default for BudgetConfig {
             thread_stack: 2048 * 1024,
             caps: HostCaps::default(),
             wait_release: Some(WaitRelease {
-                after: Duration::from_millis(50),
-                max_parked: 256,
-                max_parked_per_service: 64,
+                after: DEFAULT_WAIT_RELEASE_AFTER,
+                max_parked: DEFAULT_MAX_CONCURRENT,
+                max_parked_per_service: DEFAULT_PER_SERVICE * 2,
             }),
         }
     }
@@ -166,11 +190,8 @@ impl BudgetConfig {
                 reserve / MIB
             ));
         }
-        let per_service = vars
-            .positive("WASM_MAX_CONCURRENT_PER_SERVICE", defaults.per_service)?
-            .min(max_concurrent);
         Ok(Self {
-            wait_release: WaitRelease::from_vars(&vars.0, max_concurrent, per_service)?,
+            wait_release: WaitRelease::from_vars(&vars.0, max_concurrent)?,
             limits: budget
                 .filter(|_| mode != PolicyMode::Off)
                 .map(|budget| Limits {
@@ -183,7 +204,7 @@ impl BudgetConfig {
             mode,
             limit,
             reserve,
-            per_service,
+            per_service: per_service(&vars, max_concurrent)?,
             cold_estimate: vars.positive("WASM_MEMORY_COLD_ESTIMATE_MB", 32usize)? * MIB,
             estimate_max_age: Duration::from_secs(
                 vars.positive("WASM_ESTIMATE_MAX_AGE_SECS", 600u64)?,
@@ -274,6 +295,7 @@ impl BudgetConfig {
 mod tests {
     use super::super::cgroup::LimitSource;
     use super::*;
+    use cufflink_settings::fixed;
     use std::path::PathBuf;
 
     fn limit(mib: u64) -> Option<CgroupLimit> {
@@ -286,7 +308,7 @@ mod tests {
     }
 
     fn config(pairs: &[(&str, &str)], cgroup: Option<CgroupLimit>) -> Result<BudgetConfig> {
-        BudgetConfig::from_vars(cufflink_settings::fixed(pairs), cgroup, 256)
+        BudgetConfig::from_vars(fixed(pairs), cgroup, 256)
     }
 
     #[test]
@@ -384,6 +406,19 @@ mod tests {
     }
 
     #[test]
+    fn a_max_concurrent_of_zero_is_refused_by_its_own_name() {
+        assert_eq!(max_concurrent(fixed(&[])).expect("default"), 256);
+        assert_eq!(
+            max_concurrent(fixed(&[("WASM_MAX_CONCURRENT", "16")])).expect("set"),
+            16
+        );
+        let err = max_concurrent(fixed(&[("WASM_MAX_CONCURRENT", "0")]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "WASM_MAX_CONCURRENT must be greater than 0");
+    }
+
+    #[test]
     fn waits_release_by_default_with_pools_from_the_slot_limits() {
         let on = config(&[("WASM_MAX_CONCURRENT_PER_SERVICE", "8")], None).expect("config");
         assert_eq!(
@@ -414,6 +449,7 @@ mod tests {
         let off = config(&[("WASM_WAIT_RELEASE", "off")], None).expect("config");
         assert_eq!(off.wait_release, None);
         assert_eq!(off.per_service, 32);
+        assert_eq!(WaitRelease::after(None), Duration::from_millis(50));
         for (name, value) in [
             ("WASM_WAIT_RELEASE", "yes"),
             ("WASM_MAX_PARKED_PER_SERVICE", "0"),

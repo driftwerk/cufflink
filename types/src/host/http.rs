@@ -1,5 +1,6 @@
 //! `http_fetch_v2`.
 
+use super::wait::Wait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub struct FetchRequestV2 {
     pub max_response_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub follow_redirects: bool,
+    #[serde(default, skip_serializing_if = "Wait::is_hold")]
+    pub wait: Wait,
 }
 
 impl FetchRequestV2 {
@@ -111,6 +114,27 @@ mod tests {
                 ..Default::default()
             },
             json!({"method": "GET", "url": "https://api.example.com/v1?expand[]=a&expand[]=b"}),
+        );
+    }
+
+    #[test]
+    fn a_request_says_wait_only_to_release_its_slots() {
+        round_trip(
+            &FetchRequestV2 {
+                method: "GET".into(),
+                url: "https://rates.example.com/v1/eur".into(),
+                wait: Wait::Release,
+                ..Default::default()
+            },
+            json!({"method": "GET", "url": "https://rates.example.com/v1/eur", "wait": "release"}),
+        );
+        let held: FetchRequestV2 = serde_json::from_value(
+            json!({"method": "GET", "url": "https://rates.example.com/v1/eur", "wait": "hold"}),
+        )
+        .expect("an explicit hold");
+        assert!(held.wait.is_hold());
+        refused::<FetchRequestV2>(
+            json!({"method": "GET", "url": "https://rates.example.com/v1/eur", "wait": "park"}),
         );
     }
 
