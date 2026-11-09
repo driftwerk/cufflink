@@ -6,6 +6,7 @@ pub mod http;
 pub mod nats;
 pub mod request;
 pub mod storage;
+pub mod wait;
 
 #[cfg(test)]
 pub(crate) mod tests {
