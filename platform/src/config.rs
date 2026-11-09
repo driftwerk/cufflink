@@ -77,6 +77,7 @@ pub struct PlatformConfig {
 const MIN_CACHE_SIGNING_KEY_BYTES: usize = 16;
 const DEFAULT_WEB_UPLOAD_RETENTION_SECS: u64 = 86_400;
 const MIN_WEB_UPLOAD_RETENTION_SECS: u64 = 3_600;
+pub(crate) const MAX_WEB_UPLOAD_RETENTION_SECS: u64 = 30 * 86_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunEnv {
@@ -418,6 +419,12 @@ fn web_upload_retention(raw: Option<String>) -> Result<Duration> {
              uploaded removed"
         ));
     }
+    if secs > MAX_WEB_UPLOAD_RETENTION_SECS {
+        return Err(eyre!(
+            "WEB_UPLOAD_RETENTION_SECS is {secs}; it must be at most \
+             {MAX_WEB_UPLOAD_RETENTION_SECS} (30 days)"
+        ));
+    }
     Ok(Duration::from_secs(secs))
 }
 
@@ -756,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreleased_upload_is_kept_at_least_an_hour() {
+    fn an_unreleased_upload_is_kept_between_an_hour_and_thirty_days() {
         assert_eq!(
             web_upload_retention(None).expect("default"),
             Duration::from_secs(86_400)
@@ -770,6 +777,16 @@ mod tests {
             refused.to_string().contains("must be at least 3600"),
             "{refused}"
         );
+        assert_eq!(
+            web_upload_retention(Some("2592000".into())).expect("30 days"),
+            Duration::from_secs(MAX_WEB_UPLOAD_RETENTION_SECS)
+        );
+        let refused = web_upload_retention(Some("2592001".into())).expect_err("over 30 days");
+        assert!(
+            refused.to_string().contains("must be at most 2592000"),
+            "{refused}"
+        );
+        assert!(web_upload_retention(Some(u64::MAX.to_string())).is_err());
         assert!(web_upload_retention(Some("soon".into())).is_err());
     }
 

@@ -77,10 +77,8 @@ pub async fn upload_web_bundle(
         web::store(&state, service_id, &sha256, body, &user.subject).await
     }
     .await;
-    let result = stored
-        .as_ref()
-        .map_or("refused", |(_, stored)| stored.as_str());
-    metrics::counter!("cufflink_web_uploads_total", "result" => result).increment(1);
+    metrics::counter!("cufflink_web_uploads_total", "result" => web::upload_result(&stored))
+        .increment(1);
     let (upload, stored) = stored?;
 
     crate::repo::audit::record(

@@ -317,7 +317,7 @@ A setting that carries a secret can be given as a file instead: `<name>_FILE` na
 | `WORKER_ROUTES` | *(unset)* | JSON map `{"service": ["handler", ...]}` of handlers to dispatch to NATS workers instead of running in-process (see [WASM Workers](wasm-workers.md)) |
 | `PLATFORM_SQL_MAX_ROWS` | `100000` | Row cap for `POST /api/services/{id}/query` (`cufflink sql`) |
 | `PLATFORM_SQL_TIMEOUT_SECS` | `30` | Statement timeout for the same endpoint |
-| `WEB_UPLOAD_RETENTION_SECS` | `86400` | How long a web bundle uploaded but recorded by no version is kept; the next release, rollback, prune or version delete of its service removes it, with its object, once older. At least `3600`, so a release never finds the bundle it just uploaded removed ([web releases](deployment.md#web-releases)) |
+| `WEB_UPLOAD_RETENTION_SECS` | `86400` | How long a web bundle uploaded but recorded by no version is kept; the next release, rollback, prune or version delete of its service removes it, with its object, once older. At least `3600`, so a release never finds the bundle it just uploaded removed, and at most `2592000` (30 days); a value outside that range stops the platform at start ([web releases](deployment.md#web-releases)) |
 | `CUFFLINK_DEFAULT_KC_OPS_CLIENT_ID` | *(unset)* | Keycloak confidential client used for admin-API calls (role assignment, user search, logout) when a tenant has no ops client of its own |
 | `CUFFLINK_DEFAULT_KC_OPS_CLIENT_SECRET` | *(unset)* | Its secret |
 | `CUFFLINK_SERVICE_ACCOUNT_CLIENTS` | *(unset)* | Comma-separated Keycloak client IDs (matched on `azp`) treated as service accounts on every tenant, bypassing per-user RBAC, while a tenant's `service_accounts` policy is `off` or `warn`. The default ops client is always included. Prefer each tenant's `service_account_clients`. Never list human-login clients |
@@ -570,7 +570,7 @@ A `JOB_*` value the worker cannot use (not a number, a `JOB_LEASE_SECS` below `3
 
 ## Web Runner Configuration
 
-`web-runner/src/config.rs`. Serves `mode = "web"` services (Next.js apps uploaded through `POST /api/services/{id}/web`) and exits at startup if a required variable is missing.
+`web-runner/src/config.rs`. Serves `mode = "web"` services (Next.js apps released with their bundle, [web releases](deployment.md#web-releases)) and exits at startup if a required variable is missing.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -600,7 +600,7 @@ A `JOB_*` value the worker cannot use (not a number, a `JOB_LEASE_SECS` below `3
 | `WEB_ARTIFACT_MAX_ENTRIES` / `WEB_ARTIFACT_MAX_BYTES` | `200000` / `2147483648` | Bounds on what one artifact extracts to |
 | `WEB_STATUS_TOKEN` | *(unset)* | Bearer token `/_cufflink/status` and `/_cufflink/metrics` require; unset, neither is served. `/health` and `/_cufflink/ready` are always open. Never passed to apps |
 
-A web-mode project declares `mode = "web"` and `name` under `[service]` in `Cufflink.toml`; `cufflink deploy` builds and uploads the artifact instead of a Rust manifest.
+A web-mode project declares `mode = "web"` and `name` under `[service]` in `Cufflink.toml`; `cufflink deploy` reserves the app, builds it, uploads its bundle by content and releases it in one deploy instead of sending a Rust manifest, and needs a platform that offers `web_releases` ([web releases](deployment.md#web-releases)).
 
 ---
 

@@ -1,6 +1,6 @@
 use crate::bundle::Bundle;
 use crate::commands::services::{self, Status};
-use crate::commands::{native, version};
+use crate::commands::{native, version, web_release};
 use crate::config::CliConfig;
 use crate::project_config::ProjectConfig;
 use cufflink_types::manifest::validate::{active_refusal, inactive_refusal};
@@ -1431,74 +1431,50 @@ async fn deploy_web(
     env: Option<&str>,
 ) -> eyre::Result<()> {
     println!("Deploying web app: {}", service_name);
+    let client = config.http_client();
+    let platform = verify_platform_version(config, &client).await?;
+    web_release::require_web_releases(&platform)?;
 
     let pkg_json = read_package_json()?;
-    let scripts = pkg_json["scripts"].as_object();
-
-    if let Some(s) = scripts {
-        if s.contains_key("typecheck") {
-            run_npm_script("typecheck", "Type checking")?;
-        }
-        if s.contains_key("lint") {
-            run_npm_script("lint", "Linting")?;
-        }
-        if s.contains_key("test") {
-            run_npm_script("test", "Running tests")?;
-        }
+    if let Some(scripts) = pkg_json["scripts"].as_object() {
+        [
+            ("typecheck", "Type checking"),
+            ("lint", "Linting"),
+            ("test", "Running tests"),
+        ]
+        .into_iter()
+        .filter(|(script, _)| scripts.contains_key(*script))
+        .try_for_each(|(script, label)| run_npm_script(script, label))?;
     }
 
-    let version = pkg_json["version"].as_str().unwrap_or("0.1.0");
     let manifest = serde_json::json!({
         "name": service_name,
         "mode": "web",
-        "version": version,
+        "version": pkg_json["version"].as_str().unwrap_or("0.1.0"),
         "tables": [],
     });
+    let request = deploy_request(&manifest, &DeployFlags::default(), commit_hash, None, None);
+    let app = web_release::WebApp {
+        config,
+        client: &client,
+        name: service_name,
+    };
+    app.deploy(request, async |service_id: &str| {
+        maybe_sync_configs(config, service_id, project, env, Some(&platform)).await?;
+        built_web_app(config, service_id, project, env).await
+    })
+    .await
+}
 
-    let deploy_req = serde_json::json!({
-        "manifest": manifest,
-        "allow_destructive": false,
-        "commit_hash": commit_hash,
-    });
-
-    let client = config.http_client();
-    let resp = config
-        .auth_request(
-            &client,
-            reqwest::Method::POST,
-            &format!("{}/api/services/deploy", config.api_url),
-        )
-        .json(&deploy_req)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        eyre::bail!("Deploy failed ({}): {}", status, body);
-    }
-
-    let body: serde_json::Value = resp.json().await?;
-    let service_id = body["service_id"]
-        .as_str()
-        .ok_or_else(|| eyre::eyre!("No service_id in deploy response"))?;
-
-    println!(
-        "Registered {} v{}",
-        body["name"].as_str().unwrap_or("?"),
-        body["version"]
-    );
-    println!("  Deployment ID: {}", body["deployment_id"]);
-    println!("  Tenant:        {}", body["tenant_slug"]);
-    if let Some(hash) = body["commit_hash"].as_str() {
-        println!("  Commit:        {}", hash);
-    }
-
-    maybe_sync_configs(config, service_id, project, env, None).await?;
-
+async fn built_web_app(
+    config: &CliConfig,
+    service_id: &str,
+    project: Option<&ProjectConfig>,
+    env: Option<&str>,
+) -> eyre::Result<Vec<u8>> {
     println!("Resolving service configs...");
     let local_envs = resolve_local_build_envs(project, env)?;
-    let mut build_envs: HashMap<String, String> = fetch_service_configs(config, service_name)
+    let mut build_envs: HashMap<String, String> = fetch_service_configs(config, service_id)
         .await
         .into_iter()
         .collect();
@@ -1514,14 +1490,10 @@ async fn deploy_web(
     check_pnpm_workspace()?;
 
     println!("Building Next.js app...");
-    let pm = detect_package_manager();
-    let mut build_cmd = Command::new(&pm);
-    build_cmd.args(["run", "build"]);
-    for (key, value) in &build_envs {
-        build_cmd.env(key, value);
-    }
-    let build_output = build_cmd.output()?;
-
+    let build_output = Command::new(detect_package_manager())
+        .args(["run", "build"])
+        .envs(&build_envs)
+        .output()?;
     if !build_output.status.success() {
         eyre::bail!("Build failed:\n{}", format_command_output(&build_output));
     }
@@ -1531,42 +1503,8 @@ async fn deploy_web(
         eyre::bail!("Next.js build output not found at .next/");
     }
 
-    println!("Creating deployment artifact...");
-    let tarball = create_web_tarball()?;
-    let tarball_size = tarball.len();
-    println!(
-        "  Artifact size: {} bytes ({:.1} MB)",
-        tarball_size,
-        tarball_size as f64 / 1_048_576.0
-    );
-
-    println!("Uploading web artifact...");
-    let resp = config
-        .auth_request(
-            &client,
-            reqwest::Method::POST,
-            &format!("{}/api/services/{}/web", config.api_url, service_id),
-        )
-        .header("Content-Type", "application/gzip")
-        .body(tarball)
-        .send()
-        .await?;
-
-    if resp.status().is_success() {
-        let body: serde_json::Value = resp.json().await?;
-        println!(
-            "  Artifact hash: {}",
-            body["artifact_hash"].as_str().unwrap_or("?")
-        );
-        println!("  Size:          {} bytes", body["size_bytes"]);
-    } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        eyre::bail!("Web artifact upload failed ({}): {}", status, body);
-    }
-
-    println!("\nWeb app deployed successfully!");
-    Ok(())
+    println!("Creating the bundle...");
+    create_web_tarball()
 }
 
 fn check_pnpm_workspace() -> eyre::Result<()> {
@@ -1828,36 +1766,8 @@ async fn maybe_sync_configs(
     super::config_cmd::sync_to_platform(config, service_id, project, &env_name, platform).await
 }
 
-async fn fetch_service_configs(config: &CliConfig, service_name: &str) -> Vec<(String, String)> {
+async fn fetch_service_configs(config: &CliConfig, service_id: &str) -> Vec<(String, String)> {
     let client = config.http_client();
-
-    let resp = match config
-        .auth_request(
-            &client,
-            reqwest::Method::GET,
-            &format!("{}/api/services", config.api_url),
-        )
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    let services: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let service_id = match services["services"].as_array().and_then(|arr| {
-        arr.iter()
-            .find(|s| s["name"].as_str() == Some(service_name))
-            .and_then(|s| s["id"].as_str())
-    }) {
-        Some(id) => id.to_string(),
-        None => return Vec::new(),
-    };
-
     let resp = match config
         .auth_request(
             &client,
@@ -2992,6 +2902,31 @@ mod tests {
         for mode in [Crud, Wasm, Container, Native] {
             assert!(quiet.admits(&mode).is_ok(), "{mode:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_platform_without_web_releases_is_refused_before_building() {
+        let (config, asked) = answering(vec![Some((
+            200,
+            serde_json::json!({"api_version": 1, "platform_version": "0.37.1",
+                               "supports": ["db_v2"]}),
+        ))])
+        .await;
+
+        let refused = deploy_web(&config, "site", None, None, None)
+            .await
+            .expect_err("refused");
+
+        assert_eq!(
+            refused.to_string(),
+            "platform v0.37.1 cannot release a web app with its bundle (needs web_releases). \
+             Upgrade the platform, or deploy with a CLI older than v0.38.0"
+        );
+        assert_eq!(
+            asked.requests(),
+            ["GET /api/version"],
+            "nothing is reserved, built or uploaded"
+        );
     }
 
     const QUIET: DeployFlags = DeployFlags {

@@ -959,6 +959,38 @@ steps, and only the last one changes what runs:
    the version. The answer adds `web_artifact`, the bundle the current
    version records, and `runners_told`.
 
+`cufflink deploy` in a web project takes these steps itself:
+
+1. It asks `/api/version` and, without `web_releases`, refuses before
+   building: `platform v0.37.1 cannot release a web app with its bundle
+   (needs web_releases)`. Pin the CLI to a release before v0.38.0 to
+   deploy to such a platform.
+2. It runs the app's `typecheck`, `lint` and `test` scripts, when
+   `package.json` has them.
+3. It reserves the app and reads what it runs
+   (`GET /api/services/{id}/web/status`). The reservation's
+   `current_version` is not a release: an app reserved but never released
+   runs nothing.
+4. It syncs the project's configs, builds the app with the service's
+   configs, and tars `.next`, `node_modules`, `package.json` and `public`.
+5. It uploads the bundle by its SHA-256, unless the running version
+   already records that bundle.
+6. It releases it, naming the bundle in `web_artifact`. A `409` (the
+   bundle not uploaded, or no longer stored, or another deploy holding the
+   lock) is answered by one more upload and one more release; a second
+   `409` fails in the platform's words. A `422` naming `web_artifact`
+   comes from an older platform replica, and the CLI says to deploy again
+   once the upgrade has finished.
+
+It then checks that the answer names the bundle it sent, prints `Released
+site v8 (bundle 3f9a…)`, or `site v7 already runs bundle 3f9a…; nothing to
+release` when the release was skipped, and warns when `runners_told` is
+`false`: each runner then picks the version up at its next reconcile. A
+failed build or upload, or a release the platform refuses, releases
+nothing, and the CLI says so and names the version that still runs. A
+release that got no answer, or a `5xx`, may have released: deploying again
+releases the bundle or finds it running.
+
 A release is skipped when its manifest and its bundle are both those of
 the running version, and the runners are told again, so a retried release
 also repairs a runner that missed the first event. Any other release is a
@@ -980,7 +1012,8 @@ Its answer adds `version`, the version that now records the bundle, and
 `released`, whether the call changed what runs.
 
 An upload no version records is removed, with its object, once older than
-`WEB_UPLOAD_RETENTION_SECS` (default 86 400, at least 3 600), by the next
+`WEB_UPLOAD_RETENTION_SECS` (default 86 400, at least 3 600, at most
+2 592 000), by the next
 release, rollback, prune or version delete of its service. Pruning or
 deleting a version removes its bundle once no retained version and no
 recent upload holds it, and deleting the app, or its tenant, removes every
