@@ -572,7 +572,8 @@ A `JOB_*` value the worker cannot use (not a number, a `JOB_LEASE_SECS` below `3
 | `WEB_TENANT` | *(unset)* | Serve this one tenant's apps from the platform's runner API, holding no database, secrets or storage credentials ([tenant-scoped web runner](deployment.md#tenant-scoped-web-runner)); needs `PLATFORM_URL` and a runner key |
 | `PLATFORM_URL` | *(unset)* | With `WEB_TENANT`, the platform's URL the runner API is reached at; otherwise a value apps are passed |
 | `CUFFLINK_RUNNER_KEY` / `CUFFLINK_RUNNER_KEY_FILE` | *(unset)* | With `WEB_TENANT`, the tenant's runner key or a file holding it; refused without `WEB_TENANT` |
-| `WEB_POLL_SECS` | `30` | With `WEB_TENANT`, how often the runner asks whether its key is still accepted |
+| `WEB_RECONCILE_SECS` | `30` | How often the runner reads the current deployment of the apps it runs and switches one that runs another bundle; with `WEB_TENANT`, the same call checks its key. Must be positive ([converging](deployment.md#web-runner)) |
+| `WEB_POLL_SECS` | `30` | An alias of `WEB_RECONCILE_SECS`, read only when that is unset |
 | `NATS_URL` | `nats://localhost:4222` | NATS server |
 | `NATS_CREDS_FILE` / `NATS_NKEY_SEED` / `NATS_USER` + `NATS_PASSWORD` | *(unset)* | NATS credentials, as for the platform |
 | `RUNNER_PORT` | `3100` | Listen port |
