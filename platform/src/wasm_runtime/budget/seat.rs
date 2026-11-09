@@ -194,7 +194,7 @@ impl Lent {
     }
 
     pub(crate) fn answered_first(self) -> Vec<Taken> {
-        if self.requested() {
+        if self.parking.is_ok() {
             released(self.kind, "answered_first");
         }
         self.releasable
@@ -783,5 +783,149 @@ mod tests {
         assert!(quiet(&first) && quiet(&second));
         drop(held);
         assert!(second.admit().await.is_ok());
+    }
+    #[tokio::test]
+    async fn a_released_call_is_counted_once_by_what_it_did() {
+        let budget = budget(4, 1);
+        let global = Gate::new(4);
+        let loans = identity("loan-service");
+        let route = || ticket(&loans, Class::Interactive, InvocationKind::Route);
+        let mut first = seat(&budget, &global, route()).await;
+        let mut second = seat(&budget, &global, route()).await;
+        let catalog = identity("catalog-service");
+        let mut reducer = seat(
+            &budget,
+            &global,
+            ticket(&catalog, Class::Interactive, InvocationKind::SseReducer),
+        )
+        .await;
+        let answer = |seat: &mut Seat, wait: Wait, transaction_open: bool| {
+            let lent = seat.lend(wait, transaction_open);
+            seat.restore(lent.answered_first());
+        };
+        let recorder = cufflink_telemetry::metrics_builder()
+            .expect("builder")
+            .build_recorder();
+        let handle = recorder.handle();
+        let parked = metrics::with_local_recorder(&recorder, || {
+            answer(&mut first, Wait::Hold, false);
+            answer(&mut first, Wait::Release, true);
+            answer(&mut reducer, Wait::Release, false);
+            answer(&mut first, Wait::Release, false);
+            let parked = released(&mut first).park().expect("parked");
+            assert_eq!(
+                released(&mut second).park().err(),
+                Some(Held::ServicePoolFull)
+            );
+            assert_eq!(
+                second.lend(Wait::Release, true).park().err(),
+                Some(Held::Transaction)
+            );
+            assert_eq!(released(&mut reducer).park().err(), Some(Held::NotParkable));
+            assert_eq!(
+                second.lend(Wait::Hold, false).park().err(),
+                Some(Held::NotRequested)
+            );
+            parked
+        });
+        let rendered = handle.render();
+        let count = |kind: &str, result: &str| {
+            let series =
+                format!(r#"cufflink_wasm_wait_release_total{{kind="{kind}",result="{result}"}} "#);
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(series.as_str()))
+                .map_or(0, |value| value.parse::<u64>().expect("a count"))
+        };
+        assert_eq!(
+            [
+                count("route", "answered_first"),
+                count("route", "parked"),
+                count("route", "held_service_pool_full"),
+                count("route", "held_transaction"),
+                count("sse_reducer", "held_not_parkable"),
+                count("sse_reducer", "answered_first"),
+            ],
+            [1, 1, 1, 1, 1, 0],
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"cufflink_wasm_parked{kind="route"} 1"#),
+            "{rendered}"
+        );
+        drop(parked);
+    }
+
+    #[tokio::test]
+    async fn a_resume_at_the_shutdown_hard_deadline_holds_nothing() {
+        let first = Gate::new(1);
+        let second = Gate::new(1);
+        let parked = Parked {
+            gates: vec![Arc::clone(&first), Arc::clone(&second)],
+            kind: InvocationKind::Subscription,
+            since: Instant::now(),
+            _parked: GaugeGuard::enter(
+                metrics::gauge!("cufflink_wasm_parked", "kind" => "subscription"),
+            ),
+            _global: Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("pool"),
+            _service: Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("pool"),
+        };
+        let held = second.try_take().expect("held by a running guest");
+        let shutdown = Shutdown::new(crate::shutdown::KILL_MARGIN);
+        shutdown.trigger();
+        let cancel = CancellationToken::new();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(1),
+            parked.resume(by(Duration::from_secs(30), &cancel, &shutdown)),
+        )
+        .await
+        .expect("the hard deadline ends the resume")
+        .map(|retaken| retaken.len());
+        assert_eq!(ended, Err(Interrupt::Shutdown));
+        assert_eq!(first.available(), 1, "the retaken prefix is given back");
+        assert!(quiet(&first) && quiet(&second));
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_resumes_and_arrivals_all_finish_and_give_every_slot_back() {
+        const SLOTS: usize = 3;
+        const ROUNDS: usize = 200;
+        let gate = Gate::new(SLOTS);
+        let tasks = (0..ROUNDS)
+            .flat_map(|round| {
+                let resuming = Arc::clone(&gate);
+                let arriving = Arc::clone(&gate);
+                [
+                    tokio::spawn(async move {
+                        let permit = resuming.resume().await.expect("open");
+                        if round % 3 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        drop(permit);
+                    }),
+                    tokio::spawn(async move {
+                        let permit = arriving.admit().await.expect("open");
+                        if round % 2 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        drop(permit);
+                    }),
+                ]
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::try_join_all(tasks),
+        )
+        .await
+        .expect("every resume and arrival finishes")
+        .expect("joined");
+        assert!(quiet(&gate));
+        assert_eq!(gate.available(), SLOTS);
     }
 }

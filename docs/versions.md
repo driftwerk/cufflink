@@ -1344,8 +1344,10 @@ Unreleased. No new module-declared feature, and no migration.
 - **Metrics.** `cufflink_wasm_wait_release_total`, `cufflink_wasm_parked`,
   `cufflink_wasm_parked_seconds`, `cufflink_wasm_resume_wait_seconds` and
   `cufflink_wasm_blocking_threads` ([observability](observability.md)).
-- A guest returning to its slots is granted them ahead of new arrivals.
-  Nothing releases slots yet, so admission is otherwise unchanged.
+- A guest returning to its slots is granted each one ahead of arrivals
+  that come while it waits for it; an arrival already queued for that slot
+  keeps its place. Nothing releases slots yet, so admission is otherwise
+  unchanged.
 
 ## Changes in v0.37.1
 
