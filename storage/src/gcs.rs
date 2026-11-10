@@ -38,6 +38,7 @@ impl GcsBackend {
             auth = if sa_key_path.is_some() { "service-account-key" } else { "application-default-credentials" },
             presign = if sa_key_path.is_some() { "local-key" } else { "iam-sign-blob" },
             retry_timeout_secs = common::retry_timeout().as_secs(),
+            request_timeout_secs = common::request_timeout().as_secs(),
             "Object storage configured",
         );
 
@@ -91,6 +92,7 @@ impl GcsBackend {
 fn build_store(bucket: &str, sa_key_path: Option<&str>) -> Result<Arc<GoogleCloudStorage>> {
     let mut builder = GoogleCloudStorageBuilder::new()
         .with_bucket_name(bucket)
+        .with_client_options(common::client_options())
         .with_retry(common::retry_config());
     if let Some(path) = sa_key_path {
         builder = builder.with_service_account_path(path);

@@ -1,10 +1,11 @@
 use crate::{ObjectMeta, ObjectReader, UploadOptions, Uploaded};
 use bytes::Bytes;
 use eyre::{Result, WrapErr};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use object_store::{
-    path::Path as OsPath, Attribute, AttributeValue, Attributes, GetOptions, ObjectStore,
-    ObjectStoreExt, PutOptions, PutPayload,
+    path::Path as OsPath, Attribute, AttributeValue, Attributes, ClientOptions, GetOptions,
+    MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult,
 };
 use std::time::Duration;
 
@@ -75,13 +76,29 @@ const DEFAULT_RETRY_TIMEOUT_SECS: u64 = 20;
 
 const ENV_RETRY_TIMEOUT_SECS: &str = "OBJECT_STORE_RETRY_TIMEOUT_SECS";
 
-pub(crate) fn retry_timeout() -> Duration {
-    let secs = std::env::var(ENV_RETRY_TIMEOUT_SECS)
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+const ENV_REQUEST_TIMEOUT_SECS: &str = "OBJECT_STORE_REQUEST_TIMEOUT_SECS";
+
+fn env_secs(name: &str, default: u64) -> Duration {
+    let secs = std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_RETRY_TIMEOUT_SECS);
+        .unwrap_or(default);
     Duration::from_secs(secs)
+}
+
+pub(crate) fn retry_timeout() -> Duration {
+    env_secs(ENV_RETRY_TIMEOUT_SECS, DEFAULT_RETRY_TIMEOUT_SECS)
+}
+
+pub(crate) fn request_timeout() -> Duration {
+    env_secs(ENV_REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)
+}
+
+pub(crate) fn client_options() -> ClientOptions {
+    ClientOptions::new().with_timeout(request_timeout())
 }
 
 pub(crate) fn retry_config() -> object_store::RetryConfig {
@@ -106,6 +123,41 @@ pub(crate) async fn put(
     put_with(store, backend, keys, key, data, opts).await
 }
 
+/// When an upload goes up in parts: above `threshold` bytes, in parts of at
+/// least `min_part_size` bytes (and few enough for S3's part limit), at most
+/// `concurrency` of them in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Multipart {
+    threshold: usize,
+    min_part_size: usize,
+    concurrency: usize,
+}
+
+const MAX_PARTS: usize = 10_000;
+
+impl Multipart {
+    const DEFAULT: Self = Self {
+        threshold: 32 * 1024 * 1024,
+        min_part_size: 8 * 1024 * 1024,
+        concurrency: 4,
+    };
+
+    fn applies(self, size: usize, mode: &PutMode) -> bool {
+        size > self.threshold && *mode == PutMode::Overwrite
+    }
+
+    fn part_size(self, size: usize) -> usize {
+        self.min_part_size.max(size.div_ceil(MAX_PARTS))
+    }
+
+    fn parts(self, data: Bytes) -> impl Iterator<Item = Bytes> {
+        let part_size = self.part_size(data.len());
+        (0..data.len())
+            .step_by(part_size)
+            .map(move |start| data.slice(start..data.len().min(start + part_size)))
+    }
+}
+
 pub(crate) async fn put_with(
     store: &dyn ObjectStore,
     backend: &'static str,
@@ -114,18 +166,81 @@ pub(crate) async fn put_with(
     data: Vec<u8>,
     opts: PutOptions,
 ) -> Result<Uploaded> {
+    put_in(store, backend, keys, key, data, opts, Multipart::DEFAULT).await
+}
+
+async fn put_in(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    keys: Keys,
+    key: &str,
+    data: Vec<u8>,
+    opts: PutOptions,
+    multipart: Multipart,
+) -> Result<Uploaded> {
     let path = keys.path(key)?;
     let size = data.len() as u64;
-    let payload = PutPayload::from(Bytes::from(data));
-    let stored = store
-        .put_opts(&path, payload, opts)
+    let data = Bytes::from(data);
+    let stored = if multipart.applies(data.len(), &opts.mode) {
+        put_parts(
+            store,
+            backend,
+            &path,
+            data,
+            multipart_options(opts),
+            multipart,
+        )
         .await
-        .wrap_err_with(|| format!("{backend} upload failed for {key}"))?;
-    tracing::info!(backend, key = %key, "Uploaded");
+    } else {
+        store.put_opts(&path, PutPayload::from(data), opts).await
+    }
+    .wrap_err_with(|| format!("{backend} upload failed for {key}"))?;
+    tracing::info!(backend, key = %key, size, "Uploaded");
     Ok(Uploaded {
         size,
         etag: stored.e_tag,
     })
+}
+
+fn multipart_options(opts: PutOptions) -> PutMultipartOptions {
+    PutMultipartOptions {
+        tags: opts.tags,
+        attributes: opts.attributes,
+        extensions: opts.extensions,
+    }
+}
+
+async fn put_parts(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    path: &OsPath,
+    data: Bytes,
+    opts: PutMultipartOptions,
+    multipart: Multipart,
+) -> object_store::Result<PutResult> {
+    let mut upload = store.put_multipart_opts(path, opts).await?;
+    let sent = stream::iter(
+        multipart
+            .parts(data)
+            .map(|part| upload.put_part(PutPayload::from(part))),
+    )
+    .buffer_unordered(multipart.concurrency)
+    .try_collect::<()>()
+    .await;
+    let completed = match sent {
+        Ok(()) => upload.complete().await,
+        Err(e) => Err(e),
+    };
+    if completed.is_err() {
+        abort(upload.as_mut(), backend, path).await;
+    }
+    completed
+}
+
+async fn abort(upload: &mut dyn MultipartUpload, backend: &'static str, path: &OsPath) {
+    if let Err(e) = upload.abort().await {
+        tracing::warn!(backend, key = %path, error = %e, "Failed to abort a multipart upload");
+    }
 }
 
 fn content_type(attributes: &Attributes) -> Option<String> {
@@ -333,8 +448,177 @@ pub(crate) mod test_env {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_timeout, ENV_RETRY_TIMEOUT_SECS};
+    use super::{
+        put_in, request_timeout, retry_timeout, Keys, Multipart, ENV_REQUEST_TIMEOUT_SECS,
+        ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
+    };
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as OsPath;
+    use object_store::{Attribute, Attributes, ObjectStoreExt, PutMode, PutOptions};
     use std::time::Duration;
+
+    const SMALL: Multipart = Multipart {
+        threshold: 1024,
+        min_part_size: 256,
+        concurrency: 2,
+    };
+
+    fn payload(size: usize) -> Vec<u8> {
+        (0..size).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    fn typed(content_type: &str) -> PutOptions {
+        PutOptions {
+            attributes: Attributes::from_iter([(Attribute::ContentType, content_type.to_string())]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_overwrites_above_the_threshold_go_up_in_parts() {
+        assert!(!SMALL.applies(1024, &PutMode::Overwrite));
+        assert!(SMALL.applies(1025, &PutMode::Overwrite));
+        assert!(!SMALL.applies(1025, &PutMode::Create));
+        assert!(!Multipart::DEFAULT.applies(32 * 1024 * 1024, &PutMode::Overwrite));
+        assert!(Multipart::DEFAULT.applies(198_547_134, &PutMode::Overwrite));
+    }
+
+    #[test]
+    fn parts_cover_the_payload_in_order_within_the_part_limit() {
+        let data = Bytes::from(payload(1000));
+        let parts: Vec<Bytes> = SMALL.parts(data.clone()).collect();
+        assert_eq!(
+            parts.iter().map(Bytes::len).collect::<Vec<_>>(),
+            [256, 256, 256, 232]
+        );
+        assert_eq!(parts.concat(), data);
+        assert_eq!(SMALL.parts(Bytes::from(payload(768))).count(), 3);
+
+        let default = Multipart::DEFAULT;
+        assert_eq!(default.part_size(198_547_134), 8 * 1024 * 1024);
+        assert_eq!(
+            198_547_134_usize.div_ceil(default.part_size(198_547_134)),
+            24
+        );
+        let huge = 200 * 1024 * 1024 * 1024_usize;
+        assert!(huge.div_ceil(default.part_size(huge)) <= MAX_PARTS);
+    }
+
+    #[tokio::test]
+    async fn a_large_upload_reads_back_byte_identical_with_its_attributes() {
+        let store = InMemory::new();
+        for (key, size) in [
+            ("bundle/remainder.tar.gz", 5000),
+            ("bundle/exact.tar.gz", 4096),
+        ] {
+            let data = payload(size);
+            let uploaded = put_in(
+                &store,
+                "memory",
+                Keys::Encoded,
+                key,
+                data.clone(),
+                typed("application/gzip"),
+                SMALL,
+            )
+            .await
+            .expect("uploaded");
+            assert_eq!(uploaded.size, size as u64);
+            let got = store.get(&OsPath::from(key)).await.expect("stored");
+            assert_eq!(
+                got.attributes
+                    .get(&Attribute::ContentType)
+                    .map(|v| v.as_ref()),
+                Some("application/gzip")
+            );
+            assert_eq!(got.bytes().await.expect("read"), data);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_small_upload_reads_back_byte_identical_with_its_attributes() {
+        let store = InMemory::new();
+        let data = payload(1024);
+        put_in(
+            &store,
+            "memory",
+            Keys::Encoded,
+            "small.json",
+            data.clone(),
+            typed("application/json"),
+            SMALL,
+        )
+        .await
+        .expect("uploaded");
+        let got = store
+            .get(&OsPath::from("small.json"))
+            .await
+            .expect("stored");
+        assert_eq!(
+            got.attributes
+                .get(&Attribute::ContentType)
+                .map(|v| v.as_ref()),
+            Some("application/json")
+        );
+        assert_eq!(got.bytes().await.expect("read"), data);
+    }
+
+    #[tokio::test]
+    async fn a_conditional_upload_keeps_its_precondition_above_the_threshold() {
+        let store = InMemory::new();
+        let create = || PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        put_in(
+            &store,
+            "memory",
+            Keys::Encoded,
+            "k",
+            payload(4096),
+            create(),
+            SMALL,
+        )
+        .await
+        .expect("created");
+        let refused = put_in(
+            &store,
+            "memory",
+            Keys::Encoded,
+            "k",
+            payload(4096),
+            create(),
+            SMALL,
+        )
+        .await
+        .expect_err("already exists");
+        assert_eq!(refused.to_string(), "memory upload failed for k");
+    }
+
+    #[test]
+    fn request_timeout_defaults_to_the_clients_default_when_unset() {
+        super::test_env::with(&[(ENV_REQUEST_TIMEOUT_SECS, None)], || {
+            assert_eq!(request_timeout(), Duration::from_secs(30));
+        });
+    }
+
+    #[test]
+    fn request_timeout_honours_env_override() {
+        super::test_env::with(&[(ENV_REQUEST_TIMEOUT_SECS, Some("300"))], || {
+            assert_eq!(request_timeout(), Duration::from_secs(300));
+        });
+    }
+
+    #[test]
+    fn request_timeout_ignores_zero_and_garbage() {
+        super::test_env::with(&[(ENV_REQUEST_TIMEOUT_SECS, Some("0"))], || {
+            assert_eq!(request_timeout(), Duration::from_secs(30));
+        });
+        super::test_env::with(&[(ENV_REQUEST_TIMEOUT_SECS, Some("-5"))], || {
+            assert_eq!(request_timeout(), Duration::from_secs(30));
+        });
+    }
 
     #[test]
     fn retry_timeout_defaults_to_bounded_budget_when_unset() {

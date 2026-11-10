@@ -6,7 +6,6 @@ use crate::{
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
-use object_store::ClientOptions;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -31,7 +30,7 @@ struct Connection {
 
 impl Connection {
     fn store(&self, bucket: &str, acl: Option<CannedAcl>) -> Result<Arc<AmazonS3>> {
-        let options = ClientOptions::new().with_allow_http(self.allow_http);
+        let options = common::client_options().with_allow_http(self.allow_http);
         let options = match acl {
             Some(acl) => options.with_default_headers(http::HeaderMap::from_iter([(
                 ACL_HEADER,
@@ -92,6 +91,7 @@ impl S3Backend {
             bucket = %backend.bucket,
             region = %backend.connection.region,
             retry_timeout_secs = common::retry_timeout().as_secs(),
+            request_timeout_secs = common::request_timeout().as_secs(),
             "Object storage configured",
         );
 
@@ -771,6 +771,150 @@ mod tests {
         assert_eq!(
             acl_of("/example-documents/logos/b.png"),
             Some((None, false))
+        );
+    }
+
+    const BUNDLE: &str = "/example-documents/bundles/app.tar.gz";
+
+    async fn initiates_upload(server: &wiremock::MockServer) {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path(BUNDLE))
+            .and(query_param("uploads", ""))
+            .and(header("content-type", "application/gzip"))
+            .and(header("x-amz-acl", "public-read"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn public_bundle() -> UploadOptions {
+        UploadOptions {
+            acl: Some(CannedAcl::PublicRead),
+            ..UploadOptions::content_type("application/gzip")
+        }
+    }
+
+    fn large_payload() -> Vec<u8> {
+        (0..40 * 1024 * 1024 + 123)
+            .map(|i: usize| (i % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_large_upload_goes_up_in_parts_with_how_the_object_is_served() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_upload(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"part\""))
+            .expect(6)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole-6\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let data = large_payload();
+        let uploaded = tenant_bucket(&server.uri(), None)
+            .upload_to_bucket_with(
+                "example-documents",
+                "bundles/app.tar.gz",
+                data.clone(),
+                &public_bundle(),
+            )
+            .await
+            .expect("uploaded");
+        assert_eq!(
+            uploaded,
+            Uploaded {
+                size: data.len() as u64,
+                etag: Some("\"whole-6\"".into())
+            }
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let mut parts: Vec<(usize, &[u8])> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .filter_map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == "partNumber")
+                    .and_then(|(_, number)| number.parse().ok())
+                    .map(|number| (number, request.body.as_slice()))
+            })
+            .collect();
+        parts.sort_by_key(|(number, _)| *number);
+        assert_eq!(
+            parts.iter().map(|(number, _)| *number).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert!(parts[..5]
+            .iter()
+            .all(|(_, body)| body.len() == 8 * 1024 * 1024));
+        assert_eq!(
+            parts
+                .iter()
+                .flat_map(|(_, body)| body.iter().copied())
+                .collect::<Vec<_>>(),
+            data
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_part_aborts_the_upload_and_names_the_key() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_upload(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let refused = tenant_bucket(&server.uri(), None)
+            .upload_to_bucket_with(
+                "example-documents",
+                "bundles/app.tar.gz",
+                large_payload(),
+                &public_bundle(),
+            )
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            refused.to_string(),
+            "s3 upload failed for bundles/app.tar.gz"
         );
     }
 

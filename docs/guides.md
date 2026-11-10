@@ -4688,6 +4688,7 @@ Cufflink supports any S3-compatible object storage (and Google Cloud Storage via
 | `S3_SECRET_KEY` | Secret access key | `your-secret-key` |
 | `S3_BUCKET` | Bucket name | `cufflink` |
 | `OBJECT_STORE_RETRY_TIMEOUT_SECS` | Max wall-clock budget, across retries, for one storage op. Bounded under the deploy gateway timeout so a provider outage fails deploys fast instead of holding the deploy lock. Applies to S3 and GCS. | `20` (default) |
+| `OBJECT_STORE_REQUEST_TIMEOUT_SECS` | Timeout for one HTTP request to the store. An upload above 32 MiB goes up as a multipart upload in parts of at least 8 MiB, four at a time, so this bounds each part rather than the whole object. Applies to S3 and GCS. | `30` (default) |
 
 **Hetzner Object Storage:**
 ```bash
