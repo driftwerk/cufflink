@@ -1354,6 +1354,22 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.38.1
+
+Unreleased.
+
+- An object-storage upload above 32 MiB goes up as a multipart upload, in
+  parts of at least 8 MiB (fewer than 10,000), four at a time, with the
+  object's content type, disposition, cache control and canned ACL. A
+  failed part aborts the upload. Each part is its own request, so the
+  request timeout bounds a part rather than the whole object, and an
+  upload of any size no longer needs more bandwidth to the store than a
+  32 MiB one. A conditional put still goes up in one request. On S3, the
+  ETag of an object uploaded in parts is the store's multipart ETag, not
+  the MD5 of its content.
+- `OBJECT_STORE_REQUEST_TIMEOUT_SECS` (default `30`) sets the timeout of
+  one request to S3 or GCS ([setup](setup.md)).
+
 ## Changes in v0.38.0
 
 Web apps released with their bundle, recorded by content and rolled back
