@@ -21,6 +21,81 @@ pub struct DeployFlags {
     pub purge: bool,
     pub plan: bool,
     pub inactive: bool,
+    pub skip_scripts: SkippedScripts,
+}
+
+/// A check `cufflink deploy` runs in a web app, when its `package.json`
+/// defines the script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WebScript {
+    Typecheck,
+    Lint,
+    Test,
+}
+
+impl WebScript {
+    const ALL: [Self; 3] = [Self::Typecheck, Self::Lint, Self::Test];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Typecheck => "typecheck",
+            Self::Lint => "lint",
+            Self::Test => "test",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Typecheck => "Type checking",
+            Self::Lint => "Linting",
+            Self::Test => "Running tests",
+        }
+    }
+
+    fn skipping(self) -> &'static str {
+        match self {
+            Self::Typecheck => "type checking",
+            Self::Lint => "linting",
+            Self::Test => "tests",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkippedScripts([bool; 3]);
+
+impl SkippedScripts {
+    pub fn of(scripts: impl IntoIterator<Item = WebScript>) -> Self {
+        Self(scripts.into_iter().fold([false; 3], |mut skipped, script| {
+            skipped[script as usize] = true;
+            skipped
+        }))
+    }
+
+    fn contains(self, script: WebScript) -> bool {
+        self.0[script as usize]
+    }
+
+    fn any(self) -> bool {
+        self.0.contains(&true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebCheck {
+    Run(WebScript),
+    Skip(WebScript),
+}
+
+fn web_checks(defined: impl Fn(&str) -> bool, skipped: SkippedScripts) -> Vec<WebCheck> {
+    WebScript::ALL
+        .into_iter()
+        .filter(|script| defined(script.name()))
+        .map(|script| match skipped.contains(script) {
+            true => WebCheck::Skip(script),
+            false => WebCheck::Run(script),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -292,6 +367,15 @@ impl DeployFlags {
         }
     }
 
+    fn outside_web(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.skip_scripts.any(),
+            "--skip-script skips a web app's checks, and this deploy is not of a web app. \
+             Deploy it without the flag"
+        );
+        Ok(())
+    }
+
     fn write(&self, request: &mut serde_json::Value) {
         self.requested().into_iter().for_each(|(flag, _)| {
             request[flag] = serde_json::Value::Bool(true);
@@ -351,9 +435,11 @@ pub async fn run_with(
             project.as_ref(),
             commit_hash.as_deref(),
             env,
+            flags.skip_scripts,
         )
         .await
     } else {
+        flags.outside_web()?;
         let target = Target::of(&config, env, tenant_override, CliConfig::has_platform_key());
         deploy_rust(
             &config,
@@ -415,6 +501,7 @@ pub async fn run_bundle(
     env: Option<&str>,
     tenant_override: Option<&str>,
 ) -> eyre::Result<()> {
+    flags.outside_web()?;
     let config = loaded(env, tenant_override)?;
     let project = ProjectConfig::find_and_load()?;
 
@@ -1429,6 +1516,7 @@ async fn deploy_web(
     project: Option<&ProjectConfig>,
     commit_hash: Option<&str>,
     env: Option<&str>,
+    skipped: SkippedScripts,
 ) -> eyre::Result<()> {
     println!("Deploying web app: {}", service_name);
     let client = config.http_client();
@@ -1436,16 +1524,23 @@ async fn deploy_web(
     web_release::require_web_releases(&platform)?;
 
     let pkg_json = read_package_json()?;
-    if let Some(scripts) = pkg_json["scripts"].as_object() {
-        [
-            ("typecheck", "Type checking"),
-            ("lint", "Linting"),
-            ("test", "Running tests"),
-        ]
-        .into_iter()
-        .filter(|(script, _)| scripts.contains_key(*script))
-        .try_for_each(|(script, label)| run_npm_script(script, label))?;
-    }
+    let scripts = pkg_json["scripts"].as_object();
+    web_checks(
+        |script| scripts.is_some_and(|scripts| scripts.contains_key(script)),
+        skipped,
+    )
+    .into_iter()
+    .try_for_each(|check| match check {
+        WebCheck::Run(script) => run_npm_script(script.name(), script.label()),
+        WebCheck::Skip(script) => {
+            println!(
+                "Skipping {} (--skip-script {})",
+                script.skipping(),
+                script.name()
+            );
+            Ok(())
+        }
+    })?;
 
     let manifest = serde_json::json!({
         "name": service_name,
@@ -2904,6 +2999,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_web_deploy_runs_every_defined_check_unless_it_is_skipped() {
+        use WebCheck::{Run, Skip};
+        use WebScript::{Lint, Test, Typecheck};
+        let every = |_: &str| true;
+
+        assert_eq!(
+            web_checks(every, SkippedScripts::default()),
+            [Run(Typecheck), Run(Lint), Run(Test)]
+        );
+        assert_eq!(
+            web_checks(every, SkippedScripts::of([Test])),
+            [Run(Typecheck), Run(Lint), Skip(Test)]
+        );
+        assert_eq!(
+            web_checks(every, SkippedScripts::of([Test, Typecheck, Test])),
+            [Skip(Typecheck), Run(Lint), Skip(Test)]
+        );
+        assert_eq!(
+            web_checks(|script| script == "lint", SkippedScripts::of([Test])),
+            [Run(Lint)]
+        );
+        assert_eq!(web_checks(|_| false, SkippedScripts::default()), []);
+    }
+
+    #[test]
+    fn only_the_web_checks_can_be_skipped() {
+        use clap::ValueEnum;
+        assert_eq!(
+            WebScript::value_variants()
+                .iter()
+                .filter_map(|script| script.to_possible_value())
+                .map(|value| value.get_name().to_string())
+                .collect::<Vec<_>>(),
+            WebScript::ALL.map(WebScript::name)
+        );
+        assert!(WebScript::from_str("build", false).is_err());
+        assert_eq!(WebScript::from_str("test", false), Ok(WebScript::Test));
+    }
+
+    #[test]
+    fn a_skipped_script_is_refused_outside_a_web_app() {
+        let skipping = DeployFlags {
+            skip_scripts: SkippedScripts::of([WebScript::Lint]),
+            ..DeployFlags::default()
+        };
+        assert_eq!(
+            skipping.outside_web().expect_err("refused").to_string(),
+            "--skip-script skips a web app's checks, and this deploy is not of a web app. \
+             Deploy it without the flag"
+        );
+        assert!(DeployFlags::default().outside_web().is_ok());
+    }
+
     #[tokio::test]
     async fn a_platform_without_web_releases_is_refused_before_building() {
         let (config, asked) = answering(vec![Some((
@@ -2913,7 +3062,7 @@ mod tests {
         ))])
         .await;
 
-        let refused = deploy_web(&config, "site", None, None, None)
+        let refused = deploy_web(&config, "site", None, None, None, SkippedScripts::default())
             .await
             .expect_err("refused");
 
@@ -2935,6 +3084,7 @@ mod tests {
         purge: false,
         plan: false,
         inactive: true,
+        skip_scripts: SkippedScripts([false; 3]),
     };
 
     const STAGING_ACME: Target<'static> = Target {

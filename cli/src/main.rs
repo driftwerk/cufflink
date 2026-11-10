@@ -92,6 +92,11 @@ enum Commands {
         /// their status.
         #[arg(long)]
         inactive: bool,
+        /// Do not run this web app script before building (repeatable):
+        /// for a caller that has already run it on the same commit. The
+        /// deploy prints each script it skips. For web apps only
+        #[arg(long = "skip-script", value_name = "SCRIPT")]
+        skip_script: Vec<commands::deploy::WebScript>,
         /// Git commit hash to associate with this deployment (auto-detected
         /// if omitted; with --bundle, the commit the bundle was built at)
         #[arg(long)]
@@ -914,6 +919,7 @@ async fn run() -> eyre::Result<()> {
             purge,
             plan,
             inactive,
+            skip_script,
             commit_hash,
             tenant,
             bundle,
@@ -924,6 +930,7 @@ async fn run() -> eyre::Result<()> {
                 purge,
                 plan,
                 inactive,
+                skip_scripts: commands::deploy::SkippedScripts::of(skip_script),
             };
             let tenant = tenant.as_deref();
             match bundle {
@@ -1312,6 +1319,28 @@ mod tests {
             Cli::try_parse_from(["cufflink", "--env", "dev", "status"]).map(|cli| cli.command),
             Ok(Commands::Status)
         ));
+    }
+
+    #[test]
+    fn a_deploy_skips_each_named_web_check_and_refuses_any_other() {
+        use commands::deploy::WebScript;
+        let skipped = |arguments: &[&str]| {
+            Cli::try_parse_from(["cufflink", "deploy"].iter().chain(arguments))
+                .map(|cli| match cli.command {
+                    Commands::Deploy { skip_script, .. } => skip_script,
+                    _ => Vec::new(),
+                })
+                .map_err(|e| e.kind())
+        };
+        assert_eq!(skipped(&[]), Ok(Vec::new()));
+        assert_eq!(
+            skipped(&["--skip-script", "test", "--skip-script", "lint"]),
+            Ok(vec![WebScript::Test, WebScript::Lint])
+        );
+        assert_eq!(
+            skipped(&["--skip-script", "build"]),
+            Err(clap::error::ErrorKind::InvalidValue)
+        );
     }
 
     #[test]
