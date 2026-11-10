@@ -110,9 +110,16 @@ pub(crate) fn client_options() -> ClientOptions {
     ClientOptions::new().with_timeout(request_timeout())
 }
 
+fn timed_out_requests_cannot_retry(configured: bool, retry: Duration, request: Duration) -> bool {
+    configured && retry < request
+}
+
 pub(crate) fn warn_unless_timed_out_requests_retry(backend: &'static str) {
+    let configured = [ENV_RETRY_TIMEOUT_SECS, ENV_REQUEST_TIMEOUT_SECS]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
     let (retry, request) = (retry_timeout(), request_timeout());
-    if retry < request {
+    if timed_out_requests_cannot_retry(configured, retry, request) {
         tracing::warn!(
             backend,
             retry_timeout_secs = retry.as_secs(),
@@ -546,8 +553,8 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::{
-        already_aborted, put_in, request_timeout, retry_timeout, Keys, Multipart, Put,
-        ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
+        already_aborted, put_in, request_timeout, retry_timeout, timed_out_requests_cannot_retry,
+        Keys, Multipart, Put, ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -964,6 +971,15 @@ mod tests {
             },
             true
         ));
+    }
+
+    #[test]
+    fn only_a_configured_retry_budget_below_the_request_timeout_warns() {
+        let secs = Duration::from_secs;
+        assert!(!timed_out_requests_cannot_retry(false, secs(20), secs(30)));
+        assert!(timed_out_requests_cannot_retry(true, secs(20), secs(30)));
+        assert!(!timed_out_requests_cannot_retry(true, secs(30), secs(30)));
+        assert!(!timed_out_requests_cannot_retry(true, secs(120), secs(60)));
     }
 
     #[test]

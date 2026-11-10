@@ -1372,8 +1372,8 @@ Unreleased.
   one request to S3 or GCS ([setup](setup.md)). Downloads are still one
   request each, so it bounds a whole download. A request that times out is
   retried only when `OBJECT_STORE_RETRY_TIMEOUT_SECS` is at least the
-  request timeout, which the defaults (`20` and `30`) are not; the
-  platform warns at startup when it is below.
+  request timeout, which the defaults (`20` and `30`) are not; when
+  either is set, the platform warns at startup if it is below.
 
 ## Changes in v0.38.0
 
