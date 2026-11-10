@@ -430,7 +430,7 @@ The platform degrades gracefully without object storage (WASM upload, web apps a
 | `GCS_BUCKET` | *(required for gcs)* | Primary bucket |
 | `GOOGLE_APPLICATION_CREDENTIALS` | *(unset)* | Service-account JSON key path for GCS; without it, Application Default Credentials / Workload Identity are used and presigning goes through IAM `signBlob` |
 | `OBJECT_STORE_RETRY_TIMEOUT_SECS` | `20` | Overall retry budget per object-store request |
-| `OBJECT_STORE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for one object-store HTTP request; uploads above 32 MiB go up in parts, each its own request |
+| `OBJECT_STORE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for one object-store HTTP request: one part of an upload above 32 MiB, a whole smaller upload, a whole download. A timed-out request is retried only when `OBJECT_STORE_RETRY_TIMEOUT_SECS` is at least this value |
 
 With `STORAGE_BACKEND=s3` (or unset), the S3 backend is only activated when all five `S3_*` variables are set; otherwise the platform starts without object storage.
 

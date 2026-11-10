@@ -41,6 +41,7 @@ impl GcsBackend {
             request_timeout_secs = common::request_timeout().as_secs(),
             "Object storage configured",
         );
+        common::warn_unless_timed_out_requests_retry(BACKEND);
 
         Ok(Self {
             primary,
@@ -246,6 +247,84 @@ mod tests {
     use super::*;
     use crate::common::test_env::with as with_env;
     use cufflink_settings::process_var as var;
+
+    fn emulated(server: &str) -> GcsBackend {
+        let key = serde_json::json!({
+            "gcs_base_url": server,
+            "disable_oauth": true,
+            "client_email": "",
+            "private_key": "",
+            "private_key_id": "",
+        });
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("example-documents")
+            .with_service_account_key(key.to_string())
+            .with_client_options(common::client_options().with_allow_http(true))
+            .with_retry(common::retry_config())
+            .build()
+            .expect("store");
+        GcsBackend {
+            primary: Arc::new(store),
+            bucket: "example-documents".into(),
+            sa_key_path: None,
+            iam_signer: None,
+            keys: Keys::Encoded,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_upload_goes_up_in_parts_through_the_xml_api() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OBJECT: &str = "/example%2Ddocuments/bundles%2Fapp%2Etar%2Egz";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(OBJECT))
+            .and(query_param("uploads", ""))
+            .and(header("content-type", "application/gzip"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(OBJECT))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"part\""))
+            .expect(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(OBJECT))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole-5\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let data: Vec<u8> = (0..40 * 1024 * 1024)
+            .map(|i: usize| (i % 251) as u8)
+            .collect();
+        let uploaded = emulated(&server.uri())
+            .upload_to_bucket_with(
+                "example-documents",
+                "bundles/app.tar.gz",
+                data.clone(),
+                &UploadOptions::content_type("application/gzip"),
+            )
+            .await
+            .expect("uploaded");
+        assert_eq!(
+            uploaded,
+            Uploaded {
+                size: data.len() as u64,
+                etag: Some("\"whole-5\"".into())
+            }
+        );
+    }
 
     #[test]
     fn from_env_requires_bucket() {

@@ -94,6 +94,7 @@ impl S3Backend {
             request_timeout_secs = common::request_timeout().as_secs(),
             "Object storage configured",
         );
+        common::warn_unless_timed_out_requests_retry(BACKEND);
 
         Ok(backend)
     }
@@ -415,17 +416,21 @@ mod tests {
     }
 
     fn backend_at(endpoint: &str) -> S3Backend {
+        backend_with(endpoint, &[])
+    }
+
+    fn backend_with(endpoint: &str, timeouts: &[(&str, Option<&str>)]) -> S3Backend {
         let mut backend = None;
-        with_env(
-            &[
-                (ENV_ENDPOINT, Some(endpoint)),
-                (ENV_REGION, Some("us-east-1")),
-                (ENV_ACCESS_KEY, Some("ak")),
-                (ENV_SECRET_KEY, Some("sk")),
-                (ENV_BUCKET, Some("cufflink")),
-            ],
-            || backend = Some(S3Backend::from_vars(var).expect("should build")),
-        );
+        let vars = [
+            (ENV_ENDPOINT, Some(endpoint)),
+            (ENV_REGION, Some("us-east-1")),
+            (ENV_ACCESS_KEY, Some("ak")),
+            (ENV_SECRET_KEY, Some("sk")),
+            (ENV_BUCKET, Some("cufflink")),
+        ];
+        with_env(&[&vars[..], timeouts].concat(), || {
+            backend = Some(S3Backend::from_vars(var).expect("should build"))
+        });
         backend.unwrap()
     }
 
@@ -915,6 +920,143 @@ mod tests {
         assert_eq!(
             refused.to_string(),
             "s3 upload failed for bundles/app.tar.gz"
+        );
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the failed upload is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_answered_with_a_server_error_is_retried() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_upload(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"part\""))
+            .expect(6)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole-6\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        tenant_bucket(&server.uri(), None)
+            .upload_to_bucket_with(
+                "example-documents",
+                "bundles/app.tar.gz",
+                large_payload(),
+                &public_bundle(),
+            )
+            .await
+            .expect("uploaded after the retry");
+    }
+
+    async fn requests_until(
+        server: &wiremock::MockServer,
+        seen: impl Fn(&wiremock::Request) -> bool,
+    ) -> bool {
+        for _ in 0..200 {
+            if server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(&seen)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_dropped_upload_is_aborted() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_upload(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"part\"")
+                    .set_delay(std::time::Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bucket = tenant_bucket(&server.uri(), None);
+        let data = large_payload();
+        let options = public_bundle();
+        let upload =
+            bucket.upload_to_bucket_with("example-documents", "bundles/app.tar.gz", data, &options);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), upload)
+                .await
+                .is_err(),
+            "the upload is still sending its parts"
+        );
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the dropped upload is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_is_bounded_by_the_configured_request_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/cufflink/slow.txt"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+        let backend = backend_with(
+            &server.uri(),
+            &[
+                (common::ENV_REQUEST_TIMEOUT_SECS, Some("1")),
+                (common::ENV_RETRY_TIMEOUT_SECS, Some("1")),
+            ],
+        );
+        let started = std::time::Instant::now();
+        let refused = backend
+            .upload("slow.txt", b"x".to_vec(), "text/plain")
+            .await
+            .expect_err("timed out");
+        assert_eq!(refused.to_string(), "s3 upload failed for slow.txt");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
         );
     }
 
