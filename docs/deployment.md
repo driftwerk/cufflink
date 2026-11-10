@@ -966,7 +966,11 @@ steps, and only the last one changes what runs:
    (needs web_releases)`. Pin the CLI to a release before v0.38.0 to
    deploy to such a platform.
 2. It runs the app's `typecheck`, `lint` and `test` scripts, when
-   `package.json` has them.
+   `package.json` has them. `--skip-script <name>`, repeatable and naming
+   `typecheck`, `lint` or `test`, leaves one out for a caller that has
+   already run it on the same commit, and the deploy says so:
+   `Skipping tests (--skip-script test)`. Any other name is refused, and
+   so is the flag in a deploy that is not of a web app.
 3. It reserves the app and reads what it runs
    (`GET /api/services/{id}/web/status`). The reservation's
    `current_version` is not a release: an app reserved but never released

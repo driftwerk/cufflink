@@ -1374,6 +1374,12 @@ Unreleased.
   retried only when `OBJECT_STORE_RETRY_TIMEOUT_SECS` is at least the
   request timeout, which the defaults (`20` and `30`) are not; when
   either is set, the platform warns at startup if it is below.
+- `cufflink deploy --skip-script <typecheck|lint|test>`, repeatable, leaves
+  a web app's script out of the deploy's checks, for a caller that has
+  already run it on the same commit, and prints `Skipping tests
+  (--skip-script test)` for each one it skips. Without the flag every
+  defined script runs as before; the flag is refused in a deploy that is
+  not of a web app ([deploying a web app](deployment.md)).
 
 ## Changes in v0.38.0
 
