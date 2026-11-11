@@ -512,6 +512,15 @@ Rolling a platform back from v0.38.0 to v0.37.1:
 | Delegated end users in service identities (`act`, `SERVICE_IDENTITY_REPLAY_MAX`) | Nothing: nothing in this release mints one, so no such identity exists. v0.37.1 does not read the claim and ignores the setting |
 | The database | Nothing: `V9__web_uploads` only adds a table v0.37.1 does not read |
 
+Rolling a platform back from v0.38.1 to v0.38.0:
+
+| What v0.38.1 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Uploads above 32 MiB sent in parts | Nothing to undo: an object uploaded in parts reads back as any other. v0.38.0 sends every upload as one request again, so a large one, such as a web bundle, needs the bandwidth to finish within 30 s once more. An upload in flight when its platform stops is aborted if the platform can still reach the store; otherwise its parts stay until the bucket's lifecycle rule for incomplete multipart uploads removes them |
+| `OBJECT_STORE_REQUEST_TIMEOUT_SECS` | Nothing: the platform, worker and web runner of v0.38.0 ignore it and bound every request at 30 s, a web runner's bundle download included |
+| `cufflink deploy --skip-script` | Nothing: the flag is the CLI's alone, and a CLI of v0.38.1 deploys to v0.38.0 as a v0.38.0 CLI does |
+| The database | Nothing: v0.38.1 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -1356,7 +1365,12 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.38.1
 
-Unreleased.
+Large object-storage uploads in parts, a configurable request timeout, and
+web deploys that can skip a check their caller has already run. No new
+module-declared feature. A service built for v0.38.0 deploys and runs on
+this platform unchanged. There is no migration. New environment variable:
+`OBJECT_STORE_REQUEST_TIMEOUT_SECS` on the platform, the worker and the
+web runner, which all reach object storage through `cufflink-storage`.
 
 - An object-storage upload above 32 MiB goes up as a multipart upload, in
   parts of at least 8 MiB (fewer than 10,000), four at a time, with the
