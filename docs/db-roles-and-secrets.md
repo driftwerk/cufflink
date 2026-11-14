@@ -232,7 +232,8 @@ comes before the roles are verified:
    cufflink services db-role set harbor reports-service --read-only-role reports_ro
    ```
 
-   A binding needs the service to have been deployed once. Every statement
+   A service not yet deployed is bound with `--register`
+   ([below](#a-service-whose-schema-belongs-to-a-role)). Every statement
    of a service can switch to its read-only role, not only
    `query_read_only`: bind one that reaches no more than that service may
    read in its tenant's database
@@ -285,6 +286,49 @@ comes before the roles are verified:
    The policy is refused while any service of the tenant with a schema lacks
    a verified role. Each service's SQL, data routes and `on_migrate` hook
    now run on a login as its role, which no statement can leave.
+
+### A service whose schema belongs to a role
+
+A service whose schema already exists and belongs to a role other than the
+platform's (an [adopted](schema-ownership.md#adopting-a-schema-that-exists)
+schema, say) runs as that role, so it is bound to it before its first
+deploy:
+
+```sh
+printf '%s' "$ROLE_PASSWORD" | cufflink services db-role set harbor catalog-service \
+  --register --schema catalog_service --role catalog_service_user --password-stdin
+cufflink deploy   # the first deploy runs as catalog_service_user
+```
+
+- `--register` records the service when the tenant has not deployed it,
+  with `--schema`: the `schema_name` its manifest declares, by default the
+  service name with `-` as `_`. The name and schema are checked as a
+  deploy checks them. Without `--register` a service the platform has not
+  recorded is not found, so a mistyped name records nothing. A
+  registration names its `--role`: a service whose schema the platform may
+  own is given a role of its own at its first deploy, and needs none.
+- The binding is set and verified as for any service, under the service's
+  deploy lock. A binding that is refused leaves no service recorded; one
+  that is set but not verified is mended as in step 4. Sending the same set
+  again binds the service as before.
+- The registered service is recorded active, as a first deploy records
+  one, and runs nothing until its first deploy. That deploy may ask for
+  `--inactive` ([deployment](deployment.md#deploying-a-service-inactive)),
+  runs its schema changes and SQL as the role, and verifies the binding
+  again against the tables of the version it activated. A first deploy
+  whose `schema_name` differs from the one registered is refused.
+- `cufflink services delete` removes a registered service that was never
+  deployed, with its binding, and leaves the role as it is.
+- Who may: platform administrators, as for every binding. The set is
+  audited as `db_role.set`, with `registered` and `schema` beside the
+  role, and its verification as `db_role.verify`.
+
+Under `enforce` the first deploy of a service is refused (422) while it
+gets no verified role, with the reason: a schema that belongs to another
+role names the owner and the `db-role set` that binds it. The refused
+deploy still records the service, so binding it then and deploying again
+works too. A plan (`cufflink deploy --plan`) does not provision roles, so
+it does not show this refusal.
 
 `readers` in the policy's config lists roles that may read every service
 schema of the tenant, now and as tables are added:
