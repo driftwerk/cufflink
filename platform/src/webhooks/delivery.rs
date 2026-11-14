@@ -454,7 +454,7 @@ async fn run(state: Arc<AppState>) {
                 errors.reset();
                 info!(consumer = CONSUMER, "Webhook deliveries started");
                 let exit = pump::run(
-                    consumer,
+                    pump::PullSource::new(consumer, &state.jetstream),
                     config,
                     Arc::clone(&work),
                     Arc::new(state.jetstream.clone()),

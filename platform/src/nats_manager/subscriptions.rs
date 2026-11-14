@@ -388,7 +388,7 @@ async fn consume(
     let subject = &consuming.consumer.key.subject;
     info!("Subscription consumer started for: {}", subject);
     let exit = pump::run(
-        consumer,
+        pump::PullSource::new(consumer, &consuming.state.jetstream),
         pump,
         work,
         Arc::new(consuming.state.jetstream.clone()),

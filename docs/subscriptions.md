@@ -128,9 +128,14 @@ stops:
 | its durable is no longer consumed here: the service was disabled or deleted, or a deploy dropped the subscription | handed back at once | **the handler runs to its end**, and its answer settles the message. Nothing is cut short, so a durable is drained only once its running handlers have answered |
 | a deploy replaced it with a loop on the same durable | handled by the old loop for up to a second, not handed back; the new loop fetches the rest | runs to its end |
 
-A message handed back uses one of its deliveries, which `max_deliver`
-counts under `ack = on_success`; that is why a replaced loop does not hand
-back. Messages handed back are counted as
+A message handed back has used the one delivery that brought it to the
+loop, which `max_deliver` counts under `ack = on_success`; that is why a
+replaced loop does not hand back. A loop that hands back first closes its
+pull request, so the server delivers nothing more into it: each message it
+holds is handed back once, and a message published while it stops stays in
+its stream undelivered. A message the server had already sent when the pull
+closed, but which had not yet reached the loop, is delivered again once its
+`ack_wait` has passed. Messages handed back are counted as
 `cufflink_subscription_messages_total{result="nak"}`.
 
 ### The dead-letter queue

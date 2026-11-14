@@ -587,7 +587,7 @@ async fn run_jetstream_consumer(
     info!("JetStream consumer '{AFTER_HOOK_DURABLE}' ready for async jobs");
     let _up = readiness.consumer_up();
     let exit = pump::run(
-        consumer,
+        pump::PullSource::new(consumer, &app_state.jetstream),
         PumpConfig::sequential(AFTER_HOOK_ACK_WAIT).concurrent(concurrency),
         Arc::new(AfterHookWork {
             app_state: app_state.clone(),

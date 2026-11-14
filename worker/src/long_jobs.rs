@@ -151,7 +151,7 @@ pub async fn run(
 
     let _up = readiness.consumer_up();
     let exit = pump::run(
-        consumer,
+        pump::PullSource::new(consumer, &app_state.jetstream),
         PumpConfig::sequential(ack_wait).concurrent(concurrency),
         Arc::new(LongJobs {
             app_state: app_state.clone(),
