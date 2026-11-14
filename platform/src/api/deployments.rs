@@ -137,9 +137,47 @@ async fn claim(
         admitted.status(None)?,
     )
     .await?;
-    admitted.status(Some(service.status))?;
     let lock = acquire_deploy_lock(state, service.id, "deployment").await?;
-    Ok(Claim { service, lock })
+    match settled(state, admitted, service).await {
+        Ok(service) => Ok(Claim { service, lock }),
+        Err(e) => {
+            lock.release().await;
+            Err(e)
+        }
+    }
+}
+
+/// The status a deploy keeps: an active service that has never run (one
+/// registered for its database role, or whose first active deploy failed)
+/// stops nothing, so its first deploy may ask for `inactive`. An inactive
+/// one stays inactive, as any inactive service does.
+fn kept_status(status: Status, ever_deployed: bool) -> Option<Status> {
+    match (status, ever_deployed) {
+        (Status::Active, false) => None,
+        (status, _) => Some(status),
+    }
+}
+
+async fn standing(
+    state: &AppState,
+    service: &crate::repo::services::Service,
+) -> PlatformResult<Option<Status>> {
+    let ever_deployed =
+        crate::repo::services::ever_deployed(&state.platform_db, service.id).await?;
+    Ok(kept_status(service.status, ever_deployed))
+}
+
+async fn settled(
+    state: &AppState,
+    admitted: &Admitted,
+    service: crate::repo::services::Service,
+) -> PlatformResult<crate::repo::services::Service> {
+    let standing = standing(state, &service).await?;
+    let status = admitted.status(standing)?;
+    if status != service.status {
+        crate::repo::services::update_status(&state.platform_db, service.id, status).await?;
+    }
+    Ok(crate::repo::services::Service { status, ..service })
 }
 
 struct Admitted {
@@ -355,7 +393,11 @@ async fn plan(
     let manifest = &admitted.manifest;
     let existing =
         crate::repo::services::find(&state.platform_db, user.tenant_id, &manifest.name).await?;
-    let status = admitted.status(existing.as_ref().map(|service| service.status))?;
+    let standing = match &existing {
+        Some(service) => standing(&state, service).await?,
+        None => None,
+    };
+    let status = admitted.status(standing)?;
     let (manifest_hash, wasm_hash) = (&admitted.manifest_hash, admitted.wasm_hash.as_deref());
     let (identity, version) = match &existing {
         Some(service) => (service.identity(&user.tenant_slug), service.current_version),
@@ -1201,6 +1243,21 @@ mod tests {
                 "a web deploy that does not ask is as it was: {existing:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_active_service_that_never_ran_takes_the_status_its_first_deploy_asks_for() {
+        use ServiceMode::Wasm;
+        let first = |status, inactive| admitted_status(kept_status(status, false), &Wasm, inactive);
+        assert_eq!(first(Status::Active, true), Ok(Status::Inactive));
+        assert_eq!(first(Status::Active, false), Ok(Status::Active));
+        assert_eq!(
+            first(Status::Inactive, false),
+            Ok(Status::Inactive),
+            "an inactive one stays so until it is enabled"
+        );
+        assert_eq!(kept_status(Status::Active, true), Some(Status::Active));
+        assert_eq!(kept_status(Status::Inactive, true), Some(Status::Inactive));
     }
 
     fn admitted_status(

@@ -755,3 +755,389 @@ async fn roles_are_refused_where_a_recycle_leaves_what_a_session_set() {
         refused.output_tail()
     );
 }
+
+impl Bindings {
+    async fn policy(&self, mode: &str) -> (u16, Value) {
+        self.platform
+            .send(
+                Method::PUT,
+                &format!("/api/tenants/{}/policies", self.tenant.slug),
+                &self.admin,
+                Some(&json!({"policies": {"db_roles": {"mode": mode}}})),
+            )
+            .await
+    }
+
+    /// The tenant under `enforce`, its first service given a role of the
+    /// platform's own.
+    async fn enforced(&self) {
+        let (status, body) = self.policy("warn").await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = self.set(json!({})).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["report"]["verified"], true, "{body}");
+        let (status, body) = self.enforce_db_roles().await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// A schema, and its table, that belong to a role that logs in.
+    async fn owned_schema(&self, name: &str, password: &str) -> String {
+        let owner = self.db.role(name);
+        self.sql(&format!(
+            "CREATE ROLE {owner} LOGIN PASSWORD '{password}';
+             GRANT {owner} TO CURRENT_USER;
+             CREATE SCHEMA catalog_service AUTHORIZATION {owner};
+             CREATE TABLE catalog_service.books (
+                 id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                 title text,
+                 written_by text NOT NULL DEFAULT current_user
+             );
+             ALTER TABLE catalog_service.books OWNER TO {owner};"
+        ))
+        .await;
+        owner
+    }
+
+    async fn deploy_as(&self, query: &str, manifest: &Value) -> (u16, Value) {
+        use base64::Engine;
+        let wasm = base64::engine::general_purpose::STANDARD.encode(common::guest::module_bytes());
+        self.platform
+            .send(
+                Method::POST,
+                &format!("/api/services/deploy?{query}"),
+                &format!("ApiKey {}", self.tenant.api_key),
+                Some(&json!({"manifest": manifest, "wasm_base64": wasm, "api_version": 1})),
+            )
+            .await
+    }
+
+    async fn write_book(&self) -> (u16, Value) {
+        self.platform
+            .send(
+                Method::POST,
+                &format!("/svc/{}/catalog-service/books", self.tenant.slug),
+                &format!("ApiKey {}", self.tenant.api_key),
+                Some(&json!({"title": "Dune"})),
+            )
+            .await
+    }
+
+    async fn written_by(&self) -> Vec<String> {
+        self.tenant_db
+            .query(
+                "SELECT written_by FROM catalog_service.books ORDER BY written_by",
+                &[],
+            )
+            .await
+            .expect("books")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    async fn service_recorded(&self, name: &str) -> Option<(String, i64)> {
+        self.db
+            .pool()
+            .get()
+            .await
+            .expect("checkout")
+            .query_opt(
+                "SELECT s.status, (SELECT count(*) FROM deployments d WHERE d.service_id = s.id)
+                 FROM services s WHERE s.tenant_id = $1 AND s.name = $2",
+                &[&self.tenant.id, &name],
+            )
+            .await
+            .expect("services")
+            .map(|row| (row.get(0), row.get(1)))
+    }
+}
+
+/// A service serving the adopted `books`, whose `written_by` it does not
+/// declare: the database fills it with the role that wrote the row.
+fn served_catalog() -> Value {
+    json!({
+        "name": "catalog-service",
+        "version": "0.1.0",
+        "mode": "crud",
+        "publishes": [],
+        "schema": "adopted",
+        "tables": [{
+            "name": "books",
+            "columns": [
+                {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false, "auto_generate": true},
+                {"name": "title", "column_type": "text", "primary_key": false, "nullable": true}
+            ]
+        }],
+    })
+}
+
+#[tokio::test]
+async fn a_service_whose_schema_a_role_owns_is_bound_before_its_first_deploy_and_runs_as_it() {
+    let Some(test) = Bindings::start().await else {
+        return;
+    };
+    test.enforced().await;
+    let owner = test.owned_schema("catalog_service_user", "pw-3").await;
+    let bind = |body: Value| test.set_for("catalog-service", body);
+
+    let (status, body) = bind(json!({"role": owner, "password": "pw-3"})).await;
+    assert_eq!(
+        status, 404,
+        "no service is recorded without register: {body}"
+    );
+    let (status, body) = bind(json!({"register": true, "password": "pw-3"})).await;
+    assert_eq!(status, 422, "a registration names its role: {body}");
+    let (status, body) = bind(json!({"role": owner, "schema": "catalog_service"})).await;
+    assert_eq!(status, 422, "a schema is given only with register: {body}");
+    let platform_role: String = test
+        .tenant_db
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .expect("current user")
+        .get(0);
+    let (status, body) = test
+        .set_for(
+            "shelf-service",
+            json!({"register": true, "role": platform_role, "password": "pw"}),
+        )
+        .await;
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body.to_string()
+            .contains("the one the platform connects as"),
+        "{body}"
+    );
+    assert_eq!(
+        test.service_recorded("shelf-service").await,
+        None,
+        "a registration whose binding is refused leaves no service"
+    );
+
+    let (status, body) = bind(json!({"register": true, "role": owner, "password": "pw-3"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["registered"], true);
+    assert_eq!(body["schema"], "catalog_service");
+    assert_eq!(body["binding"]["role"], owner);
+    assert_eq!(body["binding"]["managed"], false);
+    assert_eq!(body["report"]["verified"], true, "{body}");
+    assert!(!body.to_string().contains("pw-3"), "{body}");
+    assert_eq!(
+        test.service_recorded("catalog-service").await,
+        Some(("active".to_string(), 0)),
+        "recorded as a first deploy records it, and nothing of it runs"
+    );
+    let (status, body) = bind(json!({"register": true, "role": owner})).await;
+    assert_eq!(
+        status, 200,
+        "a registration sent again binds as before: {body}"
+    );
+    assert_eq!(body["registered"], false);
+    assert_eq!(
+        body["report"]["verified"], true,
+        "the password is kept: {body}"
+    );
+    let (status, body) = bind(json!({"register": true, "role": owner, "schema": "catalog"})).await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["error"],
+        "schema_name is immutable once the service is recorded: catalog_service \u{2192} catalog",
+        "{body}"
+    );
+    let audited: Vec<Value> = test
+        .db
+        .pool()
+        .get()
+        .await
+        .expect("checkout")
+        .query(
+            "SELECT details FROM audit_log WHERE action = 'db_role.set'
+             AND tenant_id = $1 AND resource_id = 'catalog-service' ORDER BY created_at",
+            &[&test.tenant.id],
+        )
+        .await
+        .expect("audit")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        audited
+            .iter()
+            .map(|details| (
+                details["registered"].clone(),
+                details["schema"].clone(),
+                details["role"].clone()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (json!(true), json!("catalog_service"), json!(owner)),
+            (json!(false), json!("catalog_service"), json!(owner)),
+        ],
+        "each set is audited with whether it recorded the service"
+    );
+
+    let mut elsewhere = served_catalog();
+    elsewhere["schema_name"] = json!("catalog_v2");
+    let (status, body) = test.platform.deploy(&test.tenant, &elsewhere).await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(
+        body["error"],
+        "schema_name is immutable once the service is recorded: catalog_service \u{2192} catalog_v2",
+        "a first deploy declares the schema the service was registered with: {body}"
+    );
+
+    let (status, body) = test.platform.deploy(&test.tenant, &served_catalog()).await;
+    assert_eq!(
+        status, 200,
+        "the first deploy goes through in one pass: {body}"
+    );
+    assert_eq!(body["status"], "active", "and takes the status it asks for");
+    let (status, body) = test.write_book().await;
+    assert!((200..300).contains(&status), "{status} {body}");
+    assert_eq!(
+        test.written_by().await,
+        [owner.clone()],
+        "the row was written as the bound role"
+    );
+    let shown = test.show_for("catalog-service").await;
+    assert!(
+        shown["binding"]["verified_at"].is_string(),
+        "verified again against the version that runs: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_first_deploy_refused_for_want_of_a_role_is_bound_and_deployed_again() {
+    let Some(test) = Bindings::start().await else {
+        return;
+    };
+    test.enforced().await;
+    let owner = test.owned_schema("catalog_service_user", "pw-4").await;
+
+    let (status, body) = test.platform.deploy(&test.tenant, &served_catalog()).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&format!("schema catalog_service belongs to {owner}"))
+            && error.contains("cufflink services db-role set"),
+        "the refusal names the owner and the way out: {body}"
+    );
+    assert_eq!(
+        test.service_recorded("catalog-service").await,
+        Some(("active".to_string(), 0)),
+        "the service is recorded, and no version of it runs"
+    );
+    let (status, body) = test.write_book().await;
+    assert_ne!(status, 200, "{body}");
+
+    let (status, body) = test
+        .set_for(
+            "catalog-service",
+            json!({"role": owner, "password": "pw-4"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["registered"], false);
+    assert_eq!(body["report"]["verified"], true, "{body}");
+    let (status, body) = test.platform.deploy(&test.tenant, &served_catalog()).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = test.write_book().await;
+    assert!((200..300).contains(&status), "{status} {body}");
+    assert_eq!(test.written_by().await, [owner]);
+}
+
+#[tokio::test]
+async fn a_registered_service_takes_the_status_its_first_deploy_asks_for_and_leaves_its_role() {
+    let Some(test) = Bindings::start().await else {
+        return;
+    };
+    let owner = test.owned_schema("catalog_service_user", "pw-5").await;
+    let (status, body) = test
+        .set_for(
+            "catalog-service",
+            json!({"register": true, "role": owner, "password": "pw-5"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["registered"], true);
+
+    let (status, body) = test.deploy_as("plan=true", &served_catalog()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (body["new"].clone(), body["status"].clone()),
+        (json!(false), json!("active")),
+        "a plan answers the status the deploy would set: {body}"
+    );
+    let (status, body) = test.deploy_as("inactive=true", &served_catalog()).await;
+    assert_eq!(
+        status, 200,
+        "a registration does not refuse an inactive first deploy: {body}"
+    );
+    assert_eq!(body["status"], "inactive");
+    let (status, body) = test.deploy_as("inactive=true", &served_catalog()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["status"], "inactive",
+        "a service that runs keeps its status"
+    );
+
+    let shelf = test.db.role("shelf_service_user");
+    test.sql(&format!(
+        "CREATE ROLE {shelf} LOGIN PASSWORD 'pw-6';
+         GRANT {shelf} TO CURRENT_USER;
+         CREATE SCHEMA shelves AUTHORIZATION {shelf};"
+    ))
+    .await;
+    let (status, body) = test
+        .set_for(
+            "shelf-service",
+            json!({"register": true, "schema": "shelves", "role": shelf, "password": "pw-6"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["schema"], "shelves");
+    let service_id: uuid::Uuid = test
+        .db
+        .pool()
+        .get()
+        .await
+        .expect("checkout")
+        .query_one(
+            "SELECT id FROM services WHERE tenant_id = $1 AND name = 'shelf-service'",
+            &[&test.tenant.id],
+        )
+        .await
+        .expect("registered")
+        .get(0);
+    let (status, body) = test
+        .platform
+        .send(
+            Method::DELETE,
+            &format!("/api/services/{service_id}"),
+            &format!("ApiKey {}", test.tenant.api_key),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(test.service_recorded("shelf-service").await, None);
+    let (status, _) = test
+        .platform
+        .send(Method::GET, &test.path("shelf-service"), &test.admin, None)
+        .await;
+    assert_eq!(status, 404, "the binding went with the service");
+    let (can_login, owns): (bool, bool) = test
+        .tenant_db
+        .query_one(
+            &format!(
+                "SELECT rolcanlogin, (SELECT nspowner = r.oid FROM pg_namespace WHERE nspname = 'shelves')
+                 FROM pg_roles r WHERE rolname = '{shelf}'"
+            ),
+            &[],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .expect("the role is still there");
+    assert!(
+        can_login && owns,
+        "a role the platform did not make is left as it was"
+    );
+}

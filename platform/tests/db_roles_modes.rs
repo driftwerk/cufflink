@@ -1000,32 +1000,24 @@ async fn db_roles_enforce_isolates_schemas() {
         .policy("enforce", json!({"readers": ["a_reader_nobody_made"]}))
         .await;
     assert_eq!(status, 200, "{body}");
-    test.deploy_crud("late-service", &["items"]).await;
+    let (status, refused) = test
+        .deploy(&crud_manifest("late-service", &["items"]))
+        .await;
+    assert_eq!(
+        status, 422,
+        "a first version that would run without a role is not activated: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("role a_reader_nobody_made does not exist")),
+        "and the refusal says why the role could not be made: {refused}"
+    );
     assert_eq!(
         test.binding("late-service").await,
         Value::Null,
         "a role that could not be made"
     );
-    let (status, refused) = test
-        .crud(
-            Method::POST,
-            "late-service",
-            "/items",
-            Some(json!({"body": "x"})),
-        )
-        .await;
-    assert_eq!(status, 503, "{refused}");
-    assert_eq!(
-        refused["error"],
-        "service late-service has no database role; \
-         `cufflink services db-role verify` says what it lacks"
-    );
-    assert_eq!(
-        test.api_query("late-service", "SELECT 1 AS one").await,
-        json!({"status": 503, "error": refused["error"]}),
-        "nor does the query API run a service without a role as the platform"
-    );
-    assert!(test.violations("denied", "no_verified_binding").await >= 1.0);
     let (status, created) = test
         .crud(Method::POST, STOCKS, "/items", Some(json!({"body": "x"})))
         .await;
@@ -1037,6 +1029,7 @@ async fn db_roles_enforce_isolates_schemas() {
     assert_eq!(status, 200, "{made}");
     assert_eq!(made["report"]["verified"], true, "{made}");
     test.set_policy("enforce", json!({})).await;
+    test.deploy_crud("late-service", &["items"]).await;
     let (status, created) = test
         .crud(
             Method::POST,
@@ -1059,6 +1052,27 @@ async fn db_roles_enforce_isolates_schemas() {
         )
         .await;
     assert_eq!(status, 200, "{bound}");
+    assert_eq!(bound["report"]["verified"], false, "{bound}");
+    let (status, refused) = test
+        .crud(
+            Method::POST,
+            "late-service",
+            "/items",
+            Some(json!({"body": "x"})),
+        )
+        .await;
+    assert_eq!(status, 503, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "service late-service has no database role; \
+         `cufflink services db-role verify` says what it lacks"
+    );
+    assert_eq!(
+        test.api_query("late-service", "SELECT 1 AS one").await,
+        json!({"status": 503, "error": refused["error"]}),
+        "nor does the query API run a service without a verified role as the platform"
+    );
+    assert!(test.violations("denied", "no_verified_binding").await >= 1.0);
     let (status, refused) = test
         .db_role(Method::POST, "late-service", "/rotate", None)
         .await;

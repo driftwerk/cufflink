@@ -84,7 +84,7 @@ pub fn require_recorded_schema(service: &Service, declared: &str) -> PlatformRes
         Ok(())
     } else {
         Err(PlatformError::Validation(format!(
-            "schema_name is immutable once deployed: {recorded} \u{2192} {declared}"
+            "schema_name is immutable once the service is recorded: {recorded} \u{2192} {declared}"
         )))
     }
 }
@@ -167,6 +167,80 @@ pub async fn find_or_create(
         .await
         .map(|row| row_to_service(&row))
         .map_err(|e| recording_error(schema, e))
+}
+
+/// Whether a version of the service was ever activated: a service recorded
+/// by a registration, or by a first deploy that failed, has none.
+pub async fn ever_deployed(pool: &deadpool_postgres::Pool, id: Uuid) -> PlatformResult<bool> {
+    Ok(pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM deployments WHERE service_id = $1)",
+            &[&id],
+        )
+        .await?
+        .get(0))
+}
+
+/// Records a service before its first deploy, as a deploy without
+/// `--inactive` records one, with the schema given, checked as a deploy
+/// checks it. The flag says whether
+/// this call recorded it; a service already recorded is answered as it is
+/// when its schema is `schema`.
+pub async fn register(
+    pool: &deadpool_postgres::Pool,
+    tenant_id: Uuid,
+    name: &str,
+    schema: &str,
+) -> PlatformResult<(Service, bool)> {
+    let recorded = async || -> PlatformResult<Option<Service>> {
+        find(pool, tenant_id, name)
+            .await?
+            .map(|service| require_recorded_schema(&service, schema).map(|()| service))
+            .transpose()
+    };
+    if let Some(service) = recorded().await? {
+        return Ok((service, false));
+    }
+    require_unreserved_schema(name, schema)?;
+    let client = pool.get().await?;
+    require_free_schema(&client, tenant_id, name, schema).await?;
+    let inserted = client
+        .query_opt(
+            &format!(
+                "INSERT INTO services (tenant_id, name, schema_name, status)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, name) DO NOTHING
+                 RETURNING {COLUMNS}"
+            ),
+            &[&tenant_id, &name, &schema, &Status::Active.as_str()],
+        )
+        .await
+        .map_err(|e| recording_error(schema, e))?;
+    match inserted {
+        Some(row) => Ok((row_to_service(&row), true)),
+        None => recorded()
+            .await?
+            .map(|service| (service, false))
+            .ok_or_else(|| {
+                PlatformError::Conflict(format!(
+                    "Service '{name}' was deleted while it was registered"
+                ))
+            }),
+    }
+}
+
+/// Removes a service a registration recorded, while it has never run.
+pub async fn unregister(pool: &deadpool_postgres::Pool, id: Uuid) -> PlatformResult<()> {
+    pool.get()
+        .await?
+        .execute(
+            "DELETE FROM services WHERE id = $1
+             AND NOT EXISTS (SELECT 1 FROM deployments WHERE service_id = $1)",
+            &[&id],
+        )
+        .await?;
+    Ok(())
 }
 
 pub async fn sharing_a_schema(
@@ -410,7 +484,7 @@ mod tests {
             matches!(
                 &refused,
                 PlatformError::Validation(m)
-                    if m == "schema_name is immutable once deployed: stock_service \u{2192} stocks"
+                    if m == "schema_name is immutable once the service is recorded: stock_service \u{2192} stocks"
             ),
             "{refused}"
         );

@@ -217,7 +217,7 @@ async fn a_schema_is_one_services_and_stays_it() {
 
     assert_eq!(
         validation(found_or_created(&pool, tenant.id, "loan-service", "loans_v2").await),
-        "schema_name is immutable once deployed: loan_service \u{2192} loans_v2"
+        "schema_name is immutable once the service is recorded: loan_service \u{2192} loans_v2"
     );
 }
 
@@ -246,7 +246,7 @@ async fn a_service_deployed_before_schemas_were_recorded_keeps_its_own() {
     assert_eq!(service.schema(), "stock_service");
     assert_eq!(
         validation(found_or_created(&pool, tenant.id, "stock-service", "stocks").await),
-        "schema_name is immutable once deployed: stock_service \u{2192} stocks"
+        "schema_name is immutable once the service is recorded: stock_service \u{2192} stocks"
     );
     assert_eq!(
         validation(found_or_created(&pool, tenant.id, "stocks", "stock_service").await),

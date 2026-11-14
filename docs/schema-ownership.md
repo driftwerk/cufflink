@@ -32,7 +32,9 @@ cufflink::service! {
   missing or of another type refuses the deploy (422) naming it. Columns the
   database has beyond the manifest are left alone.
 - `schema_name` — the Postgres schema, when it is not the service name with
-  `-` as `_`. It is fixed at the first deploy: a later deploy that changes
+  `-` as `_`. It is fixed when the service is first recorded, by its first
+  deploy or a [registration](db-roles-and-secrets.md#a-service-whose-schema-belongs-to-a-role):
+  a later deploy that changes
   it, or names a schema another service of the tenant uses, is refused.
 - An adopted table may not declare `index(...)` or `check(...)` (the
   platform would never create them), a `soft_delete` table needs its
@@ -48,6 +50,10 @@ and dropped when a later manifest leaves it out; the deploy plan warns of it.
 
 A rollback to a version that adopted checks the adoption again and is
 refused, like a deploy, when the database no longer holds it.
+
+Under per-service database roles, a service whose adopted schema belongs
+to a role is bound to that role before its first deploy
+([`db-role set --register`](db-roles-and-secrets.md#a-service-whose-schema-belongs-to-a-role)).
 
 ## Private tables
 
