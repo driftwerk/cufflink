@@ -183,6 +183,18 @@ pub async fn ever_deployed(pool: &deadpool_postgres::Pool, id: Uuid) -> Platform
         .get(0))
 }
 
+async fn recorded(
+    pool: &deadpool_postgres::Pool,
+    tenant_id: Uuid,
+    name: &str,
+    schema: &str,
+) -> PlatformResult<Option<Service>> {
+    find(pool, tenant_id, name)
+        .await?
+        .map(|service| require_recorded_schema(&service, schema).map(|()| service))
+        .transpose()
+}
+
 /// Records a service before its first deploy, as a deploy without
 /// `--inactive` records one, with the schema given, checked as a deploy
 /// checks it. The flag says whether
@@ -194,13 +206,7 @@ pub async fn register(
     name: &str,
     schema: &str,
 ) -> PlatformResult<(Service, bool)> {
-    let recorded = async || -> PlatformResult<Option<Service>> {
-        find(pool, tenant_id, name)
-            .await?
-            .map(|service| require_recorded_schema(&service, schema).map(|()| service))
-            .transpose()
-    };
-    if let Some(service) = recorded().await? {
+    if let Some(service) = recorded(pool, tenant_id, name, schema).await? {
         return Ok((service, false));
     }
     require_unreserved_schema(name, schema)?;
@@ -219,7 +225,7 @@ pub async fn register(
         .map_err(|e| recording_error(schema, e))?;
     match inserted {
         Some(row) => Ok((row_to_service(&row), true)),
-        None => recorded()
+        None => recorded(pool, tenant_id, name, schema)
             .await?
             .map(|service| (service, false))
             .ok_or_else(|| {

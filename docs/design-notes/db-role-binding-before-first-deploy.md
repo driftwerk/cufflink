@@ -137,9 +137,11 @@ service is recorded, which a registration also does.
     statements run as the bound role;
   - the old way still works: a first deploy refused, then a binding, then
     a deploy;
-  - an unknown service without `register` is a 404; a registration without
-    a role, with an invalid or taken schema, or whose binding is refused,
-    leaves no service behind;
+  - an unknown service without `register` is a 404, a registration
+    without a role or a schema given without `register` is refused, and a
+    registration whose binding is refused leaves no service behind (an
+    invalid or reserved schema is refused before anything is recorded,
+    which the unit test of the request covers);
   - a first deploy that declares another schema than the registration is
     refused;
   - a registered service planned, and deployed `--inactive`;
