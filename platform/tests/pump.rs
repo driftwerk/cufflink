@@ -309,6 +309,126 @@ async fn a_shutdown_hands_back_the_rest_of_the_batch() {
     js.delete_stream(&name).await.expect("delete stream");
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    Stop,
+    Shutdown,
+}
+
+const HAND_BACK_MAX_DELIVER: i64 = 4;
+const HAND_BACK_ACK_WAIT: Duration = Duration::from_secs(3);
+
+async fn a_hand_back_keeps_every_delivery(ending: Ending) {
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let Some(nats_url) = infra.require_nats() else {
+        return;
+    };
+    let client = async_nats::connect(nats_url).await.expect("nats");
+    let js = jetstream::new(client.clone());
+    let name = unique("PUMP_HAND_BACK");
+    let subject = format!("pump.{}", name.to_lowercase());
+    let stream = js
+        .create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![subject.clone()],
+            retention: stream::RetentionPolicy::WorkQueue,
+            storage: stream::StorageType::Memory,
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    let mut consumer = stream
+        .create_consumer(pull::Config {
+            durable_name: Some("worker".into()),
+            ack_wait: HAND_BACK_ACK_WAIT,
+            max_deliver: HAND_BACK_MAX_DELIVER,
+            ..Default::default()
+        })
+        .await
+        .expect("consumer");
+    let mut given_up = client
+        .subscribe(format!(
+            "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.{name}.worker"
+        ))
+        .await
+        .expect("advisories");
+
+    let (stop, shutdown) = (
+        CancellationToken::new(),
+        Shutdown::new(Duration::from_secs(30)),
+    );
+    let concurrency = usize::try_from(HAND_BACK_MAX_DELIVER).expect("a small count");
+    let running = tokio::spawn(pump::run(
+        consumer.clone(),
+        PumpConfig::sequential(HAND_BACK_ACK_WAIT).concurrent(concurrency),
+        Arc::new(Slow {
+            takes: Duration::ZERO,
+            deliveries: Arc::default(),
+        }),
+        Arc::new(js.clone()),
+        stop.clone(),
+        shutdown.clone(),
+    ));
+    let deadline = Instant::now() + PROMPTLY;
+    while consumer.info().await.expect("info").num_waiting < 1 {
+        assert!(Instant::now() < deadline, "the pump never pulled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    match ending {
+        Ending::Stop => stop.cancel(),
+        Ending::Shutdown => shutdown.trigger(),
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    publish(&js, &subject, r#"{"n":1}"#).await;
+    let exit = running.await.expect("pump");
+    assert_eq!(
+        exit,
+        match ending {
+            Ending::Stop => PumpExit::Stopped,
+            Ending::Shutdown => PumpExit::ShuttingDown,
+        }
+    );
+    shutdown.drain_tasks().await;
+
+    let again = next_delivery(&consumer, PROMPTLY)
+        .await
+        .expect("the message is still deliverable after the hand-back");
+    assert_eq!(&again.payload[..], br#"{"n":1}"#);
+    let delivered = again.info().expect("info").delivered;
+    assert!(
+        delivered <= 2,
+        "{ending:?}: delivered {delivered}, more than the one that brought it in"
+    );
+    again.double_ack().await.expect("ack");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), given_up.next())
+            .await
+            .is_err(),
+        "{ending:?}: the server never gave up on the message"
+    );
+    let info = acknowledged(&mut consumer, 1, PROMPTLY).await;
+    assert_eq!(
+        (info.ack_floor.stream_sequence, info.num_ack_pending),
+        (1, 0),
+        "{info:?}"
+    );
+    stream.delete_consumer("worker").await.expect("delete");
+    js.delete_stream(&name).await.expect("delete stream");
+}
+
+#[tokio::test]
+async fn a_stopped_pump_spends_no_delivery_handing_back_a_message_that_arrives_as_it_stops() {
+    a_hand_back_keeps_every_delivery(Ending::Stop).await;
+}
+
+#[tokio::test]
+async fn a_shutdown_spends_no_delivery_handing_back_a_message_that_arrives_as_it_stops() {
+    a_hand_back_keeps_every_delivery(Ending::Shutdown).await;
+}
+
 #[tokio::test]
 async fn heartbeat_prevents_redelivery() {
     let Some(infra) = common::infra().await else {
