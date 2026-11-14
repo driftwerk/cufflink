@@ -1,10 +1,14 @@
 use crate::shutdown::Shutdown;
-use async_nats::{Client, Event, HeaderMap};
+use async_nats::jetstream::{self, consumer::pull::BatchConfig, consumer::PullConsumer};
+use async_nats::{Client, Event, HeaderMap, StatusCode, Subject, Subscriber};
 use axum::body::Bytes;
+use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, Stream, StreamExt};
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -209,38 +213,46 @@ impl HandBack for async_nats::jetstream::Message {
     async fn hand_back(&self) -> bool {
         self.ack_with(async_nats::jetstream::AckKind::Nak(None))
             .await
-            .inspect_err(|e| tracing::warn!(error = %e, "Failed to nak a message on shutdown"))
+            .inspect_err(|e| tracing::warn!(error = %e, "Failed to hand a message back"))
             .is_ok()
     }
 }
 
-pub async fn nak_rest<M, S, E>(first: M, batch: &mut S) -> usize
+pub trait Pull: Stream + Unpin + Send {
+    fn close(&mut self) -> BoxFuture<'_, ()>;
+}
+
+impl<P: Pull + ?Sized> Pull for Box<P> {
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        (**self).close()
+    }
+}
+
+pub async fn hand_back<M, P, E>(first: Option<M>, batch: &mut P) -> usize
 where
     M: HandBack,
-    S: Stream<Item = Result<M, E>> + Unpin,
+    P: Pull<Item = Result<M, E>>,
 {
     let deadline = tokio::time::Instant::now() + NAK_DRAIN_BUDGET;
-    usize::from(first.hand_back().await) + nak_arrivals(batch, deadline).await
-}
-
-pub async fn nak_pending<M, S, E>(batch: &mut S) -> usize
-where
-    M: HandBack,
-    S: Stream<Item = Result<M, E>> + Unpin,
-{
-    nak_arrivals(batch, tokio::time::Instant::now() + NAK_DRAIN_BUDGET).await
-}
-
-async fn nak_arrivals<M, S, E>(batch: &mut S, deadline: tokio::time::Instant) -> usize
-where
-    M: HandBack,
-    S: Stream<Item = Result<M, E>> + Unpin,
-{
-    let mut naked = 0;
-    while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, batch.next()).await {
-        naked += usize::from(msg.hand_back().await);
-    }
-    naked
+    let closed = tokio::time::timeout_at(deadline, batch.close())
+        .await
+        .is_ok();
+    let held: Vec<Result<M, E>> = if closed {
+        batch
+            .take_until(tokio::time::sleep_until(deadline))
+            .collect()
+            .await
+    } else {
+        tracing::warn!("A pull request did not close in time; handing back what it holds");
+        std::iter::from_fn(|| batch.next().now_or_never().flatten()).collect()
+    };
+    futures_util::stream::iter(first.map(Ok).into_iter().chain(held))
+        .take_while(|arrival| std::future::ready(arrival.is_ok()))
+        .filter_map(|arrival| std::future::ready(arrival.ok()))
+        .then(|msg| async move { msg.hand_back().await })
+        .filter(|handed_back| std::future::ready(*handed_back))
+        .count()
+        .await
 }
 
 #[derive(Debug)]
@@ -251,10 +263,10 @@ pub enum BatchStep<M = async_nats::jetstream::Message> {
     Failed(String),
 }
 
-pub async fn next_or_hand_back<M, S, E>(batch: &mut S, shutdown: &Shutdown) -> BatchStep<M>
+pub async fn next_or_hand_back<M, P, E>(batch: &mut P, shutdown: &Shutdown) -> BatchStep<M>
 where
     M: HandBack,
-    S: Stream<Item = Result<M, E>> + Unpin,
+    P: Pull<Item = Result<M, E>>,
     E: fmt::Display,
 {
     let next = if shutdown.is_triggered() {
@@ -267,14 +279,170 @@ where
         }
     };
     match next {
-        None => BatchStep::HandedBack(nak_pending(batch).await),
+        None => BatchStep::HandedBack(hand_back(None, batch).await),
         Some(Ok(Some(Ok(msg)))) if shutdown.is_triggered() => {
-            BatchStep::HandedBack(nak_rest(msg, batch).await)
+            BatchStep::HandedBack(hand_back(Some(msg), batch).await)
         }
         Some(Ok(Some(Ok(msg)))) => BatchStep::Message(Box::new(msg)),
         Some(Ok(Some(Err(e)))) => BatchStep::Failed(e.to_string()),
         Some(Ok(None)) => BatchStep::End,
         Some(Err(e)) => BatchStep::Failed(e.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    Message,
+    Heartbeat,
+    End,
+    Failed,
+}
+
+fn arrival(status: Option<StatusCode>) -> Arrival {
+    match status.unwrap_or(StatusCode::OK) {
+        StatusCode::OK => Arrival::Message,
+        StatusCode::IDLE_HEARTBEAT => Arrival::Heartbeat,
+        StatusCode::TIMEOUT | StatusCode::NOT_FOUND => Arrival::End,
+        _ => Arrival::Failed,
+    }
+}
+
+pub struct PullBatch {
+    subscriber: Subscriber,
+    context: jetstream::Context,
+    remaining: usize,
+    gives_up: Pin<Box<tokio::time::Sleep>>,
+    ended: bool,
+}
+
+const PULL_GIVES_UP_AFTER_EXPIRY: Duration = Duration::from_secs(5);
+
+impl PullBatch {
+    pub async fn request(
+        consumer: &PullConsumer,
+        context: &jetstream::Context,
+        max: usize,
+        expires: Duration,
+    ) -> Result<Self, String> {
+        let client = context.client();
+        let inbox = Subject::from(client.new_inbox());
+        let subscriber = client
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        consumer
+            .request_batch(
+                BatchConfig {
+                    batch: max,
+                    expires: Some(expires),
+                    ..BatchConfig::default()
+                },
+                inbox,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            subscriber,
+            context: context.clone(),
+            remaining: max,
+            gives_up: Box::pin(tokio::time::sleep(
+                expires.saturating_add(PULL_GIVES_UP_AFTER_EXPIRY),
+            )),
+            ended: false,
+        })
+    }
+
+    fn end<T>(&mut self, last: Option<T>) -> Poll<Option<T>> {
+        self.ended = true;
+        Poll::Ready(last)
+    }
+}
+
+impl Stream for PullBatch {
+    type Item = Result<jetstream::Message, String>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.ended || this.remaining == 0 || this.gives_up.as_mut().poll(cx).is_ready() {
+            return this.end(None);
+        }
+        loop {
+            let Some(message) = std::task::ready!(this.subscriber.poll_next_unpin(cx)) else {
+                return this.end(None);
+            };
+            match arrival(message.status) {
+                Arrival::Heartbeat => continue,
+                Arrival::End => return this.end(None),
+                Arrival::Failed => {
+                    return this.end(Some(Err(format!(
+                        "error while processing messages from the stream: {}, {:?}",
+                        message.status.unwrap_or_default(),
+                        message.description
+                    ))))
+                }
+                Arrival::Message => {
+                    this.remaining -= 1;
+                    return Poll::Ready(Some(Ok(jetstream::Message {
+                        message,
+                        context: this.context.clone(),
+                    })));
+                }
+            }
+        }
+    }
+}
+
+impl Pull for PullBatch {
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        async move {
+            if let Err(e) = self.subscriber.drain().await {
+                tracing::warn!(error = %e, "Could not close a pull request");
+            }
+        }
+        .boxed()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct Closable<S> {
+    inner: S,
+    closed: bool,
+}
+
+#[cfg(test)]
+impl<S> Closable<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            closed: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<S: Stream + Unpin> Stream for Closable<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<S::Item>> {
+        let this = &mut *self;
+        match this.inner.poll_next_unpin(cx) {
+            Poll::Pending if this.closed => Poll::Ready(None),
+            polled => polled,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<S: Stream + Unpin + Send> Pull for Closable<S> {
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        self.closed = true;
+        std::future::ready(()).boxed()
     }
 }
 
@@ -566,26 +734,44 @@ mod tests {
     }
 
     #[test]
-    fn fetch_stall_fires_before_async_nats_quietly_ends_the_batch() {
-        let async_nats_batch_end = FETCH_EXPIRES + Duration::from_secs(5);
+    fn fetch_stall_fires_before_a_pull_quietly_gives_up() {
+        let pull_gives_up = FETCH_EXPIRES + PULL_GIVES_UP_AFTER_EXPIRY;
         assert!(FETCH_STALL_AFTER > FETCH_EXPIRES);
-        assert!(FETCH_STALL_AFTER < async_nats_batch_end);
+        assert!(FETCH_STALL_AFTER < pull_gives_up);
     }
 
-    type Batch = futures_util::stream::BoxStream<
-        'static,
-        Result<async_nats::jetstream::Message, &'static str>,
+    #[test]
+    fn a_pull_reads_its_statuses_as_async_nats_does() {
+        assert_eq!(arrival(None), Arrival::Message);
+        assert_eq!(arrival(Some(StatusCode::OK)), Arrival::Message);
+        assert_eq!(
+            arrival(Some(StatusCode::IDLE_HEARTBEAT)),
+            Arrival::Heartbeat
+        );
+        assert_eq!(arrival(Some(StatusCode::TIMEOUT)), Arrival::End);
+        assert_eq!(arrival(Some(StatusCode::NOT_FOUND)), Arrival::End);
+        for failed in [StatusCode::NO_RESPONDERS, StatusCode::REQUEST_TERMINATED] {
+            assert_eq!(arrival(Some(failed)), Arrival::Failed, "{failed}");
+        }
+    }
+
+    type Batch = Closable<
+        futures_util::stream::BoxStream<
+            'static,
+            Result<async_nats::jetstream::Message, &'static str>,
+        >,
     >;
 
     #[tokio::test]
     async fn a_batch_ends_or_fails_as_the_stream_says() {
         let shutdown = Shutdown::new(Duration::from_secs(5));
-        let mut ended: Batch = futures_util::stream::empty().boxed();
+        let mut ended: Batch = Closable::new(futures_util::stream::empty().boxed());
         assert!(matches!(
             next_or_hand_back(&mut ended, &shutdown).await,
             BatchStep::End
         ));
-        let mut failing: Batch = futures_util::stream::iter([Err("consumer deleted")]).boxed();
+        let mut failing: Batch =
+            Closable::new(futures_util::stream::iter([Err("consumer deleted")]).boxed());
         assert!(matches!(
             next_or_hand_back(&mut failing, &shutdown).await,
             BatchStep::Failed(e) if e == "consumer deleted"
@@ -601,7 +787,7 @@ mod tests {
             trigger.trigger();
         });
         let started = tokio::time::Instant::now();
-        let mut silent: Batch = futures_util::stream::pending().boxed();
+        let mut silent: Batch = Closable::new(futures_util::stream::pending().boxed());
         assert!(matches!(
             next_or_hand_back(&mut silent, &shutdown).await,
             BatchStep::HandedBack(0)
@@ -659,5 +845,143 @@ mod tests {
         assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30]);
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+
+    type Naks = Arc<std::sync::Mutex<Vec<u64>>>;
+
+    struct Delivered {
+        sequence: u64,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        redeliver: tokio::sync::mpsc::UnboundedSender<u64>,
+        naks: Naks,
+    }
+
+    impl HandBack for Delivered {
+        async fn hand_back(&self) -> bool {
+            self.naks.lock().expect("naks").push(self.sequence);
+            if self.open.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.redeliver.send(self.sequence);
+            }
+            true
+        }
+    }
+
+    struct ServerPull {
+        queue: tokio::sync::mpsc::UnboundedReceiver<u64>,
+        redeliver: tokio::sync::mpsc::UnboundedSender<u64>,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        capacity: usize,
+        closes: bool,
+        naks: Naks,
+    }
+
+    impl ServerPull {
+        fn holding(sequences: &[u64], capacity: usize) -> (Self, Naks) {
+            let (redeliver, queue) = tokio::sync::mpsc::unbounded_channel();
+            sequences.iter().for_each(|sequence| {
+                redeliver.send(*sequence).expect("queued");
+            });
+            let naks = Naks::default();
+            let pull = Self {
+                queue,
+                redeliver,
+                open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                capacity,
+                closes: true,
+                naks: Arc::clone(&naks),
+            };
+            (pull, naks)
+        }
+
+        fn never_closing(self) -> Self {
+            Self {
+                closes: false,
+                ..self
+            }
+        }
+
+        fn delivered(&self, sequence: u64) -> Delivered {
+            Delivered {
+                sequence,
+                open: Arc::clone(&self.open),
+                redeliver: self.redeliver.clone(),
+                naks: Arc::clone(&self.naks),
+            }
+        }
+    }
+
+    impl Stream for ServerPull {
+        type Item = Result<Delivered, String>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            let this = &mut *self;
+            if this.capacity == 0 {
+                return Poll::Ready(None);
+            }
+            match this.queue.poll_recv(cx) {
+                Poll::Ready(Some(sequence)) => {
+                    this.capacity -= 1;
+                    Poll::Ready(Some(Ok(this.delivered(sequence))))
+                }
+                Poll::Pending if this.open.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Poll::Pending
+                }
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    impl Pull for ServerPull {
+        fn close(&mut self) -> BoxFuture<'_, ()> {
+            if !self.closes {
+                return futures_util::future::pending().boxed();
+            }
+            self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(()).boxed()
+        }
+    }
+
+    fn naked(naks: &Naks) -> Vec<u64> {
+        naks.lock().expect("naks").clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hand_back_naks_each_message_once_however_much_room_the_pull_has_left() {
+        let (mut pull, naks) = ServerPull::holding(&[1, 2], 8);
+        assert_eq!(hand_back(None, &mut pull).await, 2);
+        assert_eq!(naked(&naks), [1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hand_back_closes_the_pull_before_it_naks_the_message_in_hand() {
+        let (mut pull, naks) = ServerPull::holding(&[2], 8);
+        let in_hand = pull.delivered(1);
+        assert_eq!(hand_back(Some(in_hand), &mut pull).await, 2);
+        assert_eq!(naked(&naks), [1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_naks_each_message_in_the_batch_once() {
+        let shutdown = Shutdown::new(Duration::from_secs(5));
+        shutdown.trigger();
+        let (mut pull, naks) = ServerPull::holding(&[1, 2, 3], 8);
+        assert!(matches!(
+            next_or_hand_back(&mut pull, &shutdown).await,
+            BatchStep::HandedBack(3)
+        ));
+        assert_eq!(naked(&naks), [1, 2, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_that_never_closes_still_has_what_it_holds_handed_back_once_in_time() {
+        let (pull, naks) = ServerPull::holding(&[1, 2], 8);
+        let mut pull = pull.never_closing();
+        let started = tokio::time::Instant::now();
+        assert_eq!(hand_back(Some(pull.delivered(7)), &mut pull).await, 3);
+        assert_eq!(started.elapsed(), NAK_DRAIN_BUDGET);
+        assert_eq!(naked(&naks), [7, 1, 2]);
     }
 }

@@ -1363,6 +1363,25 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.38.2
+
+Unreleased.
+
+- A consumer loop that hands back its batch, because its consumer stopped
+  being consumed on this platform or the platform is shutting down, closes
+  its pull request before it naks anything, and naks each message it holds
+  once. It used to nak every arrival at once for up to a second while the
+  pull was still open. The server then redelivered each nacked message into
+  the same pull, where it was nacked again. A pull asks for up to the
+  consumer's concurrency, so a consumer whose concurrency was at least its
+  `max_deliver` could have a message's deliveries all spent by one stop or
+  restart: the message was given up on with no dead letter. A message
+  handed back now spends only the delivery that brought it to the loop.
+  A message published while the loop stops is never delivered to it.
+  Subscriptions, webhook deliveries and the worker's consumers all
+  change. The rollback to v0.38.1 brings the old behaviour back and needs
+  nothing undone.
+
 ## Changes in v0.38.1
 
 Large object-storage uploads in parts, a configurable request timeout, and

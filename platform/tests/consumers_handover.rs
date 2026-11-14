@@ -221,7 +221,7 @@ impl Loop {
             .expect("durable");
         let stop = CancellationToken::new();
         let running = tokio::spawn(pump::run(
-            consumer,
+            pump::PullSource::new(consumer, js),
             PumpConfig {
                 fetch_expires: Duration::from_secs(1),
                 ..PumpConfig::sequential(ACK_WAIT)

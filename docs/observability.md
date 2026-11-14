@@ -462,7 +462,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `cufflink_subscription_messages_total` | counter | `tenant`, `service`, `handler`, `result` (`ok`, `error`, `invalid`, `nak`, `retry`, `dead_letter`, `terminal`) | Subscription messages by outcome; `error` includes a handler the shutdown stopped (its message is acknowledged); `nak` counts messages handed back at shutdown. Under `ack: on_success`, `retry` is a message delivered again, `dead_letter` one given up on and kept, `terminal` one given up on without a dead letter |
+| `cufflink_subscription_messages_total` | counter | `tenant`, `service`, `handler`, `result` (`ok`, `error`, `invalid`, `nak`, `retry`, `dead_letter`, `terminal`) | Subscription messages by outcome; `error` includes a handler the shutdown stopped (its message is acknowledged); `nak` counts messages handed back at shutdown or when the loop stops, each once. Under `ack: on_success`, `retry` is a message delivered again, `dead_letter` one given up on and kept, `terminal` one given up on without a dead letter |
 | `cufflink_subscription_handler_duration_seconds` | histogram | `kind` (`subscription`, `schedule`, `job`, `hook`, `backup`, `webhook`) | How long a consumer's handler took with a message (platform and worker) |
 | `cufflink_pump_inflight` | gauge | `kind` | Messages being handled by the consumers of that kind (platform and worker) |
 | `cufflink_pump_heartbeats_total` | counter | `kind` | Times a message still being handled had its `ack_wait` restarted |

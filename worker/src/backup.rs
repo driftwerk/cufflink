@@ -75,7 +75,7 @@ pub async fn run_backup_consumer(
     tracing::info!("Backup consumer ready");
     let _up = readiness.consumer_up();
     let exit = pump::run(
-        consumer,
+        pump::PullSource::new(consumer, &app_state.jetstream),
         PumpConfig::sequential(BACKUP_ACK_WAIT),
         Arc::new(BackupWork {
             app_state: app_state.clone(),

@@ -1,15 +1,15 @@
 use super::delivery::{result_label, Decision, Outcome};
 use super::dlq::DeadLetter;
 use crate::nats_conn::{
-    nak_pending, next_or_hand_back, start_fetch, BatchStep, FetchError, HandBack, NAK_DRAIN_BUDGET,
+    hand_back, next_or_hand_back, start_fetch, BatchStep, FetchError, HandBack, Pull, PullBatch,
+    NAK_DRAIN_BUDGET,
 };
 use crate::shutdown::Shutdown;
 use async_nats::jetstream::{self, consumer::PullConsumer, AckKind};
 use chrono::{DateTime, Utc};
 use cufflink_telemetry::GaugeGuard;
 use futures_util::future::BoxFuture;
-use futures_util::stream::BoxStream;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,7 +79,7 @@ pub trait Work<M: Delivery = jetstream::Message>: Send + Sync + 'static {
     ) -> BoxFuture<'a, Option<DeadLetter>>;
 }
 
-pub type Batch<M> = BoxStream<'static, Result<M, String>>;
+pub type Batch<M> = Box<dyn Pull<Item = Result<M, String>>>;
 
 pub trait Source: Send + Sync + 'static {
     type Message: Delivery;
@@ -427,7 +427,7 @@ async fn drain<M: Delivery>(
                 step = next_or_hand_back(&mut batch, &pump.shutdown) => step,
                 _ = stop.stopped.cancelled() => {
                     if !stop.is_replaced() {
-                        pump.count("nak", nak_pending(&mut batch).await as u64);
+                        pump.count("nak", hand_back(None, &mut batch).await as u64);
                         return BatchEnd::Exit(PumpExit::Stopped);
                     }
                     replaced = Some(tokio::time::Instant::now() + NAK_DRAIN_BUDGET);
@@ -514,7 +514,24 @@ fn header_values(headers: &async_nats::HeaderMap) -> Vec<(String, Vec<String>)> 
     named
 }
 
-impl Source for PullConsumer {
+pub struct PullSource {
+    consumer: PullConsumer,
+    jetstream: jetstream::Context,
+}
+
+impl PullSource {
+    /// `jetstream` must be the context `consumer` was obtained through: the
+    /// pull's subscription and the acks share its connection, so a pull's
+    /// unsubscribe reaches the server before the naks that hand its batch back.
+    pub fn new(consumer: PullConsumer, jetstream: &jetstream::Context) -> Self {
+        Self {
+            consumer,
+            jetstream: jetstream.clone(),
+        }
+    }
+}
+
+impl Source for PullSource {
     type Message = jetstream::Message;
 
     fn fetch(
@@ -523,9 +540,14 @@ impl Source for PullConsumer {
         expires: Duration,
     ) -> BoxFuture<'_, Result<Batch<jetstream::Message>, FetchError>> {
         async move {
-            start_fetch(self.batch().max_messages(max).expires(expires).messages())
-                .await
-                .map(|batch| batch.map(|item| item.map_err(|e| e.to_string())).boxed())
+            start_fetch(PullBatch::request(
+                &self.consumer,
+                &self.jetstream,
+                max,
+                expires,
+            ))
+            .await
+            .map(|batch| Box::new(batch) as Batch<jetstream::Message>)
         }
         .boxed()
     }
@@ -545,6 +567,8 @@ impl DeadLetters for jetstream::Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nats_conn::Closable;
+    use futures_util::StreamExt;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -645,33 +669,43 @@ mod tests {
             let next = self.fetches.lock().expect("fetches").pop_front();
             async move {
                 match next {
-                    Some(Fetch::Messages(sequences)) => Ok(futures_util::stream::iter(
-                        sequences
-                            .into_iter()
-                            .take(max)
-                            .map(|sequence| self.message(sequence))
-                            .collect::<Vec<_>>(),
-                    )
-                    .boxed()),
-                    Some(Fetch::Trickle(arrivals)) => Ok(futures_util::stream::iter(
-                        arrivals
-                            .into_iter()
-                            .take(max)
-                            .map(|(delay, sequence)| (delay, self.message(sequence)))
-                            .collect::<Vec<_>>(),
-                    )
-                    .then(|(delay, message)| async move {
-                        tokio::time::sleep(delay).await;
-                        message
-                    })
-                    .chain(futures_util::stream::pending())
-                    .boxed()),
+                    Some(Fetch::Messages(sequences)) => Ok(batch(
+                        futures_util::stream::iter(
+                            sequences
+                                .into_iter()
+                                .take(max)
+                                .map(|sequence| self.message(sequence))
+                                .collect::<Vec<_>>(),
+                        )
+                        .boxed(),
+                    )),
+                    Some(Fetch::Trickle(arrivals)) => Ok(batch(
+                        futures_util::stream::iter(
+                            arrivals
+                                .into_iter()
+                                .take(max)
+                                .map(|(delay, sequence)| (delay, self.message(sequence)))
+                                .collect::<Vec<_>>(),
+                        )
+                        .then(|(delay, message)| async move {
+                            tokio::time::sleep(delay).await;
+                            message
+                        })
+                        .chain(futures_util::stream::pending())
+                        .boxed(),
+                    )),
                     Some(Fetch::Fails(error)) => Err(FetchError(error.to_string())),
-                    None => Ok(futures_util::stream::pending().boxed()),
+                    None => Ok(batch(futures_util::stream::pending().boxed())),
                 }
             }
             .boxed()
         }
+    }
+
+    fn batch(
+        arrivals: futures_util::stream::BoxStream<'static, Result<FakeMessage, String>>,
+    ) -> Batch<FakeMessage> {
+        Box::new(Closable::new(arrivals))
     }
 
     struct FakeWork {
@@ -1006,7 +1040,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_shutdown_hands_back_what_was_not_started_and_finishes_what_was() {
+    async fn a_shutdown_finishes_what_was_started_and_leaves_what_had_not_arrived() {
         let work = FakeWork::new(Duration::from_secs(5));
         let handled = Arc::clone(&work.handled);
         let running = start(config(2, 2, None), work, trickle(), true);
@@ -1023,13 +1057,13 @@ mod tests {
         assert_eq!(settled(&running.log, Settle::Ack), [1]);
         assert_eq!(
             settled(&running.log, Settle::Nak(Duration::ZERO)),
-            [2],
-            "the one that arrived after is handed back"
+            Vec::<u64>::new(),
+            "the pull is closed first, so the one due after never reaches the pump"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_stopped_pump_hands_back_the_rest_of_its_batch() {
+    async fn a_stopped_pump_closes_its_pull_before_anything_more_arrives() {
         let work = FakeWork::new(Duration::from_secs(5));
         let handled = Arc::clone(&work.handled);
         let running = start(config(2, 2, None), work, trickle(), true);
@@ -1038,7 +1072,10 @@ mod tests {
         assert_eq!(exit, PumpExit::Stopped);
         assert_eq!(handled.load(Ordering::SeqCst), 1);
         assert_eq!(settled(&log, Settle::Ack), [1]);
-        assert_eq!(settled(&log, Settle::Nak(Duration::ZERO)), [2]);
+        assert_eq!(
+            settled(&log, Settle::Nak(Duration::ZERO)),
+            Vec::<u64>::new()
+        );
         assert_eq!(fetches(&log), [2], "a stopped pump fetches nothing more");
     }
 
