@@ -17,7 +17,7 @@ axum = { workspace = true }
 eyre = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
-subtle = "2"
+subtle = "2.6.1"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
