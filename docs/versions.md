@@ -1367,6 +1367,19 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 Unreleased.
 
+Pre-release v0.38.2-rc.1 is a release candidate of the hand-back fix
+below, so that its platform image can be tried before v0.38.2 is final.
+Every published crate is at its next patch with `-rc.1`: cufflink-types,
+cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink
+0.22.2-rc.1; cufflink-fn 0.38.2-rc.1; cufflink-cli 0.29.2-rc.1;
+cufflink-nats 0.9.4-rc.1; cufflink-native 0.10.2-rc.1; cufflink-model
+0.1.6-rc.1; cufflink-sql-parse 0.2.2-rc.1. It changes no manifest, SDK or
+host function, needs no migration and adds no setting. Rolling a platform
+back from it to v0.38.1 needs nothing undone. A requirement such as
+`cufflink-fn = "0.38"`, which `cufflink init` scaffolds, never selects a
+pre-release: a service tries the candidate's crates only by naming their
+exact versions.
+
 - A consumer loop that hands back its batch, because its consumer stopped
   being consumed on this platform or the platform is shutting down, closes
   its pull request before it naks anything, and naks each message it holds
