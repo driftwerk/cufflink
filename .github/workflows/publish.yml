@@ -101,3 +101,4 @@ jobs:
         with:
           files: cufflink-linux-x86_64
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
