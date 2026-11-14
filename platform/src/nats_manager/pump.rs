@@ -9,7 +9,7 @@ use async_nats::jetstream::{self, consumer::PullConsumer, AckKind};
 use chrono::{DateTime, Utc};
 use cufflink_telemetry::GaugeGuard;
 use futures_util::future::BoxFuture;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -565,6 +565,7 @@ impl DeadLetters for jetstream::Context {
 mod tests {
     use super::*;
     use crate::nats_conn::Closable;
+    use futures_util::StreamExt;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
