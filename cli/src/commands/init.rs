@@ -780,7 +780,10 @@ mod tests {
             .join("Cargo.toml");
         let parsed: toml::Value = toml::from_str(&fs::read_to_string(manifest).unwrap()).unwrap();
         let version = parsed["package"]["version"].as_str().unwrap();
-        version.rsplit_once('.').unwrap().0.to_string()
+        let release = version
+            .split_once('-')
+            .map_or(version, |(release, _)| release);
+        release.rsplit_once('.').unwrap().0.to_string()
     }
 
     #[test]
