@@ -233,10 +233,20 @@ where
     M: HandBack,
     P: Pull<Item = Result<M, E>>,
 {
-    batch.close().await;
     let deadline = tokio::time::Instant::now() + NAK_DRAIN_BUDGET;
-    futures_util::stream::iter(first.map(Ok))
-        .chain(batch.take_until(tokio::time::sleep_until(deadline)))
+    let closed = tokio::time::timeout_at(deadline, batch.close())
+        .await
+        .is_ok();
+    let held: Vec<Result<M, E>> = if closed {
+        batch
+            .take_until(tokio::time::sleep_until(deadline))
+            .collect()
+            .await
+    } else {
+        tracing::warn!("A pull request did not close in time; handing back what it holds");
+        std::iter::from_fn(|| batch.next().now_or_never().flatten()).collect()
+    };
+    futures_util::stream::iter(first.map(Ok).into_iter().chain(held))
         .take_while(|arrival| std::future::ready(arrival.is_ok()))
         .filter_map(|arrival| std::future::ready(arrival.ok()))
         .then(|msg| async move { msg.hand_back().await })
@@ -861,6 +871,7 @@ mod tests {
         redeliver: tokio::sync::mpsc::UnboundedSender<u64>,
         open: Arc<std::sync::atomic::AtomicBool>,
         capacity: usize,
+        closes: bool,
         naks: Naks,
     }
 
@@ -876,9 +887,17 @@ mod tests {
                 redeliver,
                 open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 capacity,
+                closes: true,
                 naks: Arc::clone(&naks),
             };
             (pull, naks)
+        }
+
+        fn never_closing(self) -> Self {
+            Self {
+                closes: false,
+                ..self
+            }
         }
 
         fn delivered(&self, sequence: u64) -> Delivered {
@@ -917,6 +936,9 @@ mod tests {
 
     impl Pull for ServerPull {
         fn close(&mut self) -> BoxFuture<'_, ()> {
+            if !self.closes {
+                return futures_util::future::pending().boxed();
+            }
             self.open.store(false, std::sync::atomic::Ordering::SeqCst);
             std::future::ready(()).boxed()
         }
@@ -951,5 +973,15 @@ mod tests {
             BatchStep::HandedBack(3)
         ));
         assert_eq!(naked(&naks), [1, 2, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_that_never_closes_still_has_what_it_holds_handed_back_once_in_time() {
+        let (pull, naks) = ServerPull::holding(&[1, 2], 8);
+        let mut pull = pull.never_closing();
+        let started = tokio::time::Instant::now();
+        assert_eq!(hand_back(Some(pull.delivered(7)), &mut pull).await, 3);
+        assert_eq!(started.elapsed(), NAK_DRAIN_BUDGET);
+        assert_eq!(naked(&naks), [7, 1, 2]);
     }
 }

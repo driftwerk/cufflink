@@ -520,6 +520,9 @@ pub struct PullSource {
 }
 
 impl PullSource {
+    /// `jetstream` must be the context `consumer` was obtained through: the
+    /// pull's subscription and the acks share its connection, so a pull's
+    /// unsubscribe reaches the server before the naks that hand its batch back.
     pub fn new(consumer: PullConsumer, jetstream: &jetstream::Context) -> Self {
         Self {
             consumer,

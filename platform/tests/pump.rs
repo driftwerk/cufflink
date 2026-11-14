@@ -259,14 +259,15 @@ async fn a_shutdown_hands_back_the_rest_of_the_batch() {
     };
     let js = jetstream(nats_url).await;
     let name = unique("PUMP_BATCH");
-    let (stream, consumer, subject) = consumer_on(&js, &name, ACK_WAIT).await;
+    let ack_wait = Duration::from_secs(5);
+    let (stream, consumer, subject) = consumer_on(&js, &name, ack_wait).await;
     publish(&js, &subject, r#"{"n":1}"#).await;
 
     let deliveries = Arc::new(AtomicU64::new(0));
     let shutdown = Shutdown::new(Duration::from_secs(30));
     let running = tokio::spawn(pump::run(
         pump::PullSource::new(consumer.clone(), &js),
-        PumpConfig::sequential(ACK_WAIT).concurrent(2),
+        PumpConfig::sequential(ack_wait).concurrent(2),
         Arc::new(Slow {
             takes: Duration::from_secs(2),
             deliveries: Arc::clone(&deliveries),

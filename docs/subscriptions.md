@@ -133,9 +133,21 @@ loop, which `max_deliver` counts under `ack = on_success`; that is why a
 replaced loop does not hand back. A loop that hands back first closes its
 pull request, so the server delivers nothing more into it: each message it
 holds is handed back once, and a message published while it stops stays in
-its stream undelivered. A message the server had already sent when the pull
-closed, but which had not yet reached the loop, is delivered again once its
-`ack_wait` has passed. Messages handed back are counted as
+its stream undelivered. Two cases cost more, and neither loses a message:
+
+- A message the server had already sent when the pull closed, but which had
+  not yet reached the loop, is not handed back at once: it is delivered
+  again once its `ack_wait` has passed, having spent that one delivery.
+- On a server with leaf nodes or gateways enabled, the server still fills a
+  pull request it received in the last two seconds or so even after its
+  subscriber has gone. A message handed back in that window can be delivered
+  once more into the closed pull, which spends one extra delivery, and then
+  comes back after its `ack_wait`.
+
+If the pull cannot be closed within a second, as while the platform is
+reconnecting to NATS, the loop hands back what it already holds and stops.
+
+Messages handed back are counted as
 `cufflink_subscription_messages_total{result="nak"}`.
 
 ### The dead-letter queue
