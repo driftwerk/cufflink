@@ -995,7 +995,7 @@ async fn a_service_whose_schema_a_role_owns_is_bound_before_its_first_deploy_and
     assert!((200..300).contains(&status), "{status} {body}");
     assert_eq!(
         test.written_by().await,
-        [owner.clone()],
+        std::slice::from_ref(&owner),
         "the row was written as the bound role"
     );
     let shown = test.show_for("catalog-service").await;
