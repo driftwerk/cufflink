@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+    image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
     environment:
       POSTGRES_USER: cufflink
       POSTGRES_PASSWORD: cufflink
@@ -16,7 +16,7 @@ services:
       retries: 5
 
   nats:
-    image: nats:2.15-alpine@sha256:afae2fdbe2e326c65e1246cb83b9d05d319188734f3bd577ac8072daae78a10f
+    image: nats:2.15-alpine@sha256:558394a23dd3c36f2d3a64b51865fd09908010e80a542cea5e75c2af543ed62a
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     ports:
       - "4222:4222"
@@ -31,7 +31,7 @@ services:
       retries: 5
 
   keycloak-db:
-    image: postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+    image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
     environment:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: keycloak
@@ -45,7 +45,7 @@ services:
       retries: 5
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8@sha256:3879c623248408de29a5303178b5816c77e8dfef3890c361f8c0bbeaa979ba3b
+    image: quay.io/keycloak/keycloak:26.8@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
     command: start-dev --import-realm
     environment:
       KC_DB: postgres
@@ -65,7 +65,7 @@ services:
         condition: service_healthy
 
   redis:
-    image: redis:8.10-alpine@sha256:71885d8cc6e42f2bc0aa2eb853bfc4be200b5108a46ac50e117ae1df0531fb80
+    image: redis:8.10-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
     ports:
       - "6379:6379"
     healthcheck:
@@ -75,7 +75,7 @@ services:
       retries: 5
 
   rustfs:
-    image: rustfs/rustfs:latest@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+    image: rustfs/rustfs:latest@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a
     environment:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
@@ -86,7 +86,7 @@ services:
       - rustfsdata:/data
 
   bucket-init:
-    image: amazon/aws-cli:latest@sha256:eccdb3ec77e159d43ca6a750a70738c546883138be7f094498294a1477ec7e42
+    image: amazon/aws-cli:latest@sha256:eaf444b45380050f920ab07492754aa76223dd90234e51c1f92c2e9391b5ee6b
     environment:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
@@ -106,7 +106,7 @@ services:
     restart: "no"
 
   platform:
-    image: kingsleyh/cufflink-platform:latest@sha256:2e86e4b6a2e8ed20e6f70ef573ab7385835bdde11770b9b765a2c0e30970d5a0
+    image: kingsleyh/cufflink-platform:latest@sha256:19d7398e841b92cd8025470385f320d495450de150cdb035ca9919eecabc0dd1
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -145,7 +145,7 @@ services:
         condition: service_started
 
   wasm-worker:
-    image: kingsleyh/cufflink-worker:latest@sha256:f60a6a9f22b4345a4f3de022bcac36b42b50f0e3e74981a4a00af5f23e645a57
+    image: kingsleyh/cufflink-worker:latest@sha256:83af72ac24e2d2c2b5a1eeec7289a9c39d9d5f540d88c9c5a5f53d5248305ab8
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -235,7 +235,7 @@ services:
       - "9090:9090"
 
   grafana:
-    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
     volumes:
       - ./infra/monitoring/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
       - ./infra/monitoring/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
@@ -252,7 +252,7 @@ services:
       - loki
 
   web-runner:
-    image: kingsleyh/cufflink-web-runner:latest@sha256:3e6cfb2773287b9b054add91ea56b1fd42e9fb40eb47055292899ef2a2d269e3
+    image: kingsleyh/cufflink-web-runner:latest@sha256:a4ba24d34f4d902467cf58896355581722fe0a2ff24b907578ae05cce78349d7
     stop_grace_period: 50s
     platform: linux/amd64
     environment:
@@ -289,7 +289,7 @@ services:
         condition: service_started
 
   ext-runner:
-    image: kingsleyh/cufflink-ext-runner:latest@sha256:e2e51fddd1159457aa38f48980e4c491943c9524a359a9aba7f737254c173b12
+    image: kingsleyh/cufflink-ext-runner:latest@sha256:10405c8b50e3c4d4aacc36a9d2b1eb6d511a27e73d961b55a5cfaac559d1c4d6
     profiles: ["ext-runner"]
     stop_grace_period: 50s
     platform: linux/amd64
