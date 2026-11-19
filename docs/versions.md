@@ -1393,10 +1393,11 @@ no setting.
   `soft_delete`, `search.vector_column` and `search.config`). A table the
   running version declared managed waits for the migrations when this
   release adopts it, since the platform made it and never checked its
-  shape as adopted. Since v0.31.0 every version that adopted a table has
-  recorded it. A version stored without records, which only an earlier
-  release could have written, settles nothing: its tables wait for the
-  migrations and are checked after them.
+  shape as adopted. A version stored without adoption records settles
+  nothing, whatever it declared: since v0.31.0 such a version adopted
+  nothing, and one stored by an earlier release may have adopted tables
+  without recording them. Every table this deploy adopts then waits for
+  the migrations and is checked after them.
 - Every failure of the check after the migrations names the migrations
   applied. A refusal is a 422; a failure to check stays a server error.
   An asynchronous deploy reports the phase `adoption` while it runs.

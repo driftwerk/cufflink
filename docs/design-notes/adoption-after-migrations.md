@@ -61,9 +61,8 @@ When it holds, the check is made in two steps:
    `soft_delete`, `search.vector_column` and `search.config`. That version
    passed the same check, so a finding there is drift that no migration
    of this release was written to repair, and nothing is applied for it.
-   - A version that adopted a table always recorded it, so a snapshot
-     written as a plain list of tables belongs to a version that adopted
-     nothing, and settles nothing:
+   - A snapshot without adoption records settles nothing, whatever it
+     declared:
      - `look()` never skips the live read when a deploy adopts
        something, and `validate_adoption` adds a record key for every
        table it accepts, even one that declares no column;
@@ -71,10 +70,10 @@ When it holds, the check is made in two steps:
        the records are empty, and `StoredSnapshot::Adopting` otherwise;
        a module upload that keeps the running manifest keeps its
        records;
-     - since v0.31.0 every version that adopted a table has recorded
-       it. A version stored without records, which only an earlier
-       release could have written, settles nothing: its tables wait for
-       the migrations and are checked after them
+     - so since v0.31.0 such a snapshot belongs to a version that
+       adopted nothing. One stored by an earlier release may have
+       adopted tables without recording them. Either way the tables this
+       deploy adopts wait for the migrations and are checked after them
        (`a_snapshot_without_records_settles_nothing`).
      `a_snapshot_that_adopts_nothing_is_stored_as_every_release_stored_it`,
      `a_table_adopted_with_no_column_recorded_keeps_the_snapshot_adopting`
