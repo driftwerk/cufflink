@@ -7,7 +7,7 @@ use crate::policy::PolicyKey;
 use crate::registry::RegisteredService;
 use crate::repo::deployments::{Adoption, Snapshot};
 use crate::repo::services::Service;
-use crate::schema_manager::adopt::AdoptionReport;
+use crate::schema_manager::adopt::{self, AdoptionReport};
 use crate::schema_manager::executor::{
     apply_schema, check_adoption, ensure_schema, execute_online, execute_phase,
     prepare_schema_changes, AdoptionCheck, Direction, Guard, PreparedSchemaChanges, SchemaRequest,
@@ -168,10 +168,13 @@ async fn guard(state: &AppState, tenant_id: Uuid, options: &Options) -> Platform
     })
 }
 
-fn adoption_check(verified: Option<&MigrationsReport>) -> AdoptionCheck {
+fn adoption_check<'a>(
+    verified: Option<&MigrationsReport>,
+    settled: &'a [TableDefinition],
+) -> AdoptionCheck<'a> {
     match verified {
         Some(report) if report.mode == HistoryMode::Apply && !report.run.pending.is_empty() => {
-            AdoptionCheck::AfterMigrations
+            AdoptionCheck::AfterMigrations { settled }
         }
         _ => AdoptionCheck::Now,
     }
@@ -186,6 +189,7 @@ async fn prepare(
 ) -> PlatformResult<PreparedSchemaChanges> {
     let (state, manifest) = (ctx.state, ctx.manifest);
     let tables = tables_of(manifest, left);
+    let settled = adopt::settled(&tables.adopted, &left.tables, &left.adopted);
     prepare_schema_changes(
         tenant_pool,
         &SchemaRequest {
@@ -197,7 +201,7 @@ async fn prepare(
             leaving,
             allow_destructive: ctx.schema.allow_destructive,
             direction: Direction::Forward,
-            adoption: adoption_check(verified),
+            adoption: adoption_check(verified, &settled),
             guard: guard(state, ctx.identity.tenant_id, &ctx.schema).await?,
         },
     )
@@ -632,22 +636,23 @@ mod tests {
     #[test]
     fn adoption_waits_only_for_migrations_the_deploy_applies() {
         let pending = || vec![migrated(2, "loan_state")];
-        for (report, check) in [
-            (None, AdoptionCheck::Now),
-            (
-                Some(verified(HistoryMode::Apply, vec![], vec![])),
-                AdoptionCheck::Now,
-            ),
+        let settled = [labels()];
+        for (report, after) in [
+            (None, false),
+            (Some(verified(HistoryMode::Apply, vec![], vec![])), false),
             (
                 Some(verified(HistoryMode::VerifyOnly, pending(), vec![])),
-                AdoptionCheck::Now,
+                false,
             ),
-            (
-                Some(verified(HistoryMode::Apply, pending(), vec![])),
-                AdoptionCheck::AfterMigrations,
-            ),
+            (Some(verified(HistoryMode::Apply, pending(), vec![])), true),
         ] {
-            assert_eq!(adoption_check(report.as_ref()), check, "{report:?}");
+            match adoption_check(report.as_ref(), &settled) {
+                AdoptionCheck::AfterMigrations { settled } => {
+                    assert!(after, "{report:?}");
+                    assert_eq!(settled[0].name, "labels");
+                }
+                AdoptionCheck::Now => assert!(!after, "{report:?}"),
+            }
         }
     }
 

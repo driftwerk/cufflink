@@ -253,6 +253,54 @@ pub fn validate_adoption<'a>(
         })
 }
 
+#[derive(PartialEq)]
+struct Checked<'a> {
+    name: String,
+    columns: BTreeMap<String, &'a ColumnType>,
+    primary_key: Option<String>,
+    owner_field: Option<String>,
+    vector_column: Option<String>,
+    soft_delete: bool,
+}
+
+impl<'a> Checked<'a> {
+    fn of(table: &'a TableDefinition) -> Self {
+        Self {
+            name: folded(&table.name),
+            columns: table
+                .columns
+                .iter()
+                .map(|column| (folded(&column.name), &column.column_type))
+                .collect(),
+            primary_key: table.primary_key().map(|column| folded(&column.name)),
+            owner_field: table.owner_field.as_deref().map(folded),
+            vector_column: table
+                .search
+                .as_ref()
+                .and_then(|search| search.vector_column.as_deref())
+                .map(folded),
+            soft_delete: table.soft_delete,
+        }
+    }
+}
+
+pub fn settled(
+    declared: &[TableDefinition],
+    left: &[TableDefinition],
+    left_adopted: &AdoptedSchema,
+) -> Vec<TableDefinition> {
+    declared
+        .iter()
+        .filter(|table| {
+            left_adopted.table(&table.name).is_some()
+                && left
+                    .iter()
+                    .any(|before| Checked::of(before) == Checked::of(table))
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Default)]
 pub struct AdoptedSchemas {
     known: RwLock<HashMap<Uuid, (i32, Arc<AdoptedSchema>)>>,
@@ -348,6 +396,61 @@ mod tests {
 
     fn validate(table: &TableDefinition, live: &LiveSchema) -> AdoptionReport {
         validate_adoption("loan_service", [table], live)
+    }
+
+    #[test]
+    fn a_declaration_is_settled_only_as_the_version_left_adopted_it() {
+        let adopted = |names: &[&str]| {
+            AdoptedSchema(
+                names
+                    .iter()
+                    .map(|name| (name.to_string(), AdoptedTable::new()))
+                    .collect(),
+            )
+        };
+        let names = |tables: Vec<TableDefinition>| -> Vec<String> {
+            tables.into_iter().map(|table| table.name).collect()
+        };
+        let left = [loans()];
+        assert_eq!(
+            names(settled(&[loans()], &left, &adopted(&["loans"]))),
+            ["loans"]
+        );
+        let respelled = TableDefinition {
+            name: "Loans".into(),
+            columns: loans().columns.into_iter().rev().collect(),
+            ..loans()
+        };
+        assert_eq!(
+            names(settled(&[respelled], &left, &adopted(&["loans"]))),
+            ["Loans"],
+            "names fold and the order of the columns is not checked"
+        );
+        let unadopted = settled(&[loans()], &left, &adopted(&[]));
+        assert!(
+            unadopted.is_empty(),
+            "a table the version left did not adopt"
+        );
+        assert!(settled(&[loans()], &[], &adopted(&["loans"])).is_empty());
+        let changes: [fn(&mut TableDefinition); 5] = [
+            |table| {
+                table
+                    .columns
+                    .push(declared("returned_at", ColumnType::TimestampNaive))
+            },
+            |table| table.columns[1].column_type = ColumnType::Integer,
+            |table| table.owner_field = Some("memo".into()),
+            |table| table.soft_delete = true,
+            |table| table.columns[0].primary_key = false,
+        ];
+        for change in changes {
+            let mut changed = loans();
+            change(&mut changed);
+            assert!(
+                settled(&[changed], &left, &adopted(&["loans"])).is_empty(),
+                "a change to what the check reads unsettles the table"
+            );
+        }
     }
 
     #[test]

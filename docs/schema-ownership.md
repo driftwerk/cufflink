@@ -205,16 +205,34 @@ A manifest declares the tables it adopts as they stand once its
 migrations have run, so a migration and the column or table it makes can
 ship in one release. When the deploy adopts a table (`schema: adopted`,
 `managed = false` or `private_tables`), its history is in `apply` mode and
-migrations are pending, the adoption is checked after the SQL migrations,
-on a fresh read of the database, and before `on_migrate`, the destructive
-changes and activation. Otherwise it is checked before anything runs.
+migrations are pending, the adoption is checked in two steps:
+
+1. Before anything runs, each table declared as the running version
+   declared it (the same columns and types, primary key, `owner_field`,
+   `soft_delete` and `search.vector_column`) is checked, and a finding on
+   one refuses the deploy (422) as before: that is drift, which no
+   migration of the release was written to repair. A table that is new or
+   whose declaration changed waits for the migrations. On a service's
+   first deploy every table waits.
+2. After the SQL migrations, on a fresh read of the database and before
+   `on_migrate`, the destructive changes and activation, every adopted
+   table is checked again.
+
+Otherwise the adoption is checked before anything runs.
 
 - A declaration the migrations do not make true refuses the deploy (422)
   naming what differs and the migrations it applied, which stay applied
   and recorded. So does a migration that drops or retypes a declared
-  column. The previous version keeps serving. A release whose declaration
-  matches is the remedy: the same release, deployed again, finds nothing
-  pending and is refused before anything runs.
+  column. A release whose declaration matches is the remedy: the same
+  release, deployed again, finds nothing pending and is refused before
+  anything runs.
+- The previous version keeps serving over whatever the migrations made.
+  SQL migrations are arbitrary, so one that breaks a declared table can
+  leave the previous version unable to serve it. Keeping each migration
+  one the running version can run over (expand only) is the author's
+  part; the refusal after the migrations is a safety net that keeps the
+  new version from being activated over a schema it does not match, not
+  a rollback.
 - The version's snapshot of the adopted columns, which the data routes
   read their casts and defaults from, is the one read after the
   migrations.
@@ -272,12 +290,13 @@ neither database, takes no migration lock and records nothing. It exits 3
 when the platform refuses the deploy (422) and 1 when no plan could be made
 (another deploy running, the network).
 
-A plan applies no migration, so the adoption a deploy would check after
-its pending migrations is reported, not refused: `adoption.deferred` is
-`true` and `adoption.errors` lists what the database does not hold yet,
-which the CLI prints as `adopted once the pending migrations apply: …`.
-With nothing pending, the plan checks the adoption and is refused as the
-deploy would be.
+A plan applies no migration, so what a deploy would check after its
+pending migrations is reported, not refused: `adoption.deferred` is
+`true` and `adoption.errors` lists what the new or changed declarations
+lack in the database, which the CLI prints as `adopted once the pending
+migrations apply: …`. A finding on an unchanged declaration refuses the
+plan, as it refuses the deploy. With nothing pending, the plan checks the
+adoption and is refused as the deploy would be.
 
 Against a platform that advertises `async_deploy` the CLI deploys with
 `?async=true`: the platform answers 202 with the deploy's id at once, runs it

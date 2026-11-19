@@ -1376,14 +1376,19 @@ no setting.
 
 - When the deploy adopts a table (`schema: adopted`, `managed = false` or
   `private_tables`), its history is in `apply` mode and migrations are
-  pending, the adoption is checked on a fresh read after the migrations,
-  before `on_migrate`, the destructive changes and activation. A
+  pending, a table declared as the running version declared it is still
+  checked before anything runs, and drift on it refuses the deploy as
+  before. Every adopted table is then checked again on a fresh read after
+  the migrations, before `on_migrate`, the destructive changes and
+  activation, and a new or changed declaration is checked only there. A
   declaration the migrations do not make true is refused (422) with the
-  migrations applied named; they stay applied and recorded, and the
-  previous version keeps serving. Every other deploy checks the adoption
-  before anything runs, as before.
+  migrations applied named; they stay applied and recorded. The previous
+  version keeps serving over whatever they made: the refusal is a safety
+  net, not a rollback, and migrations the running version can run over
+  remain the author's part. Every other deploy checks the adoption before
+  anything runs, as before.
 - A plan of such a deploy no longer fails on what the pending migrations
-  are to make. Its `adoption` carries `deferred: true` with those findings
+  are to make for new or changed declarations. Its `adoption` carries `deferred: true` with those findings
   in `errors`, and `cufflink deploy --plan` prints each as `adopted once
   the pending migrations apply: …`. `deferred` is present only when true.
 

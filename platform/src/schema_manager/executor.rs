@@ -19,20 +19,28 @@ pub enum Direction {
     Rollback,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdoptionCheck {
+#[derive(Debug, Clone, Copy)]
+pub enum AdoptionCheck<'a> {
     Now,
-    AfterMigrations,
+    AfterMigrations { settled: &'a [TableDefinition] },
 }
 
-impl AdoptionCheck {
-    fn verdict(self, report: AdoptionReport) -> PlatformResult<AdoptionReport> {
+impl AdoptionCheck<'_> {
+    fn verdict(
+        self,
+        schema: &str,
+        adopted: &[TableDefinition],
+        live: &LiveSchema,
+    ) -> PlatformResult<AdoptionReport> {
         match self {
-            Self::Now => report.accepted(),
-            Self::AfterMigrations => Ok(AdoptionReport {
-                deferred: true,
-                ..report
-            }),
+            Self::Now => validate_adoption(schema, adopted, live).accepted(),
+            Self::AfterMigrations { settled } => {
+                validate_adoption(schema, settled, live).accepted()?;
+                Ok(AdoptionReport {
+                    deferred: true,
+                    ..validate_adoption(schema, adopted, live)
+                })
+            }
         }
     }
 }
@@ -130,7 +138,7 @@ pub struct SchemaRequest<'a> {
     pub leaving: i32,
     pub allow_destructive: bool,
     pub direction: Direction,
-    pub adoption: AdoptionCheck,
+    pub adoption: AdoptionCheck<'a>,
     pub guard: Guard,
 }
 
@@ -456,11 +464,7 @@ pub async fn prepare_schema_changes(
     let adoption = live
         .as_ref()
         .filter(|_| request.adopts())
-        .map(|live| {
-            request
-                .adoption
-                .verdict(validate_adoption(db.schema(), request.adopted, live))
-        })
+        .map(|live| request.adoption.verdict(db.schema(), request.adopted, live))
         .transpose()?;
     if request.ownership == SchemaOwnership::Adopted {
         return Ok(PreparedSchemaChanges {
@@ -1111,24 +1115,58 @@ mod tests {
     }
 
     #[test]
-    fn an_adoption_checked_after_the_migrations_is_reported_not_refused() {
-        let found = AdoptionReport {
-            errors: vec!["table loan_service.loans is missing".into()],
-            ..AdoptionReport::default()
+    fn after_the_migrations_only_a_settled_declaration_refuses_up_front() {
+        let table = |name: &str, columns: &[&str]| TableDefinition {
+            name: name.into(),
+            columns: columns
+                .iter()
+                .map(|column| declared(column, ColumnType::Text))
+                .collect(),
+            ..Default::default()
         };
-        let deferred = AdoptionCheck::AfterMigrations
-            .verdict(found.clone())
-            .expect("deferred");
+        let live = schema(vec![
+            ("labels", live_table(vec![column("name", "text")])),
+            ("notes", live_table(vec![column("body", "text")])),
+        ]);
+        let verdict = |check: AdoptionCheck<'_>, declared: &[TableDefinition]| {
+            check.verdict("loan_service", declared, &live)
+        };
+
+        let changed = [
+            table("labels", &["name"]),
+            table("notes", &["body", "author"]),
+        ];
+        let deferred = verdict(
+            AdoptionCheck::AfterMigrations {
+                settled: &changed[..1],
+            },
+            &changed,
+        )
+        .expect("what a changed declaration lacks waits for the migrations");
         assert!(deferred.deferred);
-        assert_eq!(deferred.errors, found.errors);
+        assert_eq!(deferred.errors, ["loan_service.notes.author is missing"]);
         assert_eq!(
             serde_json::to_value(&deferred).expect("json")["deferred"],
             true
         );
-        assert!(AdoptionCheck::Now.verdict(found).is_err());
-        let accepted = AdoptionCheck::Now
-            .verdict(AdoptionReport::default())
-            .expect("accepted");
+        assert!(verdict(AdoptionCheck::Now, &changed).is_err());
+
+        let drifted = [table("labels", &["name", "colour"]), changed[1].clone()];
+        let refused = verdict(
+            AdoptionCheck::AfterMigrations {
+                settled: &drifted[..1],
+            },
+            &drifted,
+        )
+        .expect_err("drift on a settled declaration is refused before the migrations")
+        .to_string();
+        assert!(
+            refused.contains("loan_service.labels.colour is missing")
+                && !refused.contains("author"),
+            "{refused}"
+        );
+
+        let accepted = verdict(AdoptionCheck::Now, &changed[..1]).expect("accepted");
         assert_eq!(
             serde_json::to_value(&accepted).expect("json"),
             serde_json::json!({"errors": [], "warnings": [], "undeclared_columns": {}}),

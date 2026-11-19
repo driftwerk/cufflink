@@ -1313,3 +1313,100 @@ async fn a_managed_schema_checks_the_private_table_its_migration_makes() {
     assert_eq!(hooked().await, ["2"]);
     assert_ne!(served_version(&d).await, first);
 }
+
+#[tokio::test]
+async fn drift_on_a_settled_declaration_is_refused_before_the_migrations() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    d.deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+        .await;
+    let changed = d
+        .deployed(json!({"manifest": ledger(&local, legacy_history(), true)}))
+        .await;
+    assert_eq!(
+        versions(&changed["plan"]["sql_migrations"]["applied"]),
+        [2],
+        "a changed declaration the migration makes true passes: {changed}"
+    );
+    let served = served_version(&d).await;
+
+    d.database
+        .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+        .await
+        .expect("drift");
+    let unrelated = [
+        local[0].clone(),
+        local[1].clone(),
+        migration(
+            3,
+            "loan_tags",
+            "CREATE TABLE loan_service.loan_tags (id uuid PRIMARY KEY);\n",
+        ),
+    ];
+    let manifest = ledger(&unrelated, legacy_history(), true);
+    for query in ["?plan=true", ""] {
+        let (status, body) = d.deploy_as(query, json!({"manifest": manifest})).await;
+        assert_eq!(status, 422, "{query}: {body}");
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            error.contains("loan_service.loan_notes.body is missing")
+                && !error.contains("stay applied"),
+            "{query}: {error}"
+        );
+    }
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&local));
+    assert!(!exists(&d.database, "loan_service.loan_tags").await);
+    assert_eq!(served_version(&d).await, served);
+}
+
+#[tokio::test]
+async fn a_migration_that_breaks_a_settled_declaration_is_refused_after_it() {
+    let breaks = [
+        (
+            migration(
+                2,
+                "drop_memo",
+                "ALTER TABLE loan_service.loans DROP COLUMN memo;\n",
+            ),
+            "loan_service.loans.memo is missing",
+        ),
+        (
+            migration(
+                2,
+                "count_memo",
+                "ALTER TABLE loan_service.loans ALTER COLUMN memo TYPE integer USING length(memo);\n",
+            ),
+            "loan_service.loans.memo is integer, which a column declared TEXT cannot be",
+        ),
+    ];
+    for (broken, finding) in breaks {
+        let Some(d) = start(&[]).await else {
+            return;
+        };
+        let local = ledger_migrations();
+        apply_with_refinery(&d, &local[..1]).await;
+        let first = d
+            .deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+            .await["version"]
+            .clone();
+        let both = [local[0].clone(), broken.clone()];
+        let (status, body) = d
+            .deploy(json!({"manifest": ledger(&both, legacy_history(), false)}))
+            .await;
+        assert_eq!(status, 422, "{body}");
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            error.contains(finding)
+                && error.contains(&format!(
+                    "the migrations this deploy applied stay applied: {}",
+                    broken.file_stem()
+                )),
+            "{error}"
+        );
+        assert_eq!(recorded(&d.database, HISTORY).await, history_of(&both));
+        assert_eq!(served_version(&d).await, first);
+    }
+}
