@@ -202,6 +202,13 @@ quiet "audit exceptions 15 days from their revisit date, failing within 14" \
 expect "a failing window that is not a number of days" 1 \
   "--fail-within takes a number of days from 0 to 60, not soon" "$work/metadata.json" --fail-within soon
 
+expect "a failing window past 60 days" 1 \
+  "--fail-within takes a number of days from 0 to 60, not 61" "$work/metadata.json" --fail-within 61
+
+expect "a failing window that would overflow" 1 \
+  "--fail-within takes a number of days from 0 to 60, not 9223372036854775808" \
+  "$work/metadata.json" --fail-within 9223372036854775808
+
 ignored "$(day 30)"
 WORKSPACE_REQUIREMENTS_TODAY=2026-1-5 expect "a today that is not a YYYY-MM-DD date" 1 \
   "today is 2026-1-5, which is not a YYYY-MM-DD date" "$work/metadata.json"
@@ -260,6 +267,15 @@ audit '[advisories]' 'ignore = [' ']' '[output]' 'deny = []'
 expect "audit settings beyond the ignore list" 1 \
   ".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note" \
   "$work/metadata.json"
+
+got=0
+output=$(WORKSPACE_REQUIREMENTS_TODAY=2000-01-01 "$script" 2>&1) || got=$?
+if [ "$got" = 0 ]; then
+  echo "ok: this workspace ignores the test-only today"
+else
+  printf 'FAILED: this workspace read the test-only today (exit %s)\n%s\n' "$got" "$output"
+  failures=$((failures + 1))
+fi
 
 got=0
 output=$(env -u WORKSPACE_REQUIREMENTS_TODAY "$script" 2>&1) || got=$?

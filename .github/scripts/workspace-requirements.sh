@@ -6,7 +6,7 @@ fail_within=null
 while [ $# -gt 0 ]; do
   case "$1" in
     --fail-within)
-      if ! [[ "${2:-}" =~ ^[0-9]+$ ]] || [ "$2" -gt 60 ]; then
+      if ! [[ "${2:-}" =~ ^[0-9]{1,2}$ ]] || [ "$((10#$2))" -gt 60 ]; then
         echo "::error::--fail-within takes a number of days from 0 to 60, not ${2:-nothing}"
         exit 1
       fi
@@ -48,7 +48,10 @@ root=$(jq -r '.workspace_root' "$metadata")
 config="$root/.cargo/audit.toml"
 exceptions='{"ignored": [], "refused": [], "warned": []}'
 if [ -f "$config" ]; then
-  today=${WORKSPACE_REQUIREMENTS_TODAY:-$(date -u +%F)}
+  today=$(date -u +%F)
+  if [ -n "$given" ]; then
+    today=${WORKSPACE_REQUIREMENTS_TODAY:-$today}
+  fi
   cargo metadata --locked --all-features --format-version 1 --manifest-path "$root/Cargo.toml" \
     >"$resolved"
   exceptions=$(jq -n -c --rawfile config "$config" --slurpfile metadata "$resolved" \
