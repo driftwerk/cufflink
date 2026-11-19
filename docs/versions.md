@@ -521,11 +521,12 @@ Rolling a platform back from v0.38.1 to v0.38.0:
 | `cufflink deploy --skip-script` | Nothing: the flag is the CLI's alone, and a CLI of v0.38.1 deploys to v0.38.0 as a v0.38.0 CLI does |
 | The database | Nothing: v0.38.1 has no migration |
 
-Rolling a platform back from v0.39.0, or from v0.38.2-rc.1, to v0.38.1:
+Rolling a platform back from v0.39.0 to v0.38.1 (from v0.38.2-rc.1, only
+the hand-back row applies):
 
 | What v0.39.0 changed | Before rolling the platform back |
 |----------------------|----------------------------------|
-| Adopted tables checked after the deploy's own migrations | Nothing to undo: a version deployed this way keeps running, and its adopted tables already hold what its migrations made. v0.38.1 checks every adoption before the migrations again, so a deploy whose pending migration makes a column or table it adopts is refused there (422): ship the migration in one deploy and the declaration that adopts what it makes in the next |
+| Adopted tables checked after the deploy's own migrations | Nothing to undo: a version deployed this way keeps running, and its adopted tables already hold what its migrations made. v0.38.1 checks every adoption before the migrations again, so a deploy whose pending migration makes a column or table it adopts is refused there (422): ship the migration in one deploy and the declaration that adopts what it makes in the next. v0.38.1 also brings back what this release stopped: a deploy whose pending migrations drop, rename or retype a declared column, or drop a declared table, is activated again over a schema its version cannot serve; and under `apply` with migrations pending, the adopted-column snapshot is read before the migrations again, so the data routes' casts and defaults can be stale until the next deploy |
 | Snapshots of adopted columns read after the migrations | Nothing: they are stored in the shape v0.38.1 reads |
 | The hand-back of a consumer loop | Nothing to undo. v0.38.1 brings the old hand-back back: a consumer whose concurrency is at least its `max_deliver` can have a message's deliveries spent by one stop or restart, with no dead letter |
 | The plan's `deferred` adoption | Nothing: v0.38.1 never defers, and a CLI of v0.39.0 reads the key only when it is there |
@@ -1382,13 +1383,16 @@ Adopted tables checked after the deploy's own migrations, consumer loops
 whose hand-back spends no delivery beyond the one that brought a message
 in, and the lockfile on the patched quinn releases. No new module-declared
 feature and no new platform feature: `supports` is unchanged, and a
-service built for v0.38.1 deploys and runs on this platform unchanged.
+service built for v0.38.1 deploys and runs on this platform unchanged
+(but see the behaviour changes below).
 There is no migration and no new environment variable. A CLI of this
 release deploys to a v0.38.1 platform as a v0.38.1 CLI does. The hand-back
 fix was first published as the pre-release v0.38.2-rc.1
 ([v0.38.2](#changes-in-v0382)); there is no final v0.38.2.
 
-Crates: cufflink-types 0.23.0, for the new `SqlMigration::stem_of`, with
+Crates: a minor release for the change in when adoption is checked, so
+the crate set moves minor as it did at v0.36.0, v0.37.0 and v0.38.0.
+cufflink-types 0.23.0, which also gains `SqlMigration::stem_of`, with
 cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink at
 0.23.0 beside it; cufflink-fn 0.39.0; cufflink-cli 0.30.0, whose plan
 names the adoption that waits for the migrations; cufflink-native 0.11.0
@@ -1451,10 +1455,14 @@ It changes no manifest, SDK or host function.
   consumer's concurrency, so a consumer whose concurrency was at least its
   `max_deliver` could have a message's deliveries all spent by one stop or
   restart: the message was given up on with no dead letter. A message
-  handed back now spends only the delivery that brought it to the loop.
-  A message published while the loop stops is never delivered to it.
-  Subscriptions, webhook deliveries and the worker's consumers all
-  change ([durable names](subscriptions.md#durable-names)).
+  handed back now spends only the delivery that brought it to the loop,
+  and a message published while the loop stops is not delivered to it,
+  with two exceptions, neither of which loses a message. A message already
+  on its way when the pull closes comes back once its `ack_wait` has
+  passed. On a server with leaf nodes or gateways, a message handed back
+  just after the pull closed can spend one extra delivery. Subscriptions,
+  webhook deliveries and the worker's consumers all change
+  ([what a stopping loop does with its messages](subscriptions.md#durable-names)).
 
 **Security.**
 
@@ -1469,10 +1477,16 @@ It changes no manifest, SDK or host function.
 
 **Images and release tooling.**
 
-- The platform, worker, web-runner and ext-runner images build with Rust
-  1.100.0; the web runner runs on Node 26.13.1, and the other runtime
-  images on the current Ubuntu 26.04 digest. `docker-compose.yml` takes the
-  current digests of its images.
+- The published platform, worker, web-runner and ext-runner images
+  (`sha-<commit>` and `latest`, from the `Dockerfile.*.ci` files) take the
+  current Ubuntu 26.04 digest. Their binaries are still built by CI with
+  Rust 1.93.1, and the web runner's image still installs Node v24.22.1.
+- The source-build Dockerfiles (`Dockerfile.platform`, `Dockerfile.worker`,
+  `Dockerfile.web-runner` and `Dockerfile.ext-runner`, which `cufflink dev
+  up --from-source` builds) build with Rust 1.100.0. Their runtime stays
+  debian bookworm-slim, except the web runner's, which moves to Node
+  26.13.1.
+- `docker-compose.yml` takes the current digests of its images.
 - `publish.yml` refuses a tag whose workspace requires one of its own crates
   at a version other than the one it builds
   (`.github/scripts/workspace-requirements.sh`, which CI runs too), and
