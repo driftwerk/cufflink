@@ -228,6 +228,9 @@ enum Commands {
         /// Tenant slug for URL paths (used with --local, default: "local")
         #[arg(long)]
         tenant_slug: Option<String>,
+        /// One of the service's public documents, by name, instead of its whole spec
+        #[arg(long)]
+        doc: Option<String>,
     },
     /// Generate a TypeScript client from the OpenAPI spec
     GenerateClient(commands::openapi::GenerateClientArgs),
@@ -1033,11 +1036,13 @@ async fn run() -> eyre::Result<()> {
             output,
             local,
             tenant_slug,
+            doc,
         } => {
             if let Some(path) = output {
-                commands::openapi::save(&path, local, tenant_slug.as_deref(), env).await?;
+                commands::openapi::save(&path, local, tenant_slug.as_deref(), doc.as_deref(), env)
+                    .await?;
             } else {
-                commands::openapi::run(local, tenant_slug.as_deref(), env).await?;
+                commands::openapi::run(local, tenant_slug.as_deref(), doc.as_deref(), env).await?;
             }
         }
         Commands::GenerateClient(args) => {

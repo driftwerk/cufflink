@@ -865,6 +865,33 @@ mod tests {
     }
 
     #[test]
+    fn a_parameters_lifted_examples_leave_the_client_unchanged() {
+        let client = |force: Value, note_id: Value| {
+            let mut spec = relative_spec();
+            spec["paths"]["/notes/{note_id}"]["put"]["parameters"] = json!([note_id, force]);
+            typed_client(&spec, "loans-service", "NotesClient")
+        };
+        let parameter = |name: &str, place: &str, schema: Value| json!({"name": name, "in": place, "required": place == "path", "schema": schema});
+        let in_schema = client(
+            parameter(
+                "force",
+                "query",
+                json!({"type": ["boolean", "null"], "examples": [true]}),
+            ),
+            parameter(
+                "note_id",
+                "path",
+                json!({"type": "string", "examples": ["n-1", "n-2"]}),
+            ),
+        );
+        let mut force = parameter("force", "query", json!({"type": ["boolean", "null"]}));
+        force["example"] = json!(true);
+        let mut note_id = parameter("note_id", "path", json!({"type": "string"}));
+        note_id["examples"] = json!({"0": {"value": "n-1"}, "1": {"value": "n-2"}});
+        assert_eq!(client(force, note_id), in_schema);
+    }
+
+    #[test]
     fn unions_name_each_member_once_in_order() {
         let members = ["b", "a", "b", "c", "a"].map(String::from);
         assert_eq!(union(members.into_iter()), "b | a | c");
