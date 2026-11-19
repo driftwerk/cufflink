@@ -291,18 +291,13 @@ pub fn settled(
     left: &[TableDefinition],
     left_adopted: &AdoptedSchema,
 ) -> Vec<TableDefinition> {
-    let adopted_before = |before: &TableDefinition| {
-        if left_adopted.is_empty() {
-            !before.managed
-        } else {
-            left_adopted.table(&before.name).is_some()
-        }
-    };
     declared
         .iter()
         .filter(|table| {
-            left.iter()
-                .any(|before| adopted_before(before) && Checked::of(before) == Checked::of(table))
+            left_adopted.table(&table.name).is_some()
+                && left
+                    .iter()
+                    .any(|before| Checked::of(before) == Checked::of(table))
         })
         .cloned()
         .collect()
@@ -444,31 +439,13 @@ mod tests {
             settled(&left, &left, &AdoptedSchema::default()).is_empty(),
             "a table the platform made for the version left was never checked as adopted"
         );
-        let unmanaged = TableDefinition {
+        let unmanaged = [TableDefinition {
             managed: false,
             ..searched("english", "document")
-        };
-        assert_eq!(
-            names(settled(
-                std::slice::from_ref(&unmanaged),
-                std::slice::from_ref(&unmanaged),
-                &AdoptedSchema::default()
-            )),
-            ["loans"],
-            "a version stored without adoption records adopted what it declared unmanaged"
-        );
+        }];
         assert!(
-            settled(
-                &[unmanaged],
-                &[TableDefinition {
-                    name: "notes".into(),
-                    managed: false,
-                    ..loans()
-                }],
-                &AdoptedSchema::default()
-            )
-            .is_empty(),
-            "a table it did not declare"
+            settled(&unmanaged, &unmanaged, &AdoptedSchema::default()).is_empty(),
+            "a snapshot without records adopted nothing, whatever it declared"
         );
         assert!(
             settled(&left, &[], &adopted).is_empty(),
@@ -498,6 +475,21 @@ mod tests {
                 "a change to what can fail the check unsettles the table"
             );
         }
+    }
+
+    #[test]
+    fn every_table_accepted_is_recorded_even_with_no_column_declared() {
+        let bare = TableDefinition {
+            columns: Vec::new(),
+            ..loans()
+        };
+        let report = validate(&bare, &live_loans(as_a_legacy_schema_has_them(), &["id"]));
+        assert_eq!(report.errors, Vec::<String>::new());
+        assert!(report.adopted.table("loans").is_some());
+        assert_eq!(
+            serde_json::to_value(&report.adopted).expect("json"),
+            serde_json::json!({"loans": {}})
+        );
     }
 
     #[test]

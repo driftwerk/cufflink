@@ -64,17 +64,26 @@ expect "a dev requirement on another version" 1 \
 
 workspace "" dependencies 'cufflink-types = "0.23.0"'
 expect "a workspace crate required from a registry" 1 \
-  "cufflink-cli requires cufflink-types ^0.23.0 from a registry" "$work/metadata.json"
+  "cufflink-cli requires cufflink-types ^0.23.0 from registry+https://github.com/rust-lang/crates.io-index, not the cufflink-types 0.23.0 the workspace builds" \
+  "$work/metadata.json"
+
+workspace "" dependencies 'cufflink-types = { git = "https://git.example.com/cufflink.git" }'
+expect "a workspace crate required from git" 1 \
+  "cufflink-cli requires cufflink-types * from git+https://git.example.com/cufflink.git, not the cufflink-types 0.23.0 the workspace builds" \
+  "$work/metadata.json"
 
 workspace "" dependencies 'cufflink-types = { path = "../types" }'
 expect "nothing to compare" 1 "no requirement on a workspace crate was found" \
   "$work/metadata.json"
 
-compared=$("$script" | sed -n 's/^each of the \([0-9]*\) requirements.*/\1/p')
-if [ "${compared:-0}" -gt 0 ]; then
+got=0
+output=$("$script" 2>&1) || got=$?
+compared=$(sed -n 's/^each of the \([0-9]*\) requirements.*/\1/p' <<<"$output")
+if [ "$got" = 0 ] && [ "${compared:-0}" -gt 0 ]; then
   echo "ok: this workspace compares $compared requirements"
 else
-  echo "FAILED: this workspace compares no requirement"
+  printf 'FAILED: this workspace (exit %s, %s requirements compared)\n%s\n' \
+    "$got" "${compared:-no}" "$output"
   failures=$((failures + 1))
 fi
 

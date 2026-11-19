@@ -13,12 +13,12 @@ checked=$(metadata "${1:-}" | jq -c '
   (.packages | map({key: .name, value: .version}) | from_entries) as $versions
   | [.packages[] | .name as $from | .dependencies[]
      | select($versions[.name] != null and (.path == null or .req != "*"))
-     | {from: $from, name, as: (.rename // .name), req, path, built: $versions[.name]}]
+     | {from: $from, name, as: (.rename // .name), req, path, source, built: $versions[.name]}]
   | {
       compared: length,
       refused: map(
         if .path == null then
-          "\(.from) requires \(.as) \(.req) from a registry, and the workspace builds \(.name) \(.built)"
+          "\(.from) requires \(.as) \(.req) from \(.source // "outside the workspace"), not the \(.name) \(.built) the workspace builds"
         elif .req != "^" + .built and .req != "=" + .built then
           "\(.from) requires \(.as) \(.req), and the workspace builds \(.name) \(.built)"
         else empty end)

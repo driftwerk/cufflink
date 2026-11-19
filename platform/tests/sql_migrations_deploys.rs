@@ -1501,11 +1501,18 @@ async fn an_adopted_search_config_a_pending_migration_makes_is_checked_after_it(
     let (status, plan) = d.deploy_as("?plan=true", searched(&made)).await;
     assert_eq!(status, 200, "{plan}");
     assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
-    assert!(
-        errors(&plan)
-            .iter()
-            .all(|error| !error.contains("loan_english")),
+    assert_eq!(
+        errors(&plan),
+        Vec::<String>::new(),
         "a plan does not look for what the migrations are to create: {plan}"
+    );
+    assert!(
+        plan["plan"]["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|warning| !warning.to_string().contains("loan_english")),
+        "{plan}"
     );
     let body = d.deployed(searched(&made)).await;
     assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
@@ -1660,7 +1667,7 @@ async fn a_table_taken_from_the_platform_into_adoption_waits_for_the_migrations(
 }
 
 #[tokio::test]
-async fn a_snapshot_without_records_settles_what_it_declared_unmanaged() {
+async fn a_snapshot_without_records_settles_nothing() {
     let Some(d) = start(&[]).await else {
         return;
     };
@@ -1707,13 +1714,9 @@ async fn a_snapshot_without_records_settles_what_it_declared_unmanaged() {
     let error = body["error"].as_str().expect("error");
     assert!(
         error.contains("loan_service.loan_notes.body is missing")
-            && !error.contains("stay applied"),
-        "{error}"
+            && error.contains("stay applied: V2__loan_labels"),
+        "the table waits for the migrations: {error}"
     );
-    assert_eq!(
-        recorded(&d.database, HISTORY).await,
-        history_of(std::slice::from_ref(&colours))
-    );
-    assert!(!exists(&d.database, "loan_service.loan_labels").await);
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&unrelated));
     assert_eq!(served_version(&d).await, served);
 }

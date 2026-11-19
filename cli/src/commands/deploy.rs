@@ -1256,10 +1256,7 @@ fn migration_names(list: &serde_json::Value) -> Vec<String> {
         .map(|m| {
             format!(
                 "{} ({})",
-                cufflink_types::SqlMigration::stem_of(
-                    shown(&m["version"]),
-                    m["name"].as_str().unwrap_or("?")
-                ),
+                cufflink_types::SqlMigration::stem_of(shown(&m["version"]), &shown(&m["name"])),
                 shown(&m["checksum"])
             )
         })
@@ -3665,12 +3662,14 @@ mod tests {
             migration_names(&serde_json::json!([
                 {"version": 2, "name": "loan_state", "checksum": 42},
                 {"version": "3", "name": "loan_notes", "checksum": "7"},
-                {"name": "loan_tags"}
+                {"name": "loan_tags"},
+                {"version": 5}
             ])),
             [
                 "V2__loan_state (42)",
                 "V3__loan_notes (7)",
-                "V?__loan_tags (?)"
+                "V?__loan_tags (?)",
+                "V5__? (?)"
             ]
         );
     }

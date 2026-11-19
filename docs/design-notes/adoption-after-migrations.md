@@ -61,17 +61,23 @@ When it holds, the check is made in two steps:
    `soft_delete`, `search.vector_column` and `search.config`. That version
    passed the same check, so a finding there is drift that no migration
    of this release was written to repair, and nothing is applied for it.
-   - The check that accepts a table records its columns, the snapshot
-     keeps them (`StoredSnapshot::Adopting`), and a module upload that
-     keeps the running manifest keeps its records. A snapshot written as
-     a plain list of tables keeps none, either because its version
-     adopted nothing or because a platform that kept no records wrote
-     it; which one cannot be told from the snapshot. From such a
-     snapshot a declaration the version being left made
-     `managed = false` is taken as adopted, since the platform never
-     makes such a table, and a managed one as made by the platform. A
-     table of a `schema: adopted` service it stored that way is not
-     settled, and waits for the migrations.
+   - A version that adopted a table always recorded it, so a snapshot
+     written as a plain list of tables belongs to a version that adopted
+     nothing, and settles nothing:
+     - `look()` never skips the live read when a deploy adopts
+       something, and `validate_adoption` adds a record key for every
+       table it accepts, even one that declares no column;
+     - `stored()` (`repo/deployments.rs`) writes a plain list only when
+       the records are empty, and `StoredSnapshot::Adopting` otherwise;
+       a module upload that keeps the running manifest keeps its
+       records;
+     - the records and the check arrived together in the first public
+       commit, b85f228 (v0.31.0), so no release stored an adopted table
+       without its record.
+     `a_snapshot_that_adopts_nothing_is_stored_as_every_release_stored_it`,
+     `a_table_adopted_with_no_column_recorded_keeps_the_snapshot_adopting`
+     and `every_table_accepted_is_recorded_even_with_no_column_declared`
+     pin this.
    - A table the version being left declared managed was made by the
      platform, and its live shape was never checked against the adoption
      rules (with the schema guard off, not at all). Taken into adoption,
@@ -205,10 +211,9 @@ report, so there is nothing to defer.
   `.github/scripts/workspace-requirements.sh`, run by CI and by
   `publish.yml`, refuses a workspace whose requirement on one of its
   crates names a version other than the one it builds or takes that
-  crate from a registry, and one in which it found nothing to compare.
-  A published CLI
-  or migrate crate therefore requires the `cufflink-types` it was built
-  with.
+  crate from outside the workspace, and one in which it found nothing to
+  compare. A published CLI or migrate crate therefore requires the
+  `cufflink-types` it was built with.
 
 ### 2.3 CLI
 
@@ -388,10 +393,11 @@ one, which pins what stays as it is:
     drift the release deploys; with a column dropped by hand, a migration
     that adds it back deploys, and an unrelated one is refused after it
     ran, naming it.
-13. `a_snapshot_without_records_settles_what_it_declared_unmanaged`:
-    the served snapshot of a service with a `managed = false` private
-    table is rewritten without its records. Drift on that table is
-    refused before an unrelated pending migration runs.
+13. `a_snapshot_without_records_settles_nothing`: the served snapshot of
+    a service with a `managed = false` private table is rewritten as a
+    plain list. With drift on that table and an unrelated migration
+    pending, the table waits: the migration runs and the deploy is
+    refused after it, naming it.
 
 The suite's other tests, which cover managed schemas, `verify_only` and
 the lock, pass unchanged. The two that hold the migration lock wait until
@@ -406,9 +412,9 @@ Unit tests:
   before. With nothing settled, a schema that does not exist is deferred;
   with a settled table, it is refused.
 - `adopt::settled` keeps an unchanged declaration (names folded, columns
-  in any order), keeps one a snapshot without records declared
-  `managed = false`, and drops a table the version left did not adopt
-  (one the platform made for it), one it did not declare, and one with a
+  in any order) and drops a table the version left did not adopt (one
+  the platform made for it, or any table of a snapshot without records,
+  `managed = false` included), one it did not declare, and one with a
   column added or removed, a column type, owner field,
   `soft_delete`, primary key, `search.vector_column` or `search.config`
   changed. A report that is not deferred serializes without `deferred`.
@@ -417,8 +423,10 @@ Unit tests:
   message when none were applied.
 - `SchemaReport::adoption` refuses a report still deferred.
 - `SqlMigration::stem_of` is the stem `file_stem` gives. The CLI shows
-  a migration's version and checksum unquoted when they are sent as
-  strings, and `?` for a missing one.
+  a migration's version, name and checksum unquoted when they are sent
+  as strings, and `?` for a missing one.
+- An accepted table that declares no column is recorded, and a snapshot
+  holding only such a record is stored as adopting.
 - `.github/scripts/workspace-requirements.test.sh`, over fixture
   workspaces read by `cargo metadata`: an inherited and an exact
   requirement on the version built pass; an inherited one left behind

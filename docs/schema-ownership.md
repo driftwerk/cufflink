@@ -208,21 +208,21 @@ ship in one release. When the deploy adopts a table (`schema: adopted`,
 migrations are pending, the adoption is checked in two steps:
 
 1. Before anything runs, each table the running version adopted and
-   declared the same, in everything that can make the check fail
-   (columns and types, primary key, `owner_field`, `soft_delete`,
+   declared the same, in everything that can make the check fail (columns
+   and types, primary key, `owner_field`, `soft_delete`,
    `search.vector_column` and `search.config`), is checked, and a finding
    on one refuses the deploy (422) as before: that is drift, which no
    migration of the release was written to repair. A table that is new,
-   whose declaration changed, or that the running version declared
-   managed waits for the migrations: the platform made that one, and
-   never checked its shape as adopted, so a migration may bring it into
-   line. A running version stored without adoption records counts as
-   having adopted the tables it declared `managed = false`, and no
-   others. The search configuration a waiting table names waits too,
-   since a migration may create it. On a service's first deploy every
-   table waits, and so does its schema: the first plan of a service
-   whose schema the deploy makes reports the schema as missing,
-   deferred, rather than refusing.
+   whose declaration changed, or that the running version declared managed
+   waits for the migrations: the platform made that one, and never checked
+   its shape as adopted, so a migration may bring it into line. A version
+   that adopted a table has always recorded it (since v0.31.0, which
+   brought both), so a running version stored without adoption records
+   adopted nothing. The search configuration a waiting table names waits
+   too, since a migration may create it. On a service's first deploy every
+   table waits, and so does its schema: the first plan of a service whose
+   schema the deploy makes reports the schema as missing, deferred, rather
+   than refusing.
 2. After the SQL migrations, on a fresh read of the database and before
    `on_migrate`, the destructive changes and activation, every adopted
    table is checked again.
