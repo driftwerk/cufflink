@@ -1381,7 +1381,7 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 Adopted tables checked after the deploy's own migrations, consumer loops
 whose hand-back spends no delivery beyond the one that brought a message
-in, and the lockfile on the patched quinn releases. No new module-declared
+in, and the lockfile on the patched quinn and wasmtime releases. No new module-declared
 feature and no new platform feature: `supports` is unchanged, and a
 service built for v0.38.1 deploys and runs on this platform unchanged
 (but see the behaviour changes below).
@@ -1474,6 +1474,11 @@ It changes no manifest, SDK or host function.
   prints nothing). The fix is the lockfile's, which the images and `cargo
   install --locked` build from: it no longer names the vulnerable
   versions, and `cargo audit` passes again.
+- The lockfile takes wasmtime 36.0.21, patched for RUSTSEC-2026-0566,
+  RUSTSEC-2026-0569 and RUSTSEC-2026-0571. The platform's engine runs
+  every guest module, so this one is the platform's own: its images take
+  it. New engine tests pin what the production engine refuses: shared
+  memory, `memory.atomic.notify`, a GC struct type and an `externref`.
 
 **Images and release tooling.**
 
