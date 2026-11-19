@@ -1255,9 +1255,11 @@ fn migration_names(list: &serde_json::Value) -> Vec<String> {
         .flatten()
         .map(|m| {
             format!(
-                "V{}__{} ({})",
-                m["version"],
-                m["name"].as_str().unwrap_or("?"),
+                "{} ({})",
+                cufflink_types::SqlMigration::stem_of(
+                    &m["version"],
+                    m["name"].as_str().unwrap_or("?")
+                ),
                 m["checksum"]
             )
         })

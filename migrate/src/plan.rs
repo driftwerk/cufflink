@@ -42,7 +42,10 @@ pub enum PlanError {
         applied_checksum: u64,
         local_checksum: u64,
     },
-    #[error("applied migration V{version}__{name} has no local file")]
+    #[error(
+        "applied migration {} has no local file",
+        SqlMigration::stem_of(version, name)
+    )]
     Missing { version: i32, name: String },
     #[error(
         "migration V{version} is not applied and precedes V{max_applied}, which is; \

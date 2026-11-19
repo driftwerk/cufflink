@@ -27,7 +27,13 @@ impl SqlMigration {
 
     /// `V{version}__{name}`, the name the migration's checksum covers.
     pub fn file_stem(&self) -> String {
-        format!("V{}__{}", self.version, self.name)
+        Self::stem_of(self.version, &self.name)
+    }
+
+    /// The [`file_stem`](Self::file_stem) of the migration `version` named
+    /// `name`, wherever only the two are at hand.
+    pub fn stem_of(version: impl std::fmt::Display, name: &str) -> String {
+        format!("V{version}__{name}")
     }
 }
 
@@ -99,6 +105,20 @@ impl HistoryMode {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_migration_is_named_by_one_stem() {
+        let migration = SqlMigration {
+            version: 12,
+            name: "loan_state".into(),
+            ..SqlMigration::default()
+        };
+        assert_eq!(migration.file_stem(), "V12__loan_state");
+        assert_eq!(
+            SqlMigration::stem_of(12_i32, "loan_state"),
+            migration.file_stem()
+        );
+    }
 
     #[test]
     fn a_migration_keeps_its_bytes() {
