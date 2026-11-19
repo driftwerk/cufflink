@@ -57,6 +57,7 @@ pub const GUEST_MEMORY_BUDGET: &str = "guest_memory_budget";
 pub const GUEST_STATEMENT_TIMEOUT: &str = "guest_statement_timeout";
 pub const SQL_PARSE: &str = "sql_parse";
 pub const WEB_RELEASES: &str = "web_releases";
+pub const PUBLIC_DOCS: &str = "public_docs";
 
 impl ServiceManifest {
     /// Features this manifest's declared shape requires, sorted and
@@ -529,6 +530,24 @@ mod tests {
             m.derived_features(),
             BTreeSet::from([COLUMN_TYPES_V2, PRIVATE_TABLES, SCHEMA_ADOPTED])
         );
+    }
+
+    #[test]
+    fn public_docs_are_demanded_only_by_a_manifest_declaring_one() {
+        let mut m = sample_manifest();
+        m.openapi = Some(crate::OpenApiOptions::default());
+        assert!(!m.derived_features().contains(PUBLIC_DOCS));
+        m.openapi = Some(crate::OpenApiOptions {
+            docs: vec![serde_json::from_value(serde_json::json!({
+                "name": "public-api",
+                "mount": "/docs/public-api",
+                "include_tags": ["Catalog"],
+                "info": {"title": "Catalog Public API", "version": "1.0.0"}
+            }))
+            .expect("document")],
+            ..Default::default()
+        });
+        assert_eq!(m.derived_features(), BTreeSet::from([PUBLIC_DOCS]));
     }
 
     #[test]

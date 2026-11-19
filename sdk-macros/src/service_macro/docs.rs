@@ -482,6 +482,7 @@ impl OpenApiBlock {
                 servers: #servers,
                 tags: #tags,
                 security_scheme: #security_scheme,
+                docs: ::std::vec::Vec::new(),
             }
         }
     }
