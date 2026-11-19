@@ -5,7 +5,7 @@ metadata() {
   if [ -n "${1:-}" ]; then
     cat "$1"
   else
-    cargo metadata --locked --no-deps --format-version 1
+    cargo metadata --no-deps --format-version 1
   fi
 }
 
