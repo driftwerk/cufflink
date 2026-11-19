@@ -1393,7 +1393,8 @@ no setting.
   `soft_delete`, `search.vector_column` and `search.config`). A table the
   running version declared managed waits for the migrations when this
   release adopts it, since the platform made it and never checked its
-  shape as adopted.
+  shape as adopted. A running version stored without adoption records
+  counts as having adopted what it declared `managed = false`.
 - Every failure of the check after the migrations names the migrations
   applied. A refusal is a 422; a failure to check stays a server error.
   An asynchronous deploy reports the phase `adoption` while it runs.

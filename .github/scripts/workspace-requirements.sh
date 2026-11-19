@@ -9,18 +9,28 @@ metadata() {
   fi
 }
 
-mismatched=$(metadata "${1:-}" | jq -r '
+checked=$(metadata "${1:-}" | jq -c '
   (.packages | map({key: .name, value: .version}) | from_entries) as $versions
-  | .packages[] | .name as $from
-  | .dependencies[]
-  | select(.path != null and .req != "*" and $versions[.name] != null)
-  | select(.req != "^" + $versions[.name] and .req != "=" + $versions[.name])
-  | "\($from) requires \(.name) \(.req), and the workspace builds \(.name) \($versions[.name])"')
+  | [.packages[] | .name as $from | .dependencies[]
+     | select($versions[.name] != null and (.path == null or .req != "*"))
+     | {from: $from, name, as: (.rename // .name), req, path, built: $versions[.name]}]
+  | {
+      compared: length,
+      refused: map(
+        if .path == null then
+          "\(.from) requires \(.as) \(.req) from a registry, and the workspace builds \(.name) \(.built)"
+        elif .req != "^" + .built and .req != "=" + .built then
+          "\(.from) requires \(.as) \(.req), and the workspace builds \(.name) \(.built)"
+        else empty end)
+    }')
 
-if [ -n "$mismatched" ]; then
-  while IFS= read -r line; do
-    echo "::error::$line"
-  done <<<"$mismatched"
+compared=$(jq -r '.compared' <<<"$checked")
+if [ "$compared" = 0 ]; then
+  echo "::error::no requirement on a workspace crate was found to compare"
   exit 1
 fi
-echo "every workspace requirement names the version the workspace builds"
+jq -r '.refused[] | "::error::\(.)"' <<<"$checked"
+if jq -e '.refused | length > 0' <<<"$checked" >/dev/null; then
+  exit 1
+fi
+echo "each of the $compared requirements on a workspace crate names the version the workspace builds"

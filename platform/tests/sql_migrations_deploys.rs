@@ -1502,7 +1502,9 @@ async fn an_adopted_search_config_a_pending_migration_makes_is_checked_after_it(
     assert_eq!(status, 200, "{plan}");
     assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
     assert!(
-        !plan.to_string().contains("text search configuration"),
+        errors(&plan)
+            .iter()
+            .all(|error| !error.contains("loan_english")),
         "a plan does not look for what the migrations are to create: {plan}"
     );
     let body = d.deployed(searched(&made)).await;
@@ -1655,4 +1657,63 @@ async fn a_table_taken_from_the_platform_into_adoption_waits_for_the_migrations(
             }
         }
     }
+}
+
+#[tokio::test]
+async fn a_snapshot_without_records_settles_what_it_declared_unmanaged() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let colours = migration(
+        1,
+        "colours",
+        "CREATE TABLE loan_service.colours (name text PRIMARY KEY);\n\
+         CREATE TABLE loan_service.loan_notes (id uuid PRIMARY KEY, body text NOT NULL);\n",
+    );
+    d.deployed(json!({"manifest": noted_service(std::slice::from_ref(&colours), true)}))
+        .await;
+    let served = served_version(&d).await;
+    let rewritten =
+        d.db.pool()
+            .get()
+            .await
+            .expect("checkout")
+            .execute(
+                "UPDATE schema_snapshots SET schema_json = schema_json -> 'tables' \
+             WHERE jsonb_typeof(schema_json) = 'object' AND service_id IN \
+             (SELECT id FROM services WHERE tenant_id = $1 AND name = 'loan-service')",
+                &[&d.tenant.id],
+            )
+            .await
+            .expect("a snapshot without adoption records");
+    assert_eq!(rewritten, 1);
+
+    d.database
+        .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+        .await
+        .expect("drift");
+    let unrelated = [
+        colours.clone(),
+        migration(
+            2,
+            "loan_labels",
+            "CREATE TABLE loan_service.loan_labels (id uuid PRIMARY KEY);\n",
+        ),
+    ];
+    let (status, body) = d
+        .deploy(json!({"manifest": noted_service(&unrelated, true)}))
+        .await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("loan_service.loan_notes.body is missing")
+            && !error.contains("stay applied"),
+        "{error}"
+    );
+    assert_eq!(
+        recorded(&d.database, HISTORY).await,
+        history_of(std::slice::from_ref(&colours))
+    );
+    assert!(!exists(&d.database, "loan_service.loan_labels").await);
+    assert_eq!(served_version(&d).await, served);
 }

@@ -291,13 +291,18 @@ pub fn settled(
     left: &[TableDefinition],
     left_adopted: &AdoptedSchema,
 ) -> Vec<TableDefinition> {
+    let adopted_before = |before: &TableDefinition| {
+        if left_adopted.is_empty() {
+            !before.managed
+        } else {
+            left_adopted.table(&before.name).is_some()
+        }
+    };
     declared
         .iter()
         .filter(|table| {
-            left_adopted.table(&table.name).is_some()
-                && left
-                    .iter()
-                    .any(|before| Checked::of(before) == Checked::of(table))
+            left.iter()
+                .any(|before| adopted_before(before) && Checked::of(before) == Checked::of(table))
         })
         .cloned()
         .collect()
@@ -438,6 +443,32 @@ mod tests {
         assert!(
             settled(&left, &left, &AdoptedSchema::default()).is_empty(),
             "a table the platform made for the version left was never checked as adopted"
+        );
+        let unmanaged = TableDefinition {
+            managed: false,
+            ..searched("english", "document")
+        };
+        assert_eq!(
+            names(settled(
+                std::slice::from_ref(&unmanaged),
+                std::slice::from_ref(&unmanaged),
+                &AdoptedSchema::default()
+            )),
+            ["loans"],
+            "a version stored without adoption records adopted what it declared unmanaged"
+        );
+        assert!(
+            settled(
+                &[unmanaged],
+                &[TableDefinition {
+                    name: "notes".into(),
+                    managed: false,
+                    ..loans()
+                }],
+                &AdoptedSchema::default()
+            )
+            .is_empty(),
+            "a table it did not declare"
         );
         assert!(
             settled(&left, &[], &adopted).is_empty(),

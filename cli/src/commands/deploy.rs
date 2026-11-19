@@ -1257,15 +1257,21 @@ fn migration_names(list: &serde_json::Value) -> Vec<String> {
             format!(
                 "{} ({})",
                 cufflink_types::SqlMigration::stem_of(
-                    m["version"]
-                        .as_str()
-                        .map_or_else(|| m["version"].to_string(), str::to_string),
+                    shown(&m["version"]),
                     m["name"].as_str().unwrap_or("?")
                 ),
-                m["checksum"]
+                shown(&m["checksum"])
             )
         })
         .collect()
+}
+
+fn shown(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "?".into(),
+        other => other.to_string(),
+    }
 }
 
 pub(crate) const PRIVATE_TABLES: &str = "Private tables (checked, not served)";
@@ -3658,9 +3664,14 @@ mod tests {
         assert_eq!(
             migration_names(&serde_json::json!([
                 {"version": 2, "name": "loan_state", "checksum": 42},
-                {"version": "3", "name": "loan_notes", "checksum": 7}
+                {"version": "3", "name": "loan_notes", "checksum": "7"},
+                {"name": "loan_tags"}
             ])),
-            ["V2__loan_state (42)", "V3__loan_notes (7)"]
+            [
+                "V2__loan_state (42)",
+                "V3__loan_notes (7)",
+                "V?__loan_tags (?)"
+            ]
         );
     }
 
