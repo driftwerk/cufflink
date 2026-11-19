@@ -536,7 +536,7 @@ the hand-back row applies):
 | Snapshots of adopted columns read after the migrations | Nothing to undo; v0.38.1 reads the snapshot before pending migrations again, so casts and defaults can be stale until a deploy with no pending migrations |
 | The hand-back of a consumer loop | Nothing to undo. v0.38.1 brings the old hand-back back: a consumer whose concurrency is at least its `max_deliver` can have a message's deliveries spent by one stop or restart, with no dead letter |
 | The plan's `deferred` adoption | Nothing: v0.38.1 never defers, and a CLI of v0.39.0 reads the key only when it is there |
-| Public documents (`public_docs`) | Nothing to undo, but every document goes: a version that declares them keeps running and serving its API, while v0.38.1 answers `404` under each mount. Its feature check refuses a deploy of a manifest that declares `docs`, so deploy without them until the platform is on v0.39.0 again |
+| Public documents (`public_docs`) | Nothing to undo, but every document goes: a version that declares them keeps running and serving its API, while v0.38.1 answers `404` under each mount. Its feature check refuses a deploy of a manifest built with this SDK that declares `docs`, since such a manifest requires `public_docs`, so deploy without them until the platform is on v0.39.0 again |
 | The database | Nothing: v0.39.0 has no migration |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
@@ -1400,10 +1400,17 @@ release deploys to a v0.38.1 platform as a v0.38.1 CLI does. The hand-back
 fix was first published as the pre-release v0.38.2-rc.1
 ([v0.38.2](#changes-in-v0382)); there is no final v0.38.2.
 
-Crates: a minor release for the change in when adoption is checked, so
-the crate set moves minor as it did at v0.36.0, v0.37.0 and v0.38.0.
-cufflink-types 0.23.0, which also gains `SqlMigration::stem_of`, with
-cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink at
+Crates: a minor release for the change in when adoption is checked and
+for public documents, whose new public field `OpenApiOptions::docs`
+breaks a struct literal of `OpenApiOptions`, so the crate set moves minor
+as it did at v0.36.0, v0.37.0 and v0.38.0. cufflink-types 0.23.0, which
+also gains `SqlMigration::stem_of`, the public document types
+(`PublicDoc`, `PublicDocInfo`, `ContactDoc`, `ApiKeyDoc`, `PublicDocCors`,
+`PublicDocError`), `openapi::{public_doc, public_doc_spec,
+mount_segments}`, `route_path::is_literal`, `ServiceManifest::public_docs`
+and `features::PUBLIC_DOCS`, with
+cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros (which reads
+`docs: [...]` in the `openapi` block) and cufflink at
 0.23.0 beside it; cufflink-fn 0.39.0; cufflink-cli 0.30.0, whose plan
 names the adoption that waits for the migrations and whose `openapi --doc`
 prints or fetches one public document; cufflink-native 0.11.0
@@ -1464,8 +1471,16 @@ info, servers and tags, and a CORS mode (`restricted`, `any` or
 A document is built once per deployed version; one that cannot be built
 answers `404` and is counted in `cufflink_public_docs_build_errors_total`,
 and the service keeps serving. `GET /api/version` advertises
-`public_docs`, and a deploy of a manifest that declares documents to a
-platform without it is refused by the feature check.
+`public_docs`. A manifest built with this SDK requires `public_docs` when
+it declares documents, so its deploy to a platform without the feature is
+refused by the feature check.
+
+**Parameter examples in every spec.** A parameter's examples move from
+its schema onto the Parameter object, as its description already did: one
+example becomes `example`, several become an `examples` map keyed `"0"`,
+`"1"`, …. This shows in every service's `_meta/openapi.json` and `cufflink
+openapi`, documents or not. The built-in client generator's output is
+unchanged; a client generated with another tool may differ.
 
 **Consumer hand-back.**
 
