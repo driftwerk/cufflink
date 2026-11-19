@@ -521,6 +521,16 @@ Rolling a platform back from v0.38.1 to v0.38.0:
 | `cufflink deploy --skip-script` | Nothing: the flag is the CLI's alone, and a CLI of v0.38.1 deploys to v0.38.0 as a v0.38.0 CLI does |
 | The database | Nothing: v0.38.1 has no migration |
 
+Rolling a platform back from v0.39.0, or from v0.38.2-rc.1, to v0.38.1:
+
+| What v0.39.0 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Adopted tables checked after the deploy's own migrations | Nothing to undo: a version deployed this way keeps running, and its adopted tables already hold what its migrations made. v0.38.1 checks every adoption before the migrations again, so a deploy whose pending migration makes a column or table it adopts is refused there (422): ship the migration in one deploy and the declaration that adopts what it makes in the next |
+| Snapshots of adopted columns read after the migrations | Nothing: they are stored in the shape v0.38.1 reads |
+| The hand-back of a consumer loop | Nothing to undo. v0.38.1 brings the old hand-back back: a consumer whose concurrency is at least its `max_deliver` can have a message's deliveries spent by one stop or restart, with no dead letter |
+| The plan's `deferred` adoption | Nothing: v0.38.1 never defers, and a CLI of v0.39.0 reads the key only when it is there |
+| The database | Nothing: v0.39.0 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -571,8 +581,11 @@ additive and the older binary does not abort on a newer schema. It serves `_fn`,
 6. Tag `v<cufflink-fn version>`. `publish.yml` refuses a tag that does not
    match, publishes nothing while any crate's version is on crates.io from
    another commit or packaged with uncommitted changes (`--allow-dirty`),
+   or while the workspace requires one of its crates at a version other
+   than the one it builds (`.github/scripts/workspace-requirements.sh`),
    and fails unless crates.io ends up serving each crate built from the
-   tagged commit.
+   tagged commit. A tag whose name holds a hyphen is published as a GitHub
+   pre-release.
 
 ## v0.31.0 release notes
 
@@ -1365,14 +1378,31 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.39.0
 
-Unreleased.
+Adopted tables checked after the deploy's own migrations, consumer loops
+whose hand-back spends no delivery beyond the one that brought a message
+in, and the lockfile on the patched quinn releases. No new module-declared
+feature and no new platform feature: `supports` is unchanged, and a
+service built for v0.38.1 deploys and runs on this platform unchanged.
+There is no migration and no new environment variable. A CLI of this
+release deploys to a v0.38.1 platform as a v0.38.1 CLI does. The hand-back
+fix was first published as the pre-release v0.38.2-rc.1
+([v0.38.2](#changes-in-v0382)); there is no final v0.38.2.
 
-A deploy checks the tables a service adopts after its own SQL migrations
-when those migrations are pending, so that a migration and the column or
-table it makes ship in one release
+Crates: cufflink-types 0.23.0, for the new `SqlMigration::stem_of`, with
+cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink at
+0.23.0 beside it; cufflink-fn 0.39.0; cufflink-cli 0.30.0, whose plan
+names the adoption that waits for the migrations; cufflink-native 0.11.0
+and cufflink-sql-parse 0.3.0, unchanged but exposing cufflink-types items
+in their public API; cufflink-nats 0.9.4 and cufflink-model 0.1.6,
+unchanged. `cufflink init` scaffolds `cufflink = "0.23"` and `cufflink-fn
+= "0.39"`.
+
+**Adopted tables and the deploy's migrations.** A deploy checks the tables
+a service adopts after its own SQL migrations when those migrations are
+pending, so that a migration and the column or table it makes ship in one
+release
 ([adopted tables and the deploy's migrations](schema-ownership.md#adopted-tables-and-the-deploys-migrations)).
-It changes no manifest, SDK or host function, needs no migration and adds
-no setting.
+It changes no manifest, SDK or host function.
 
 - When the deploy adopts a table (`schema: adopted`, `managed = false` or
   `private_tables`), its history is in `apply` mode and migrations are
@@ -1410,6 +1440,45 @@ no setting.
   deploy succeeds and prints nothing about the adoption that waits for
   the migrations, findings included.
 
+**Consumer hand-back.**
+
+- A consumer loop that hands back its batch, because its consumer stopped
+  being consumed on this platform or the platform is shutting down, closes
+  its pull request before it naks anything, and naks each message it holds
+  once. It used to nak every arrival at once for up to a second while the
+  pull was still open. The server then redelivered each nacked message into
+  the same pull, where it was nacked again. A pull asks for up to the
+  consumer's concurrency, so a consumer whose concurrency was at least its
+  `max_deliver` could have a message's deliveries all spent by one stop or
+  restart: the message was given up on with no dead letter. A message
+  handed back now spends only the delivery that brought it to the loop.
+  A message published while the loop stops is never delivered to it.
+  Subscriptions, webhook deliveries and the worker's consumers all
+  change ([durable names](subscriptions.md#durable-names)).
+
+**Security.**
+
+- The lockfile takes quinn-proto 0.11.19 and quinn-udp 0.5.16, the first
+  releases patched for RUSTSEC-2026-0523 and RUSTSEC-2026-0524
+  (quinn-proto) and RUSTSEC-2026-0538 (quinn-udp). Both are transitive
+  dependencies of reqwest, which no workspace crate builds with the
+  features the workspace enables (`cargo tree -i quinn --target all`
+  prints nothing). The fix is the lockfile's, which the images and `cargo
+  install --locked` build from: it no longer names the vulnerable
+  versions, and `cargo audit` passes again.
+
+**Images and release tooling.**
+
+- The platform, worker, web-runner and ext-runner images build with Rust
+  1.100.0; the web runner runs on Node 26.13.1, and the other runtime
+  images on the current Ubuntu 26.04 digest. `docker-compose.yml` takes the
+  current digests of its images.
+- `publish.yml` refuses a tag whose workspace requires one of its own crates
+  at a version other than the one it builds
+  (`.github/scripts/workspace-requirements.sh`, which CI runs too), and
+  publishes a tag whose name holds a hyphen, such as `v0.38.2-rc.1`, as a
+  GitHub pre-release rather than as Latest.
+
 **Behaviour changes:**
 
 - A deploy whose pending migrations drop, rename or retype a declared
@@ -1425,41 +1494,30 @@ no setting.
 - A text search configuration that an adopted declaration names, and that
   a pending migration creates, no longer refuses the deploy before the
   migrations; it is checked after them.
+- A message handed back at a stop or a shutdown spends one delivery, not
+  up to all of them (above).
 
-Rolling a platform back to v0.38 restores the old order and needs nothing
-undone.
+Rolling a platform back from v0.39.0 to v0.38.1 needs nothing undone first
+([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.38.2
 
-Unreleased.
+Not released as final: its one change, the hand-back fix, is released in
+[v0.39.0](#changes-in-v0390).
 
-Pre-release v0.38.2-rc.1 is a release candidate of the hand-back fix
-below, so that its platform image can be tried before v0.38.2 is final.
-Every published crate is at its next patch with `-rc.1`: cufflink-types,
-cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink
-0.22.2-rc.1; cufflink-fn 0.38.2-rc.1; cufflink-cli 0.29.2-rc.1;
-cufflink-nats 0.9.4-rc.1; cufflink-native 0.10.2-rc.1; cufflink-model
-0.1.6-rc.1; cufflink-sql-parse 0.2.2-rc.1. It changes no manifest, SDK or
-host function, needs no migration and adds no setting. Rolling a platform
+Pre-release v0.38.2-rc.1 was a release candidate of that fix, published so
+that its platform image could be tried first. Every published crate was at
+its next patch with `-rc.1`: cufflink-types, cufflink-migrate,
+cufflink-pgcodec, cufflink-sdk-macros and cufflink 0.22.2-rc.1;
+cufflink-fn 0.38.2-rc.1; cufflink-cli 0.29.2-rc.1; cufflink-nats
+0.9.4-rc.1; cufflink-native 0.10.2-rc.1; cufflink-model 0.1.6-rc.1;
+cufflink-sql-parse 0.2.2-rc.1. It changed no manifest, SDK or host
+function, needed no migration and added no setting. Rolling a platform
 back from it to v0.38.1 needs nothing undone. A requirement such as
-`cufflink-fn = "0.38"`, which `cufflink init` scaffolds, never selects a
-pre-release: a service tries the candidate's crates only by naming their
-exact versions.
-
-- A consumer loop that hands back its batch, because its consumer stopped
-  being consumed on this platform or the platform is shutting down, closes
-  its pull request before it naks anything, and naks each message it holds
-  once. It used to nak every arrival at once for up to a second while the
-  pull was still open. The server then redelivered each nacked message into
-  the same pull, where it was nacked again. A pull asks for up to the
-  consumer's concurrency, so a consumer whose concurrency was at least its
-  `max_deliver` could have a message's deliveries all spent by one stop or
-  restart: the message was given up on with no dead letter. A message
-  handed back now spends only the delivery that brought it to the loop.
-  A message published while the loop stops is never delivered to it.
-  Subscriptions, webhook deliveries and the worker's consumers all
-  change. The rollback to v0.38.1 brings the old behaviour back and needs
-  nothing undone.
+`cufflink-fn = "0.38"`, which `cufflink init` scaffolded, never selects a
+pre-release: a service tried the candidate's crates only by naming their
+exact versions. A platform on v0.38.2-rc.1 moves to v0.39.0 like one on
+v0.38.1.
 
 ## Changes in v0.38.1
 
