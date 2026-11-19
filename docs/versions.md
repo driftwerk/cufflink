@@ -527,6 +527,18 @@ Rolling a platform back from v0.38.1 to v0.38.0:
 | `cufflink deploy --skip-script` | Nothing: the flag is the CLI's alone, and a CLI of v0.38.1 deploys to v0.38.0 as a v0.38.0 CLI does |
 | The database | Nothing: v0.38.1 has no migration |
 
+Rolling a platform back from v0.39.0 to v0.38.1 (from v0.38.2-rc.1, only
+the hand-back row applies):
+
+| What v0.39.0 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Adopted tables checked after the deploy's own migrations | Nothing to undo: a version deployed this way keeps running, and its adopted tables already hold what its migrations made. v0.38.1 checks every adoption before the migrations again, so a deploy whose pending migration makes a column or table it adopts is refused there (422): ship the migration in one deploy and the declaration that adopts what it makes in the next. v0.38.1 also brings back what this release stopped: a deploy whose pending migrations drop, rename or retype a declared column, or drop a declared table, is activated again over a schema its version cannot serve |
+| Snapshots of adopted columns read after the migrations | Nothing to undo; v0.38.1 reads the snapshot before pending migrations again, so casts and defaults can be stale until a deploy with no pending migrations |
+| The hand-back of a consumer loop | Nothing to undo. v0.38.1 brings the old hand-back back: a consumer whose concurrency is at least its `max_deliver` can have a message's deliveries spent by one stop or restart, with no dead letter |
+| The plan's `deferred` adoption | Nothing: v0.38.1 never defers, and a CLI of v0.39.0 reads the key only when it is there |
+| Public documents (`public_docs`) | Nothing to undo, but every document goes: a version that declares them keeps running and serving its API, while v0.38.1 answers `404` under each mount. A manifest built with this SDK that declares `docs` requires `public_docs`, so v0.38.1's feature check refuses its deploy. Deploy without them until the platform is on v0.39.0 again |
+| The database | Nothing: v0.39.0 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -577,8 +589,11 @@ additive and the older binary does not abort on a newer schema. It serves `_fn`,
 6. Tag `v<cufflink-fn version>`. `publish.yml` refuses a tag that does not
    match, publishes nothing while any crate's version is on crates.io from
    another commit or packaged with uncommitted changes (`--allow-dirty`),
+   or while the workspace requires one of its crates at a version other
+   than the one it builds (`.github/scripts/workspace-requirements.sh`),
    and fails unless crates.io ends up serving each crate built from the
-   tagged commit.
+   tagged commit. A tag whose name holds a hyphen is published as a GitHub
+   pre-release.
 
 ## v0.31.0 release notes
 
@@ -1371,14 +1386,45 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.39.0
 
-Unreleased.
+Adopted tables checked after the deploy's own migrations, public API
+documents served with an embedded Swagger UI, consumer loops whose
+hand-back spends no delivery beyond the one that brought a message in,
+and the lockfile on the patched quinn and wasmtime releases. One new
+platform feature, `public_docs`, which a manifest needs only when its
+`openapi` block declares `docs`
+([features added in v0.39.0](#features-added-in-v0390)). A service built
+for v0.38.1 deploys and runs on this platform unchanged (but see the
+behaviour changes below).
+There is no migration and no new environment variable. A CLI of this
+release deploys to a v0.38.1 platform as a v0.38.1 CLI does. The hand-back
+fix was first published as the pre-release v0.38.2-rc.1
+([v0.38.2](#changes-in-v0382)); there is no final v0.38.2.
 
-A deploy checks the tables a service adopts after its own SQL migrations
-when those migrations are pending, so that a migration and the column or
-table it makes ship in one release
+Crates: a minor release for the change in when adoption is checked and
+for public documents, whose new public field `OpenApiOptions::docs`
+breaks a struct literal of `OpenApiOptions`, so the crate set moves minor
+as it did at v0.36.0, v0.37.0 and v0.38.0. cufflink-types 0.23.0, which
+also gains `SqlMigration::stem_of`, the public document types
+(`PublicDoc`, `PublicDocInfo`, `ContactDoc`, `ApiKeyDoc`, `PublicDocCors`,
+`PublicDocError`), `openapi::{public_doc, public_doc_spec,
+mount_segments}`, `route_path::is_literal`, `ServiceManifest::public_docs`
+and `features::PUBLIC_DOCS`, with
+cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros (which reads
+`docs: [...]` in the `openapi` block) and cufflink at
+0.23.0 beside it; cufflink-fn 0.39.0; cufflink-cli 0.30.0, whose plan
+names the adoption that waits for the migrations and whose `openapi --doc`
+prints or fetches one public document; cufflink-native 0.11.0
+and cufflink-sql-parse 0.3.0, unchanged but exposing cufflink-types items
+in their public API; cufflink-nats 0.9.4 and cufflink-model 0.1.6,
+unchanged. `cufflink init` scaffolds `cufflink = "0.23"` and `cufflink-fn
+= "0.39"`.
+
+**Adopted tables and the deploy's migrations.** A deploy checks the tables
+a service adopts after its own SQL migrations when those migrations are
+pending, so that a migration and the column or table it makes ship in one
+release
 ([adopted tables and the deploy's migrations](schema-ownership.md#adopted-tables-and-the-deploys-migrations)).
-It changes no manifest, SDK or host function, needs no migration and adds
-no setting.
+It changes no manifest, SDK or host function.
 
 - When the deploy adopts a table (`schema: adopted`, `managed = false` or
   `private_tables`), its history is in `apply` mode and migrations are
@@ -1416,6 +1462,80 @@ no setting.
   deploy succeeds and prints nothing about the adoption that waits for
   the migrations, findings included.
 
+**Public documents.** A service on `routing: strict` declares `docs` in
+its `openapi` block: each a name, a mount, the tags it includes, its own
+info, servers and tags, and a CORS mode (`restricted`, `any` or
+`mirror`). The platform serves each one without a token at
+`<mount>/openapi.json`, with Swagger UI 5.17.14, embedded in the image, at
+`<mount>/swagger-ui/` ([public documents](openapi.md#public-documents)).
+A document is built once per deployed version; one that cannot be built
+answers `404` and is counted in `cufflink_public_docs_build_errors_total`,
+and the service keeps serving. `GET /api/version` advertises
+`public_docs`. A manifest built with this SDK requires `public_docs` when
+it declares documents, so its deploy to a platform without the feature is
+refused by the feature check.
+
+**Parameter examples in every spec.** A parameter's examples move from
+its schema onto the Parameter object, as its description already did: one
+example becomes `example`, several become an `examples` map keyed `"0"`,
+`"1"`, …. This shows in every service's `_meta/openapi.json` and `cufflink
+openapi`, documents or not. The built-in client generator's output is
+unchanged; a client generated with another tool may differ.
+
+**Consumer hand-back.**
+
+- A consumer loop that hands back its batch, because its consumer stopped
+  being consumed on this platform or the platform is shutting down, closes
+  its pull request before it naks anything, and naks each message it holds
+  once. It used to nak every arrival at once for up to a second while the
+  pull was still open. The server then redelivered each nacked message into
+  the same pull, where it was nacked again. A pull asks for up to the
+  consumer's concurrency, so a consumer whose concurrency was at least its
+  `max_deliver` could have a message's deliveries all spent by one stop or
+  restart: the message was given up on with no dead letter. A message
+  handed back now spends only the delivery that brought it to the loop,
+  and a message published while the loop stops is not delivered to it,
+  with two exceptions, neither of which loses a message. A message already
+  on its way when the pull closes comes back once its `ack_wait` has
+  passed. On a server with leaf nodes or gateways, a message handed back
+  just after the pull closed can spend one extra delivery. Subscriptions,
+  webhook deliveries and the worker's consumers all change
+  ([what a stopping loop does with its messages](subscriptions.md#durable-names)).
+
+**Security.**
+
+- The lockfile takes quinn-proto 0.11.19 and quinn-udp 0.5.16, the first
+  releases patched for RUSTSEC-2026-0523 and RUSTSEC-2026-0524
+  (quinn-proto) and RUSTSEC-2026-0538 (quinn-udp). Both are transitive
+  dependencies of reqwest, which no workspace crate builds with the
+  features the workspace enables (`cargo tree -i quinn --target all`
+  prints nothing). The fix is the lockfile's, which the images and `cargo
+  install --locked` build from: it no longer names the vulnerable
+  versions, and `cargo audit` passes again.
+- The lockfile takes wasmtime 36.0.21, patched for RUSTSEC-2026-0566,
+  RUSTSEC-2026-0569 and RUSTSEC-2026-0571. The platform's engine runs
+  every guest module, so this one is the platform's own: its images take
+  it. New engine tests pin what the production engine refuses: shared
+  memory, `memory.atomic.notify`, a GC struct type and an `externref`.
+
+**Images and release tooling.**
+
+- The published platform, worker, web-runner and ext-runner images
+  (`sha-<commit>` and `latest`, from the `Dockerfile.*.ci` files) take the
+  current Ubuntu 26.04 digest. Their binaries are still built by CI with
+  Rust 1.93.1, and the web runner's image still installs Node v24.22.1.
+- The source-build Dockerfiles (`Dockerfile.platform`, `Dockerfile.worker`,
+  `Dockerfile.web-runner` and `Dockerfile.ext-runner`, which `cufflink dev
+  up --from-source` builds) build with Rust 1.100.0. Their runtime stays
+  debian bookworm-slim, except the web runner's, which moves to Node
+  26.13.1.
+- `docker-compose.yml` takes the current digests of its images.
+- `publish.yml` refuses a tag whose workspace requires one of its own crates
+  at a version other than the one it builds
+  (`.github/scripts/workspace-requirements.sh`, which CI runs too), and
+  publishes a tag whose name holds a hyphen, such as `v0.38.2-rc.1`, as a
+  GitHub pre-release rather than as Latest.
+
 **Behaviour changes:**
 
 - A deploy whose pending migrations drop, rename or retype a declared
@@ -1431,41 +1551,31 @@ no setting.
 - A text search configuration that an adopted declaration names, and that
   a pending migration creates, no longer refuses the deploy before the
   migrations; it is checked after them.
+- A message handed back at a stop or a shutdown spends one delivery, not
+  up to all of them (above).
 
-Rolling a platform back to v0.38 restores the old order and needs nothing
-undone.
+Rolling a platform back from v0.39.0 to v0.38.1 needs nothing undone
+first, though every public document then answers `404`
+([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.38.2
 
-Unreleased.
+Not released as final: its one change, the hand-back fix, is released in
+[v0.39.0](#changes-in-v0390).
 
-Pre-release v0.38.2-rc.1 is a release candidate of the hand-back fix
-below, so that its platform image can be tried before v0.38.2 is final.
-Every published crate is at its next patch with `-rc.1`: cufflink-types,
-cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink
-0.22.2-rc.1; cufflink-fn 0.38.2-rc.1; cufflink-cli 0.29.2-rc.1;
-cufflink-nats 0.9.4-rc.1; cufflink-native 0.10.2-rc.1; cufflink-model
-0.1.6-rc.1; cufflink-sql-parse 0.2.2-rc.1. It changes no manifest, SDK or
-host function, needs no migration and adds no setting. Rolling a platform
+Pre-release v0.38.2-rc.1 was a release candidate of that fix, published so
+that its platform image could be tried first. Every published crate was at
+its next patch with `-rc.1`: cufflink-types, cufflink-migrate,
+cufflink-pgcodec, cufflink-sdk-macros and cufflink 0.22.2-rc.1;
+cufflink-fn 0.38.2-rc.1; cufflink-cli 0.29.2-rc.1; cufflink-nats
+0.9.4-rc.1; cufflink-native 0.10.2-rc.1; cufflink-model 0.1.6-rc.1;
+cufflink-sql-parse 0.2.2-rc.1. It changed no manifest, SDK or host
+function, needed no migration and added no setting. Rolling a platform
 back from it to v0.38.1 needs nothing undone. A requirement such as
-`cufflink-fn = "0.38"`, which `cufflink init` scaffolds, never selects a
-pre-release: a service tries the candidate's crates only by naming their
-exact versions.
-
-- A consumer loop that hands back its batch, because its consumer stopped
-  being consumed on this platform or the platform is shutting down, closes
-  its pull request before it naks anything, and naks each message it holds
-  once. It used to nak every arrival at once for up to a second while the
-  pull was still open. The server then redelivered each nacked message into
-  the same pull, where it was nacked again. A pull asks for up to the
-  consumer's concurrency, so a consumer whose concurrency was at least its
-  `max_deliver` could have a message's deliveries all spent by one stop or
-  restart: the message was given up on with no dead letter. A message
-  handed back now spends only the delivery that brought it to the loop.
-  A message published while the loop stops is never delivered to it.
-  Subscriptions, webhook deliveries and the worker's consumers all
-  change. The rollback to v0.38.1 brings the old behaviour back and needs
-  nothing undone.
+`cufflink-fn = "0.38"`, which `cufflink init` scaffolded, never selects a
+pre-release: a service tried the candidate's crates only by naming their
+exact versions. A platform on v0.38.2-rc.1 moves to v0.39.0 like one on
+v0.38.1.
 
 ## Changes in v0.38.1
 
