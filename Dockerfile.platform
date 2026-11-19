@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y ca-certificates tini && rm -rf /var/lib
 
 COPY --from=builder /app/target/release/cufflink-platform /usr/local/bin/cufflink-platform
 COPY --from=builder /app/target/release/cufflink-sql-parser /usr/local/bin/cufflink-sql-parser
+COPY platform/assets/swagger-ui/LICENSE platform/assets/swagger-ui/NOTICE /usr/share/doc/cufflink/swagger-ui/
 
 EXPOSE 8080
 

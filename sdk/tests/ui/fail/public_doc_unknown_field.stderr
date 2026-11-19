@@ -1,0 +1,5 @@
+error: unknown public document field 'host'; expected name, mount, include_tags, title, version, description, contact, servers, tags, path_prefix, api_key or cors
+ --> tests/ui/fail/public_doc_unknown_field.rs:7:115
+  |
+7 |             { name: "public-api", mount: "/docs/public-api", include_tags: ["Catalog"], title: "A", version: "1", host: "example.com" },
+  |                                                                                                                   ^^^^

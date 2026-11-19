@@ -111,3 +111,113 @@ cufflink generate-client --local --generator openapi-generator \
   A plain headers record is still accepted. A non-2xx response throws a
   `CufflinkError` with `status` and the parsed `body`; its message is the
   body's `error` or `error_message` when there is one.
+- A parameter's schema examples move to the Parameter object, where
+  Swagger UI shows them: one example becomes its `example`, two or more its
+  `examples` map, keyed `"0"`, `"1"`, … with each `{"value": …}`. Clients are
+  unchanged by it, and so are `deploy_hash` and `schema_hash`.
+
+## Public documents
+
+A service on `routing: strict` can publish named, unauthenticated API
+documents, each a subset of its spec, under mounts it chooses:
+
+```rust
+openapi: {
+    title: "catalog-service",
+    docs: [
+        {
+            name: "public-api",
+            mount: "/docs/public-api",
+            include_tags: ["Catalog", "Orders"],
+            title: "Catalog Public API",
+            version: "1.0.0",
+            description: catalog_docs::public_api_description(),
+            contact: { name: "API Support", email: "support@example.com" },
+            servers: [("https://api.example.com", "Production")],
+            tags: [("Catalog", "Products and prices")],
+            path_prefix: "/api",
+            api_key: { header: "Authorization", description: "The key issued to you" },
+            cors: mirror,
+        },
+    ],
+},
+```
+
+`name`, `mount`, `include_tags`, `title` and `version` are required;
+`description` takes any expression whose value implements `ToString`. A
+manifest declaring documents requires the platform feature `public_docs`.
+
+**What is selected.** A document holds the operations of the service's
+server-relative spec tagged with any of `include_tags` (internal routes never),
+the schemas they reach through `$ref`, and the security schemes they name.
+Its `info`, `tags` and `servers` are its own. Its servers are the first
+non-empty of its own `servers`, the `openapi` block's `servers`, and the
+service's base. `path_prefix` is put before every path; it describes a
+gateway's public layout, so it needs the document's own `servers`, which
+address that gateway. `api_key` presents the `api_key` scheme in another
+header, for a key a gateway checks; a document that selects a route whose
+key the platform checks itself (the `api_key` posture, in `X-Api-Key`)
+cannot declare it.
+
+**What the deploy refuses**, naming the document: documents on
+`routing: legacy`; a name outside `[a-z][a-z0-9-]{0,62}` or used twice; an
+empty `include_tags`, or a tag that selects no published operation; a
+mount that is not literal segments, starts with a reserved segment or a
+table's name, overlaps another document's mount, or has a route under it
+(the bare mount and the mount plus `/` included); an `api_key.header` that is
+not a header name; a malformed `path_prefix`; an empty server URL, title or
+version; and a `cors` mode the platform does not know.
+
+**The answers**, under `/svc/{tenant}/{service}{mount}`, with no token:
+
+| Request | Answer |
+|---|---|
+| `GET`/`HEAD …/openapi.json` | `200 application/json`, the document |
+| `GET`/`HEAD …/swagger-ui/` and `…/swagger-ui/index.html` | `200`, Swagger UI's page |
+| `GET`/`HEAD …/swagger-ui/<file>` | `200`, one of the files that page loads |
+| `GET`/`HEAD …/swagger-ui` | `303`, `location: swagger-ui/` |
+| any other method on those paths but `OPTIONS` | `405`, `allow: GET,HEAD` |
+| anything else under the mount | the platform's `404` |
+
+Every link is relative (the page loads `../openapi.json`), so the same
+bytes work at the platform's own path and behind a gateway that publishes
+the mount elsewhere. A service's [error profile](routing.md#error-profile)
+renders the `404` and `405`.
+
+**Caching.** Each `200` carries a strong `etag` (the SHA-256 of the bytes)
+and `cache-control: no-cache`; an `If-None-Match` that matches answers
+`304`. A document is built once per deployed version, outside the request
+path. A document that cannot be built (only a stored manifest that never
+passed the deploy's checks can fail) answers `404`, and its failed build
+is counted in `cufflink_public_docs_build_errors_total`; the service and
+its other documents keep answering.
+
+**CORS**, per document:
+- `restricted` (the default): the platform's own policy
+  (`CORS_ALLOWED_ORIGINS`), as for every route. A browser page on another
+  origin cannot load the document.
+- `any`: `access-control-allow-origin: *`, never credentials; a preflight
+  allows `GET,HEAD` and any header.
+- `mirror`: what tower-http's `CorsLayer::very_permissive()` sends: the
+  request's `Origin` echoed, `access-control-allow-credentials: true`, a
+  `vary` on the request's origin, method and headers, and a preflight's
+  method and headers echoed. Documents set and need no cookie, so a
+  credentialed read reveals no more than an anonymous one.
+
+Only paths under that document's mount are affected; the service's routes
+keep the platform's policy. A platform that meets a mode it does not know
+(a rollback) serves the document as `restricted` and logs a warning.
+
+**Swagger UI** is `swagger-ui-dist` 5.17.14 (Apache-2.0), embedded in the
+platform binary: `index.html`, `swagger-ui.css`, `index.css`,
+`swagger-ui-bundle.js`, `swagger-ui-standalone-preset.js` and the two
+favicons, unmodified, plus the platform's own `swagger-initializer.js`.
+Nothing is loaded from a CDN, and no other file of the package is served.
+`_meta/docs` loads the same files from `_meta/docs/{file}`, which needs no
+token. `platform/assets/swagger-ui/README.md` names the source and how to
+move to another version.
+
+**From the CLI.** `cufflink openapi --doc public-api --local` prints the
+document built from the local manifest; without `--local` it fetches it from
+the deployed service's mount, as its readers do. An unknown name lists the
+declared ones. `generate-client` always uses the whole spec.

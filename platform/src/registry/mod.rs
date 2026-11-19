@@ -3,12 +3,13 @@ mod identity;
 pub use identity::ServiceIdentity;
 
 use crate::deployer::ServiceManifest;
+use crate::router::public_docs::PublicDocs;
 use crate::router::strict::{RouteTable, RouteTableError};
 use crate::shutdown::Shutdown;
 use crate::wasm_runtime::WasmEngine;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
@@ -35,7 +36,11 @@ pub struct ServiceRegistry {
     version: Arc<AtomicU64>,
     mutations: Arc<AtomicU64>,
     changes: Arc<watch::Sender<u64>>,
+    open_docs: Arc<AtomicBool>,
+    build_docs: BuildDocs,
 }
+
+type BuildDocs = Arc<dyn Fn(&RegisteredService) -> PublicDocs + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Membership {
@@ -60,12 +65,30 @@ struct RegistryIndex {
     by_key: HashMap<(Uuid, String), Arc<RegisteredService>>,
     by_slug: HashMap<(String, String), Arc<RegisteredService>>,
     route_tables: HashMap<Uuid, Arc<RouteTable>>,
+    docs: HashMap<Uuid, Arc<PublicDocs>>,
     current_versions: HashMap<Uuid, i32>,
 }
 
 struct Routable {
     service: RegisteredService,
     routes: Option<RouteTable>,
+    docs: Option<Arc<PublicDocs>>,
+}
+
+struct Docs<'a> {
+    known: HashMap<Uuid, Arc<PublicDocs>>,
+    build: &'a (dyn Fn(&RegisteredService) -> PublicDocs + Send + Sync),
+}
+
+impl Docs<'_> {
+    fn of(&self, service: &RegisteredService) -> Option<Arc<PublicDocs>> {
+        service.manifest.public_docs().next()?;
+        self.known
+            .get(&service.service_id)
+            .filter(|docs| docs.built_for(service))
+            .cloned()
+            .or_else(|| Some(Arc::new((self.build)(service))))
+    }
 }
 
 impl Routable {
@@ -82,12 +105,25 @@ impl Routable {
                 ..service
             },
             routes,
+            docs: None,
         })
+    }
+
+    fn documented(self, docs: &Docs) -> Self {
+        let docs = self.routes.as_ref().and_then(|_| docs.of(&self.service));
+        Self { docs, ..self }
     }
 }
 
 impl RegistryIndex {
-    fn insert(&mut self, Routable { service, routes }: Routable) {
+    fn insert(
+        &mut self,
+        Routable {
+            service,
+            routes,
+            docs,
+        }: Routable,
+    ) {
         self.current_versions
             .insert(service.service_id, service.version);
         match routes {
@@ -95,6 +131,10 @@ impl RegistryIndex {
                 .route_tables
                 .insert(service.service_id, Arc::new(routes)),
             None => self.route_tables.remove(&service.service_id),
+        };
+        match docs {
+            Some(docs) => self.docs.insert(service.service_id, docs),
+            None => self.docs.remove(&service.service_id),
         };
         let service = Arc::new(service);
         self.by_slug.insert(
@@ -108,6 +148,7 @@ impl RegistryIndex {
     fn remove_by_id(&mut self, service_id: Uuid) {
         self.current_versions.remove(&service_id);
         self.route_tables.remove(&service_id);
+        self.docs.remove(&service_id);
         self.by_key
             .retain(|_, service| service.service_id != service_id);
         self.by_slug
@@ -177,6 +218,53 @@ impl ServiceRegistry {
             version: Arc::new(AtomicU64::new(0)),
             mutations: Arc::new(AtomicU64::new(0)),
             changes: Arc::new(watch::Sender::new(0)),
+            open_docs: Arc::new(AtomicBool::new(false)),
+            build_docs: Arc::new(PublicDocs::build),
+        }
+    }
+
+    #[cfg(test)]
+    fn building_docs_with(
+        self,
+        build: impl Fn(&RegisteredService) -> PublicDocs + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            build_docs: Arc::new(build),
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    async fn documented_row(&self, service: &RegisteredService) -> LoadedRow {
+        let docs = self.docs_stage().await;
+        LoadedRow {
+            service_id: service.service_id,
+            version: service.version,
+            deployed: Some(
+                Routable::new(service.clone())
+                    .map(|routable| routable.documented(&docs))
+                    .map_err(|e| SkippedRow {
+                        service: service.name.clone(),
+                        tenant: service.tenant_slug.clone(),
+                        error: e.to_string(),
+                    }),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn route_documented(&self, service: &RegisteredService) -> Membership {
+        self.refresh_from(service.service_id, || async {
+            Ok(Some(self.documented_row(service).await))
+        })
+        .await
+        .expect("refreshed")
+    }
+
+    async fn docs_stage(&self) -> Docs<'_> {
+        Docs {
+            known: self.services.read().await.docs.clone(),
+            build: self.build_docs.as_ref(),
         }
     }
 
@@ -208,6 +296,7 @@ impl ServiceRegistry {
     }
 
     async fn read_active(&self) -> eyre::Result<Vec<LoadedRow>> {
+        let docs = self.docs_stage().await;
         Ok(self
             .db
             .get()
@@ -215,11 +304,12 @@ impl ServiceRegistry {
             .query(SELECT_ACTIVE, &[])
             .await?
             .iter()
-            .map(decode_row)
+            .map(|row| decode_row(row, &docs))
             .collect())
     }
 
     async fn read_one(&self, service_id: Uuid) -> eyre::Result<Option<LoadedRow>> {
+        let docs = self.docs_stage().await;
         Ok(self
             .db
             .get()
@@ -227,7 +317,7 @@ impl ServiceRegistry {
             .query_opt(&format!("{SELECT_ACTIVE} AND s.id = $1"), &[&service_id])
             .await?
             .as_ref()
-            .map(decode_row))
+            .map(|row| decode_row(row, &docs)))
     }
 
     pub async fn refresh(&self, service_id: Uuid) -> eyre::Result<Membership> {
@@ -267,6 +357,7 @@ impl ServiceRegistry {
         let unchanged = self.mutations.load(Ordering::Acquire) == epoch;
         if unchanged {
             *services = index;
+            self.opened(&services);
             self.changed();
         }
         unchanged
@@ -293,9 +384,33 @@ impl ServiceRegistry {
         change: impl FnOnce(&mut RegistryIndex) -> T,
     ) -> T {
         let changed = change(index);
+        self.opened(index);
         self.mutations.fetch_add(1, Ordering::Release);
         self.changed();
         changed
+    }
+
+    fn opened(&self, index: &RegistryIndex) {
+        self.open_docs.store(
+            index.docs.values().any(|docs| docs.is_open()),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn any_open_docs(&self) -> bool {
+        self.open_docs.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn public_docs(
+        &self,
+        tenant_slug: &str,
+        service_name: &str,
+    ) -> Option<Arc<PublicDocs>> {
+        let index = self.services.read().await;
+        let service = index
+            .by_slug
+            .get(&(tenant_slug.to_string(), service_name.to_string()))?;
+        index.docs.get(&service.service_id).cloned()
     }
 
     pub async fn notify_change(&self) {
@@ -355,7 +470,7 @@ impl ServiceRegistry {
         &self,
         tenant_slug: &str,
         service_name: &str,
-    ) -> Option<(Arc<RegisteredService>, Arc<RouteTable>)> {
+    ) -> Option<StrictRoutes> {
         let index = self.services.read().await;
         let service = index
             .by_slug
@@ -363,7 +478,11 @@ impl ServiceRegistry {
         index
             .route_tables
             .get(&service.service_id)
-            .map(|routes| (Arc::clone(service), Arc::clone(routes)))
+            .map(|routes| StrictRoutes {
+                service: Arc::clone(service),
+                routes: Arc::clone(routes),
+                docs: index.docs.get(&service.service_id).cloned(),
+            })
     }
 
     pub async fn get_by_tenant(&self, tenant_id: Uuid) -> Vec<Arc<RegisteredService>> {
@@ -401,6 +520,12 @@ impl ServiceRegistry {
     }
 }
 
+pub(crate) struct StrictRoutes {
+    pub service: Arc<RegisteredService>,
+    pub routes: Arc<RouteTable>,
+    pub docs: Option<Arc<PublicDocs>>,
+}
+
 fn count_reload(succeeded: bool) {
     let result = if succeeded { "ok" } else { "error" };
     metrics::counter!("cufflink_registry_reload_total", "result" => result).increment(1);
@@ -432,7 +557,7 @@ fn build_index(rows: impl IntoIterator<Item = LoadedRow>) -> (RegistryIndex, Loa
     )
 }
 
-fn decode_row(row: &tokio_postgres::Row) -> LoadedRow {
+fn decode_row(row: &tokio_postgres::Row, docs: &Docs) -> LoadedRow {
     let service_id = row.get("id");
     let version = row.get("current_version");
     let deployed = row
@@ -453,6 +578,7 @@ fn decode_row(row: &tokio_postgres::Row) -> LoadedRow {
                         wasm_hash: row.get("wasm_hash"),
                         commit_hash: row.get("commit_hash"),
                     })
+                    .map(|routable| routable.documented(docs))
                     .map_err(|e| e.to_string())
                 })
                 .map_err(|error| SkippedRow {
@@ -739,6 +865,132 @@ mod tests {
         index.remove(tenant, "orders");
         assert!(index.by_key.is_empty() && index.by_slug.is_empty());
         assert!(index.current_versions.is_empty());
+    }
+
+    fn counting_builds() -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        impl Fn(&RegisteredService) -> PublicDocs + Send + Sync + 'static,
+    ) {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        (builds, move |service: &RegisteredService| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            PublicDocs::build(service)
+        })
+    }
+
+    #[tokio::test]
+    async fn a_versions_documents_are_built_once_and_follow_the_service() {
+        use crate::router::public_docs::tests::{catalog, public_api};
+        let (builds, build) = counting_builds();
+        let registry = offline_registry().await.building_docs_with(build);
+        let first = catalog(serde_json::json!([public_api("any")]));
+        let docs = |registry: &ServiceRegistry| {
+            let registry = registry.clone();
+            async move { registry.public_docs("acme", "catalog-service").await }
+        };
+
+        assert_eq!(registry.route_documented(&first).await, Membership::Routed);
+        let built = docs(&registry).await.expect("documents");
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(registry.any_open_docs());
+        assert!(registry
+            .strict_routes("acme", "catalog-service")
+            .await
+            .and_then(|routes| routes.docs)
+            .is_some_and(|docs| Arc::ptr_eq(&docs, &built)));
+
+        assert_eq!(registry.route_documented(&first).await, Membership::Routed);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "an unchanged version is not rebuilt"
+        );
+        assert!(Arc::ptr_eq(
+            &docs(&registry).await.expect("documents"),
+            &built
+        ));
+
+        let (index, _) = build_index([registry.documented_row(&first).await]);
+        assert!(
+            registry
+                .swap_unless_mutated(registry.mutations.load(Ordering::Acquire), index)
+                .await
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a reload of the same version builds nothing"
+        );
+        assert!(Arc::ptr_eq(
+            &docs(&registry).await.expect("documents"),
+            &built
+        ));
+
+        let second = RegisteredService {
+            version: 4,
+            ..first.clone()
+        };
+        registry.route_documented(&second).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert!(!Arc::ptr_eq(
+            &docs(&registry).await.expect("documents"),
+            &built
+        ));
+
+        let restricted = RegisteredService {
+            version: 5,
+            ..catalog(serde_json::json!([public_api("restricted")]))
+        };
+        let restricted = RegisteredService {
+            service_id: first.service_id,
+            tenant_id: first.tenant_id,
+            ..restricted
+        };
+        registry.route_documented(&restricted).await;
+        assert!(!registry.any_open_docs());
+
+        let undocumented = RegisteredService {
+            version: 6,
+            ..restricted.clone()
+        };
+        let undocumented = RegisteredService {
+            manifest: ServiceManifest {
+                openapi: None,
+                ..undocumented.manifest.clone()
+            },
+            ..undocumented
+        };
+        registry.route_documented(&undocumented).await;
+        assert!(docs(&registry).await.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+
+        registry.route_documented(&second).await;
+        assert!(registry.any_open_docs());
+        registry.remove(first.tenant_id, "catalog-service").await;
+        assert!(docs(&registry).await.is_none());
+        assert!(!registry.any_open_docs());
+    }
+
+    #[tokio::test]
+    async fn a_document_that_fails_to_build_leaves_the_service_routed() {
+        use crate::router::public_docs::tests::{catalog, public_api};
+        let registry = offline_registry().await;
+        let mut unmountable = public_api("any");
+        unmountable["mount"] = serde_json::json!("/docs/{version}");
+        let service = catalog(serde_json::json!([unmountable]));
+        assert_eq!(
+            registry.route_documented(&service).await,
+            Membership::Routed
+        );
+        let routes = registry
+            .strict_routes("acme", "catalog-service")
+            .await
+            .expect("still routed");
+        assert!(routes
+            .docs
+            .is_some_and(|docs| docs.target("/docs/1/openapi.json").is_none()));
+        assert!(!registry.any_open_docs());
     }
 
     #[tokio::test]
@@ -1142,10 +1394,11 @@ mod tests {
             registry.refresh(orders.id).await.expect("refreshed"),
             Membership::Routed
         );
-        let (routed, _) = registry
+        let routed = registry
             .strict_routes(&stored.tenant.slug, "orders")
             .await
-            .expect("its route table came with it");
+            .expect("its route table came with it")
+            .service;
         assert_eq!((routed.version, &routed.wasm_hash), (second, &None));
         assert_eq!(second, first + 1);
         assert_eq!(registry.count().await, 1);

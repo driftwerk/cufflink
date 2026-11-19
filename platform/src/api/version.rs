@@ -12,7 +12,7 @@ const BASE_FEATURES: &[&str] = &[
     "tenant_policies",
 ];
 
-const SUBSYSTEM_FEATURES: [&[&str]; 15] = [
+const SUBSYSTEM_FEATURES: [&[&str]; 16] = [
     crate::router::custom::FEATURES,
     crate::auth::scope::FEATURES,
     crate::auth::columns::FEATURES,
@@ -28,6 +28,7 @@ const SUBSYSTEM_FEATURES: [&[&str]; 15] = [
     crate::deployer::web::FEATURES,
     crate::api::deployments::FEATURES,
     crate::api::config::FEATURES,
+    crate::router::public_docs::FEATURES,
 ];
 
 pub fn platform_version() -> &'static str {
@@ -152,6 +153,7 @@ mod tests {
             ROUTE_CONCURRENCY,
             GUEST_MEMORY_BUDGET,
             RESPONSE_RAW_JSON,
+            PUBLIC_DOCS,
         ] {
             assert!(supports.contains(&finished), "{finished}");
         }

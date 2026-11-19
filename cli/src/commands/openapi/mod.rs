@@ -88,31 +88,70 @@ async fn fetch_remote_spec(env: Option<&str>) -> eyre::Result<serde_json::Value>
     Ok(spec_resp.json().await?)
 }
 
-/// Fetch and display the OpenAPI spec for the current service
-pub async fn run(local: bool, tenant_slug: Option<&str>, env: Option<&str>) -> eyre::Result<()> {
-    let spec = if local {
-        generate_local_spec(tenant_slug)?
-    } else {
-        fetch_remote_spec(env).await?
-    };
+/// The local manifest's public document `name`.
+fn generate_local_doc(tenant_slug: Option<&str>, name: &str) -> eyre::Result<serde_json::Value> {
+    let manifest = load_local_manifest()?;
+    Ok(cufflink_types::openapi::public_doc_spec(
+        &manifest,
+        tenant_slug.unwrap_or("local"),
+        name,
+    )?)
+}
 
+/// Fetch the deployed service's public document `name` from its mount,
+/// unauthenticated, as its readers fetch it.
+async fn fetch_remote_doc(name: &str, env: Option<&str>) -> eyre::Result<serde_json::Value> {
+    let config = CliConfig::load_with_env(env)?;
+    let manifest = load_local_manifest()?;
+    let doc = cufflink_types::openapi::public_doc(&manifest, name)?;
+    let url = format!(
+        "{}/svc/{}/{}{}/openapi.json",
+        config.api_url, config.tenant_slug, manifest.name, doc.mount
+    );
+    let response = config.http_client().get(&url).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        eyre::bail!("Failed to fetch public document '{name}' ({status}): {body}");
+    }
+    Ok(response.json().await?)
+}
+
+async fn spec(
+    local: bool,
+    tenant_slug: Option<&str>,
+    doc: Option<&str>,
+    env: Option<&str>,
+) -> eyre::Result<serde_json::Value> {
+    match (local, doc) {
+        (true, None) => generate_local_spec(tenant_slug),
+        (true, Some(name)) => generate_local_doc(tenant_slug, name),
+        (false, None) => fetch_remote_spec(env).await,
+        (false, Some(name)) => fetch_remote_doc(name, env).await,
+    }
+}
+
+/// Fetch and display the OpenAPI spec, or one public document, of the current service
+pub async fn run(
+    local: bool,
+    tenant_slug: Option<&str>,
+    doc: Option<&str>,
+    env: Option<&str>,
+) -> eyre::Result<()> {
+    let spec = spec(local, tenant_slug, doc, env).await?;
     println!("{}", serde_json::to_string_pretty(&spec)?);
     Ok(())
 }
 
-/// Fetch OpenAPI spec and write to a file
+/// Fetch the OpenAPI spec, or one public document, and write it to a file
 pub async fn save(
     output_path: &str,
     local: bool,
     tenant_slug: Option<&str>,
+    doc: Option<&str>,
     env: Option<&str>,
 ) -> eyre::Result<()> {
-    let spec = if local {
-        generate_local_spec(tenant_slug)?
-    } else {
-        fetch_remote_spec(env).await?
-    };
-
+    let spec = spec(local, tenant_slug, doc, env).await?;
     std::fs::write(output_path, serde_json::to_string_pretty(&spec)?)?;
     println!("OpenAPI spec written to {}", output_path);
     Ok(())

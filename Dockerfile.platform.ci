@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY cufflink-platform /usr/local/bin/cufflink-platform
 COPY cufflink-sql-parser /usr/local/bin/cufflink-sql-parser
+COPY platform/assets/swagger-ui/LICENSE platform/assets/swagger-ui/NOTICE /usr/share/doc/cufflink/swagger-ui/
 
 EXPOSE 8080
 

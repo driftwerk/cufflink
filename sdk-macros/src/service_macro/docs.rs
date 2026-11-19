@@ -1,13 +1,15 @@
 //! OpenAPI documentation keywords: a route's `request`, `response(s)`,
 //! `query`, `path`, `tags`, `operation_id`, `summary`, `description`,
-//! `deprecated` and `security`, and the service's `openapi: { … }`.
+//! `deprecated` and `security`, and the service's `openapi: { … }` with its
+//! public `docs`.
 
-use super::emit::optional_string;
+use super::emit::{optional, optional_string};
+use crate::keywords::{once, strings};
 use cufflink_types::ResponseDoc;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{Ident, LitInt, LitStr, Token, Type};
+use syn::{Expr, Ident, LitInt, LitStr, Token, Type};
 
 #[derive(Default)]
 pub(super) struct RouteDocOpts {
@@ -375,6 +377,258 @@ pub(super) struct OpenApiBlock {
     tags: Option<Vec<(LitStr, Option<LitStr>)>>,
     security_scheme: Option<LitStr>,
     schemas: Option<Vec<Type>>,
+    docs: Option<Vec<PublicDocBlock>>,
+}
+
+/// One public document of `docs: [{ … }, …]`.
+struct PublicDocBlock {
+    name: LitStr,
+    mount: LitStr,
+    include_tags: Vec<LitStr>,
+    title: LitStr,
+    version: LitStr,
+    description: Option<Expr>,
+    contact: Option<ContactBlock>,
+    servers: Vec<(LitStr, Option<LitStr>)>,
+    tags: Vec<(LitStr, Option<LitStr>)>,
+    path_prefix: Option<LitStr>,
+    api_key: Option<ApiKeyBlock>,
+    cors: Option<TokenStream>,
+}
+
+#[derive(Default)]
+struct ContactBlock {
+    name: Option<LitStr>,
+    email: Option<LitStr>,
+    url: Option<LitStr>,
+}
+
+struct ApiKeyBlock {
+    header: LitStr,
+    description: Option<LitStr>,
+}
+
+/// `{ key: value, … }`, each value parsed by `field`; returns the braces'
+/// span.
+fn fields(
+    input: ParseStream,
+    mut field: impl FnMut(&Ident, ParseStream) -> syn::Result<()>,
+) -> syn::Result<Span> {
+    let content;
+    let braces = syn::braced!(content in input);
+    while !content.is_empty() {
+        let key: Ident = content.parse()?;
+        content.parse::<Token![:]>()?;
+        field(&key, &content)?;
+        if content.peek(Token![,]) {
+            content.parse::<Token![,]>()?;
+        }
+    }
+    Ok(braces.span.join())
+}
+
+fn unknown(key: &Ident, block: &str, expected: &str) -> syn::Error {
+    syn::Error::new(
+        key.span(),
+        format!("unknown {block} field '{key}'; expected {expected}"),
+    )
+}
+
+fn required<T>(value: Option<T>, span: Span, block: &str, key: &str) -> syn::Result<T> {
+    value.ok_or_else(|| syn::Error::new(span, format!("{block} is missing {key}")))
+}
+
+fn parse_docs(input: ParseStream) -> syn::Result<Vec<PublicDocBlock>> {
+    let content;
+    syn::bracketed!(content in input);
+    Ok(content
+        .parse_terminated(parse_public_doc, Token![,])?
+        .into_iter()
+        .collect())
+}
+
+fn parse_public_doc(input: ParseStream) -> syn::Result<PublicDocBlock> {
+    let mut name: Option<LitStr> = None;
+    let mut mount: Option<LitStr> = None;
+    let mut include_tags: Option<Vec<LitStr>> = None;
+    let mut title: Option<LitStr> = None;
+    let mut version: Option<LitStr> = None;
+    let mut description: Option<Expr> = None;
+    let mut contact: Option<ContactBlock> = None;
+    let mut servers: Option<Vec<(LitStr, Option<LitStr>)>> = None;
+    let mut tags: Option<Vec<(LitStr, Option<LitStr>)>> = None;
+    let mut path_prefix: Option<LitStr> = None;
+    let mut api_key: Option<ApiKeyBlock> = None;
+    let mut cors: Option<TokenStream> = None;
+    let span = fields(input, |key, value| match key.to_string().as_str() {
+        "name" => once(&mut name, key, value.parse()?),
+        "mount" => once(&mut mount, key, value.parse()?),
+        "include_tags" => once(&mut include_tags, key, strings(value)?),
+        "title" => once(&mut title, key, value.parse()?),
+        "version" => once(&mut version, key, value.parse()?),
+        "description" => once(&mut description, key, value.parse()?),
+        "contact" => once(&mut contact, key, parse_contact(value)?),
+        "servers" => once(&mut servers, key, described_list(value)?),
+        "tags" => once(&mut tags, key, described_list(value)?),
+        "path_prefix" => once(&mut path_prefix, key, value.parse()?),
+        "api_key" => once(&mut api_key, key, parse_api_key(value)?),
+        "cors" => once(&mut cors, key, parse_cors(value)?),
+        _ => Err(unknown(
+            key,
+            "public document",
+            "name, mount, include_tags, title, version, description, contact, servers, tags, \
+             path_prefix, api_key or cors",
+        )),
+    })?;
+    let block = "public document";
+    Ok(PublicDocBlock {
+        name: required(name, span, block, "name")?,
+        mount: required(mount, span, block, "mount")?,
+        include_tags: required(include_tags, span, block, "include_tags")?,
+        title: required(title, span, block, "title")?,
+        version: required(version, span, block, "version")?,
+        description,
+        contact,
+        servers: servers.unwrap_or_default(),
+        tags: tags.unwrap_or_default(),
+        path_prefix,
+        api_key,
+        cors,
+    })
+}
+
+fn parse_contact(input: ParseStream) -> syn::Result<ContactBlock> {
+    let mut contact = ContactBlock::default();
+    let span = fields(input, |key, value| match key.to_string().as_str() {
+        "name" => once(&mut contact.name, key, value.parse()?),
+        "email" => once(&mut contact.email, key, value.parse()?),
+        "url" => once(&mut contact.url, key, value.parse()?),
+        _ => Err(unknown(key, "contact", "name, email or url")),
+    })?;
+    match (&contact.name, &contact.email, &contact.url) {
+        (None, None, None) => Err(syn::Error::new(
+            span,
+            "a contact gives at least one of name, email or url",
+        )),
+        _ => Ok(contact),
+    }
+}
+
+fn parse_api_key(input: ParseStream) -> syn::Result<ApiKeyBlock> {
+    let mut header: Option<LitStr> = None;
+    let mut description: Option<LitStr> = None;
+    let span = fields(input, |key, value| match key.to_string().as_str() {
+        "header" => once(&mut header, key, value.parse()?),
+        "description" => once(&mut description, key, value.parse()?),
+        _ => Err(unknown(key, "api_key", "header or description")),
+    })?;
+    Ok(ApiKeyBlock {
+        header: required(header, span, "api_key", "header")?,
+        description,
+    })
+}
+
+/// `restricted`, `any` or `mirror`, as its `PublicDocCors` variant.
+fn parse_cors(input: ParseStream) -> syn::Result<TokenStream> {
+    let mode: Ident = input.parse()?;
+    match mode.to_string().as_str() {
+        "restricted" => Ok(quote! { ::cufflink::manifest::PublicDocCors::Restricted }),
+        "any" => Ok(quote! { ::cufflink::manifest::PublicDocCors::Any }),
+        "mirror" => Ok(quote! { ::cufflink::manifest::PublicDocCors::Mirror }),
+        _ => Err(syn::Error::new(
+            mode.span(),
+            format!("cors is restricted, any or mirror, not '{mode}'"),
+        )),
+    }
+}
+
+/// A `Vec` expression of `ServerDoc`s or `TagDoc`s: `ty { key, description }`.
+fn described_tokens(
+    items: &[(LitStr, Option<LitStr>)],
+    ty: TokenStream,
+    key: TokenStream,
+) -> TokenStream {
+    let items = items.iter().map(|(value, description)| {
+        let description = optional_string(description.as_ref());
+        quote! { #ty { #key: #value.to_string(), description: #description } }
+    });
+    quote! { vec![#(#items),*] }
+}
+
+fn servers_tokens(servers: &[(LitStr, Option<LitStr>)]) -> TokenStream {
+    described_tokens(
+        servers,
+        quote! { ::cufflink::manifest::ServerDoc },
+        quote! { url },
+    )
+}
+
+fn tags_tokens(tags: &[(LitStr, Option<LitStr>)]) -> TokenStream {
+    described_tokens(
+        tags,
+        quote! { ::cufflink::manifest::TagDoc },
+        quote! { name },
+    )
+}
+
+impl PublicDocBlock {
+    fn tokens(&self) -> TokenStream {
+        let Self {
+            name,
+            mount,
+            include_tags,
+            title,
+            version,
+            ..
+        } = self;
+        let description = optional(
+            self.description
+                .as_ref()
+                .map(|description| quote! { ::std::string::ToString::to_string(&(#description)) }),
+        );
+        let contact = optional(self.contact.as_ref().map(|contact| {
+            let [name, email, url] = [&contact.name, &contact.email, &contact.url]
+                .map(|field| optional_string(field.as_ref()));
+            quote! {
+                ::cufflink::manifest::ContactDoc { name: #name, email: #email, url: #url }
+            }
+        }));
+        let servers = servers_tokens(&self.servers);
+        let tags = tags_tokens(&self.tags);
+        let path_prefix = optional_string(self.path_prefix.as_ref());
+        let api_key = optional(self.api_key.as_ref().map(|api_key| {
+            let header = &api_key.header;
+            let description = optional_string(api_key.description.as_ref());
+            quote! {
+                ::cufflink::manifest::ApiKeyDoc {
+                    header: #header.to_string(),
+                    description: #description,
+                }
+            }
+        }));
+        let cors = self
+            .cors
+            .clone()
+            .unwrap_or_else(|| quote! { ::cufflink::manifest::PublicDocCors::Restricted });
+        quote! {
+            ::cufflink::manifest::PublicDoc {
+                name: #name.to_string(),
+                mount: #mount.to_string(),
+                include_tags: vec![#(#include_tags.to_string()),*],
+                info: ::cufflink::manifest::PublicDocInfo {
+                    title: #title.to_string(),
+                    version: #version.to_string(),
+                    description: #description,
+                    contact: #contact,
+                },
+                servers: #servers,
+                tags: #tags,
+                path_prefix: #path_prefix,
+                api_key: #api_key,
+                cors: #cors,
+            }
+        }
+    }
 }
 
 /// `[("value", "description"), …]` with the description optional.
@@ -400,42 +654,32 @@ fn described_list(input: ParseStream) -> syn::Result<Vec<(LitStr, Option<LitStr>
 }
 
 pub(super) fn parse_openapi(input: ParseStream) -> syn::Result<OpenApiBlock> {
-    let content;
-    syn::braced!(content in input);
     let mut block = OpenApiBlock::default();
-    while !content.is_empty() {
-        let key: Ident = content.parse()?;
-        content.parse::<Token![:]>()?;
-        match key.to_string().as_str() {
-            "title" => set(&mut block.title, content.parse()?, &key)?,
-            "version" => set(&mut block.version, content.parse()?, &key)?,
-            "description" => set(&mut block.description, content.parse()?, &key)?,
-            "security_scheme" => set(&mut block.security_scheme, content.parse()?, &key)?,
-            "servers" => set(&mut block.servers, described_list(&content)?, &key)?,
-            "tags" => set(&mut block.tags, described_list(&content)?, &key)?,
-            "schemas" => {
-                let types;
-                syn::bracketed!(types in content);
-                let schemas = types
-                    .parse_terminated(Type::parse, Token![,])?
-                    .into_iter()
-                    .collect();
-                set(&mut block.schemas, schemas, &key)?
-            }
-            other => {
-                return Err(syn::Error::new(
-                    key.span(),
-                    format!(
-                        "unknown openapi field '{other}'; expected title, version, description, \
-                         servers, tags, security_scheme or schemas"
-                    ),
-                ))
-            }
+    fields(input, |key, content| match key.to_string().as_str() {
+        "title" => once(&mut block.title, key, content.parse()?),
+        "version" => once(&mut block.version, key, content.parse()?),
+        "description" => once(&mut block.description, key, content.parse()?),
+        "security_scheme" => once(&mut block.security_scheme, key, content.parse()?),
+        "servers" => once(&mut block.servers, key, described_list(content)?),
+        "tags" => once(&mut block.tags, key, described_list(content)?),
+        "schemas" => {
+            let types;
+            syn::bracketed!(types in content);
+            let schemas = types
+                .parse_terminated(Type::parse, Token![,])?
+                .into_iter()
+                .collect();
+            once(&mut block.schemas, key, schemas)
         }
-        if content.peek(Token![,]) {
-            content.parse::<Token![,]>()?;
-        }
-    }
+        "docs" => once(&mut block.docs, key, parse_docs(content)?),
+        other => Err(syn::Error::new(
+            key.span(),
+            format!(
+                "unknown openapi field '{other}'; expected title, version, description, \
+                 servers, tags, security_scheme, schemas or docs"
+            ),
+        )),
+    })?;
     Ok(block)
 }
 
@@ -457,23 +701,9 @@ impl OpenApiBlock {
         let version = optional_string(self.version.as_ref());
         let description = optional_string(self.description.as_ref());
         let security_scheme = optional_string(self.security_scheme.as_ref());
-        let described = |items: &[(LitStr, Option<LitStr>)], ty: TokenStream, key: TokenStream| {
-            let items = items.iter().map(|(value, description)| {
-                let description = optional_string(description.as_ref());
-                quote! { #ty { #key: #value.to_string(), description: #description } }
-            });
-            quote! { vec![#(#items),*] }
-        };
-        let servers = described(
-            self.servers.as_deref().unwrap_or_default(),
-            quote! { ::cufflink::manifest::ServerDoc },
-            quote! { url },
-        );
-        let tags = described(
-            self.tags.as_deref().unwrap_or_default(),
-            quote! { ::cufflink::manifest::TagDoc },
-            quote! { name },
-        );
+        let servers = servers_tokens(self.servers.as_deref().unwrap_or_default());
+        let tags = tags_tokens(self.tags.as_deref().unwrap_or_default());
+        let docs = self.docs.iter().flatten().map(PublicDocBlock::tokens);
         quote! {
             ::cufflink::manifest::OpenApiOptions {
                 title: #title,
@@ -482,6 +712,7 @@ impl OpenApiBlock {
                 servers: #servers,
                 tags: #tags,
                 security_scheme: #security_scheme,
+                docs: vec![#(#docs),*],
             }
         }
     }

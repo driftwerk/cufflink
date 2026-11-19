@@ -122,22 +122,56 @@ pub(super) fn properties<'a>(
         })
 }
 
-/// A parameter object: the property's description moves out of its schema.
+/// A parameter object: the property's description and examples move out of
+/// its schema, one example as `example` and several as an `examples` map.
 fn parameter(name: &str, location: &str, required: bool, schema: &Value) -> Value {
     let mut schema = schema.clone();
-    let description = schema
-        .as_object_mut()
-        .and_then(|schema| schema.remove("description"));
-    let mut parameter = json!({
-        "name": name,
-        "in": location,
-        "required": required,
-        "schema": schema,
+    let lifted = schema.as_object_mut().map(|schema| {
+        let description = schema.remove("description");
+        let examples = match schema.remove("examples") {
+            Some(Value::Array(examples)) if !examples.is_empty() => Some(examples),
+            Some(other) => {
+                schema.insert("examples".into(), other);
+                None
+            }
+            None => None,
+        };
+        (description, examples)
     });
-    if let (Some(description), Some(parameter)) = (description, parameter.as_object_mut()) {
+    let mut parameter = Map::from_iter([
+        ("name".to_string(), json!(name)),
+        ("in".to_string(), json!(location)),
+        ("required".to_string(), json!(required)),
+        ("schema".to_string(), schema),
+    ]);
+    let (description, examples) = lifted.unwrap_or_default();
+    if let Some(description) = description {
         parameter.insert("description".into(), description);
     }
-    parameter
+    match examples.as_deref() {
+        Some([example]) => {
+            parameter.insert("example".into(), example.clone());
+        }
+        Some(examples) => {
+            let keyed: Map<String, Value> = examples
+                .iter()
+                .enumerate()
+                .map(|(index, example)| (index.to_string(), json!({ "value": example })))
+                .collect();
+            parameter.insert("examples".into(), Value::Object(keyed));
+        }
+        None => {}
+    }
+    Value::Object(parameter)
+}
+
+/// The tags of a published custom route's operation: its doc's, else the
+/// service's name.
+pub(super) fn tags(route: &CustomRouteDefinition, service: &str) -> Vec<String> {
+    match route.doc.as_ref().map(|doc| &doc.tags) {
+        Some(tags) if !tags.is_empty() => tags.clone(),
+        _ => vec![service.to_string()],
+    }
 }
 
 /// The path, lowercase method and operation object of a documented or
@@ -174,12 +208,7 @@ pub(super) fn relative_operation(
     let parameters: Vec<Value> = path_parameters.chain(query_parameters).collect();
 
     let mut operation = Map::new();
-    let tags = if doc.tags.is_empty() {
-        vec![manifest.name.clone()]
-    } else {
-        doc.tags.clone()
-    };
-    operation.insert("tags".into(), json!(tags));
+    operation.insert("tags".into(), json!(tags(route, &manifest.name)));
     operation.insert("operationId".into(), json!(operation_id(route)));
     if let Some(summary) = &doc.summary {
         operation.insert("summary".into(), json!(summary));

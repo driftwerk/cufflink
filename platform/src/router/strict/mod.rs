@@ -2,8 +2,9 @@ mod table;
 
 pub(crate) use table::{RouteMatch, RouteTable, RouteTableError};
 
-use crate::registry::RegisteredService;
+use crate::registry::{RegisteredService, StrictRoutes};
 use crate::router::custom::{self, StrictTarget};
+use crate::router::public_docs::{self, DocTarget, PublicDocs};
 use crate::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -18,6 +19,7 @@ use table::{allow_header, MatchOutcome};
 enum Resolution {
     Pass(Vec<Method>),
     Dispatch(Arc<RegisteredService>, usize, StrictTarget),
+    Doc(Arc<RegisteredService>, Arc<PublicDocs>, DocTarget),
     Reject(Response),
 }
 
@@ -26,19 +28,22 @@ pub(crate) async fn route(
     request: Request,
     next: Next,
 ) -> Response {
-    match resolve(&state, request.method(), request.uri().path()).await {
-        Resolution::Pass(allow) => also_allowing(next.run(request).await, &allow),
+    let head = request.method() == Method::HEAD;
+    let response = match resolve(&state, request.method(), request.uri().path()).await {
+        Resolution::Pass(allow) => return also_allowing(next.run(request).await, &allow),
+        Resolution::Reject(response) => return response,
         Resolution::Dispatch(service, route, target) => {
-            let head = request.method() == Method::HEAD;
-            let response =
-                custom::strict_route_handler(state, service, route, target, request).await;
-            if head {
-                response.map(|_| Body::empty())
-            } else {
-                response
-            }
+            custom::strict_route_handler(state, service, route, target, request).await
         }
-        Resolution::Reject(response) => response,
+        Resolution::Doc(service, docs, target) => {
+            crate::telemetry::resolve(&service.scope(), &format!("_docs/{}", docs.name(&target)));
+            public_docs::answer(&docs, &target, request.method(), request.headers())
+        }
+    };
+    if head {
+        response.map(|_| Body::empty())
+    } else {
+        response
     }
 }
 
@@ -46,11 +51,21 @@ async fn resolve(state: &AppState, method: &Method, path: &str) -> Resolution {
     let Some((tenant, service, rest)) = split_svc_path(path) else {
         return Resolution::Pass(Vec::new());
     };
-    let Some((service, routes)) = state.registry.strict_routes(tenant, service).await else {
+    let Some(StrictRoutes {
+        service,
+        routes,
+        docs,
+    }) = state.registry.strict_routes(tenant, service).await
+    else {
         return Resolution::Pass(Vec::new());
     };
     if first_segment(rest).is_some_and(|first| RESERVED_FIRST_SEGMENTS.contains(&first)) {
         return counted("passthrough", Resolution::Pass(Vec::new()));
+    }
+    if let Some((docs, target)) =
+        docs.and_then(|docs| docs.target(rest).map(|target| (docs, target)))
+    {
+        return counted("document", Resolution::Doc(service, docs, target));
     }
     match routes.match_route(method, rest) {
         MatchOutcome::Matched(RouteMatch { route, params }) => counted(
@@ -180,6 +195,51 @@ pub(crate) fn crud_shadow<'a>(
 mod tests {
     use super::*;
     use cufflink_types::{ColumnDefinition, ColumnType, CustomRouteDefinition, TableDefinition};
+
+    #[tokio::test]
+    async fn a_documents_mount_resolves_before_the_routes() {
+        use crate::router::public_docs::tests::{catalog, public_api};
+        let engine = crate::wasm_runtime::WasmEngine::new(
+            crate::wasm_runtime::WasmLimits::default(),
+            crate::shutdown::Shutdown::new(std::time::Duration::from_secs(1)),
+        )
+        .expect("engine");
+        let state = AppState::minimal(engine).await;
+        let mut service = catalog(serde_json::json!([public_api("restricted")]));
+        service.manifest.custom_routes.push(
+            serde_json::from_value(serde_json::json!({
+                "method": "GET",
+                "path": "/docs/public-api/openapi.json",
+                "handler": "shadowed",
+            }))
+            .expect("route"),
+        );
+        state.registry.route_documented(&service).await;
+        let resolved = |path: &'static str| {
+            let state = Arc::clone(&state);
+            async move { resolve(&state, &Method::GET, path).await }
+        };
+        assert!(matches!(
+            resolved("/svc/acme/catalog-service/docs/public-api/openapi.json").await,
+            Resolution::Doc(..)
+        ));
+        assert!(matches!(
+            resolved("/svc/acme/catalog-service/docs/public-api").await,
+            Resolution::Doc(..)
+        ));
+        assert!(matches!(
+            resolved("/svc/acme/catalog-service/orders").await,
+            Resolution::Dispatch(..)
+        ));
+        assert!(matches!(
+            resolved("/svc/acme/catalog-service/docs/public-api-v2/x").await,
+            Resolution::Reject(..)
+        ));
+        assert!(matches!(
+            resolved("/svc/globex/catalog-service/docs/public-api/openapi.json").await,
+            Resolution::Pass(..)
+        ));
+    }
 
     #[test]
     fn splits_svc_paths_and_passes_everything_else() {

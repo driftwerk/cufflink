@@ -68,7 +68,7 @@ mod tests {
         let missing_service = r#"{"error":"Service 'shop' not found"}"#;
         let unauthenticated = r#"{"error":"Missing Authorization header"}"#;
         let json_required = "Expected request with `Content-Type: application/json`";
-        let cases: [(&str, &str, u16, Option<&str>, &str); 31] = [
+        let cases: [(&str, &str, u16, Option<&str>, &str); 34] = [
             ("GET", "/svc", 404, None, ""),
             ("GET", "/svc/", 404, None, ""),
             ("GET", "/svc/acme", 404, None, ""),
@@ -107,6 +107,9 @@ mod tests {
             ("HEAD", "/svc/acme/shop/_meta/health", 404, None, ""),
             ("GET", "/svc/acme/shop/_meta/openapi.json", 401, None, unauthenticated),
             ("GET", "/svc/acme/shop/_meta/docs", 401, None, unauthenticated),
+            ("GET", "/svc/acme/shop/_meta/docs/index.css", 200, None, "html {"),
+            ("GET", "/svc/acme/shop/_meta/docs/index.html", 404, None, r#"{"error":"Not found"}"#),
+            ("POST", "/svc/acme/shop/_meta/docs/index.css", 405, Some("GET,HEAD"), ""),
             (
                 "POST",
                 "/svc/acme/shop/_fn/hello",

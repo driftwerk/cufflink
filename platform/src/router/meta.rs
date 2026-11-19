@@ -4,7 +4,8 @@ use crate::registry::RegisteredService;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    response::Html,
+    http::HeaderMap,
+    response::{Html, Response},
     Json,
 };
 use cufflink_types::openapi::service_spec;
@@ -84,6 +85,13 @@ pub async fn docs_handler(
     Ok(Html(swagger_ui_html(&spec_url, &title)))
 }
 
+pub async fn docs_asset_handler(
+    Path((_, _, asset)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    crate::router::public_docs::meta_asset(&asset, &headers)
+}
+
 fn swagger_ui_html(spec_url: &str, title: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -91,12 +99,12 @@ fn swagger_ui_html(spec_url: &str, title: &str) -> String {
 <head>
   <meta charset="UTF-8">
   <title>{title}</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+  <link rel="stylesheet" href="docs/swagger-ui.css">
   <style>body {{ margin: 0; }}</style>
 </head>
 <body>
   <div id="swagger-ui"></div>
-  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script src="docs/swagger-ui-bundle.js"></script>
   <script>
     window.onload = () => {{
       window.ui = SwaggerUIBundle({{
@@ -123,7 +131,9 @@ mod tests {
         );
         assert!(html.contains(r#"url: "/svc/default/audit-service/_meta/openapi.json""#));
         assert!(html.contains("<title>audit-service — API docs</title>"));
-        assert!(html.contains("swagger-ui-dist@5"));
+        assert!(html.contains(r#"<link rel="stylesheet" href="docs/swagger-ui.css">"#));
+        assert!(html.contains(r#"<script src="docs/swagger-ui-bundle.js"></script>"#));
+        assert!(!html.contains("cdn."));
     }
 
     #[test]

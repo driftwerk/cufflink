@@ -53,6 +53,12 @@ service, `/svc/{tenant}/{service}/books/7/due-date`:
   declares `("GET", "/notes/{note_id}", …)`. A method no route takes there
   is the `405` with `Allow` of the routes alone.
 
+- A [public document](openapi.md#public-documents)'s mount and the routes
+  are disjoint: a deploy whose route could match a path under a mount, the
+  bare mount and the mount plus `/` included, is refused with a message
+  naming the route and the mount. Paths under a mount are answered by the
+  document; `/docs/public-api-v2` is not under `/docs/public-api`.
+
 ## Route limits
 
 ```rust

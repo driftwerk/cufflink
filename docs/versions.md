@@ -350,6 +350,12 @@ Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 | `web_releases` | `cufflink deploy` of a web app, from a CLI of v0.38.0; never demanded by a manifest | a web app reserved, uploaded by content and released in one deploy that names its bundle, rollbacks that carry the bundle, and releases skipped by content ([web releases](deployment.md#web-releases)) |
 | `wait_release` | never demanded: a guest asks for it in the raw `http_fetch_v2` or `service_call` request, `"wait": "release"`, which no `cufflink-fn` function sends yet | a guest that gives back its execution slots while its call is outstanding, and takes them back before it continues ([wait pools](scaling.md#wait-pools)) |
 
+## Features added in v0.39.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `public_docs` | the manifest's `openapi` block declares `docs` | named, unauthenticated API documents, each a tagged subset of the service's spec, served with an embedded Swagger UI under a mount the service chooses ([public documents](openapi.md#public-documents)) |
+
 ## Changes in v0.33.0
 
 No new module-declared feature. Spec and client changes:
