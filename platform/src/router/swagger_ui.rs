@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub(crate) struct Asset {
     pub name: &'static str,
     pub content_type: &'static str,
@@ -28,19 +30,30 @@ pub(crate) static ASSETS: [Asset; 8] = [
     asset!("swagger-initializer.js", "text/javascript"),
 ];
 
-pub(crate) fn page_file(name: &str) -> Option<&'static Asset> {
-    let name = match name {
-        "" => INDEX,
-        name => name,
-    };
-    ASSETS.iter().find(|asset| asset.name == name)
-}
+pub(crate) struct Files<T>(HashMap<&'static str, T>);
 
-pub(crate) fn meta_file(name: &str) -> Option<&'static Asset> {
-    ASSETS
-        .iter()
-        .filter(|asset| !PAGE_ONLY.contains(&asset.name))
-        .find(|asset| asset.name == name)
+impl<T> Files<T> {
+    pub(crate) fn of(entry: impl Fn(&'static Asset) -> T) -> Self {
+        Self(
+            ASSETS
+                .iter()
+                .map(|asset| (asset.name, entry(asset)))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn page(&self, name: &str) -> Option<&T> {
+        self.0.get(match name {
+            "" => INDEX,
+            name => name,
+        })
+    }
+
+    pub(crate) fn meta(&self, name: &str) -> Option<&T> {
+        (!PAGE_ONLY.contains(&name))
+            .then(|| self.0.get(name))
+            .flatten()
+    }
 }
 
 #[cfg(test)]
@@ -130,12 +143,12 @@ mod tests {
 
     #[test]
     fn the_page_serves_its_index_twice_and_meta_serves_only_the_shared_files() {
-        let name = |asset: Option<&Asset>| asset.map(|asset| asset.name);
-        assert_eq!(name(page_file("")), Some("index.html"));
-        assert_eq!(name(page_file("index.html")), Some("index.html"));
+        let files = Files::of(|asset| asset.name);
+        assert_eq!(files.page(""), Some(&"index.html"));
+        assert_eq!(files.page("index.html"), Some(&"index.html"));
         assert_eq!(
-            name(page_file("swagger-initializer.js")),
-            Some("swagger-initializer.js")
+            files.page("swagger-initializer.js"),
+            Some(&"swagger-initializer.js")
         );
         for missing in [
             "swagger-ui.js",
@@ -144,12 +157,12 @@ mod tests {
             "LICENSE",
             "../index.html",
         ] {
-            assert_eq!(name(page_file(missing)), None, "{missing}");
+            assert_eq!(files.page(missing), None, "{missing}");
         }
         let shared: Vec<_> = ASSETS
             .iter()
-            .filter_map(|asset| meta_file(asset.name))
-            .map(|asset| asset.name)
+            .filter_map(|asset| files.meta(asset.name))
+            .copied()
             .collect();
         assert_eq!(
             shared,
@@ -162,6 +175,6 @@ mod tests {
                 "favicon-16x16.png",
             ]
         );
-        assert_eq!(name(meta_file("")), None);
+        assert_eq!(files.meta(""), None);
     }
 }

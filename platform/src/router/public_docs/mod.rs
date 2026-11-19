@@ -2,15 +2,14 @@ pub(crate) mod cors;
 
 use crate::errors::PlatformError;
 use crate::registry::RegisteredService;
-use crate::router::swagger_ui::{self, ASSETS};
+use crate::router::swagger_ui::Files;
 use axum::body::{Body, Bytes};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cufflink_types::features::PUBLIC_DOCS;
 use cufflink_types::openapi::{mount_segments, public_doc_spec};
 use cufflink_types::{PublicDoc, PublicDocCors};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::{error, warn};
 
@@ -53,16 +52,8 @@ enum DocFile {
     Missing,
 }
 
-static PAGE_FILES: LazyLock<HashMap<&'static str, Entity>> = LazyLock::new(|| {
-    ASSETS
-        .iter()
-        .map(|asset| {
-            (
-                asset.name,
-                Entity::new(asset.content_type, Bytes::from_static(asset.bytes)),
-            )
-        })
-        .collect()
+static PAGE_FILES: LazyLock<Files<Entity>> = LazyLock::new(|| {
+    Files::of(|asset| Entity::new(asset.content_type, Bytes::from_static(asset.bytes)))
 });
 
 impl Entity {
@@ -197,7 +188,7 @@ pub(crate) fn answer(
     let found = match &target.file {
         DocFile::OpenApi => Some(Answer::Entity(&docs.documents[target.document].openapi)),
         DocFile::SwaggerUi => Some(Answer::Redirect),
-        DocFile::Page(file) => page_file(file).map(Answer::Entity),
+        DocFile::Page(file) => PAGE_FILES.page(file).map(Answer::Entity),
         DocFile::Missing => None,
     };
     match (found, method) {
@@ -213,13 +204,9 @@ pub(crate) fn answer(
 }
 
 pub(crate) fn meta_asset(name: &str, headers: &HeaderMap) -> Response {
-    swagger_ui::meta_file(name)
-        .and_then(|asset| PAGE_FILES.get(asset.name))
+    PAGE_FILES
+        .meta(name)
         .map_or_else(not_found, |entity| serve(entity, &Method::GET, headers))
-}
-
-fn page_file(name: &str) -> Option<&'static Entity> {
-    swagger_ui::page_file(name).and_then(|asset| PAGE_FILES.get(asset.name))
 }
 
 fn not_found() -> Response {
@@ -248,31 +235,31 @@ fn serve(entity: &Entity, method: &Method, headers: &HeaderMap) -> Response {
 
 enum IfNoneMatch<'a> {
     Any,
-    Tags(Vec<&'a str>),
+    Tags(Vec<&'a [u8]>),
 }
 
 impl IfNoneMatch<'_> {
     fn matches(&self, etag: &str) -> bool {
         match self {
             Self::Any => true,
-            Self::Tags(tags) => tags.contains(&etag),
+            Self::Tags(tags) => tags.contains(&etag.as_bytes()),
         }
     }
 }
 
 fn if_none_match(headers: &HeaderMap) -> Option<IfNoneMatch<'_>> {
-    let values = headers
+    let values: Vec<&[u8]> = headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
-        .map(|value| value.to_str().ok())
-        .collect::<Option<Vec<_>>>()?;
+        .map(HeaderValue::as_bytes)
+        .collect();
     match values.as_slice() {
         [] => None,
-        [value] if value.trim() == "*" => Some(IfNoneMatch::Any),
+        [value] if value.trim_ascii() == b"*" => Some(IfNoneMatch::Any),
         values => values
             .iter()
-            .flat_map(|value| value.split(','))
-            .map(str::trim)
+            .flat_map(|value| value.split(|byte| *byte == b','))
+            .map(<[u8]>::trim_ascii)
             .filter(|element| !element.is_empty())
             .map(opaque_tag)
             .collect::<Option<Vec<_>>>()
@@ -281,12 +268,12 @@ fn if_none_match(headers: &HeaderMap) -> Option<IfNoneMatch<'_>> {
     }
 }
 
-fn opaque_tag(entity_tag: &str) -> Option<&str> {
-    let opaque = entity_tag.strip_prefix("W/").unwrap_or(entity_tag);
-    let inner = opaque.strip_prefix('"')?.strip_suffix('"')?;
+fn opaque_tag(entity_tag: &[u8]) -> Option<&[u8]> {
+    let opaque = entity_tag.strip_prefix(b"W/").unwrap_or(entity_tag);
+    let inner = opaque.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
     inner
-        .bytes()
-        .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+        .iter()
+        .all(|&byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
         .then_some(opaque)
 }
 

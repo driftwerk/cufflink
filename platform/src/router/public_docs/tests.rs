@@ -1,5 +1,5 @@
 use super::*;
-use axum::http::HeaderValue;
+use crate::router::swagger_ui::ASSETS;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -358,4 +358,26 @@ fn a_platform_that_does_not_advertise_public_docs_refuses_a_documented_service()
             .contains("requires platform feature 'public_docs'"),
         "{refused}"
     );
+}
+
+#[tokio::test]
+async fn an_if_none_match_with_obs_text_tags_is_read_as_bytes() {
+    let docs = docs();
+    let target = docs
+        .target("/docs/public-api/openapi.json")
+        .expect("mounted");
+    let etag = docs.documents[0].openapi.etag.clone();
+    let status = |value: Vec<u8>| {
+        let headers = HeaderMap::from_iter([(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_bytes(&value).expect("obs-text is a valid header value"),
+        )]);
+        answer(&docs, &target, &Method::GET, &headers).status()
+    };
+    let foreign = b"\"caf\xc3\xa9\"".to_vec();
+    assert_eq!(
+        status([foreign.as_slice(), b", ", etag.as_bytes()].concat()),
+        StatusCode::NOT_MODIFIED
+    );
+    assert_eq!(status(foreign), StatusCode::OK);
 }
