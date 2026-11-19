@@ -236,6 +236,10 @@ pub(super) fn outer(routes: Router<Arc<AppState>>, state: &AppState) -> Router<A
             middleware::rate_limit::rate_limit_middleware,
         ))
         .layer(cors_layer(&limits.cors))
+        .layer(axum::middleware::from_fn_with_state(
+            state.registry.clone(),
+            crate::router::public_docs::cors::layer,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<_>| {

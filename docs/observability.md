@@ -376,7 +376,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_scope_decisions_total` | counter | `table`, `op`, `scope` (`all`, `rows`, `denied`, `widen`, `invalid`) | Row-scope decisions on scoped tables and routes |
 | `cufflink_column_decisions_total` | counter | `table`, `columns` (`all`, `withheld`) | Column decisions on tables with [column permissions](column-permissions.md): whether the caller reads and writes every column |
 | `cufflink_custom_route_duration_seconds` | histogram | `service`, `route` (the declared path, or the handler through `_fn`), `status_class` | Custom-route latency |
-| `cufflink_strict_route_matches_total` | counter | `result` (`matched`, `passthrough`, `no_route`, `method_not_allowed`) | Strict-routing decisions |
+| `cufflink_strict_route_matches_total` | counter | `result` (`matched`, `document`, `passthrough`, `no_route`, `method_not_allowed`) | Strict-routing decisions; `document` is a path under a [public document](openapi.md#public-documents)'s mount |
 | `cufflink_request_body_rejected_total` | counter | `reason` (`too_large`, `multipart`) | Custom-route bodies refused: over the route's limit, or not the multipart form the route takes |
 | `cufflink_guest_response_v2_total` | counter | `body` (`empty`, `json`, `bytes`, `s3`, `sse`) | Response-v2 envelopes rendered |
 | `cufflink_guest_header_dropped_total` | counter | `name` | Response headers a guest set that the platform owns, dropped. `name` is the header, or `proxy-` or `access-control-` for those prefixes, so a guest cannot mint labels |
@@ -496,6 +496,7 @@ Histogram buckets: `*_seconds` metrics use 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 25
 | `cufflink_registry_version` | gauge | — | Registry reload generation (also in `/ready`) |
 | `cufflink_registry_reload_total` | counter | `result` (`ok`, `error`) | Registry reloads, and refreshes of one service after its deploy, rollback, module upload or enabling. A refresh is discarded and read again when anything in the replica's registry changed under it, another service's refresh included, and gives up after three such reads. So several deploys or status changes landing on one replica at once can count an `error` on a healthy platform: each has committed, and the notification it sends makes the replica reload. Alert on `error` that persists, or that comes with `cufflink_registry_load_errors_total` or database errors, not on single counts during deploys |
 | `cufflink_registry_load_errors_total` | counter | — | Service rows skipped because their manifest no longer decodes |
+| `cufflink_public_docs_build_errors_total` | counter | — | [Public documents](openapi.md#public-documents) that could not be built; each answers 404 while its service stays routed |
 | `cufflink_ready` | gauge | `state` (`starting`, `migrated`, `ready`, `shutting_down`) | 1 for the platform's current readiness state, 0 for the others |
 | `cufflink_migrations_pending` | gauge | — | Control-plane migrations not yet applied |
 | `cufflink_db_pool_max` / `cufflink_db_pool_size` / `cufflink_db_pool_available` / `cufflink_db_pool_waiting` | gauge | `pool` (`platform`, `tenant:{slug}`, `login:{tenant}:{service}`) | Connection-pool state (set at scrape; platform and worker). A `login:` pool is the one a service logs in through as its own role (`db_roles: enforce`) |

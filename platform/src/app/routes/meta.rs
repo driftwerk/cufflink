@@ -17,4 +17,8 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
             "/svc/{tenant}/{service}/_meta/docs",
             get(router::meta::docs_handler),
         )
+        .route(
+            "/svc/{tenant}/{service}/_meta/docs/{asset}",
+            get(router::meta::docs_asset_handler),
+        )
 }

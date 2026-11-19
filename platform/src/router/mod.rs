@@ -10,11 +10,13 @@ pub(crate) mod guest_response;
 pub mod jobs;
 pub mod meta;
 pub(crate) mod postures;
+pub(crate) mod public_docs;
 pub(crate) mod query;
 pub mod row_convert;
 pub mod sse;
 pub(crate) mod sse_bridge;
 pub(crate) mod strict;
+pub(crate) mod swagger_ui;
 
 use crate::errors::{PlatformError, PlatformResult};
 use crate::wasm_runtime::budget::{ChargedJson, ChargedJsonError, Hold};
