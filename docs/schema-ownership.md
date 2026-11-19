@@ -213,7 +213,9 @@ migrations are pending, the adoption is checked in two steps:
    one refuses the deploy (422) as before: that is drift, which no
    migration of the release was written to repair. A table that is new or
    whose declaration changed waits for the migrations. On a service's
-   first deploy every table waits.
+   first deploy every table waits, and so does its schema: the first
+   plan of a service whose schema the deploy makes reports the schema
+   as missing, deferred, rather than refusing.
 2. After the SQL migrations, on a fresh read of the database and before
    `on_migrate`, the destructive changes and activation, every adopted
    table is checked again.

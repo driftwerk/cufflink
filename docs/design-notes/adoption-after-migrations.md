@@ -62,7 +62,10 @@ When it holds, the check is made in two steps:
    this release was written to repair, so nothing is applied for it. A
    first deploy has no version to leave, so nothing is settled. The
    findings on the other declarations, new or changed, are reported as
-   deferred.
+   deferred. With nothing settled, nothing is refused up front, not even
+   a schema that does not exist yet: the first plan of a managed service
+   runs before `ensure_schema` makes it, and reports `schema … is missing`
+   as deferred.
 2. After the migrations have run, and before `on_migrate`, the destructive
    phase and activation, every declaration is checked again on a fresh
    read of the live schema, settled ones included. A settled declaration
@@ -85,7 +88,8 @@ pub enum AdoptionCheck<'a> {
 - `prepare_schema_changes` still reads the live schema and runs
   `validate_adoption`. Under `Now` it refuses on errors (`accepted()`), as
   today. Under `AfterMigrations` it refuses on the errors of the `settled`
-  tables, and otherwise returns the report of every adopted table, marked
+  tables when there are any (`validate_adoption` reports a missing schema
+  even for no tables, so an empty `settled` is not checked), and otherwise returns the report of every adopted table, marked
   `deferred: true`. Its errors are then only those of new or changed
   declarations.
 - `adopt::settled(declared, left_tables, left_adopted)` picks the settled
@@ -296,6 +300,11 @@ one, which pins what stays as it is:
    drops the declared `memo`, or retypes it to `integer`. The deploy is
    refused (422) naming `memo` and V2, V2 stays recorded, and the previous
    version is still served.
+9. `the_first_plan_of_a_schema_not_made_yet_waits_for_the_migrations`: a
+   managed service whose private table its migration makes, planned
+   before its schema exists. The plan succeeds with `schema loan_service
+   is missing` deferred, and the deploy makes the schema, applies the
+   migration and passes the check after it.
 
 The suite's other tests, which cover managed schemas, `verify_only` and
 the lock, pass unchanged.
@@ -306,7 +315,8 @@ Unit tests:
   pending migrations.
 - `AdoptionCheck::AfterMigrations` refuses a finding on a settled
   declaration, returns the others without refusing, and `Now` refuses as
-  before.
+  before. With nothing settled, a schema that does not exist is deferred;
+  with a settled table, it is refused.
 - `adopt::settled` keeps an unchanged declaration (names folded, columns
   in any order) and drops a table the version left did not adopt, one it
   did not declare, and one whose columns, column types, owner field,

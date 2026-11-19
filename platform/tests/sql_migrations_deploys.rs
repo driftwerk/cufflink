@@ -1410,3 +1410,37 @@ async fn a_migration_that_breaks_a_settled_declaration_is_refused_after_it() {
         assert_eq!(served_version(&d).await, first);
     }
 }
+
+#[tokio::test]
+async fn the_first_plan_of_a_schema_not_made_yet_waits_for_the_migrations() {
+    let Some(d) = Deployment::start(&[]).await else {
+        return;
+    };
+    assert!(
+        d.texts("SELECT nspname::text FROM pg_namespace WHERE nspname = 'loan_service'")
+            .await
+            .is_empty(),
+        "the schema is not there before the first deploy"
+    );
+    let local = [migration(
+        1,
+        "loan_notes",
+        "CREATE TABLE loan_service.loan_notes (id uuid PRIMARY KEY);\n",
+    )];
+    let mut manifest = loan_service(&local, json!({"table": "schema_history"}));
+    manifest["private_tables"] = json!([{"name": "loan_notes", "managed": false, "columns": [
+        {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false}
+    ]}]);
+
+    let (status, plan) = d
+        .deploy_as("?plan=true", json!({"manifest": manifest}))
+        .await;
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
+    assert_eq!(errors(&plan), ["schema loan_service is missing"], "{plan}");
+
+    let body = d.deployed(json!({"manifest": manifest})).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [1]);
+    assert_eq!(errors(&body), Vec::<String>::new(), "{body}");
+    assert!(exists(&d.database, "loan_service.loan_notes").await);
+}

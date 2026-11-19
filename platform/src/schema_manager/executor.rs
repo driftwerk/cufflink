@@ -35,7 +35,9 @@ impl AdoptionCheck<'_> {
         match self {
             Self::Now => validate_adoption(schema, adopted, live).accepted(),
             Self::AfterMigrations { settled } => {
-                validate_adoption(schema, settled, live).accepted()?;
+                if !settled.is_empty() {
+                    validate_adoption(schema, settled, live).accepted()?;
+                }
                 Ok(AdoptionReport {
                     deferred: true,
                     ..validate_adoption(schema, adopted, live)
@@ -1164,6 +1166,24 @@ mod tests {
             refused.contains("loan_service.labels.colour is missing")
                 && !refused.contains("author"),
             "{refused}"
+        );
+
+        let unmade = LiveSchema {
+            exists: false,
+            ..LiveSchema::default()
+        };
+        let waiting = AdoptionCheck::AfterMigrations { settled: &[] }
+            .verdict("loan_service", &changed, &unmade)
+            .expect("with nothing settled, a schema not made yet waits for the migrations");
+        assert_eq!(waiting.errors, ["schema loan_service is missing"]);
+        assert!(waiting.deferred);
+        assert!(
+            AdoptionCheck::AfterMigrations {
+                settled: &changed[..1]
+            }
+            .verdict("loan_service", &changed, &unmade)
+            .is_err(),
+            "a settled table in a schema that is gone is drift"
         );
 
         let accepted = verdict(AdoptionCheck::Now, &changed[..1]).expect("accepted");
