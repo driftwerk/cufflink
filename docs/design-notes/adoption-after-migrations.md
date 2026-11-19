@@ -51,25 +51,48 @@ One predicate chooses when the adoption check is made:
 > The deploy adopts a table, its history's mode is `apply`, and the verify
 > pass leaves migrations pending.
 
-When it holds, the check is made on a fresh read of the live schema after
-the migrations have run, and before `on_migrate`, the destructive phase and
-activation. Otherwise it is made where it is made today.
+When it holds, the check is made in two steps:
+
+1. Before anything runs, the declarations that are **settled** are checked
+   and any finding on them refuses the deploy, as today. A settled
+   declaration is an adopted table that the version being left adopted,
+   declared the same in everything the check reads: its name, its columns
+   and their types, its primary key, `owner_field`, `soft_delete` and
+   `search.vector_column`. A finding there is drift that no migration of
+   this release was written to repair, so nothing is applied for it. A
+   first deploy has no version to leave, so nothing is settled. The
+   findings on the other declarations, new or changed, are reported as
+   deferred.
+2. After the migrations have run, and before `on_migrate`, the destructive
+   phase and activation, every declaration is checked again on a fresh
+   read of the live schema, settled ones included. A settled declaration
+   that passed in step 1 proves nothing about what the migrations then did
+   to it.
+
+Otherwise the check is made where it is made today.
 
 ### 2.1 Executor
 
 `SchemaRequest` gains `adoption: AdoptionCheck`:
 
 ```rust
-pub enum AdoptionCheck {
+pub enum AdoptionCheck<'a> {
     Now,
-    AfterMigrations,
+    AfterMigrations { settled: &'a [TableDefinition] },
 }
 ```
 
 - `prepare_schema_changes` still reads the live schema and runs
   `validate_adoption`. Under `Now` it refuses on errors (`accepted()`), as
-  today. Under `AfterMigrations` it returns the report as found, marked
-  `deferred: true`, and refuses nothing.
+  today. Under `AfterMigrations` it refuses on the errors of the `settled`
+  tables, and otherwise returns the report of every adopted table, marked
+  `deferred: true`. Its errors are then only those of new or changed
+  declarations.
+- `adopt::settled(declared, left_tables, left_adopted)` picks the settled
+  declarations. It compares the projection the check reads (`Checked`,
+  beside `validate_adoption`, so the two change together), with names
+  folded and columns unordered. A change to anything else in a table,
+  such as its hooks, leaves its declaration settled.
 - A new `executor::check_adoption(db, adopted)` reads the live schema
   (`introspect::live_schema`) and returns
   `validate_adoption(db.schema(), adopted, &live).accepted()`.
@@ -87,10 +110,14 @@ pub enum AdoptionCheck {
 one function used by both paths:
 
 ```rust
-fn adoption_check(verified: Option<&MigrationsReport>) -> AdoptionCheck
+fn adoption_check<'a>(
+    verified: Option<&MigrationsReport>,
+    settled: &'a [TableDefinition],
+) -> AdoptionCheck<'a>
 ```
 
-It returns `AfterMigrations` exactly when the report's mode is
+`prepare` computes `settled` from the version being left (`left.tables`
+and `left.adopted`). `adoption_check` returns `AfterMigrations` exactly when the report's mode is
 `HistoryMode::Apply` and its `run.pending` is not empty, and `Now`
 otherwise. Whether the deploy adopts anything needs no extra test: a
 request that adopts nothing produces no adoption report, so there is
@@ -100,15 +127,17 @@ nothing to defer.
   `apply` already uses. The verify pass is read-only and takes no lock, so
   the reordering changes only which error a plan reports when the history
   and the adoption are both wrong: the history's, as a deploy reports.
-  - With migrations pending under `apply`, the plan succeeds. Its
-    `adoption` carries `deferred: true` and, in `errors`, what the current
-    schema lacks: what the pending migrations are expected to provide.
+  - With migrations pending under `apply`, the plan is refused for a
+    finding on a settled declaration, as the deploy is. Otherwise it
+    succeeds, and its `adoption` carries `deferred: true` and, in
+    `errors`, what the new or changed declarations lack: what the pending
+    migrations are expected to provide.
   - With nothing pending, or under `verify_only`, the plan checks adoption
     as today, and errors fail it.
 - **`apply`** passes the same check to `prepare`. In `run_phases`, right
   after the SQL migrations ran and before `on_migrate` and the destructive
-  phase, a deferred adoption is checked with `check_adoption` over the
-  adopted tables of `tables_of(manifest, left)`. `Phases` carries the
+  phase, a deferred adoption is checked with `check_adoption` over every
+  adopted table of `tables_of(manifest, left)`. `Phases` carries the
   resulting report. `SchemaReport::of` takes it in place of the deferred
   one from `prepare`, so the report returned, and the snapshot
   `activate_module` stores, come from the read made after the migrations.
@@ -144,6 +173,23 @@ exact, but:
 The deploy checks again after applying in any case, so the plan's part is
 to say what it expects, not to prove it.
 
+### 2.5 Why the migrations and the check are not one transaction
+
+Making the migrations and the check after them atomic, so that a refusal
+rolls the migrations back, was considered and not taken:
+
+- `migrate_exec` runs each migration in a transaction of its own and
+  records it in the history there, so that a failure leaves the ones
+  before it applied and recorded. A refinery runner that shares the
+  history relies on that, and so does the retry after a partial failure.
+- A `-- cufflink:no-transaction` migration (`CREATE INDEX CONCURRENTLY`)
+  cannot run inside a transaction at all, so one transaction could not
+  cover every release.
+- One transaction would hold every migration's locks on live tables until
+  the check ends, where each now holds its own only while it runs.
+
+The check after the migrations is therefore a safety net, not a rollback.
+
 ## 3. Failure semantics
 
 - **A migration fails.** Unchanged: it rolls back, the migrations before it
@@ -154,12 +200,19 @@ to say what it expects, not to prove it.
   - the deploy stops before `on_migrate`, the destructive phase and
     activation, and the previous version keeps serving;
   - what ran stays: a managed schema's additive phase, and the migrations,
-    recorded in the history. Both are expand-only, and so safe for the
-    previous version, as they are when a later phase fails today;
+    recorded in the history. The previous version keeps serving over
+    whatever the migrations made. SQL migrations are arbitrary: one that
+    breaks a declaration can leave the previous version unable to serve
+    that table. Writing migrations that the version being left can run
+    over (expand only) is the author's responsibility, as it is whenever
+    a later phase fails today, and the refusal keeps the new version from
+    being activated over a schema it does not match;
   - the error names the findings and the migrations applied;
   - the remedy is a release whose declaration matches. A retry of the same
     release finds nothing pending and is refused before anything runs, as
     today.
+- **A settled declaration has drifted.** The deploy and its plan are
+  refused before anything runs, as today, whatever migrations are pending.
 - **Another runner holds the migration lock.** The apply waits as today,
   then applies what is still pending. The check reads the schema after the
   lock is released, so it sees what the other runner made too.
@@ -168,8 +221,9 @@ to say what it expects, not to prove it.
 
 ## 4. Behaviour changes
 
-- A deploy that is refused today because its declaration is ahead of the
-  live schema, and whose pending migrations make it true, now succeeds.
+- A deploy that is refused today because a new or changed declaration is
+  ahead of the live schema, and whose pending migrations make it true, now
+  succeeds. Drift on a settled declaration is refused up front as today.
   A plan of it succeeds with `adoption.deferred: true`.
 - A deploy whose pending migrations break a declared table (drop, rename
   or retype a declared column, drop a declared table) is now refused after
@@ -230,6 +284,18 @@ one, which pins what stays as it is:
    runner holds the migration lock, applies and records V2 itself, then
    releases it. The deploy waits, applies nothing, and passes on its fresh
    read.
+7. `drift_on_a_settled_declaration_is_refused_before_the_migrations`: a
+   changed declaration that its migration makes true passes on a second
+   deploy. A column of that table is then dropped by hand, and a release
+   declaring the same tables ships an unrelated migration. The plan and
+   the deploy are refused with today's message, the history gains no row,
+   the unrelated table is not made, and the previous version is still
+   served.
+8. `a_migration_that_breaks_a_settled_declaration_is_refused_after_it`:
+   the declaration is unchanged and passes before the migrations, and V2
+   drops the declared `memo`, or retypes it to `integer`. The deploy is
+   refused (422) naming `memo` and V2, V2 stays recorded, and the previous
+   version is still served.
 
 The suite's other tests, which cover managed schemas, `verify_only` and
 the lock, pass unchanged.
@@ -238,8 +304,13 @@ Unit tests:
 
 - `adoption_check` for no report, `verify_only`, `apply` with and without
   pending migrations.
-- `AdoptionCheck::AfterMigrations` returns findings without refusing, and
-  `Now` refuses as before. A report that is not deferred serializes
+- `AdoptionCheck::AfterMigrations` refuses a finding on a settled
+  declaration, returns the others without refusing, and `Now` refuses as
+  before.
+- `adopt::settled` keeps an unchanged declaration (names folded, columns
+  in any order) and drops a table the version left did not adopt, one it
+  did not declare, and one whose columns, column types, owner field,
+  `soft_delete` or primary key changed. A report that is not deferred serializes
   without `deferred`.
 - The error after migrations names the applied migrations, and keeps
   today's message when none were applied.
@@ -254,8 +325,9 @@ it as it is.
 
 - No todos and no partial paths: plan, apply, the CLI and the docs change
   together.
-- The judgement stays in `validate_adoption` and the predicate in
-  `adoption_check`. Each path calls them once.
+- The judgement stays in `validate_adoption`, the predicate in
+  `adoption_check`, and what counts as settled in `adopt::settled`, beside
+  the check whose inputs it compares.
 - No comments beyond what the order needs, and no duplicated formatting of
   migration names.
 - Docs: the phase order and the plan in
