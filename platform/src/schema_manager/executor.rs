@@ -373,9 +373,8 @@ pub fn prepared(
         online_sql: phase(MigrationPhase::Online),
         diff: build_schema_diff(&planned.changes),
         guard: report,
-        adoption: None,
-        adopted: request.adopted.to_vec(),
         warnings: planned.warnings,
+        ..PreparedSchemaChanges::default()
     })
 }
 
@@ -480,26 +479,34 @@ pub async fn prepare_schema_changes(
         .filter(|_| request.adopts())
         .map(|live| request.adoption.verdict(db.schema(), request.adopted, live))
         .transpose()?;
-    if request.ownership == SchemaOwnership::Adopted {
-        return Ok(PreparedSchemaChanges {
-            adoption,
-            adopted: request.adopted.to_vec(),
-            ..PreparedSchemaChanges::default()
-        });
-    }
+    let changes = if request.ownership == SchemaOwnership::Adopted {
+        PreparedSchemaChanges::default()
+    } else {
+        managed_changes(db, request, live.as_ref(), unread).await?
+    };
+    Ok(PreparedSchemaChanges {
+        adoption,
+        adopted: request.adopted.to_vec(),
+        ..changes
+    })
+}
+
+async fn managed_changes(
+    db: &ServiceSessions,
+    request: &SchemaRequest<'_>,
+    live: Option<&LiveSchema>,
+    unread: Vec<String>,
+) -> PlatformResult<PreparedSchemaChanges> {
     let archives = if may_restore(request) {
         introspect::archives(db).await?
     } else {
         Archives::default()
     };
-    let guarded = live
-        .as_ref()
-        .filter(|_| request.guard.mode != PolicyMode::Off);
+    let guarded = live.filter(|_| request.guard.mode != PolicyMode::Off);
     let planned = planned_changes(request, &archives, guarded)?;
     let (found, unfound) = dependents(db, request, &planned).await?;
     let prepared = prepared(request, db.schema(), planned, found)?;
     Ok(PreparedSchemaChanges {
-        adoption,
         warnings: unread
             .into_iter()
             .chain(unfound)

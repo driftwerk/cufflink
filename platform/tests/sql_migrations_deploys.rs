@@ -1498,9 +1498,38 @@ async fn an_adopted_search_config_a_pending_migration_makes_is_checked_after_it(
              (COPY = pg_catalog.english);\n",
         ),
     ];
+    let (status, plan) = d.deploy_as("?plan=true", searched(&made)).await;
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
+    assert!(
+        !plan.to_string().contains("text search configuration"),
+        "a plan does not look for what the migrations are to create: {plan}"
+    );
     let body = d.deployed(searched(&made)).await;
     assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
     assert_eq!(recorded(&d.database, HISTORY).await, history_of(&made));
+    let served = served_version(&d).await;
+
+    d.database
+        .batch_execute("DROP TEXT SEARCH CONFIGURATION loan_service.loan_english")
+        .await
+        .expect("drift");
+    let unrelated = made.iter().cloned().chain([migration(
+        4,
+        "loan_tags",
+        "CREATE TABLE loan_service.loan_tags (id uuid PRIMARY KEY);\n",
+    )]);
+    let (status, body) = d.deploy(searched(&unrelated.collect::<Vec<_>>())).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("no text search configuration 'loan_english'")
+            && !error.contains("stay applied"),
+        "a settled declaration's configuration is checked before anything runs: {error}"
+    );
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&made));
+    assert!(!exists(&d.database, "loan_service.loan_tags").await);
+    assert_eq!(served_version(&d).await, served);
 }
 
 #[tokio::test]
@@ -1547,61 +1576,83 @@ async fn an_async_deploy_refused_after_the_migrations_ends_in_the_adoption_phase
     );
 }
 
-#[tokio::test]
-async fn a_version_stored_without_adoption_records_settles_what_it_declared() {
-    let Some(d) = start(&[]).await else {
-        return;
-    };
-    let local = ledger_migrations();
-    apply_with_refinery(&d, &local).await;
-    d.deployed(json!({"manifest": ledger(&local, legacy_history(), true)}))
-        .await;
-    let served = served_version(&d).await;
-    let rewritten =
-        d.db.pool()
-            .get()
-            .await
-            .expect("checkout")
-            .execute(
-                "UPDATE schema_snapshots SET schema_json = schema_json -> 'tables' \
-             WHERE jsonb_typeof(schema_json) = 'object'",
-                &[],
-            )
-            .await
-            .expect("a snapshot as an older platform stored it");
-    assert_eq!(rewritten, 1);
+fn noted_service(migrations: &[SqlMigration], private: bool) -> Value {
+    let notes = json!({"name": "loan_notes", "managed": !private, "columns": [
+        {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false},
+        {"name": "body", "column_type": "text", "primary_key": false, "nullable": false}
+    ]});
+    let mut manifest = loan_service(migrations, json!({"table": "schema_history"}));
+    let list = if private { "private_tables" } else { "tables" };
+    manifest[list] = manifest[list]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain([notes])
+        .collect();
+    manifest
+}
 
-    d.database
-        .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
-        .await
-        .expect("drift");
-    let unrelated = [
-        local[0].clone(),
-        local[1].clone(),
-        migration(
-            3,
-            "loan_tags",
-            "CREATE TABLE loan_service.loan_tags (id uuid PRIMARY KEY);\n",
+#[tokio::test]
+async fn a_table_taken_from_the_platform_into_adoption_waits_for_the_migrations() {
+    let colours = migration(
+        1,
+        "colours",
+        "CREATE TABLE loan_service.colours (name text PRIMARY KEY);\n",
+    );
+    let labels = migration(
+        2,
+        "loan_labels",
+        "CREATE TABLE loan_service.loan_labels (id uuid PRIMARY KEY);\n",
+    );
+    let body = migration(
+        2,
+        "loan_note_body",
+        "ALTER TABLE loan_service.loan_notes ADD COLUMN body text NOT NULL;\n",
+    );
+    let releases = [
+        (false, labels.clone(), None),
+        (true, body, None),
+        (
+            true,
+            labels,
+            Some("loan_service.loan_notes.body is missing"),
         ),
     ];
-    let manifest = json!({"manifest": ledger(&unrelated, legacy_history(), true)});
-    let (status, body) = d.deploy(manifest.clone()).await;
-    assert_eq!(status, 422, "{body}");
-    let error = body["error"].as_str().expect("error");
-    assert!(
-        error.contains("loan_service.loan_notes.body is missing")
-            && !error.contains("stay applied"),
-        "{error}"
-    );
-    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&local));
-    assert!(!exists(&d.database, "loan_service.loan_tags").await);
-    assert_eq!(served_version(&d).await, served);
-
-    d.database
-        .batch_execute("ALTER TABLE loan_service.loan_notes ADD COLUMN body text NOT NULL")
-        .await
-        .expect("the drift undone");
-    let body = d.deployed(manifest).await;
-    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
-    assert_ne!(served_version(&d).await, served);
+    for (drifted, pending, refusal) in releases {
+        let Some(d) = start(&[]).await else {
+            return;
+        };
+        let first = d
+            .deployed(json!({"manifest": noted_service(std::slice::from_ref(&colours), false)}))
+            .await["version"]
+            .clone();
+        if drifted {
+            d.database
+                .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+                .await
+                .expect("drift");
+        }
+        let both = [colours.clone(), pending.clone()];
+        let (status, body) = d
+            .deploy(json!({"manifest": noted_service(&both, true)}))
+            .await;
+        assert_eq!(recorded(&d.database, HISTORY).await, history_of(&both));
+        match refusal {
+            None => {
+                assert_eq!(status, 200, "{}: {body}", pending.file_stem());
+                assert_ne!(served_version(&d).await, first);
+            }
+            Some(finding) => {
+                assert_eq!(status, 422, "{body}");
+                let error = body["error"].as_str().expect("error");
+                assert!(
+                    error.contains(finding)
+                        && error.contains(&format!("stay applied: {}", pending.file_stem())),
+                    "{error}"
+                );
+                assert_eq!(served_version(&d).await, first);
+            }
+        }
+    }
 }

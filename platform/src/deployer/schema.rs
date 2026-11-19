@@ -191,7 +191,7 @@ async fn prepare(
 ) -> PlatformResult<PreparedSchemaChanges> {
     let (state, manifest) = (ctx.state, ctx.manifest);
     let tables = tables_of(manifest, left);
-    let settled = adopt::settled(&tables.adopted, &left.tables);
+    let settled = adopt::settled(&tables.adopted, &left.tables, &left.adopted);
     prepare_schema_changes(
         tenant_pool,
         &SchemaRequest {

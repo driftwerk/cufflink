@@ -286,12 +286,18 @@ impl<'a> Checked<'a> {
     }
 }
 
-pub fn settled(declared: &[TableDefinition], left: &[TableDefinition]) -> Vec<TableDefinition> {
+pub fn settled(
+    declared: &[TableDefinition],
+    left: &[TableDefinition],
+    left_adopted: &AdoptedSchema,
+) -> Vec<TableDefinition> {
     declared
         .iter()
         .filter(|table| {
-            left.iter()
-                .any(|before| Checked::of(before) == Checked::of(table))
+            left_adopted.table(&table.name).is_some()
+                && left
+                    .iter()
+                    .any(|before| Checked::of(before) == Checked::of(table))
         })
         .cloned()
         .collect()
@@ -395,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_is_settled_only_as_the_version_left_declared_it() {
+    fn a_declaration_is_settled_only_as_the_version_left_adopted_it() {
         let names = |tables: Vec<TableDefinition>| -> Vec<String> {
             tables.into_iter().map(|table| table.name).collect()
         };
@@ -409,25 +415,33 @@ mod tests {
                 ..loans()
             }
         }
-        let left = [loans(), searched("english", "document")];
-        assert_eq!(names(settled(&[loans()], &left)), ["loans"]);
-        let respelled = TableDefinition {
-            name: "Loans".into(),
-            columns: loans().columns.into_iter().rev().collect(),
-            ..loans()
-        };
+        let adopted = AdoptedSchema([("loans".to_string(), AdoptedTable::new())].into());
+        let left = [searched("english", "document")];
+        let settles = |table: TableDefinition| !settled(&[table], &left, &adopted).is_empty();
         assert_eq!(
-            names(settled(&[respelled], &left)),
+            names(settled(&[searched("english", "document")], &left, &adopted)),
+            ["loans"]
+        );
+        assert_eq!(
+            names(settled(
+                &[TableDefinition {
+                    name: "Loans".into(),
+                    columns: loans().columns.into_iter().rev().collect(),
+                    ..searched("english", "document")
+                }],
+                &left,
+                &adopted
+            )),
             ["Loans"],
             "names fold and the order of the columns is not checked"
         );
         assert!(
-            settled(&[loans()], &[]).is_empty(),
-            "a table the version left did not declare"
+            settled(&left, &left, &AdoptedSchema::default()).is_empty(),
+            "a table the platform made for the version left was never checked as adopted"
         );
-        assert_eq!(
-            settled(&[searched("english", "document")], &left[1..]).len(),
-            1
+        assert!(
+            settled(&left, &[], &adopted).is_empty(),
+            "a table the version left did not declare"
         );
         let changes: [fn(&mut TableDefinition); 8] = [
             |table| {
@@ -449,7 +463,7 @@ mod tests {
             let mut changed = searched("english", "document");
             change(&mut changed);
             assert!(
-                settled(&[changed], &left[1..]).is_empty(),
+                !settles(changed),
                 "a change to what can fail the check unsettles the table"
             );
         }

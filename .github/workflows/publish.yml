@@ -50,6 +50,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check each workspace requirement names the version it builds
+        run: .github/scripts/workspace-requirements.sh
+
       - name: Check no crate's version is taken
         run: |
           for crate in $CRATES; do

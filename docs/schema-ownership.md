@@ -207,16 +207,17 @@ ship in one release. When the deploy adopts a table (`schema: adopted`,
 `managed = false` or `private_tables`), its history is in `apply` mode and
 migrations are pending, the adoption is checked in two steps:
 
-1. Before anything runs, each table declared as the running version
-   declared it, the same in everything that can make the check fail
+1. Before anything runs, each table the running version adopted and
+   declared the same, in everything that can make the check fail
    (columns and types, primary key, `owner_field`, `soft_delete`,
    `search.vector_column` and `search.config`), is checked, and a finding
    on one refuses the deploy (422) as before: that is drift, which no
-   migration of the release was written to repair. This holds whether the
-   running version adopted the table or the platform made it, and for a
-   version an older platform stored too. A table that is new or whose
-   declaration changed waits for the migrations, and so does the search
-   configuration it names, which a migration may create. On a service's
+   migration of the release was written to repair. A table that is new,
+   whose declaration changed, or that the running version declared
+   managed waits for the migrations: the platform made that one, and
+   never checked its shape as adopted, so a migration may bring it into
+   line. So does the search configuration a waiting table names, which a
+   migration may create. On a service's
    first deploy every table waits, and so does its schema: the first
    plan of a service whose schema the deploy makes reports the schema
    as missing, deferred, rather than refusing.
@@ -228,10 +229,11 @@ Otherwise the adoption is checked before anything runs.
 
 - A declaration the migrations do not make true refuses the deploy (422)
   naming what differs and the migrations it applied, which stay applied
-  and recorded. Any other failure of that check names them too. So does a migration that drops or retypes a declared
-  column. A release whose declaration matches is the remedy: the same
-  release, deployed again, finds nothing pending and is refused before
-  anything runs.
+  and recorded. So does a migration that drops or retypes a declared
+  column. Any other failure of that check names the migrations too. A
+  release whose declaration matches is the remedy: the same release,
+  deployed again, finds nothing pending and is refused before anything
+  runs.
 - The previous version keeps serving over whatever the migrations made.
   SQL migrations are arbitrary, so one that breaks a declared table can
   leave the previous version unable to serve it. Keeping each migration

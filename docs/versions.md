@@ -1387,12 +1387,13 @@ no setting.
   net, not a rollback, and migrations the running version can run over
   remain the author's part. Every other deploy checks the adoption before
   anything runs, as before.
-- A table counts as declared as the running version declared it when it
-  is the same in everything that can make the check fail (columns and
-  types, primary key, `owner_field`, `soft_delete`, `search.vector_column`
-  and `search.config`), whether that version adopted it or the platform
-  made it, and also when an older platform stored that version without
-  adoption records.
+- A table counts as declared as the running version declared it when that
+  version adopted it and it is the same in everything that can make the
+  check fail (columns and types, primary key, `owner_field`,
+  `soft_delete`, `search.vector_column` and `search.config`). A table the
+  running version declared managed waits for the migrations when this
+  release adopts it, since the platform made it and never checked its
+  shape as adopted.
 - Every failure of the check after the migrations names the migrations
   applied. A refusal is a 422; a failure to check stays a server error.
   An asynchronous deploy reports the phase `adoption` while it runs.

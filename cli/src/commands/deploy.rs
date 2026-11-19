@@ -1257,7 +1257,9 @@ fn migration_names(list: &serde_json::Value) -> Vec<String> {
             format!(
                 "{} ({})",
                 cufflink_types::SqlMigration::stem_of(
-                    &m["version"],
+                    m["version"]
+                        .as_str()
+                        .map_or_else(|| m["version"].to_string(), str::to_string),
                     m["name"].as_str().unwrap_or("?")
                 ),
                 m["checksum"]
@@ -3648,6 +3650,17 @@ mod tests {
         assert_eq!(
             plan_lines(&plan(serde_json::json!({"errors": []}))),
             migrations
+        );
+    }
+
+    #[test]
+    fn a_migration_is_named_by_its_stem_whatever_its_version_is_sent_as() {
+        assert_eq!(
+            migration_names(&serde_json::json!([
+                {"version": 2, "name": "loan_state", "checksum": 42},
+                {"version": "3", "name": "loan_notes", "checksum": 7}
+            ])),
+            ["V2__loan_state (42)", "V3__loan_notes (7)"]
         );
     }
 
