@@ -21,6 +21,31 @@ workspace() {
     >"$work/metadata.json"
 }
 
+wasmtime() {
+  local version="$1" features="$2"
+  mkdir -p "$work/wasmtime/src"
+  printf '[package]\nname = "wasmtime"\nversion = "%s"\nedition = "2021"\n\n[features]\ngc = []\nthreads = []\n' \
+    "$version" >"$work/wasmtime/Cargo.toml"
+  touch "$work/wasmtime/src/lib.rs"
+  workspace "$inherits" dependencies "cufflink-types = { workspace = true }
+wasmtime = { path = \"../../wasmtime\", version = \"$version\", features = [$features] }"
+}
+
+audit() {
+  mkdir -p "$work/workspace/.cargo"
+  printf '%s\n' "$@" >"$work/workspace/.cargo/audit.toml"
+}
+
+ignored() {
+  local revisit="$1"
+  audit '[advisories]' 'ignore = [' \
+    "    # revisit $revisit: GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0" \
+    '    "RUSTSEC-2026-0567",' \
+    "    # revisit $revisit: GHSA-wvgq-g5hf-6gm6 affects wasmtime >=47.0.0" \
+    '    "RUSTSEC-2026-0573",' \
+    ']'
+}
+
 failures=0
 
 expect() {
@@ -74,6 +99,82 @@ expect "a workspace crate required from git" 1 \
 
 workspace "" dependencies 'cufflink-types = { path = "../types" }'
 expect "nothing to compare" 1 "no requirement on a workspace crate was found" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+ignored 2999-12-31
+expect "the audit exceptions on wasmtime 36 without gc or threads" 0 \
+  "the audit ignores RUSTSEC-2026-0567, RUSTSEC-2026-0573 hold for wasmtime 36.0.21 without gc or threads until 2999-12-31" \
+  "$work/metadata.json"
+
+wasmtime 48.0.9 '"gc", "threads"'
+expect "another wasmtime major and features with no audit exceptions" 0 "each of the 1 requirements" \
+  "$work/metadata.json"
+
+wasmtime 48.0.9 ""
+ignored 2999-12-31
+expect "the audit exceptions on another wasmtime major" 1 \
+  "the audit exceptions hold for wasmtime 36 only, and the workspace builds wasmtime 48.0.9: drop them" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 '"gc"'
+ignored 2999-12-31
+expect "the audit exceptions with the gc feature" 1 \
+  "the audit exceptions hold only while wasmtime builds without its gc feature, and the workspace enables it" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 '"threads"'
+ignored 2999-12-31
+expect "the audit exceptions with the threads feature" 1 \
+  "the audit exceptions hold only while wasmtime builds without its threads feature, and the workspace enables it" \
+  "$work/metadata.json"
+
+workspace "$inherits" dependencies 'cufflink-types = { workspace = true }'
+ignored 2999-12-31
+expect "the audit exceptions with no wasmtime" 1 \
+  "the audit exceptions are for wasmtime, which the workspace no longer builds: drop them" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+ignored 2000-01-01
+expect "audit exceptions past their revisit date" 1 \
+  "RUSTSEC-2026-0567 was to be revisited by 2000-01-01: check it still does not apply, then set a new date or drop the ignore" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+ignored 2026-02-30
+expect "audit exceptions with an impossible revisit date" 1 \
+  "RUSTSEC-2026-0573 is to be revisited on 2026-02-30, which is not a date" "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+audit '[advisories]' 'ignore = [' '    # GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0' \
+  '    "RUSTSEC-2026-0567",' ']'
+expect "an audit exception with no revisit date" 1 \
+  'each id in .cargo/audit.toml needs a "# revisit YYYY-MM-DD: <why>" line above it' \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+audit '[advisories]' 'ignore = [' '    "RUSTSEC-2026-0567",' ']'
+expect "an audit exception with no note" 1 \
+  ".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+audit '[advisories]' 'ignore = [' '    # revisit 2999-12-31: unmaintained' '    "RUSTSEC-2024-0436",' ']'
+expect "an audit exception for another advisory" 1 \
+  "RUSTSEC-2024-0436 is ignored, and only RUSTSEC-2026-0567 and RUSTSEC-2026-0573 may be" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+audit '[advisories]' 'ignore = ["RUSTSEC-2024-0436"]'
+expect "an inline audit ignore list" 1 \
+  ".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 ""
+audit '[advisories]' 'ignore = [' ']' '[output]' 'deny = []'
+expect "audit settings beyond the ignore list" 1 \
+  ".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note" \
   "$work/metadata.json"
 
 got=0

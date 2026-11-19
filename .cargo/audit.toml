@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # revisit 2026-12-19: GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0; this workspace locks 36.x without threads, guarded by .github/scripts/workspace-requirements.sh
+    "RUSTSEC-2026-0567",
+    # revisit 2026-12-19: GHSA-wvgq-g5hf-6gm6 affects wasmtime >=47.0.0; this workspace locks 36.x without gc, guarded by .github/scripts/workspace-requirements.sh
+    "RUSTSEC-2026-0573",
+]

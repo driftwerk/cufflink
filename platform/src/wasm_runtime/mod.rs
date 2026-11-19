@@ -2852,6 +2852,32 @@ pub(crate) mod tests {
         );
     }
 
+    fn refusal(wat: &str) -> String {
+        let engine = engine();
+        let err = Module::new(&engine.engine, wat).expect_err("the module does not compile");
+        format!("{err:?}")
+    }
+
+    #[tokio::test]
+    async fn a_gc_type_does_not_compile() {
+        let err = refusal("(module (type (struct)))");
+        assert!(
+            err.contains("not supported without the gc feature"),
+            "gc is off, so no guest allocates on a GC heap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_atomic_notify_on_an_unshared_memory_does_not_compile() {
+        let err = refusal(
+            "(module (memory 1) (func (drop (memory.atomic.notify (i32.const 0) (i32.const 1)))))",
+        );
+        assert!(
+            err.contains("threads support is not enabled"),
+            "threads are off, so no guest reaches an atomic wait or notify: {err}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_cap_is_enforced_or_warned_by_mode() {
         let hog = guest(
