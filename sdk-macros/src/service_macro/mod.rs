@@ -703,6 +703,120 @@ mod tests {
     }
 
     #[test]
+    fn public_docs_are_emitted_and_their_syntax_checked() {
+        let out = expand(quote! {
+            name: "catalog-service",
+            tables: [],
+            routing: strict,
+            openapi: {
+                title: "catalog-service",
+                docs: [
+                    {
+                        name: "public-api",
+                        mount: "/docs/public-api",
+                        include_tags: ["Catalog", "Orders"],
+                        title: "Catalog Public API",
+                        version: "1.0.0",
+                        description: catalog_docs::public_api_description(),
+                        contact: { name: "API Support", email: "support@example.com" },
+                        servers: [("https://api.example.com", "Production")],
+                        tags: [("Catalog", "Products and prices")],
+                        path_prefix: "/api",
+                        api_key: { header: "Authorization", description: "The key issued to you" },
+                        cors: mirror,
+                    },
+                    { name: "status", mount: "/docs/status", include_tags: ["Status"],
+                      title: "Status", version: "1" },
+                ],
+            },
+        })
+        .expect("expands");
+        for needle in [
+            "name : \"public-api\" . to_string ()",
+            "include_tags : vec ! [\"Catalog\" . to_string () , \"Orders\" . to_string ()]",
+            "description : :: std :: option :: Option :: Some (:: std :: string :: ToString :: to_string (& (catalog_docs :: public_api_description ())))",
+            "ContactDoc { name : :: std :: option :: Option :: Some (\"API Support\" . to_string ()) , email : :: std :: option :: Option :: Some (\"support@example.com\" . to_string ()) , url : :: std :: option :: Option :: None }",
+            "ServerDoc { url : \"https://api.example.com\" . to_string ()",
+            "path_prefix : :: std :: option :: Option :: Some (\"/api\" . to_string ())",
+            "ApiKeyDoc { header : \"Authorization\" . to_string ()",
+            "cors : :: cufflink :: manifest :: PublicDocCors :: Mirror",
+            "cors : :: cufflink :: manifest :: PublicDocCors :: Restricted",
+            "contact : :: std :: option :: Option :: None , } , servers : vec ! [] , tags : vec ! [] , path_prefix : :: std :: option :: Option :: None , api_key : :: std :: option :: Option :: None",
+        ] {
+            assert!(out.contains(needle), "{needle}: {out}");
+        }
+        let plain =
+            expand(quote! { name: "svc", tables: [], openapi: { title: "Svc" } }).expect("expands");
+        assert!(plain.contains("docs : vec ! []"), "{plain}");
+
+        let full = quote! { name: "a", mount: "/a", include_tags: ["T"], title: "T", version: "1" };
+        for (doc, message) in [
+            (
+                quote! { { #full, host: "x" } },
+                "unknown public document field 'host'; expected name, mount, include_tags, title, \
+                 version, description, contact, servers, tags, path_prefix, api_key or cors",
+            ),
+            (quote! { { #full, name: "b" } }, "duplicate name keyword"),
+            (
+                quote! { { name: "a", include_tags: ["T"], title: "T", version: "1" } },
+                "public document is missing mount",
+            ),
+            (
+                quote! { { mount: "/a", include_tags: ["T"], title: "T", version: "1" } },
+                "public document is missing name",
+            ),
+            (
+                quote! { { name: "a", mount: "/a", title: "T", version: "1" } },
+                "public document is missing include_tags",
+            ),
+            (
+                quote! { { name: "a", mount: "/a", include_tags: ["T"], version: "1" } },
+                "public document is missing title",
+            ),
+            (
+                quote! { { name: "a", mount: "/a", include_tags: ["T"], title: "T" } },
+                "public document is missing version",
+            ),
+            (
+                quote! { { name: "a", mount: "/a", include_tags: ["T"], title: Title, version: "1" } },
+                "expected string literal",
+            ),
+            (
+                quote! { { #full, cors: open } },
+                "cors is restricted, any or mirror, not 'open'",
+            ),
+            (quote! { { #full, cors: "any" } }, "expected identifier"),
+            (
+                quote! { { #full, contact: {} } },
+                "a contact gives at least one of name, email or url",
+            ),
+            (
+                quote! { { #full, contact: { phone: "1" } } },
+                "unknown contact field 'phone'; expected name, email or url",
+            ),
+            (
+                quote! { { #full, contact: { name: "a", name: "b" } } },
+                "duplicate name keyword",
+            ),
+            (
+                quote! { { #full, api_key: { description: "x" } } },
+                "api_key is missing header",
+            ),
+            (
+                quote! { { #full, api_key: { header: "A", scheme: "x" } } },
+                "unknown api_key field 'scheme'; expected header or description",
+            ),
+        ] {
+            let err =
+                expand(quote! { name: "svc", tables: [], openapi: { docs: [#doc] } }).unwrap_err();
+            assert_eq!(err.to_string(), message, "{doc}");
+        }
+        let err = expand(quote! { name: "svc", tables: [], openapi: { docs: [], docs: [] } })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "duplicate docs modifier");
+    }
+
+    #[test]
     fn internal_routes_name_their_callers() {
         let out = expand(quote! {
             name: "svc",
