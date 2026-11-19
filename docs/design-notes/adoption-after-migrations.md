@@ -61,24 +61,17 @@ When it holds, the check is made in two steps:
    `soft_delete`, `search.vector_column` and `search.config`. That version
    passed the same check, so a finding there is drift that no migration
    of this release was written to repair, and nothing is applied for it.
-   - A snapshot without adoption records settles nothing, whatever it
-     declared:
-     - `look()` never skips the live read when a deploy adopts
-       something, and `validate_adoption` adds a record key for every
-       table it accepts, even one that declares no column;
-     - `stored()` (`repo/deployments.rs`) writes a plain list only when
-       the records are empty, and `StoredSnapshot::Adopting` otherwise;
-       a module upload that keeps the running manifest keeps its
-       records;
-     - so since v0.31.0 such a snapshot belongs to a version that
-       adopted nothing. One stored by an earlier release may have
-       adopted tables without recording them. Either way the tables this
-       deploy adopts wait for the migrations and are checked after them
-       (`a_snapshot_without_records_settles_nothing`).
-     `a_snapshot_that_adopts_nothing_is_stored_as_every_release_stored_it`,
-     `a_table_adopted_with_no_column_recorded_keeps_the_snapshot_adopting`
-     and `every_table_accepted_is_recorded_even_with_no_column_declared`
-     pin this.
+   - `settled` keeps only a table the version being left records as
+     adopted, so a snapshot without adoption records settles nothing,
+     whichever release or path wrote it: every table this deploy adopts,
+     and its schema, waits for the migrations and is checked after them
+     (`a_snapshot_without_records_settles_nothing`). A deploy whose
+     adoption is checked records every table it accepts, even one that
+     declares no column
+     (`every_table_accepted_is_recorded_even_with_no_column_declared`,
+     `a_table_adopted_with_no_column_recorded_keeps_the_snapshot_adopting`),
+     and one that adopts nothing is stored as a plain list
+     (`a_snapshot_that_adopts_nothing_is_stored_as_every_release_stored_it`).
    - A table the version being left declared managed was made by the
      platform, and its live shape was never checked against the adoption
      rules (with the schema guard off, not at all). Taken into adoption,
