@@ -17,6 +17,9 @@ pub struct SetDbRoleRequest {
     pub role: Option<String>,
     pub password: Option<String>,
     pub read_only_role: Option<String>,
+    #[serde(default)]
+    pub register: bool,
+    pub schema: Option<String>,
 }
 
 fn binding_body(binding: &Binding) -> Value {
@@ -64,20 +67,24 @@ pub async fn set_db_role(
     Json(req): Json<SetDbRoleRequest>,
 ) -> PlatformResult<Json<Value>> {
     let tenant = tenants::require_by_slug(&state.platform_db, &slug).await?;
-    let service = db_roles::require_service(&state, &tenant, &service_name).await?;
-    let (binding, report) = db_roles::bind(
+    let bound = db_roles::set(
         &state,
         &tenant,
-        &service,
+        &service_name,
         &BindRequest {
             role: req.role.as_deref(),
             password: req.password.as_deref(),
             read_only_role: req.read_only_role.as_deref(),
             actor: &admin.subject,
+            register: req.register,
+            schema: req.schema.as_deref(),
         },
     )
     .await?;
-    Ok(checked(&slug, &service.name, &binding, &report))
+    let Json(mut body) = checked(&slug, &bound.service.name, &bound.binding, &bound.report);
+    body["registered"] = json!(bound.registered);
+    body["schema"] = json!(bound.service.schema());
+    Ok(Json(body))
 }
 
 pub async fn verify_db_role(
@@ -100,4 +107,22 @@ pub async fn rotate_db_role(
     let service = db_roles::require_service(&state, &tenant, &service_name).await?;
     let (binding, report) = db_roles::rotate(&state, &tenant, &service, &admin.subject).await?;
     Ok(checked(&slug, &service.name, &binding, &report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_reads_a_registration_only_when_it_is_asked_for() {
+        let read = |body: Value| serde_json::from_value::<SetDbRoleRequest>(body);
+        let plain = read(json!({"role": "r", "password": null, "read_only_role": null}))
+            .expect("a set as before");
+        assert!(!plain.register && plain.schema.is_none());
+        let registering = read(json!({"role": "r", "register": true, "schema": "catalog"}))
+            .expect("a registration");
+        assert!(registering.register);
+        assert_eq!(registering.schema.as_deref(), Some("catalog"));
+        assert!(read(json!({"role": "r", "registered": true})).is_err());
+    }
 }

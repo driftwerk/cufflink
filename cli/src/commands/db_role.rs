@@ -23,6 +23,14 @@ pub enum DbRoleAction {
         /// A role the service switches to for read-only queries
         #[arg(long)]
         read_only_role: Option<String>,
+        /// Record the service first when it has not been deployed, so its
+        /// first deploy runs as the role
+        #[arg(long, requires = "role")]
+        register: bool,
+        /// The schema the service's manifest declares (`schema_name`), when
+        /// registering it; by default its name with `-` as `_`
+        #[arg(long, requires = "register")]
+        schema: Option<String>,
     },
     /// Check the binding against the tenant database and record the report
     Verify {
@@ -51,12 +59,29 @@ fn path(tenant: &str, service: &str) -> String {
     format!("/api/tenants/{tenant}/services/{service}/db-role")
 }
 
-fn set_body(role: Option<&str>, password: Option<&str>, read_only_role: Option<&str>) -> Value {
-    json!({
-        "role": role,
-        "password": password,
-        "read_only_role": read_only_role,
-    })
+struct SetRequest<'a> {
+    role: Option<&'a str>,
+    password: Option<&'a str>,
+    read_only_role: Option<&'a str>,
+    register: bool,
+    schema: Option<&'a str>,
+}
+
+/// The body of a set. `register` and `schema` are sent only when asked
+/// for, so a set without them is the one a platform before them reads.
+fn set_body(request: &SetRequest<'_>) -> Value {
+    let mut body = json!({
+        "role": request.role,
+        "password": request.password,
+        "read_only_role": request.read_only_role,
+    });
+    if request.register {
+        body["register"] = json!(true);
+    }
+    if let Some(schema) = request.schema {
+        body["schema"] = json!(schema);
+    }
+    body
 }
 
 /// A failure while the report says the binding is not verified, so the
@@ -181,6 +206,8 @@ pub async fn run(
             role,
             password_stdin,
             read_only_role,
+            register,
+            schema,
         } => {
             let password = password_stdin
                 .then(|| secret_from(std::io::stdin(), "--password-stdin"))
@@ -189,15 +216,23 @@ pub async fn run(
                 "Database role",
                 reqwest::Method::PUT,
                 &path(&tenant, &service),
-                Some(set_body(
-                    role.as_deref(),
-                    password.as_deref(),
-                    read_only_role.as_deref(),
-                )),
+                Some(set_body(&SetRequest {
+                    role: role.as_deref(),
+                    password: password.as_deref(),
+                    read_only_role: read_only_role.as_deref(),
+                    register,
+                    schema: schema.as_deref(),
+                })),
                 api_url,
                 env,
             )
             .await?;
+            if body["registered"].as_bool().unwrap_or(false) {
+                println!(
+                    "Registered {service} with schema {}; its first deploy runs as the role.",
+                    body["schema"].as_str().unwrap_or_default()
+                );
+            }
             print_binding(&body);
             println!("Run `cufflink services db-role verify {tenant} {service}` to check it.");
         }
@@ -274,15 +309,81 @@ mod tests {
         }
     }
 
+    fn request<'a>(
+        role: Option<&'a str>,
+        password: Option<&'a str>,
+        read_only_role: Option<&'a str>,
+    ) -> SetRequest<'a> {
+        SetRequest {
+            role,
+            password,
+            read_only_role,
+            register: false,
+            schema: None,
+        }
+    }
+
     #[test]
     fn what_is_not_given_is_sent_as_null_and_kept() {
         assert_eq!(
-            set_body(None, Some("pw"), None),
+            set_body(&request(None, Some("pw"), None)),
             json!({"role": null, "password": "pw", "read_only_role": null})
         );
         assert_eq!(
-            set_body(Some("loan_service_user"), None, Some("reports_ro")),
+            set_body(&request(
+                Some("loan_service_user"),
+                None,
+                Some("reports_ro")
+            )),
             json!({"role": "loan_service_user", "password": null, "read_only_role": "reports_ro"})
+        );
+    }
+
+    #[test]
+    fn a_registration_is_sent_only_when_asked_for() {
+        assert_eq!(
+            set_body(&SetRequest {
+                register: true,
+                ..request(Some("catalog_service_user"), Some("pw"), None)
+            }),
+            json!({"role": "catalog_service_user", "password": "pw", "read_only_role": null,
+                   "register": true})
+        );
+        assert_eq!(
+            set_body(&SetRequest {
+                register: true,
+                schema: Some("catalog"),
+                ..request(Some("catalog_service_user"), None, None)
+            }),
+            json!({"role": "catalog_service_user", "password": null, "read_only_role": null,
+                   "register": true, "schema": "catalog"})
+        );
+    }
+
+    #[test]
+    fn a_registration_names_its_role_and_a_schema_is_given_only_with_one() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Command {
+            #[command(subcommand)]
+            action: DbRoleAction,
+        }
+        let parse = |args: &[&str]| {
+            Command::try_parse_from(
+                ["db-role", "set", "acme", "catalog-service"]
+                    .iter()
+                    .chain(args),
+            )
+        };
+        assert!(parse(&["--register", "--role", "catalog_service_user"]).is_ok());
+        assert!(parse(&["--register", "--schema", "catalog", "--role", "r"]).is_ok());
+        assert!(
+            parse(&["--register"]).is_err(),
+            "a registration names its role"
+        );
+        assert!(
+            parse(&["--schema", "catalog", "--role", "r"]).is_err(),
+            "a schema is given only with --register"
         );
     }
 

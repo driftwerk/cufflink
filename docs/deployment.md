@@ -289,11 +289,12 @@ cufflink deploy --inactive
 ```
 
 deploys without starting the service (`POST /api/services/deploy?inactive=true`).
-A deploy never changes the status of a service that exists:
+A deploy never changes the status of a service that runs:
 
 | The service | `--inactive` | no flag |
 |---|---|---|
 | does not exist | created inactive and deployed; nothing starts | created active and deployed |
+| is active and has never been deployed (it was [registered for its database role](db-roles-and-secrets.md#a-service-whose-schema-belongs-to-a-role), or its first deploy failed) | deployed inactive; nothing starts | deployed |
 | is inactive | deployed, stays inactive | deployed, stays inactive |
 | is active | refused (409): disable it first, or deploy without the flag | deployed |
 

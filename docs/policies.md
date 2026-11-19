@@ -115,6 +115,7 @@ Once the policy leaves `off`, each service has a role of its own:
 
 ```sh
 cufflink services db-role set harbor catalog-service --role catalog_service_user --password-stdin
+cufflink services db-role set harbor catalog-service --register --role catalog_service_user --password-stdin  # before its first deploy
 cufflink services db-role set default reports-service --read-only-role reports_ro
 cufflink services db-role verify default reports-service   # non-zero until verified
 cufflink services db-role rotate default reports-service   # a new password for a managed role
@@ -126,7 +127,7 @@ cufflink services db-role show default reports-service
 | Guest SQL and data routes | The platform's connection with `SET LOCAL ROLE` to the service's role. A statement Postgres refuses the role (SQLSTATE `42501`) runs again as the platform and is recorded with Postgres's message, never the statement | A connection from the service's own pool, logged in as the role: `RESET ROLE`, `SET ROLE` and `SET SESSION AUTHORIZATION` give a statement nothing the role does not have |
 | A deploy's schema changes | In transactions on the platform's connection with `SET LOCAL ROLE`, with the same fallback | In transactions on the platform's connection with `SET LOCAL ROLE`, no fallback; a refusal fails the deploy. The `on_migrate` hook logs in as the role |
 | `db::query_read_only` | As `DB_READ_ONLY_ROLE`, as before; what that role is refused is refused | As the binding's read-only role, or the service's own role where it has none, read-only either way |
-| A service without a verified role | Runs as the platform (recorded once a minute) | 503 for its guest and data routes; its deploy runs, and makes the role |
+| A service without a verified role | Runs as the platform (recorded once a minute) | 503 for its guest and data routes; its deploy runs, and makes the role. A first deploy that gets no verified role is refused with the reason ([binding before the first deploy](db-roles-and-secrets.md#a-service-whose-schema-belongs-to-a-role)) |
 
 Under `warn` every statement of a transaction runs behind a savepoint, so
 that a refusal can be undone: a round trip or two more for each statement,

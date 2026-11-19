@@ -974,7 +974,9 @@ async fn verified_or_not(state: &AppState, service_id: Uuid) -> bool {
 /// again for the coming version when the policy asks, so a role that may
 /// not create in the schema loses its verification before the deploy runs
 /// any statement as it. Otherwise a binding not yet verified is
-/// provisioned, when the policy asks, as before, and a failure is logged.
+/// provisioned, when the policy asks, and a failure is logged; under
+/// `enforce` the first version of a service is refused while it has no
+/// verified binding, with the reason provisioning gave.
 pub async fn before_deploy(
     state: &AppState,
     tenant_id: Uuid,
@@ -1008,11 +1010,38 @@ pub async fn before_deploy(
             refresh(state, &entry, service_id, Some(deploying)).await
         }
         (_, false, true) => {
-            let _ = refresh(state, &entry, service_id, Some(deploying)).await;
-            Ok(())
+            let refreshed = refresh(state, &entry, service_id, Some(deploying)).await;
+            match entry.mode(PolicyKey::DbRoles) {
+                PolicyMode::Enforce
+                    if !running_is(state, service_id, |active| active.is_some()).await =>
+                {
+                    refreshed?;
+                    require_verified(state, &entry, service_id).await
+                }
+                _ => Ok(()),
+            }
         }
         _ => Ok(()),
     }
+}
+
+/// Under `enforce` no statement of a service runs without a verified
+/// role, so a first version is not activated without one.
+async fn require_verified(
+    state: &AppState,
+    entry: &TenantEntry,
+    service_id: Uuid,
+) -> PlatformResult<()> {
+    if verified_or_not(state, service_id).await {
+        return Ok(());
+    }
+    let service = crate::repo::services::get_by_id(&state.platform_db, service_id)
+        .await?
+        .map_or_else(|| service_id.to_string(), |service| service.name);
+    Err(PlatformError::Validation(format!(
+        "service {service} has no verified database role, which its tenant's db_roles policy (enforce) needs before its first version runs; `cufflink services db-role verify {} {service}` says what it lacks",
+        entry.tenant.slug
+    )))
 }
 
 /// After a version is activated: the binding is provisioned for it. A
