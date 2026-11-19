@@ -63,8 +63,9 @@ When it holds, the check is made in two steps:
    of this release was written to repair, and nothing is applied for it.
    - `settled` keeps only a table the version being left records as
      adopted, so a snapshot without adoption records settles nothing,
-     whichever release or path wrote it: every table this deploy adopts,
-     and its schema, waits for the migrations and is checked after them
+     whichever release or path wrote it: every table this deploy adopts
+     waits for the migrations, as does the deploy's schema, and is
+     checked after them
      (`a_snapshot_without_records_settles_nothing`). A deploy whose
      adoption is checked records every table it accepts, even one that
      declares no column

@@ -218,11 +218,11 @@ migrations are pending, the adoption is checked in two steps:
    its shape as adopted, so a migration may bring it into line. Over a
    running version stored without adoption records, whichever release or
    path wrote it, every table this deploy adopts waits for the
-   migrations. The search configuration a waiting table names waits too,
-   since a migration may create it. When no table is checked before the
-   migrations, on a service's first deploy or over a version stored
-   without records, the schema waits too: a plan reports a schema the
-   deploy makes as missing, deferred, rather than refusing.
+   migrations and is checked after them. The search configuration a
+   waiting table names waits too, since a migration may create it. When
+   no table is checked before the migrations, the schema waits too: a
+   plan reports a schema the deploy makes as missing, deferred, rather
+   than refusing.
 2. After the SQL migrations, on a fresh read of the database and before
    `on_migrate`, the destructive changes and activation, every adopted
    table is checked again.
