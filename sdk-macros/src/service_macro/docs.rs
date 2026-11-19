@@ -656,12 +656,12 @@ fn described_list(input: ParseStream) -> syn::Result<Vec<(LitStr, Option<LitStr>
 pub(super) fn parse_openapi(input: ParseStream) -> syn::Result<OpenApiBlock> {
     let mut block = OpenApiBlock::default();
     fields(input, |key, content| match key.to_string().as_str() {
-        "title" => set(&mut block.title, content.parse()?, key),
-        "version" => set(&mut block.version, content.parse()?, key),
-        "description" => set(&mut block.description, content.parse()?, key),
-        "security_scheme" => set(&mut block.security_scheme, content.parse()?, key),
-        "servers" => set(&mut block.servers, described_list(content)?, key),
-        "tags" => set(&mut block.tags, described_list(content)?, key),
+        "title" => once(&mut block.title, key, content.parse()?),
+        "version" => once(&mut block.version, key, content.parse()?),
+        "description" => once(&mut block.description, key, content.parse()?),
+        "security_scheme" => once(&mut block.security_scheme, key, content.parse()?),
+        "servers" => once(&mut block.servers, key, described_list(content)?),
+        "tags" => once(&mut block.tags, key, described_list(content)?),
         "schemas" => {
             let types;
             syn::bracketed!(types in content);
@@ -669,9 +669,9 @@ pub(super) fn parse_openapi(input: ParseStream) -> syn::Result<OpenApiBlock> {
                 .parse_terminated(Type::parse, Token![,])?
                 .into_iter()
                 .collect();
-            set(&mut block.schemas, schemas, key)
+            once(&mut block.schemas, key, schemas)
         }
-        "docs" => set(&mut block.docs, parse_docs(content)?, key),
+        "docs" => once(&mut block.docs, key, parse_docs(content)?),
         other => Err(syn::Error::new(
             key.span(),
             format!(

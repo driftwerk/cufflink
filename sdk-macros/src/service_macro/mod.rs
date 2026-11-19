@@ -698,7 +698,7 @@ mod tests {
             (quote! { schemas: [A], schemas: [B] }, "schemas"),
         ] {
             let err = expand(quote! { name: "svc", tables: [], openapi: { #block } }).unwrap_err();
-            assert_eq!(err.to_string(), format!("duplicate {key} modifier"));
+            assert_eq!(err.to_string(), format!("duplicate {key} keyword"));
         }
     }
 
@@ -813,7 +813,7 @@ mod tests {
         }
         let err = expand(quote! { name: "svc", tables: [], openapi: { docs: [], docs: [] } })
             .unwrap_err();
-        assert_eq!(err.to_string(), "duplicate docs modifier");
+        assert_eq!(err.to_string(), "duplicate docs keyword");
     }
 
     #[test]
