@@ -5,7 +5,8 @@ use cufflink_platform::policy::PolicyMode;
 use cufflink_platform::repo::deployments::{self, ActivateVersion, Adoption};
 use cufflink_platform::schema_manager::adopt::AdoptedSchemas;
 use cufflink_platform::schema_manager::executor::{
-    apply_schema, ensure_schema, prepare_schema_changes, Direction, Guard, SchemaRequest, Tables,
+    apply_schema, ensure_schema, prepare_schema_changes, AdoptionCheck, Direction, Guard,
+    SchemaRequest, Tables,
 };
 use cufflink_platform::schema_manager::introspect::TypeKind;
 use cufflink_platform::tenant_sessions::ServiceSessions;
@@ -70,6 +71,7 @@ fn adopting<'a>(
         leaving: 1,
         allow_destructive: true,
         direction: Direction::Forward,
+        adoption: AdoptionCheck::Now,
         guard: Guard { mode, ..Guard::OFF },
     }
 }

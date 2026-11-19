@@ -19,6 +19,44 @@ pub enum Direction {
     Rollback,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum AdoptionCheck<'a> {
+    Now,
+    AfterMigrations { settled: &'a [TableDefinition] },
+}
+
+impl<'a> AdoptionCheck<'a> {
+    fn up_front<'b>(self, adopted: &'b [TableDefinition]) -> &'b [TableDefinition]
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::Now => adopted,
+            Self::AfterMigrations { settled } => settled,
+        }
+    }
+
+    fn verdict(
+        self,
+        schema: &str,
+        adopted: &[TableDefinition],
+        live: &LiveSchema,
+    ) -> PlatformResult<AdoptionReport> {
+        match self {
+            Self::Now => validate_adoption(schema, adopted, live).accepted(),
+            Self::AfterMigrations { settled } => {
+                if !settled.is_empty() {
+                    validate_adoption(schema, settled, live).accepted()?;
+                }
+                Ok(AdoptionReport {
+                    deferred: true,
+                    ..validate_adoption(schema, adopted, live)
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Guard {
     pub mode: PolicyMode,
@@ -112,6 +150,7 @@ pub struct SchemaRequest<'a> {
     pub leaving: i32,
     pub allow_destructive: bool,
     pub direction: Direction,
+    pub adoption: AdoptionCheck<'a>,
     pub guard: Guard,
 }
 
@@ -123,6 +162,7 @@ pub struct PreparedSchemaChanges {
     pub diff: SchemaDiff,
     pub guard: Option<GuardReport>,
     pub adoption: Option<AdoptionReport>,
+    pub adopted: Vec<TableDefinition>,
     pub warnings: Vec<String>,
 }
 
@@ -333,8 +373,8 @@ pub fn prepared(
         online_sql: phase(MigrationPhase::Online),
         diff: build_schema_diff(&planned.changes),
         guard: report,
-        adoption: None,
         warnings: planned.warnings,
+        ..PreparedSchemaChanges::default()
     })
 }
 
@@ -429,7 +469,7 @@ pub async fn prepare_schema_changes(
         &request
             .tables
             .iter()
-            .chain(request.adopted)
+            .chain(request.adoption.up_front(request.adopted))
             .collect::<Vec<_>>(),
     )
     .await?;
@@ -437,27 +477,36 @@ pub async fn prepare_schema_changes(
     let adoption = live
         .as_ref()
         .filter(|_| request.adopts())
-        .map(|live| validate_adoption(db.schema(), request.adopted, live).accepted())
+        .map(|live| request.adoption.verdict(db.schema(), request.adopted, live))
         .transpose()?;
-    if request.ownership == SchemaOwnership::Adopted {
-        return Ok(PreparedSchemaChanges {
-            adoption,
-            ..PreparedSchemaChanges::default()
-        });
-    }
+    let changes = if request.ownership == SchemaOwnership::Adopted {
+        PreparedSchemaChanges::default()
+    } else {
+        managed_changes(db, request, live.as_ref(), unread).await?
+    };
+    Ok(PreparedSchemaChanges {
+        adoption,
+        adopted: request.adopted.to_vec(),
+        ..changes
+    })
+}
+
+async fn managed_changes(
+    db: &ServiceSessions,
+    request: &SchemaRequest<'_>,
+    live: Option<&LiveSchema>,
+    unread: Vec<String>,
+) -> PlatformResult<PreparedSchemaChanges> {
     let archives = if may_restore(request) {
         introspect::archives(db).await?
     } else {
         Archives::default()
     };
-    let guarded = live
-        .as_ref()
-        .filter(|_| request.guard.mode != PolicyMode::Off);
+    let guarded = live.filter(|_| request.guard.mode != PolicyMode::Off);
     let planned = planned_changes(request, &archives, guarded)?;
     let (found, unfound) = dependents(db, request, &planned).await?;
     let prepared = prepared(request, db.schema(), planned, found)?;
     Ok(PreparedSchemaChanges {
-        adoption,
         warnings: unread
             .into_iter()
             .chain(unfound)
@@ -465,6 +514,15 @@ pub async fn prepare_schema_changes(
             .collect(),
         ..prepared
     })
+}
+
+pub async fn check_adoption(
+    db: &ServiceSessions,
+    adopted: &[TableDefinition],
+) -> PlatformResult<AdoptionReport> {
+    check_search_configs(db, &adopted.iter().collect::<Vec<_>>()).await?;
+    let live = introspect::live_schema(db).await?;
+    validate_adoption(db.schema(), adopted, &live).accepted()
 }
 
 pub async fn execute_phase(
@@ -601,6 +659,7 @@ mod tests {
             leaving: 7,
             allow_destructive: true,
             direction: Direction::Forward,
+            adoption: AdoptionCheck::Now,
             guard,
         }
     }
@@ -1076,6 +1135,84 @@ mod tests {
             "a table that is made has no rows to rewrite"
         );
         assert_eq!(made.additive_sql.len(), 4);
+    }
+
+    #[test]
+    fn after_the_migrations_only_a_settled_declaration_refuses_up_front() {
+        let table = |name: &str, columns: &[&str]| TableDefinition {
+            name: name.into(),
+            columns: columns
+                .iter()
+                .map(|column| declared(column, ColumnType::Text))
+                .collect(),
+            ..Default::default()
+        };
+        let live = schema(vec![
+            ("labels", live_table(vec![column("name", "text")])),
+            ("notes", live_table(vec![column("body", "text")])),
+        ]);
+        let verdict = |check: AdoptionCheck<'_>, declared: &[TableDefinition]| {
+            check.verdict("loan_service", declared, &live)
+        };
+
+        let changed = [
+            table("labels", &["name"]),
+            table("notes", &["body", "author"]),
+        ];
+        let deferred = verdict(
+            AdoptionCheck::AfterMigrations {
+                settled: &changed[..1],
+            },
+            &changed,
+        )
+        .expect("what a changed declaration lacks waits for the migrations");
+        assert!(deferred.deferred);
+        assert_eq!(deferred.errors, ["loan_service.notes.author is missing"]);
+        assert_eq!(
+            serde_json::to_value(&deferred).expect("json")["deferred"],
+            true
+        );
+        assert!(verdict(AdoptionCheck::Now, &changed).is_err());
+
+        let drifted = [table("labels", &["name", "colour"]), changed[1].clone()];
+        let refused = verdict(
+            AdoptionCheck::AfterMigrations {
+                settled: &drifted[..1],
+            },
+            &drifted,
+        )
+        .expect_err("drift on a settled declaration is refused before the migrations")
+        .to_string();
+        assert!(
+            refused.contains("loan_service.labels.colour is missing")
+                && !refused.contains("author"),
+            "{refused}"
+        );
+
+        let unmade = LiveSchema {
+            exists: false,
+            ..LiveSchema::default()
+        };
+        let waiting = AdoptionCheck::AfterMigrations { settled: &[] }
+            .verdict("loan_service", &changed, &unmade)
+            .expect("with nothing settled, a schema not made yet waits for the migrations");
+        assert_eq!(waiting.errors, ["schema loan_service is missing"]);
+        assert!(waiting.deferred);
+        assert!(
+            AdoptionCheck::AfterMigrations {
+                settled: &changed[..1]
+            }
+            .verdict("loan_service", &changed, &unmade)
+            .is_err(),
+            "a settled table in a schema that is gone is drift"
+        );
+
+        let accepted = verdict(AdoptionCheck::Now, &changed[..1]).expect("accepted");
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("json"),
+            serde_json::json!({"errors": [], "warnings": [], "undeclared_columns": {}}),
+            "a report checked when it is found serializes as it always did"
+        );
     }
 
     #[test]

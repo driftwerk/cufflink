@@ -1255,13 +1255,20 @@ fn migration_names(list: &serde_json::Value) -> Vec<String> {
         .flatten()
         .map(|m| {
             format!(
-                "V{}__{} ({})",
-                m["version"],
-                m["name"].as_str().unwrap_or("?"),
-                m["checksum"]
+                "{} ({})",
+                cufflink_types::SqlMigration::stem_of(shown(&m["version"]), &shown(&m["name"])),
+                shown(&m["checksum"])
             )
         })
         .collect()
+}
+
+fn shown(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "?".into(),
+        other => other.to_string(),
+    }
 }
 
 pub(crate) const PRIVATE_TABLES: &str = "Private tables (checked, not served)";
@@ -1312,6 +1319,18 @@ fn plan_lines(plan: &serde_json::Value) -> Vec<String> {
             migrations["verified"]
         )
     });
+    let adoption = &plan["adoption"];
+    let deferred = (adoption["deferred"].as_bool() == Some(true))
+        .then(|| {
+            std::iter::once("Adoption:       checked after the pending migrations".to_string())
+                .chain(
+                    texts(&adoption["errors"])
+                        .into_iter()
+                        .map(|error| format!("not there yet: {error}")),
+                )
+        })
+        .into_iter()
+        .flatten();
     let private = texts(&plan["private_tables"]);
     let heading = (!private.is_empty()).then(|| format!("{PRIVATE_TABLES}:"));
     heading
@@ -1333,6 +1352,7 @@ fn plan_lines(plan: &serde_json::Value) -> Vec<String> {
                 .into_iter()
                 .map(|m| format!("pending: {m}")),
         )
+        .chain(deferred)
         .chain(guard.map(|mode| format!("Schema guard:   {mode}")))
         .chain(
             texts(&plan["satisfied"])
@@ -3590,6 +3610,66 @@ mod tests {
                 "  loan_tags",
                 "table loans: no longer served",
                 "warning: schema_guard could not read the schema: timeout",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plan_names_what_the_pending_migrations_are_to_make() {
+        let plan = |adoption: serde_json::Value| {
+            serde_json::json!({
+                "schema_changes": [],
+                "sql_migrations": {
+                    "history": "loan_service.schema_history",
+                    "mode": "apply",
+                    "verified": 1,
+                    "pending": [{"version": 2, "name": "loan_state", "checksum": 42}]
+                },
+                "adoption": adoption
+            })
+        };
+        let migrations = [
+            "SQL migrations: loan_service.schema_history (apply, 1 verified)",
+            "pending: V2__loan_state (42)",
+        ];
+        let deferred = "Adoption:       checked after the pending migrations";
+        assert_eq!(
+            plan_lines(&plan(serde_json::json!({
+                "errors": ["loan_service.loans.state is missing"],
+                "deferred": true
+            }))),
+            [
+                migrations[0],
+                migrations[1],
+                deferred,
+                "not there yet: loan_service.loans.state is missing",
+            ]
+        );
+        assert_eq!(
+            plan_lines(&plan(serde_json::json!({"errors": [], "deferred": true}))),
+            [migrations[0], migrations[1], deferred],
+            "a deferred check is named when the database already holds what is adopted"
+        );
+        assert_eq!(
+            plan_lines(&plan(serde_json::json!({"errors": []}))),
+            migrations
+        );
+    }
+
+    #[test]
+    fn a_migration_is_named_by_its_stem_whatever_its_version_is_sent_as() {
+        assert_eq!(
+            migration_names(&serde_json::json!([
+                {"version": 2, "name": "loan_state", "checksum": 42},
+                {"version": "3", "name": "loan_notes", "checksum": "7"},
+                {"name": "loan_tags"},
+                {"version": 5}
+            ])),
+            [
+                "V2__loan_state (42)",
+                "V3__loan_notes (7)",
+                "V?__loan_tags (?)",
+                "V5__? (?)"
             ]
         );
     }

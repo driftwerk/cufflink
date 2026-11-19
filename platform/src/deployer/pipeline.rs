@@ -337,6 +337,7 @@ async fn run_on_platform(
 
     fail_after_schema()?;
 
+    let adoption = schema.adoption()?;
     eventing::before_activation(state, &ctx.identity, &eventing).await?;
     let deployment = activate_module(
         state,
@@ -347,7 +348,7 @@ async fn run_on_platform(
             manifest_hash: ctx.manifest_hash,
             wasm_hash: ctx.wasm_hash,
             commit_hash: ctx.commit_hash,
-            adoption: schema.adoption(),
+            adoption,
         },
     )
     .await?;
@@ -567,7 +568,7 @@ pub(crate) async fn rollback_locked(
                     commit_hash: target_commit_hash.as_deref(),
                     schema_json: Some(
                         &schema
-                            .adoption()
+                            .adoption()?
                             .snapshot(
                                 &state.platform_db,
                                 &manifest.name,

@@ -76,6 +76,8 @@ pub struct AdoptionReport {
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub undeclared_columns: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
     #[serde(skip)]
     pub adopted: AdoptedSchema,
 }
@@ -251,6 +253,56 @@ pub fn validate_adoption<'a>(
         })
 }
 
+#[derive(PartialEq)]
+struct Checked<'a> {
+    name: String,
+    columns: BTreeMap<String, &'a ColumnType>,
+    primary_key: Option<String>,
+    owner_field: Option<String>,
+    vector_column: Option<String>,
+    search_config: Option<&'a str>,
+    soft_delete: bool,
+}
+
+impl<'a> Checked<'a> {
+    fn of(table: &'a TableDefinition) -> Self {
+        Self {
+            name: folded(&table.name),
+            columns: table
+                .columns
+                .iter()
+                .map(|column| (folded(&column.name), &column.column_type))
+                .collect(),
+            primary_key: table.primary_key().map(|column| folded(&column.name)),
+            owner_field: table.owner_field.as_deref().map(folded),
+            vector_column: table
+                .search
+                .as_ref()
+                .and_then(|search| search.vector_column.as_deref())
+                .map(folded),
+            search_config: table.search.as_ref().map(|search| search.config.as_str()),
+            soft_delete: table.soft_delete,
+        }
+    }
+}
+
+pub fn settled(
+    declared: &[TableDefinition],
+    left: &[TableDefinition],
+    left_adopted: &AdoptedSchema,
+) -> Vec<TableDefinition> {
+    declared
+        .iter()
+        .filter(|table| {
+            left_adopted.table(&table.name).is_some()
+                && left
+                    .iter()
+                    .any(|before| Checked::of(before) == Checked::of(table))
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Default)]
 pub struct AdoptedSchemas {
     known: RwLock<HashMap<Uuid, (i32, Arc<AdoptedSchema>)>>,
@@ -346,6 +398,107 @@ mod tests {
 
     fn validate(table: &TableDefinition, live: &LiveSchema) -> AdoptionReport {
         validate_adoption("loan_service", [table], live)
+    }
+
+    #[test]
+    fn a_declaration_is_settled_only_as_the_version_left_adopted_it() {
+        let names = |tables: Vec<TableDefinition>| -> Vec<String> {
+            tables.into_iter().map(|table| table.name).collect()
+        };
+        fn searched(config: &str, vector: &str) -> TableDefinition {
+            TableDefinition {
+                search: Some(cufflink_types::SearchSpec {
+                    columns: vec!["memo".into()],
+                    config: config.into(),
+                    vector_column: Some(vector.into()),
+                }),
+                ..loans()
+            }
+        }
+        let adopted = AdoptedSchema([("loans".to_string(), AdoptedTable::new())].into());
+        let left = [searched("english", "document")];
+        let settles = |table: TableDefinition| !settled(&[table], &left, &adopted).is_empty();
+        assert_eq!(
+            names(settled(&[searched("english", "document")], &left, &adopted)),
+            ["loans"]
+        );
+        assert_eq!(
+            names(settled(
+                &[TableDefinition {
+                    name: "Loans".into(),
+                    columns: loans().columns.into_iter().rev().collect(),
+                    ..searched("english", "document")
+                }],
+                &left,
+                &adopted
+            )),
+            ["Loans"],
+            "names fold and the order of the columns is not checked"
+        );
+        assert!(
+            settled(&left, &left, &AdoptedSchema::default()).is_empty(),
+            "a table the platform made for the version left was never checked as adopted"
+        );
+        let unmanaged = [TableDefinition {
+            managed: false,
+            ..searched("english", "document")
+        }];
+        assert!(
+            settled(&unmanaged, &unmanaged, &AdoptedSchema::default()).is_empty(),
+            "a snapshot without records settles nothing, whatever it declared"
+        );
+        assert!(
+            settled(
+                &left,
+                &left,
+                &AdoptedSchema([("notes".to_string(), AdoptedTable::new())].into())
+            )
+            .is_empty(),
+            "records that lack the table"
+        );
+        assert!(
+            settled(&left, &[], &adopted).is_empty(),
+            "a table the version left did not declare"
+        );
+        let changes: [fn(&mut TableDefinition); 8] = [
+            |table| {
+                table
+                    .columns
+                    .push(declared("returned_at", ColumnType::TimestampNaive))
+            },
+            |table| {
+                table.columns.pop();
+            },
+            |table| table.columns[1].column_type = ColumnType::Integer,
+            |table| table.owner_field = Some("memo".into()),
+            |table| table.soft_delete = true,
+            |table| table.columns[0].primary_key = false,
+            |table| *table = searched("english", "terms"),
+            |table| *table = searched("loan_english", "document"),
+        ];
+        for change in changes {
+            let mut changed = searched("english", "document");
+            change(&mut changed);
+            assert!(
+                !settles(changed),
+                "a change to what can fail the check unsettles the table"
+            );
+        }
+    }
+
+    #[test]
+    fn every_table_accepted_is_recorded_even_with_no_column_declared() {
+        let bare = TableDefinition {
+            columns: Vec::new(),
+            ..loans()
+        };
+        let report = validate(&bare, &live_loans(as_a_legacy_schema_has_them(), &["id"]));
+        assert_eq!(report.errors, Vec::<String>::new());
+        assert!(report.adopted.table("loans").is_some());
+        assert_eq!(
+            serde_json::to_value(&report.adopted).expect("json"),
+            serde_json::json!({"loans": {}})
+        );
     }
 
     #[test]

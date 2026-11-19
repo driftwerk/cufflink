@@ -717,6 +717,22 @@ mod tests {
     }
 
     #[test]
+    fn a_table_adopted_with_no_column_recorded_keeps_the_snapshot_adopting() {
+        let tables: Vec<TableDefinition> =
+            serde_json::from_value(json!([{ "name": "notes", "columns": [], "managed": false }]))
+                .unwrap();
+        let adopted: AdoptedSchema = serde_json::from_value(json!({"notes": {}})).unwrap();
+        let json = stored(&tables, &adopted).unwrap();
+        assert_eq!(json["adopted"], json!({"notes": {}}));
+        assert_eq!(
+            parse_snapshot("loan-service", 4, Some(json))
+                .unwrap()
+                .adopted,
+            adopted
+        );
+    }
+
+    #[test]
     fn a_snapshot_keeps_what_its_version_adopted() {
         let tables: Vec<TableDefinition> =
             serde_json::from_value(json!([{ "name": "notes", "columns": [], "managed": false }]))

@@ -94,6 +94,12 @@ pub struct MigrationRef {
     pub no_transaction: bool,
 }
 
+impl MigrationRef {
+    pub fn file_stem(&self) -> String {
+        SqlMigration::stem_of(self.version, &self.name)
+    }
+}
+
 impl From<&SqlMigration> for MigrationRef {
     fn from(migration: &SqlMigration) -> Self {
         Self {
@@ -123,7 +129,7 @@ pub enum MigrateError {
     Plan(#[from] PlanError),
     #[error("timed out after {0:?} waiting for the migration lock of {1}")]
     LockTimeout(Duration, String),
-    #[error("migration V{version}__{name} failed: {}", crate::db_error::from_pg(source).message)]
+    #[error("migration {} failed: {}", SqlMigration::stem_of(version, name), crate::db_error::from_pg(source).message)]
     Apply {
         version: u32,
         name: String,

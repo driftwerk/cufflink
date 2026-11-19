@@ -1363,6 +1363,72 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.39.0
+
+Unreleased.
+
+A deploy checks the tables a service adopts after its own SQL migrations
+when those migrations are pending, so that a migration and the column or
+table it makes ship in one release
+([adopted tables and the deploy's migrations](schema-ownership.md#adopted-tables-and-the-deploys-migrations)).
+It changes no manifest, SDK or host function, needs no migration and adds
+no setting.
+
+- When the deploy adopts a table (`schema: adopted`, `managed = false` or
+  `private_tables`), its history is in `apply` mode and migrations are
+  pending, a table declared as the running version declared it is still
+  checked before anything runs, and drift on it refuses the deploy as
+  before. Every adopted table is then checked again on a fresh read after
+  the migrations, before `on_migrate`, the destructive changes and
+  activation, and a new or changed declaration is checked only there. A
+  declaration the migrations do not make true is refused (422) with the
+  migrations applied named; they stay applied and recorded. The previous
+  version keeps serving over whatever they made: the refusal is a safety
+  net, not a rollback, and migrations the running version can run over
+  remain the author's part. Every other deploy checks the adoption before
+  anything runs, as before.
+- A table counts as declared as the running version declared it when that
+  version adopted it and it is the same in everything that can make the
+  check fail (columns and types, primary key, `owner_field`,
+  `soft_delete`, `search.vector_column` and `search.config`). A table the
+  running version declared managed waits for the migrations when this
+  release adopts it, since the platform made it and never checked its
+  shape as adopted. Over a running version stored without adoption
+  records, whichever release or path wrote it, no table counts as
+  declared as it declared it, so every table this deploy adopts waits for
+  the migrations and is checked after them.
+- Every failure of the check after the migrations names the migrations
+  applied. A refusal is a 422; a failure to check stays a server error.
+  An asynchronous deploy reports the phase `adoption` while it runs.
+- A plan of such a deploy no longer fails on what the pending migrations
+  are to make for new or changed declarations. Its `adoption` carries
+  `deferred: true` with those findings in `errors`, and `cufflink deploy
+  --plan` prints `Adoption:       checked after the pending migrations`,
+  then each finding as `not there yet: …`. `deferred` is present only
+  when true.
+- Compatibility: an older CLI ignores `deferred`. Its plan of such a
+  deploy succeeds and prints nothing about the adoption that waits for
+  the migrations, findings included.
+
+**Behaviour changes:**
+
+- A deploy whose pending migrations drop, rename or retype a declared
+  column, or drop a declared table, is now refused after the migrations
+  ran. It used to be activated over a schema its version could not serve.
+- The snapshot of the adopted columns stored for a version deployed with
+  pending migrations in `apply` mode, which the data routes read their
+  casts and defaults from, is now read after the migrations. It used to
+  hold the columns as they were before them.
+- A plan checks the migration history before any schema refusal: when
+  the history is wrong and so is the adoption, the guard or a search
+  configuration, it reports the history's error, as the deploy does.
+- A text search configuration that an adopted declaration names, and that
+  a pending migration creates, no longer refuses the deploy before the
+  migrations; it is checked after them.
+
+Rolling a platform back to v0.38 restores the old order and needs nothing
+undone.
+
 ## Changes in v0.38.2
 
 Unreleased.

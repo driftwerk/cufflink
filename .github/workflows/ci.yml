@@ -428,6 +428,9 @@ jobs:
       - name: Test the publish script
         run: .github/scripts/publish-crate.test.sh
 
+      - name: Test the workspace requirement check
+        run: .github/scripts/workspace-requirements.test.sh
+
   audit:
     name: Audit
     runs-on: ubuntu-latest

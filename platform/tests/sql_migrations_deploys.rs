@@ -2,11 +2,11 @@ use cufflink_testkit as common;
 
 use base64::Engine;
 use common::{legacy, Deployment};
-use cufflink_migrate::{checksum, legacy_table_lock_key};
+use cufflink_migrate::{checksum, legacy_table_lock_key, TRY_LOCK};
 use cufflink_types::SqlMigration;
 use reqwest::Method;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
 const HISTORY: &str = "loan_service.schema_history";
@@ -81,6 +81,48 @@ async fn holders(database: &Client, key: i64) -> i64 {
         )
         .await
         .expect("pg_locks")
+        .get(0)
+}
+
+async fn deploy_behind_the_lock(
+    d: &Deployment,
+    body: Value,
+) -> tokio::task::JoinHandle<(u16, Value)> {
+    let url = format!("{}/api/services/deploy", d.platform.base_url);
+    let auth = format!("ApiKey {}", d.tenant.api_key);
+    let client = d.platform.http.clone();
+    let waiting = tokio::spawn(async move {
+        let response = client
+            .post(url)
+            .header("authorization", auth)
+            .json(&body)
+            .send()
+            .await
+            .expect("deploy");
+        (
+            response.status().as_u16(),
+            response.json::<Value>().await.unwrap_or(Value::Null),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !trying_the_lock(&d.database).await {
+        assert!(!waiting.is_finished(), "the deploy waits for the lock");
+        assert!(Instant::now() < deadline, "the deploy never tried the lock");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!waiting.is_finished(), "the deploy waits for the lock");
+    waiting
+}
+
+async fn trying_the_lock(database: &Client) -> bool {
+    database
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() AND query = $1)",
+            &[&TRY_LOCK],
+        )
+        .await
+        .expect("pg_stat_activity")
         .get(0)
 }
 
@@ -297,27 +339,11 @@ async fn legacy_lock_excludes_concurrent_runner() {
         .await
         .expect("the legacy runner's lock");
 
-    let waiting = {
-        let url = format!("{}/api/services/deploy", d.platform.base_url);
-        let auth = format!("ApiKey {}", d.tenant.api_key);
-        let body = json!({"manifest": loan_service(&local, legacy_history())});
-        let client = d.platform.http.clone();
-        tokio::spawn(async move {
-            let response = client
-                .post(url)
-                .header("authorization", auth)
-                .json(&body)
-                .send()
-                .await
-                .expect("deploy");
-            (
-                response.status().as_u16(),
-                response.json::<Value>().await.unwrap_or(Value::Null),
-            )
-        })
-    };
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!waiting.is_finished(), "the deploy waits for the lock");
+    let waiting = deploy_behind_the_lock(
+        &d,
+        json!({"manifest": loan_service(&local, legacy_history())}),
+    )
+    .await;
     assert!(!exists(&d.database, "loan_service.loans").await);
 
     d.database
@@ -935,4 +961,764 @@ async fn an_adopted_service_with_a_hook_and_a_verified_history_runs_no_ddl() {
         recorded(&d.database, HISTORY).await,
         history_of(&local[..2])
     );
+}
+
+fn ledger_migrations() -> [SqlMigration; 2] {
+    [
+        migration(
+            1,
+            "loans",
+            "CREATE TABLE loan_service.loans (id uuid PRIMARY KEY, memo text NOT NULL);\n",
+        ),
+        migration(
+            2,
+            "loan_state",
+            "CREATE TYPE loan_service.loan_state AS ENUM ('open', 'closed');\n\
+             ALTER TABLE loan_service.loans \
+                 ADD COLUMN state loan_service.loan_state NOT NULL DEFAULT 'open';\n\
+             CREATE TABLE loan_service.loan_notes (id uuid PRIMARY KEY, body text NOT NULL);\n",
+        ),
+    ]
+}
+
+fn ledger(migrations: &[SqlMigration], history: Value, stated: bool) -> Value {
+    let column = |name: &str, primary_key: bool| {
+        json!({"name": name, "column_type": if primary_key { "uuid" } else { "text" },
+               "primary_key": primary_key, "nullable": false})
+    };
+    let loans = [column("id", true), column("memo", false)]
+        .into_iter()
+        .chain(stated.then(|| column("state", false)))
+        .collect::<Vec<_>>();
+    let notes = stated.then(
+        || json!({"name": "loan_notes", "columns": [column("id", true), column("body", false)]}),
+    );
+    json!({
+        "name": "loan-service", "version": "0.1.0", "mode": "crud", "publishes": [],
+        "schema": "adopted",
+        "tables": [{"name": "loans", "columns": loans}],
+        "private_tables": notes.into_iter().collect::<Vec<_>>(),
+        "migrations": migrations,
+        "migration_history": history,
+    })
+}
+
+fn errors(body: &Value) -> Vec<String> {
+    body["plan"]["adoption"]["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|error| error.as_str().map(str::to_string))
+        .collect()
+}
+
+async fn served_version(d: &Deployment) -> Value {
+    let (_, health) = d
+        .platform
+        .get_json(&format!("/svc/{}/loan-service/_meta/health", d.tenant.slug))
+        .await
+        .expect("health");
+    health["version"].clone()
+}
+
+const UNSTATED: [&str; 2] = [
+    "loan_service.loans.state is missing",
+    "table loan_service.loan_notes is missing",
+];
+
+#[tokio::test]
+async fn an_adopted_schema_is_checked_after_the_migrations_that_make_it() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    let manifest = ledger(&local, legacy_history(), true);
+
+    let (status, plan) = d
+        .deploy_as("?plan=true", json!({"manifest": manifest}))
+        .await;
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
+    assert_eq!(errors(&plan), UNSTATED, "{plan}");
+    assert_eq!(versions(&plan["plan"]["sql_migrations"]["pending"]), [2]);
+    assert_eq!(
+        recorded(&d.database, HISTORY).await,
+        history_of(&local[..1])
+    );
+
+    let body = d.deployed(json!({"manifest": manifest})).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [2]);
+    assert_eq!(body["plan"]["adoption"]["deferred"], Value::Null, "{body}");
+    assert_eq!(errors(&body), Vec::<String>::new(), "{body}");
+    assert_eq!(body["plan"]["private_tables"], json!(["loan_notes"]));
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&local));
+
+    let loans = format!("/svc/{}/loan-service/loans", d.tenant.slug);
+    let closed = uuid::Uuid::new_v4().to_string();
+    let opened = uuid::Uuid::new_v4().to_string();
+    for row in [
+        json!({"id": closed, "memo": "returned", "state": "closed"}),
+        json!({"id": opened, "memo": "lent"}),
+    ] {
+        let (status, created) = d.send(Method::POST, &loans, Some(row)).await;
+        assert!(status == 200 || status == 201, "{status} {created}");
+    }
+    assert_eq!(
+        d.texts(&format!(
+            "SELECT state::text FROM loan_service.loans WHERE id IN ('{closed}', '{opened}') \
+             ORDER BY memo DESC"
+        ))
+        .await,
+        ["closed", "open"],
+        "the version's snapshot holds the enum and the default the migration made"
+    );
+}
+
+#[tokio::test]
+async fn an_adoption_the_migrations_do_not_make_is_refused_after_them() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    let first = d
+        .deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+        .await["version"]
+        .clone();
+    let unmade = [
+        local[0].clone(),
+        migration(
+            2,
+            "loan_stage",
+            "ALTER TABLE loan_service.loans ADD COLUMN stage text;\n",
+        ),
+    ];
+    let manifest = ledger(&unmade, legacy_history(), true);
+
+    let (status, body) = d.deploy(json!({"manifest": manifest})).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    for named in UNSTATED
+        .into_iter()
+        .chain(["the migrations this deploy applied stay applied: V2__loan_stage"])
+    {
+        assert!(error.contains(named), "{named} in {error}");
+    }
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&unmade));
+    assert!(exists(&d.database, "loan_service.loans").await);
+    assert_eq!(served_version(&d).await, first);
+
+    for query in ["", "?plan=true"] {
+        let (status, body) = d.deploy_as(query, json!({"manifest": manifest})).await;
+        assert_eq!(status, 422, "{query}: {body}");
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            error.contains(UNSTATED[0]) && !error.contains("stay applied"),
+            "nothing pending is checked before anything runs: {error}"
+        );
+    }
+    assert_eq!(served_version(&d).await, first);
+}
+
+#[tokio::test]
+async fn a_failing_migration_under_an_adopted_schema_fails_as_it_did() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    let broken = [
+        local[0].clone(),
+        migration(
+            2,
+            "broken",
+            "ALTER TABLE loan_service.no_such_table ADD COLUMN x int;\n",
+        ),
+    ];
+    let (status, body) = d
+        .deploy(json!({"manifest": ledger(&broken, legacy_history(), true)}))
+        .await;
+    assert_eq!(status, 500, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(error.contains("V2__broken"), "{error}");
+    assert!(!error.contains("does not hold"), "{error}");
+    assert_eq!(
+        recorded(&d.database, HISTORY).await,
+        history_of(&local[..1])
+    );
+}
+
+#[tokio::test]
+async fn a_verified_history_checks_adoption_before_anything_runs() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    legacy::record_ddl(&d.database).await;
+    let verify_only =
+        json!({"table": "schema_history", "lock": "legacy_table_hash", "mode": "verify_only"});
+    let manifest = ledger(&local, verify_only, true);
+    for query in ["", "?plan=true"] {
+        let (status, body) = d.deploy_as(query, json!({"manifest": manifest})).await;
+        assert_eq!(status, 422, "{query}: {body}");
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            UNSTATED.iter().all(|unstated| error.contains(unstated)),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        legacy::ddl_statements(&d.database).await,
+        legacy::DdlStatements::NONE
+    );
+    assert_eq!(
+        recorded(&d.database, HISTORY).await,
+        history_of(&local[..1])
+    );
+}
+
+#[tokio::test]
+async fn adoption_is_checked_on_what_a_runner_holding_the_lock_made() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    let key = legacy_table_lock_key(HISTORY);
+    d.database
+        .execute("SELECT pg_advisory_lock($1)", &[&key])
+        .await
+        .expect("the legacy runner's lock");
+
+    let waiting = deploy_behind_the_lock(
+        &d,
+        json!({"manifest": ledger(&local, legacy_history(), true)}),
+    )
+    .await;
+
+    d.database
+        .batch_execute(&local[1].sql)
+        .await
+        .expect("the runner applies V2");
+    d.database
+        .execute(
+            &format!(
+                "INSERT INTO {HISTORY} (version, name, applied_on, checksum) \
+                 VALUES ($1, $2, '2024-05-01T09:30:00.000000000Z', $3)"
+            ),
+            &[
+                &(local[1].version as i32),
+                &local[1].name,
+                &checksum(&local[1]).to_string(),
+            ],
+        )
+        .await
+        .expect("the runner records V2");
+    d.database
+        .execute("SELECT pg_advisory_unlock($1)", &[&key])
+        .await
+        .expect("unlock");
+
+    let (status, body) = waiting.await.expect("deploy task");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        versions(&body["plan"]["sql_migrations"]["applied"]),
+        Vec::<u64>::new()
+    );
+    assert_eq!(errors(&body), Vec::<String>::new(), "{body}");
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&local));
+}
+
+fn shelf(migrations: &[SqlMigration], noted: bool, kept: bool) -> Value {
+    let column = |name: &str, nullable: bool| json!({"name": name, "column_type": "text", "primary_key": false, "nullable": nullable});
+    let items = [
+        json!({"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false,
+               "auto_generate": true}),
+        column("title", true),
+    ]
+    .into_iter()
+    .chain(kept.then(|| column("legacy_note", true)))
+    .chain((!kept).then(|| column("shade", true)))
+    .collect::<Vec<_>>();
+    let notes =
+        [json!({"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false})]
+            .into_iter()
+            .chain(noted.then(|| column("body", false)))
+            .collect::<Vec<_>>();
+    json!({
+        "name": "loan-service", "version": "0.1.0", "mode": "crud", "publishes": [],
+        "tables": [{"name": "items", "columns": items}],
+        "private_tables": (!kept)
+            .then(|| json!({"name": "loan_notes", "managed": false, "columns": notes}))
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "migrations": migrations,
+        "migration_history": {"table": "schema_history"},
+        "on_migrate": "insert_hooked",
+    })
+}
+
+#[tokio::test]
+async fn a_managed_schema_checks_the_private_table_its_migration_makes() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let module = base64::engine::general_purpose::STANDARD.encode(common::guest::module_bytes());
+    let deploy = |manifest: Value| json!({"manifest": manifest, "wasm_base64": module, "allow_destructive": true});
+    let local = [
+        migration(
+            1,
+            "colours",
+            "CREATE TABLE loan_service.colours (name text PRIMARY KEY);\n",
+        ),
+        migration(
+            2,
+            "loan_notes",
+            "CREATE TABLE loan_service.loan_notes (id uuid PRIMARY KEY);\n",
+        ),
+        migration(
+            3,
+            "loan_note_body",
+            "ALTER TABLE loan_service.loan_notes ADD COLUMN body text NOT NULL;\n",
+        ),
+    ];
+    let first = d.deployed(deploy(shelf(&local[..1], false, true))).await["version"].clone();
+    let hooked = || async {
+        d.texts("SELECT count(*)::text FROM loan_service.items")
+            .await
+    };
+    assert_eq!(hooked().await, ["1"]);
+
+    let (status, body) = d.deploy(deploy(shelf(&local[..2], true, false))).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("loan_service.loan_notes.body is missing")
+            && error.contains("the migrations this deploy applied stay applied: V2__loan_notes"),
+        "{error}"
+    );
+    assert_eq!(served_version(&d).await, first);
+    assert_eq!(
+        recorded(&d.database, HISTORY).await,
+        history_of(&local[..2])
+    );
+    let columns = d
+        .texts(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'loan_service' AND table_name = 'items' ORDER BY 1",
+        )
+        .await;
+    assert_eq!(
+        columns,
+        ["id", "legacy_note", "shade", "title"],
+        "the additive phase ran and the destructive one did not"
+    );
+    assert_eq!(hooked().await, ["1"], "on_migrate did not run");
+
+    let body = d.deployed(deploy(shelf(&local, true, false))).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
+    assert_eq!(body["plan"]["private_tables"], json!(["loan_notes"]));
+    assert_eq!(hooked().await, ["2"]);
+    assert_ne!(served_version(&d).await, first);
+}
+
+#[tokio::test]
+async fn drift_on_a_settled_declaration_is_refused_before_the_migrations() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    d.deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+        .await;
+    let changed = d
+        .deployed(json!({"manifest": ledger(&local, legacy_history(), true)}))
+        .await;
+    assert_eq!(
+        versions(&changed["plan"]["sql_migrations"]["applied"]),
+        [2],
+        "a changed declaration the migration makes true passes: {changed}"
+    );
+    let served = served_version(&d).await;
+
+    d.database
+        .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+        .await
+        .expect("drift");
+    let unrelated = [
+        local[0].clone(),
+        local[1].clone(),
+        migration(
+            3,
+            "loan_tags",
+            "CREATE TABLE loan_service.loan_tags (id uuid PRIMARY KEY);\n",
+        ),
+    ];
+    let manifest = ledger(&unrelated, legacy_history(), true);
+    for query in ["?plan=true", ""] {
+        let (status, body) = d.deploy_as(query, json!({"manifest": manifest})).await;
+        assert_eq!(status, 422, "{query}: {body}");
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            error.contains("loan_service.loan_notes.body is missing")
+                && !error.contains("stay applied"),
+            "{query}: {error}"
+        );
+    }
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&local));
+    assert!(!exists(&d.database, "loan_service.loan_tags").await);
+    assert_eq!(served_version(&d).await, served);
+}
+
+#[tokio::test]
+async fn a_migration_that_breaks_a_settled_declaration_is_refused_after_it() {
+    let breaks = [
+        (
+            migration(
+                2,
+                "drop_memo",
+                "ALTER TABLE loan_service.loans DROP COLUMN memo;\n",
+            ),
+            "loan_service.loans.memo is missing",
+        ),
+        (
+            migration(
+                2,
+                "count_memo",
+                "ALTER TABLE loan_service.loans ALTER COLUMN memo TYPE integer USING length(memo);\n",
+            ),
+            "loan_service.loans.memo is integer, which a column declared TEXT cannot be",
+        ),
+    ];
+    for (broken, finding) in breaks {
+        let Some(d) = start(&[]).await else {
+            return;
+        };
+        let local = ledger_migrations();
+        apply_with_refinery(&d, &local[..1]).await;
+        let first = d
+            .deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+            .await["version"]
+            .clone();
+        let both = [local[0].clone(), broken.clone()];
+        let (status, body) = d
+            .deploy(json!({"manifest": ledger(&both, legacy_history(), false)}))
+            .await;
+        assert_eq!(status, 422, "{body}");
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            error.contains(finding)
+                && error.contains(&format!(
+                    "the migrations this deploy applied stay applied: {}",
+                    broken.file_stem()
+                )),
+            "{error}"
+        );
+        assert_eq!(recorded(&d.database, HISTORY).await, history_of(&both));
+        assert_eq!(served_version(&d).await, first);
+    }
+}
+
+#[tokio::test]
+async fn the_first_plan_of_a_schema_not_made_yet_waits_for_the_migrations() {
+    let Some(d) = Deployment::start(&[]).await else {
+        return;
+    };
+    assert!(
+        d.texts("SELECT nspname::text FROM pg_namespace WHERE nspname = 'loan_service'")
+            .await
+            .is_empty(),
+        "the schema is not there before the first deploy"
+    );
+    let local = [migration(
+        1,
+        "loan_notes",
+        "CREATE TABLE loan_service.loan_notes (id uuid PRIMARY KEY);\n",
+    )];
+    let mut manifest = loan_service(&local, json!({"table": "schema_history"}));
+    manifest["private_tables"] = json!([{"name": "loan_notes", "managed": false, "columns": [
+        {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false}
+    ]}]);
+
+    let (status, plan) = d
+        .deploy_as("?plan=true", json!({"manifest": manifest}))
+        .await;
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
+    assert_eq!(errors(&plan), ["schema loan_service is missing"], "{plan}");
+
+    let body = d.deployed(json!({"manifest": manifest})).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [1]);
+    assert_eq!(errors(&body), Vec::<String>::new(), "{body}");
+    assert!(exists(&d.database, "loan_service.loan_notes").await);
+}
+
+fn staged(local: &[SqlMigration]) -> [SqlMigration; 2] {
+    [
+        local[0].clone(),
+        migration(
+            2,
+            "loan_stage",
+            "ALTER TABLE loan_service.loans ADD COLUMN stage text;\n",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn an_adopted_search_config_a_pending_migration_makes_is_checked_after_it() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    let searched = |migrations: &[SqlMigration]| {
+        let mut manifest = ledger(migrations, legacy_history(), false);
+        manifest["tables"][0]["search"] = json!({"columns": ["memo"], "config": "loan_english"});
+        json!({"manifest": manifest})
+    };
+    let unmade = staged(&local);
+    let (status, body) = d.deploy(searched(&unmade)).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("no text search configuration 'loan_english'")
+            && error.contains("the migrations this deploy applied stay applied: V2__loan_stage"),
+        "{error}"
+    );
+
+    let made = [
+        unmade[0].clone(),
+        unmade[1].clone(),
+        migration(
+            3,
+            "loan_english",
+            "CREATE TEXT SEARCH CONFIGURATION loan_service.loan_english \
+             (COPY = pg_catalog.english);\n",
+        ),
+    ];
+    let (status, plan) = d.deploy_as("?plan=true", searched(&made)).await;
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["plan"]["adoption"]["deferred"], true, "{plan}");
+    assert_eq!(
+        errors(&plan),
+        Vec::<String>::new(),
+        "a plan does not look for what the migrations are to create: {plan}"
+    );
+    assert!(
+        match &plan["plan"]["warnings"] {
+            Value::Null => true,
+            Value::Array(warnings) => warnings
+                .iter()
+                .all(|warning| !warning.to_string().contains("loan_english")),
+            _ => false,
+        },
+        "warnings are absent or a list, and none names the configuration: {plan}"
+    );
+    let body = d.deployed(searched(&made)).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&made));
+    let served = served_version(&d).await;
+
+    d.database
+        .batch_execute("DROP TEXT SEARCH CONFIGURATION loan_service.loan_english")
+        .await
+        .expect("drift");
+    let unrelated = made.iter().cloned().chain([migration(
+        4,
+        "loan_tags",
+        "CREATE TABLE loan_service.loan_tags (id uuid PRIMARY KEY);\n",
+    )]);
+    let (status, body) = d.deploy(searched(&unrelated.collect::<Vec<_>>())).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("no text search configuration 'loan_english'")
+            && !error.contains("stay applied"),
+        "a settled declaration's configuration is checked before anything runs: {error}"
+    );
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&made));
+    assert!(!exists(&d.database, "loan_service.loan_tags").await);
+    assert_eq!(served_version(&d).await, served);
+}
+
+#[tokio::test]
+async fn an_async_deploy_refused_after_the_migrations_ends_in_the_adoption_phase() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    d.deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+        .await;
+    let (status, accepted) = d
+        .deploy_as(
+            "?async=true",
+            json!({"manifest": ledger(&staged(&local), legacy_history(), true)}),
+        )
+        .await;
+    assert_eq!(status, 202, "{accepted}");
+    let job = format!(
+        "/api/deploys/{}",
+        accepted["deploy_id"].as_str().expect("deploy_id")
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ended = loop {
+        let (status, job) = d.send(Method::GET, &job, None).await;
+        assert_eq!(status, 200, "{job}");
+        if matches!(job["status"].as_str(), Some("succeeded" | "failed")) {
+            break job;
+        }
+        assert!(Instant::now() < deadline, "{job}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(ended["status"], "failed", "{ended}");
+    assert_eq!(
+        ended["progress"],
+        json!({"phase": "adoption", "tables": 2}),
+        "{ended}"
+    );
+    assert!(
+        ended["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("stay applied: V2__loan_stage")),
+        "{ended}"
+    );
+}
+
+fn noted_service(migrations: &[SqlMigration], private: bool) -> Value {
+    let notes = json!({"name": "loan_notes", "managed": !private, "columns": [
+        {"name": "id", "column_type": "uuid", "primary_key": true, "nullable": false},
+        {"name": "body", "column_type": "text", "primary_key": false, "nullable": false}
+    ]});
+    let mut manifest = loan_service(migrations, json!({"table": "schema_history"}));
+    let list = if private { "private_tables" } else { "tables" };
+    manifest[list] = manifest[list]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .cloned()
+        .chain([notes])
+        .collect();
+    manifest
+}
+
+#[tokio::test]
+async fn a_table_taken_from_the_platform_into_adoption_waits_for_the_migrations() {
+    let colours = migration(
+        1,
+        "colours",
+        "CREATE TABLE loan_service.colours (name text PRIMARY KEY);\n",
+    );
+    let labels = migration(
+        2,
+        "loan_labels",
+        "CREATE TABLE loan_service.loan_labels (id uuid PRIMARY KEY);\n",
+    );
+    let body = migration(
+        2,
+        "loan_note_body",
+        "ALTER TABLE loan_service.loan_notes ADD COLUMN body text NOT NULL;\n",
+    );
+    let releases = [
+        (false, labels.clone(), None),
+        (true, body, None),
+        (
+            true,
+            labels,
+            Some("loan_service.loan_notes.body is missing"),
+        ),
+    ];
+    for (drifted, pending, refusal) in releases {
+        let Some(d) = start(&[]).await else {
+            return;
+        };
+        let first = d
+            .deployed(json!({"manifest": noted_service(std::slice::from_ref(&colours), false)}))
+            .await["version"]
+            .clone();
+        if drifted {
+            d.database
+                .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+                .await
+                .expect("drift");
+        }
+        let both = [colours.clone(), pending.clone()];
+        let (status, body) = d
+            .deploy(json!({"manifest": noted_service(&both, true)}))
+            .await;
+        assert_eq!(recorded(&d.database, HISTORY).await, history_of(&both));
+        match refusal {
+            None => {
+                assert_eq!(status, 200, "{}: {body}", pending.file_stem());
+                assert_ne!(served_version(&d).await, first);
+            }
+            Some(finding) => {
+                assert_eq!(status, 422, "{body}");
+                let error = body["error"].as_str().expect("error");
+                assert!(
+                    error.contains(finding)
+                        && error.contains(&format!("stay applied: {}", pending.file_stem())),
+                    "{error}"
+                );
+                assert_eq!(served_version(&d).await, first);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_snapshot_without_records_settles_nothing() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let colours = migration(
+        1,
+        "colours",
+        "CREATE TABLE loan_service.colours (name text PRIMARY KEY);\n\
+         CREATE TABLE loan_service.loan_notes (id uuid PRIMARY KEY, body text NOT NULL);\n",
+    );
+    d.deployed(json!({"manifest": noted_service(std::slice::from_ref(&colours), true)}))
+        .await;
+    let served = served_version(&d).await;
+    let rewritten =
+        d.db.pool()
+            .get()
+            .await
+            .expect("checkout")
+            .execute(
+                "UPDATE schema_snapshots SET schema_json = schema_json -> 'tables' \
+             WHERE jsonb_typeof(schema_json) = 'object' AND service_id IN \
+             (SELECT id FROM services WHERE tenant_id = $1 AND name = 'loan-service')",
+                &[&d.tenant.id],
+            )
+            .await
+            .expect("a snapshot without adoption records");
+    assert_eq!(rewritten, 1);
+
+    d.database
+        .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+        .await
+        .expect("drift");
+    let unrelated = [
+        colours.clone(),
+        migration(
+            2,
+            "loan_labels",
+            "CREATE TABLE loan_service.loan_labels (id uuid PRIMARY KEY);\n",
+        ),
+    ];
+    let (status, body) = d
+        .deploy(json!({"manifest": noted_service(&unrelated, true)}))
+        .await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("loan_service.loan_notes.body is missing")
+            && error.contains("stay applied: V2__loan_labels"),
+        "the table waits for the migrations: {error}"
+    );
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&unrelated));
+    assert_eq!(served_version(&d).await, served);
 }
