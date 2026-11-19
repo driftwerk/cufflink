@@ -25,7 +25,17 @@ pub enum AdoptionCheck<'a> {
     AfterMigrations { settled: &'a [TableDefinition] },
 }
 
-impl AdoptionCheck<'_> {
+impl<'a> AdoptionCheck<'a> {
+    fn up_front<'b>(self, adopted: &'b [TableDefinition]) -> &'b [TableDefinition]
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::Now => adopted,
+            Self::AfterMigrations { settled } => settled,
+        }
+    }
+
     fn verdict(
         self,
         schema: &str,
@@ -152,6 +162,7 @@ pub struct PreparedSchemaChanges {
     pub diff: SchemaDiff,
     pub guard: Option<GuardReport>,
     pub adoption: Option<AdoptionReport>,
+    pub adopted: Vec<TableDefinition>,
     pub warnings: Vec<String>,
 }
 
@@ -363,6 +374,7 @@ pub fn prepared(
         diff: build_schema_diff(&planned.changes),
         guard: report,
         adoption: None,
+        adopted: request.adopted.to_vec(),
         warnings: planned.warnings,
     })
 }
@@ -458,7 +470,7 @@ pub async fn prepare_schema_changes(
         &request
             .tables
             .iter()
-            .chain(request.adopted)
+            .chain(request.adoption.up_front(request.adopted))
             .collect::<Vec<_>>(),
     )
     .await?;
@@ -471,6 +483,7 @@ pub async fn prepare_schema_changes(
     if request.ownership == SchemaOwnership::Adopted {
         return Ok(PreparedSchemaChanges {
             adoption,
+            adopted: request.adopted.to_vec(),
             ..PreparedSchemaChanges::default()
         });
     }
@@ -500,6 +513,7 @@ pub async fn check_adoption(
     db: &ServiceSessions,
     adopted: &[TableDefinition],
 ) -> PlatformResult<AdoptionReport> {
+    check_search_configs(db, &adopted.iter().collect::<Vec<_>>()).await?;
     let live = introspect::live_schema(db).await?;
     validate_adoption(db.schema(), adopted, &live).accepted()
 }

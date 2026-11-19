@@ -149,12 +149,14 @@ impl SchemaReport {
         }
     }
 
-    pub(crate) fn adoption(&self) -> Adoption<'_> {
-        self.adoption
-            .as_ref()
-            .map_or(Adoption::Nothing, |adoption| {
-                Adoption::Read(&adoption.adopted)
-            })
+    pub(crate) fn adoption(&self) -> PlatformResult<Adoption<'_>> {
+        match &self.adoption {
+            Some(adoption) if adoption.deferred => Err(PlatformError::Internal(
+                "an adoption deferred to after the migrations was never checked".into(),
+            )),
+            Some(adoption) => Ok(Adoption::Read(&adoption.adopted)),
+            None => Ok(Adoption::Nothing),
+        }
     }
 }
 
@@ -189,7 +191,7 @@ async fn prepare(
 ) -> PlatformResult<PreparedSchemaChanges> {
     let (state, manifest) = (ctx.state, ctx.manifest);
     let tables = tables_of(manifest, left);
-    let settled = adopt::settled(&tables.adopted, &left.tables, &left.adopted);
+    let settled = adopt::settled(&tables.adopted, &left.tables);
     prepare_schema_changes(
         tenant_pool,
         &SchemaRequest {
@@ -488,12 +490,17 @@ async fn run_phases(
             )
             .await;
     }
-    let adoption = match (&prepared.adoption, &migrations) {
-        (Some(found), Some(report)) if found.deferred => Some(
-            check_adoption(tenant_pool, &tables_of(manifest, verified.left).adopted)
-                .await
-                .map_err(|error| applied_before(error, report))?,
-        ),
+    let adoption = match &prepared.adoption {
+        Some(found) if found.deferred => {
+            progress
+                .phase("adoption", json!({ "tables": prepared.adopted.len() }))
+                .await;
+            Some(
+                check_adoption(tenant_pool, &prepared.adopted)
+                    .await
+                    .map_err(|error| applied_before(error, migrations.as_ref()))?,
+            )
+        }
         _ => None,
     };
     if let Some(hook) = hook {
@@ -531,21 +538,35 @@ async fn run_phases(
     })
 }
 
-fn applied_before(error: PlatformError, report: &MigrationsReport) -> PlatformError {
+fn applied_before(error: PlatformError, report: Option<&MigrationsReport>) -> PlatformError {
+    let applied: Vec<String> = report
+        .into_iter()
+        .flat_map(|report| &report.run.applied)
+        .map(MigrationRef::file_stem)
+        .collect();
+    if applied.is_empty() {
+        return error;
+    }
+    let noted = |message: String| {
+        format!(
+            "{message}; the migrations this deploy applied stay applied: {}",
+            applied.join(", ")
+        )
+    };
     match error {
-        PlatformError::Validation(message) if !report.run.applied.is_empty() => {
-            PlatformError::Validation(format!(
-                "{message}; the migrations this deploy applied stay applied: {}",
-                report
-                    .run
-                    .applied
-                    .iter()
-                    .map(MigrationRef::file_stem)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        PlatformError::Validation(message) => PlatformError::Validation(noted(message)),
+        PlatformError::Unavailable(message) => PlatformError::Unavailable(noted(message)),
+        PlatformError::RetryLater { message, after } => PlatformError::RetryLater {
+            message: noted(message),
+            after,
+        },
+        PlatformError::Internal(message) => PlatformError::Internal(noted(message)),
+        error => {
+            tracing::error!(%error, "the adoption check after the migrations failed");
+            PlatformError::SchemaMigration(noted(
+                "the adoption check after the migrations failed".into(),
             ))
         }
-        error => error,
     }
 }
 
@@ -658,6 +679,8 @@ mod tests {
 
     #[test]
     fn a_refusal_after_the_migrations_names_those_it_applied() {
+        let kept =
+            "the migrations this deploy applied stay applied: V2__loan_state, V3__loan_notes";
         let refused = || {
             PlatformError::Validation(
                 "the database does not hold what the manifest adopts: table loan_service.loan_notes is missing".into(),
@@ -669,20 +692,53 @@ mod tests {
             vec![migrated(2, "loan_state"), migrated(3, "loan_notes")],
         );
         assert_eq!(
-            applied_before(refused(), &applied).to_string(),
-            format!(
-                "{}; the migrations this deploy applied stay applied: V2__loan_state, V3__loan_notes",
-                refused()
-            )
+            applied_before(refused(), Some(&applied)).to_string(),
+            format!("{}; {kept}", refused())
         );
-        assert_eq!(
-            applied_before(refused(), &verified(HistoryMode::Apply, vec![], vec![])).to_string(),
-            refused().to_string(),
-            "a check after a runner applied everything reads as it did"
-        );
+        for unapplied in [None, Some(&verified(HistoryMode::Apply, vec![], vec![]))] {
+            assert_eq!(
+                applied_before(refused(), unapplied).to_string(),
+                refused().to_string(),
+                "a check after a runner applied everything reads as it did"
+            );
+        }
+        let failures = [
+            PlatformError::Unavailable("the service's role is not bound".into()),
+            PlatformError::Internal("introspection".into()),
+            PlatformError::SerdeJson(serde_json::from_str::<Value>("{").expect_err("not json")),
+        ];
+        for failure in failures {
+            let noted = applied_before(failure, Some(&applied));
+            assert!(
+                noted.to_string().ends_with(kept),
+                "every failure of the check names what stays applied: {noted}"
+            );
+            assert!(
+                axum::response::IntoResponse::into_response(noted)
+                    .status()
+                    .is_server_error(),
+                "a failure to check stays a server error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deferred_adoption_is_never_stored_unchecked() {
+        let report = |deferred: bool| SchemaReport {
+            adoption: Some(AdoptionReport {
+                deferred,
+                ..AdoptionReport::default()
+            }),
+            ..SchemaReport::default()
+        };
+        assert!(matches!(report(false).adoption(), Ok(Adoption::Read(_))));
         assert!(matches!(
-            applied_before(PlatformError::Internal("introspection".into()), &applied),
-            PlatformError::Internal(message) if message == "introspection"
+            SchemaReport::default().adoption(),
+            Ok(Adoption::Nothing)
+        ));
+        assert!(matches!(
+            report(true).adoption(),
+            Err(PlatformError::Internal(_))
         ));
     }
 

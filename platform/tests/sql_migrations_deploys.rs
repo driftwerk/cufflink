@@ -2,11 +2,11 @@ use cufflink_testkit as common;
 
 use base64::Engine;
 use common::{legacy, Deployment};
-use cufflink_migrate::{checksum, legacy_table_lock_key};
+use cufflink_migrate::{checksum, legacy_table_lock_key, TRY_LOCK};
 use cufflink_types::SqlMigration;
 use reqwest::Method;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
 const HISTORY: &str = "loan_service.schema_history";
@@ -81,6 +81,48 @@ async fn holders(database: &Client, key: i64) -> i64 {
         )
         .await
         .expect("pg_locks")
+        .get(0)
+}
+
+async fn deploy_behind_the_lock(
+    d: &Deployment,
+    body: Value,
+) -> tokio::task::JoinHandle<(u16, Value)> {
+    let url = format!("{}/api/services/deploy", d.platform.base_url);
+    let auth = format!("ApiKey {}", d.tenant.api_key);
+    let client = d.platform.http.clone();
+    let waiting = tokio::spawn(async move {
+        let response = client
+            .post(url)
+            .header("authorization", auth)
+            .json(&body)
+            .send()
+            .await
+            .expect("deploy");
+        (
+            response.status().as_u16(),
+            response.json::<Value>().await.unwrap_or(Value::Null),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !trying_the_lock(&d.database).await {
+        assert!(!waiting.is_finished(), "the deploy waits for the lock");
+        assert!(Instant::now() < deadline, "the deploy never tried the lock");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!waiting.is_finished(), "the deploy waits for the lock");
+    waiting
+}
+
+async fn trying_the_lock(database: &Client) -> bool {
+    database
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() AND query = $1)",
+            &[&TRY_LOCK],
+        )
+        .await
+        .expect("pg_stat_activity")
         .get(0)
 }
 
@@ -297,27 +339,11 @@ async fn legacy_lock_excludes_concurrent_runner() {
         .await
         .expect("the legacy runner's lock");
 
-    let waiting = {
-        let url = format!("{}/api/services/deploy", d.platform.base_url);
-        let auth = format!("ApiKey {}", d.tenant.api_key);
-        let body = json!({"manifest": loan_service(&local, legacy_history())});
-        let client = d.platform.http.clone();
-        tokio::spawn(async move {
-            let response = client
-                .post(url)
-                .header("authorization", auth)
-                .json(&body)
-                .send()
-                .await
-                .expect("deploy");
-            (
-                response.status().as_u16(),
-                response.json::<Value>().await.unwrap_or(Value::Null),
-            )
-        })
-    };
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!waiting.is_finished(), "the deploy waits for the lock");
+    let waiting = deploy_behind_the_lock(
+        &d,
+        json!({"manifest": loan_service(&local, legacy_history())}),
+    )
+    .await;
     assert!(!exists(&d.database, "loan_service.loans").await);
 
     d.database
@@ -1166,27 +1192,11 @@ async fn adoption_is_checked_on_what_a_runner_holding_the_lock_made() {
         .await
         .expect("the legacy runner's lock");
 
-    let waiting = {
-        let url = format!("{}/api/services/deploy", d.platform.base_url);
-        let auth = format!("ApiKey {}", d.tenant.api_key);
-        let body = json!({"manifest": ledger(&local, legacy_history(), true)});
-        let client = d.platform.http.clone();
-        tokio::spawn(async move {
-            let response = client
-                .post(url)
-                .header("authorization", auth)
-                .json(&body)
-                .send()
-                .await
-                .expect("deploy");
-            (
-                response.status().as_u16(),
-                response.json::<Value>().await.unwrap_or(Value::Null),
-            )
-        })
-    };
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!waiting.is_finished(), "the deploy waits for the lock");
+    let waiting = deploy_behind_the_lock(
+        &d,
+        json!({"manifest": ledger(&local, legacy_history(), true)}),
+    )
+    .await;
 
     d.database
         .batch_execute(&local[1].sql)
@@ -1443,4 +1453,155 @@ async fn the_first_plan_of_a_schema_not_made_yet_waits_for_the_migrations() {
     assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [1]);
     assert_eq!(errors(&body), Vec::<String>::new(), "{body}");
     assert!(exists(&d.database, "loan_service.loan_notes").await);
+}
+
+fn staged(local: &[SqlMigration]) -> [SqlMigration; 2] {
+    [
+        local[0].clone(),
+        migration(
+            2,
+            "loan_stage",
+            "ALTER TABLE loan_service.loans ADD COLUMN stage text;\n",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn an_adopted_search_config_a_pending_migration_makes_is_checked_after_it() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    let searched = |migrations: &[SqlMigration]| {
+        let mut manifest = ledger(migrations, legacy_history(), false);
+        manifest["tables"][0]["search"] = json!({"columns": ["memo"], "config": "loan_english"});
+        json!({"manifest": manifest})
+    };
+    let unmade = staged(&local);
+    let (status, body) = d.deploy(searched(&unmade)).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("no text search configuration 'loan_english'")
+            && error.contains("the migrations this deploy applied stay applied: V2__loan_stage"),
+        "{error}"
+    );
+
+    let made = [
+        unmade[0].clone(),
+        unmade[1].clone(),
+        migration(
+            3,
+            "loan_english",
+            "CREATE TEXT SEARCH CONFIGURATION loan_service.loan_english \
+             (COPY = pg_catalog.english);\n",
+        ),
+    ];
+    let body = d.deployed(searched(&made)).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&made));
+}
+
+#[tokio::test]
+async fn an_async_deploy_refused_after_the_migrations_ends_in_the_adoption_phase() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local[..1]).await;
+    d.deployed(json!({"manifest": ledger(&local[..1], legacy_history(), false)}))
+        .await;
+    let (status, accepted) = d
+        .deploy_as(
+            "?async=true",
+            json!({"manifest": ledger(&staged(&local), legacy_history(), true)}),
+        )
+        .await;
+    assert_eq!(status, 202, "{accepted}");
+    let job = format!(
+        "/api/deploys/{}",
+        accepted["deploy_id"].as_str().expect("deploy_id")
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ended = loop {
+        let (status, job) = d.send(Method::GET, &job, None).await;
+        assert_eq!(status, 200, "{job}");
+        if matches!(job["status"].as_str(), Some("succeeded" | "failed")) {
+            break job;
+        }
+        assert!(Instant::now() < deadline, "{job}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(ended["status"], "failed", "{ended}");
+    assert_eq!(
+        ended["progress"],
+        json!({"phase": "adoption", "tables": 2}),
+        "{ended}"
+    );
+    assert!(
+        ended["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("stay applied: V2__loan_stage")),
+        "{ended}"
+    );
+}
+
+#[tokio::test]
+async fn a_version_stored_without_adoption_records_settles_what_it_declared() {
+    let Some(d) = start(&[]).await else {
+        return;
+    };
+    let local = ledger_migrations();
+    apply_with_refinery(&d, &local).await;
+    d.deployed(json!({"manifest": ledger(&local, legacy_history(), true)}))
+        .await;
+    let served = served_version(&d).await;
+    let rewritten =
+        d.db.pool()
+            .get()
+            .await
+            .expect("checkout")
+            .execute(
+                "UPDATE schema_snapshots SET schema_json = schema_json -> 'tables' \
+             WHERE jsonb_typeof(schema_json) = 'object'",
+                &[],
+            )
+            .await
+            .expect("a snapshot as an older platform stored it");
+    assert_eq!(rewritten, 1);
+
+    d.database
+        .batch_execute("ALTER TABLE loan_service.loan_notes DROP COLUMN body")
+        .await
+        .expect("drift");
+    let unrelated = [
+        local[0].clone(),
+        local[1].clone(),
+        migration(
+            3,
+            "loan_tags",
+            "CREATE TABLE loan_service.loan_tags (id uuid PRIMARY KEY);\n",
+        ),
+    ];
+    let manifest = json!({"manifest": ledger(&unrelated, legacy_history(), true)});
+    let (status, body) = d.deploy(manifest.clone()).await;
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(
+        error.contains("loan_service.loan_notes.body is missing")
+            && !error.contains("stay applied"),
+        "{error}"
+    );
+    assert_eq!(recorded(&d.database, HISTORY).await, history_of(&local));
+    assert!(!exists(&d.database, "loan_service.loan_tags").await);
+    assert_eq!(served_version(&d).await, served);
+
+    d.database
+        .batch_execute("ALTER TABLE loan_service.loan_notes ADD COLUMN body text NOT NULL")
+        .await
+        .expect("the drift undone");
+    let body = d.deployed(manifest).await;
+    assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);
+    assert_ne!(served_version(&d).await, served);
 }

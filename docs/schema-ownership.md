@@ -208,11 +208,15 @@ ship in one release. When the deploy adopts a table (`schema: adopted`,
 migrations are pending, the adoption is checked in two steps:
 
 1. Before anything runs, each table declared as the running version
-   declared it (the same columns and types, primary key, `owner_field`,
-   `soft_delete` and `search.vector_column`) is checked, and a finding on
-   one refuses the deploy (422) as before: that is drift, which no
-   migration of the release was written to repair. A table that is new or
-   whose declaration changed waits for the migrations. On a service's
+   declared it, the same in everything that can make the check fail
+   (columns and types, primary key, `owner_field`, `soft_delete`,
+   `search.vector_column` and `search.config`), is checked, and a finding
+   on one refuses the deploy (422) as before: that is drift, which no
+   migration of the release was written to repair. This holds whether the
+   running version adopted the table or the platform made it, and for a
+   version an older platform stored too. A table that is new or whose
+   declaration changed waits for the migrations, and so does the search
+   configuration it names, which a migration may create. On a service's
    first deploy every table waits, and so does its schema: the first
    plan of a service whose schema the deploy makes reports the schema
    as missing, deferred, rather than refusing.
@@ -224,7 +228,7 @@ Otherwise the adoption is checked before anything runs.
 
 - A declaration the migrations do not make true refuses the deploy (422)
   naming what differs and the migrations it applied, which stay applied
-  and recorded. So does a migration that drops or retypes a declared
+  and recorded. Any other failure of that check names them too. So does a migration that drops or retypes a declared
   column. A release whose declaration matches is the remedy: the same
   release, deployed again, finds nothing pending and is refused before
   anything runs.
@@ -240,6 +244,8 @@ Otherwise the adoption is checked before anything runs.
   migrations.
 - Under `verify_only` nothing is applied, so the adoption is checked
   before anything runs.
+- An asynchronous deploy reports the phase `adoption` while that check
+  runs, between `sql_migrations` and `on_migrate`.
 
 ### Taking over from refinery
 
@@ -295,10 +301,14 @@ when the platform refuses the deploy (422) and 1 when no plan could be made
 A plan applies no migration, so what a deploy would check after its
 pending migrations is reported, not refused: `adoption.deferred` is
 `true` and `adoption.errors` lists what the new or changed declarations
-lack in the database, which the CLI prints as `adopted once the pending
-migrations apply: …`. A finding on an unchanged declaration refuses the
-plan, as it refuses the deploy. With nothing pending, the plan checks the
-adoption and is refused as the deploy would be.
+lack in the database. The CLI prints `Adoption:       checked after the
+pending migrations`, then each finding as `not there yet: …`; a CLI
+older than v0.39 prints neither. A search configuration that the
+migrations are to create is not looked for. A finding on an unchanged
+declaration refuses the plan, as it refuses the deploy. With nothing
+pending, the plan checks the adoption and is refused as the deploy would
+be. A plan checks the migration history before any of the schema, so when
+both are wrong it reports the history's error, as the deploy does.
 
 Against a platform that advertises `async_deploy` the CLI deploys with
 `?async=true`: the platform answers 202 with the deploy's id at once, runs it

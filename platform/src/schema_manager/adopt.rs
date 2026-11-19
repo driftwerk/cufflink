@@ -260,6 +260,7 @@ struct Checked<'a> {
     primary_key: Option<String>,
     owner_field: Option<String>,
     vector_column: Option<String>,
+    search_config: Option<&'a str>,
     soft_delete: bool,
 }
 
@@ -279,23 +280,18 @@ impl<'a> Checked<'a> {
                 .as_ref()
                 .and_then(|search| search.vector_column.as_deref())
                 .map(folded),
+            search_config: table.search.as_ref().map(|search| search.config.as_str()),
             soft_delete: table.soft_delete,
         }
     }
 }
 
-pub fn settled(
-    declared: &[TableDefinition],
-    left: &[TableDefinition],
-    left_adopted: &AdoptedSchema,
-) -> Vec<TableDefinition> {
+pub fn settled(declared: &[TableDefinition], left: &[TableDefinition]) -> Vec<TableDefinition> {
     declared
         .iter()
         .filter(|table| {
-            left_adopted.table(&table.name).is_some()
-                && left
-                    .iter()
-                    .any(|before| Checked::of(before) == Checked::of(table))
+            left.iter()
+                .any(|before| Checked::of(before) == Checked::of(table))
         })
         .cloned()
         .collect()
@@ -399,56 +395,62 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_is_settled_only_as_the_version_left_adopted_it() {
-        let adopted = |names: &[&str]| {
-            AdoptedSchema(
-                names
-                    .iter()
-                    .map(|name| (name.to_string(), AdoptedTable::new()))
-                    .collect(),
-            )
-        };
+    fn a_declaration_is_settled_only_as_the_version_left_declared_it() {
         let names = |tables: Vec<TableDefinition>| -> Vec<String> {
             tables.into_iter().map(|table| table.name).collect()
         };
-        let left = [loans()];
-        assert_eq!(
-            names(settled(&[loans()], &left, &adopted(&["loans"]))),
-            ["loans"]
-        );
+        fn searched(config: &str, vector: &str) -> TableDefinition {
+            TableDefinition {
+                search: Some(cufflink_types::SearchSpec {
+                    columns: vec!["memo".into()],
+                    config: config.into(),
+                    vector_column: Some(vector.into()),
+                }),
+                ..loans()
+            }
+        }
+        let left = [loans(), searched("english", "document")];
+        assert_eq!(names(settled(&[loans()], &left)), ["loans"]);
         let respelled = TableDefinition {
             name: "Loans".into(),
             columns: loans().columns.into_iter().rev().collect(),
             ..loans()
         };
         assert_eq!(
-            names(settled(&[respelled], &left, &adopted(&["loans"]))),
+            names(settled(&[respelled], &left)),
             ["Loans"],
             "names fold and the order of the columns is not checked"
         );
-        let unadopted = settled(&[loans()], &left, &adopted(&[]));
         assert!(
-            unadopted.is_empty(),
-            "a table the version left did not adopt"
+            settled(&[loans()], &[]).is_empty(),
+            "a table the version left did not declare"
         );
-        assert!(settled(&[loans()], &[], &adopted(&["loans"])).is_empty());
-        let changes: [fn(&mut TableDefinition); 5] = [
+        assert_eq!(
+            settled(&[searched("english", "document")], &left[1..]).len(),
+            1
+        );
+        let changes: [fn(&mut TableDefinition); 8] = [
             |table| {
                 table
                     .columns
                     .push(declared("returned_at", ColumnType::TimestampNaive))
             },
+            |table| {
+                table.columns.pop();
+            },
             |table| table.columns[1].column_type = ColumnType::Integer,
             |table| table.owner_field = Some("memo".into()),
             |table| table.soft_delete = true,
             |table| table.columns[0].primary_key = false,
+            |table| *table = searched("english", "terms"),
+            |table| *table = searched("loan_english", "document"),
         ];
         for change in changes {
-            let mut changed = loans();
+            let mut changed = searched("english", "document");
             change(&mut changed);
             assert!(
-                settled(&[changed], &left, &adopted(&["loans"])).is_empty(),
-                "a change to what the check reads unsettles the table"
+                settled(&[changed], &left[1..]).is_empty(),
+                "a change to what can fail the check unsettles the table"
             );
         }
     }

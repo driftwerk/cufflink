@@ -1315,10 +1315,17 @@ fn plan_lines(plan: &serde_json::Value) -> Vec<String> {
         )
     });
     let adoption = &plan["adoption"];
-    let deferred = texts(&adoption["errors"])
+    let deferred = (adoption["deferred"].as_bool() == Some(true))
+        .then(|| {
+            std::iter::once("Adoption:       checked after the pending migrations".to_string())
+                .chain(
+                    texts(&adoption["errors"])
+                        .into_iter()
+                        .map(|error| format!("not there yet: {error}")),
+                )
+        })
         .into_iter()
-        .filter(|_| adoption["deferred"].as_bool() == Some(true))
-        .map(|error| format!("adopted once the pending migrations apply: {error}"));
+        .flatten();
     let private = texts(&plan["private_tables"]);
     let heading = (!private.is_empty()).then(|| format!("{PRIVATE_TABLES}:"));
     heading
@@ -3604,7 +3611,7 @@ mod tests {
 
     #[test]
     fn a_plan_names_what_the_pending_migrations_are_to_make() {
-        let plan = |deferred: bool| {
+        let plan = |adoption: serde_json::Value| {
             serde_json::json!({
                 "schema_changes": [],
                 "sql_migrations": {
@@ -3613,26 +3620,34 @@ mod tests {
                     "verified": 1,
                     "pending": [{"version": 2, "name": "loan_state", "checksum": 42}]
                 },
-                "adoption": {
-                    "errors": ["loan_service.loans.state is missing"],
-                    "deferred": deferred
-                }
+                "adoption": adoption
             })
         };
+        let migrations = [
+            "SQL migrations: loan_service.schema_history (apply, 1 verified)",
+            "pending: V2__loan_state (42)",
+        ];
+        let deferred = "Adoption:       checked after the pending migrations";
         assert_eq!(
-            plan_lines(&plan(true)),
+            plan_lines(&plan(serde_json::json!({
+                "errors": ["loan_service.loans.state is missing"],
+                "deferred": true
+            }))),
             [
-                "SQL migrations: loan_service.schema_history (apply, 1 verified)",
-                "pending: V2__loan_state (42)",
-                "adopted once the pending migrations apply: loan_service.loans.state is missing",
+                migrations[0],
+                migrations[1],
+                deferred,
+                "not there yet: loan_service.loans.state is missing",
             ]
         );
         assert_eq!(
-            plan_lines(&plan(false)),
-            [
-                "SQL migrations: loan_service.schema_history (apply, 1 verified)",
-                "pending: V2__loan_state (42)",
-            ]
+            plan_lines(&plan(serde_json::json!({"errors": [], "deferred": true}))),
+            [migrations[0], migrations[1], deferred],
+            "a deferred check is named when the database already holds what is adopted"
+        );
+        assert_eq!(
+            plan_lines(&plan(serde_json::json!({"errors": []}))),
+            migrations
         );
     }
 

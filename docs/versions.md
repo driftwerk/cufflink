@@ -1387,10 +1387,24 @@ no setting.
   net, not a rollback, and migrations the running version can run over
   remain the author's part. Every other deploy checks the adoption before
   anything runs, as before.
+- A table counts as declared as the running version declared it when it
+  is the same in everything that can make the check fail (columns and
+  types, primary key, `owner_field`, `soft_delete`, `search.vector_column`
+  and `search.config`), whether that version adopted it or the platform
+  made it, and also when an older platform stored that version without
+  adoption records.
+- Every failure of the check after the migrations names the migrations
+  applied. A refusal is a 422; a failure to check stays a server error.
+  An asynchronous deploy reports the phase `adoption` while it runs.
 - A plan of such a deploy no longer fails on what the pending migrations
-  are to make for new or changed declarations. Its `adoption` carries `deferred: true` with those findings
-  in `errors`, and `cufflink deploy --plan` prints each as `adopted once
-  the pending migrations apply: …`. `deferred` is present only when true.
+  are to make for new or changed declarations. Its `adoption` carries
+  `deferred: true` with those findings in `errors`, and `cufflink deploy
+  --plan` prints `Adoption:       checked after the pending migrations`,
+  then each finding as `not there yet: …`. `deferred` is present only
+  when true.
+- Compatibility: an older CLI ignores `deferred`. Its plan of such a
+  deploy succeeds and prints nothing about the adoption that waits for
+  the migrations, findings included.
 
 **Behaviour changes:**
 
@@ -1401,8 +1415,12 @@ no setting.
   pending migrations in `apply` mode, which the data routes read their
   casts and defaults from, is now read after the migrations. It used to
   hold the columns as they were before them.
-- A plan whose history and adoption are both wrong reports the history's
-  error, as the deploy does.
+- A plan checks the migration history before any schema refusal: when
+  the history is wrong and so is the adoption, the guard or a search
+  configuration, it reports the history's error, as the deploy does.
+- A text search configuration that an adopted declaration names, and that
+  a pending migration creates, no longer refuses the deploy before the
+  migrations; it is checked after them.
 
 Rolling a platform back to v0.38 restores the old order and needs nothing
 undone.
