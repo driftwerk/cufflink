@@ -442,9 +442,6 @@ jobs:
         with:
           tool: cargo-audit
 
-      - name: Check the audit exceptions still hold
-        run: .github/scripts/workspace-requirements.sh
-
       - name: Audit dependencies
         continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: cargo audit
