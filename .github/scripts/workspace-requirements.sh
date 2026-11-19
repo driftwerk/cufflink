@@ -1,13 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+given=""
+fail_within=null
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fail-within)
+      if ! [[ "${2:-}" =~ ^[0-9]+$ ]] || [ "$2" -gt 60 ]; then
+        echo "::error::--fail-within takes a number of days from 0 to 60, not ${2:-nothing}"
+        exit 1
+      fi
+      fail_within=$((10#$2))
+      shift 2
+      ;;
+    *)
+      given="$1"
+      shift
+      ;;
+  esac
+done
+
 metadata=$(mktemp)
 resolved=$(mktemp)
 trap 'rm -f "$metadata" "$resolved"' EXIT
-if [ -n "${1:-}" ]; then
-  cat "$1" >"$metadata"
+if [ -n "$given" ]; then
+  cat "$given" >"$metadata"
 else
-  cargo metadata --no-deps --format-version 1 >"$metadata"
+  cargo metadata --locked --no-deps --format-version 1 >"$metadata"
 fi
 
 checked=$(jq -c '
@@ -29,16 +48,19 @@ root=$(jq -r '.workspace_root' "$metadata")
 config="$root/.cargo/audit.toml"
 exceptions='{"ignored": [], "refused": [], "warned": []}'
 if [ -f "$config" ]; then
-  today=$(date -u +%F)
-  cargo metadata --all-features --format-version 1 --manifest-path "$root/Cargo.toml" >"$resolved"
+  today=${WORKSPACE_REQUIREMENTS_TODAY:-$(date -u +%F)}
+  cargo metadata --locked --all-features --format-version 1 --manifest-path "$root/Cargo.toml" \
+    >"$resolved"
   exceptions=$(jq -n -c --rawfile config "$config" --slurpfile metadata "$resolved" \
-    --arg today "$today" '
+    --arg today "$today" --argjson fail_within "$fail_within" '
     def held: ["RUSTSEC-2026-0567", "RUSTSEC-2026-0573"];
     def real_date: (try (strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")) catch null) == .;
     def days_from_today: (strptime("%Y-%m-%d") | mktime) - ($today | strptime("%Y-%m-%d") | mktime) | . / 86400;
     $metadata[0] as $m
     | [$config | split("\n")[] | sub("\\s+$"; "") | select(length > 0)] as $lines
-    | if ($lines | length) < 3 or ($lines | length) % 2 == 0 or $lines[0] != "[advisories]"
+    | if ($today | real_date | not) then
+        {ignored: [], refused: ["today is \($today), which is not a YYYY-MM-DD date"], warned: []}
+      elif ($lines | length) < 3 or ($lines | length) % 2 == 0 or $lines[0] != "[advisories]"
         or $lines[1] != "ignore = [" or $lines[-1] != "]"
       then {ignored: [], refused: [".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note"], warned: []}
       else
@@ -49,6 +71,13 @@ if [ -f "$config" ]; then
         | [$m.packages[] | select(.name == "wasmtime")] as $wasmtime
         | ([$m.resolve.nodes[] | select(.id | IN($wasmtime[].id)) | .features[]
             | select(IN("gc", "threads"))] | unique) as $enabled
+        | ([14, ($fail_within // 0)] | max) as $window
+        | [$entries[]
+           | select(.advisory != null and .revisit != null and (.revisit | real_date) and .revisit >= $today)
+           | (.revisit | days_from_today) as $left
+           | select($left <= $window)
+           | {left: $left, text: "\(.advisory) is to be revisited by \(.revisit), in \($left) days: check it still does not apply, then set a new date or drop the ignore"}] as $due
+        | ($fail_within != null) as $failing
         | {
             ignored: [$entries[].advisory // empty],
             revisit: ([$entries[].revisit // empty] | min),
@@ -66,6 +95,9 @@ if [ -f "$config" ]; then
                  elif (.revisit | days_from_today) > 60 then
                    "\(.advisory) is to be revisited on \(.revisit), more than 60 days after \($today)"
                  else empty end]
+              + [$entries | map(.advisory // empty) | group_by(.)[] | select(length > 1)
+                 | "\(.[0]) is listed more than once"]
+              + [$due[] | select($failing and .left <= $fail_within) | .text]
               + if ($entries | length) == 0 then []
                 elif ($wasmtime | length) == 0 then
                   ["the audit exceptions are for wasmtime, which the workspace no longer builds: drop them"]
@@ -75,11 +107,7 @@ if [ -f "$config" ]; then
                   + [$enabled[]
                      | "the audit exceptions hold only while wasmtime builds without its \(.) feature, and the workspace enables it"]
                 end),
-            warned: [$entries[]
-              | select(.advisory != null and .revisit != null and (.revisit | real_date) and .revisit >= $today)
-              | (.revisit | days_from_today) as $left
-              | select($left <= 14)
-              | "\(.advisory) is to be revisited by \(.revisit), in \($left) days: check it still does not apply, then set a new date or drop the ignore"]
+            warned: [$due[] | select(.left <= 14 and ($failing and .left <= $fail_within | not)) | .text]
           }
       end')
 fi

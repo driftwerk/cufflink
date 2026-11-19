@@ -5,6 +5,8 @@ cd "$(dirname "$0")/../.."
 script="$PWD/.github/scripts/workspace-requirements.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+today=$(date -u +%F)
+export WORKSPACE_REQUIREMENTS_TODAY="$today"
 
 workspace() {
   local inherited="$1" section="$2" dependency="$3" root="$work/workspace"
@@ -35,12 +37,14 @@ $more"
 }
 
 day() {
-  jq -nr --argjson offset "$1" '(now / 86400 | floor) + $offset | . * 86400 | strftime("%Y-%m-%d")'
+  jq -nr --arg today "$today" --argjson offset "$1" \
+    '$today | strptime("%Y-%m-%d") | mktime + $offset * 86400 | strftime("%Y-%m-%d")'
 }
 
 audit() {
   mkdir -p "$work/workspace/.cargo"
   printf '%s\n' "$@" >"$work/workspace/.cargo/audit.toml"
+  cargo generate-lockfile --offline --quiet --manifest-path "$work/workspace/Cargo.toml"
 }
 
 ignored() {
@@ -70,7 +74,8 @@ expect() {
 
 quiet() {
   local case="$1" output got=0
-  output=$("$script" "$2" 2>&1) || got=$?
+  shift
+  output=$("$script" "$@" 2>&1) || got=$?
   if [ "$got" = 0 ] && ! grep -qF -- "::warning::" <<<"$output"; then
     echo "ok: $case"
   else
@@ -185,6 +190,32 @@ expect "audit exceptions 14 days from their revisit date" 0 \
 ignored "$(day 15)"
 quiet "audit exceptions 15 days from their revisit date" "$work/metadata.json"
 
+ignored "$(day 14)"
+expect "audit exceptions 14 days from their revisit date, failing within 14" 1 \
+  "::error::RUSTSEC-2026-0567 is to be revisited by $(day 14), in 14 days" \
+  "$work/metadata.json" --fail-within 14
+
+ignored "$(day 15)"
+quiet "audit exceptions 15 days from their revisit date, failing within 14" \
+  "$work/metadata.json" --fail-within 14
+
+expect "a failing window that is not a number of days" 1 \
+  "--fail-within takes a number of days from 0 to 60, not soon" "$work/metadata.json" --fail-within soon
+
+ignored "$(day 30)"
+WORKSPACE_REQUIREMENTS_TODAY=2026-1-5 expect "a today that is not a YYYY-MM-DD date" 1 \
+  "today is 2026-1-5, which is not a YYYY-MM-DD date" "$work/metadata.json"
+
+audit '[advisories]' 'ignore = [' \
+  "    # revisit $(day 30): GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0 <48.0.9" '    "RUSTSEC-2026-0567",' \
+  "    # revisit $(day 30): GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0 <48.0.9" '    "RUSTSEC-2026-0567",' ']'
+expect "an advisory ignored twice" 1 "RUSTSEC-2026-0567 is listed more than once" "$work/metadata.json"
+
+ignored "$(day 30)"
+printf 'gc-helper = { path = "../../gc-helper" }\n' >>"$work/workspace/cli/Cargo.toml"
+expect "audit exceptions against a stale lock" 101 "--locked" "$work/metadata.json"
+
+wasmtime 36.0.21 ""
 ignored "$(day 60)"
 expect "audit exceptions revisited 60 days out" 0 "the audit ignores RUSTSEC-2026-0567, RUSTSEC-2026-0573" \
   "$work/metadata.json"
@@ -231,7 +262,7 @@ expect "audit settings beyond the ignore list" 1 \
   "$work/metadata.json"
 
 got=0
-output=$("$script" 2>&1) || got=$?
+output=$(env -u WORKSPACE_REQUIREMENTS_TODAY "$script" 2>&1) || got=$?
 compared=$(sed -n 's/^each of the \([0-9]*\) requirements.*/\1/p' <<<"$output")
 if [ "$got" = 0 ] && [ "${compared:-0}" -gt 0 ]; then
   echo "ok: this workspace compares $compared requirements"
