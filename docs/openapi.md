@@ -188,9 +188,9 @@ renders the `404` and `405`.
 and `cache-control: no-cache`; an `If-None-Match` that matches answers
 `304`. A document is built once per deployed version, outside the request
 path. A document that cannot be built (only a stored manifest that never
-passed the deploy's checks can fail) answers `404` and is counted in
-`cufflink_public_docs_build_errors_total`; the service and its other
-documents keep answering.
+passed the deploy's checks can fail) answers `404`, and its failed build
+is counted in `cufflink_public_docs_build_errors_total`; the service and
+its other documents keep answering.
 
 **CORS**, per document:
 - `restricted` (the default): the platform's own policy
