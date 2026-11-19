@@ -2,7 +2,8 @@ use crate::deployer::manifest::{ColumnDefinition, ColumnType, IndexDefinition, T
 use crate::errors::PlatformError;
 use crate::policy::{PolicyKey, PolicyMode, PolicySet};
 use crate::schema_manager::executor::{
-    planned_changes, prepared, Direction, Guard, PreparedSchemaChanges, SchemaRequest,
+    planned_changes, prepared, AdoptionCheck, Direction, Guard, PreparedSchemaChanges,
+    SchemaRequest,
 };
 use crate::schema_manager::introspect::fixtures::{column, index, schema, table};
 use crate::schema_manager::introspect::{
@@ -79,6 +80,7 @@ fn request<'a>(
         leaving: 41,
         allow_destructive: false,
         direction: Direction::Forward,
+        adoption: AdoptionCheck::Now,
         guard: Guard { mode, ..Guard::OFF },
     }
 }

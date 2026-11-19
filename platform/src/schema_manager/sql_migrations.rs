@@ -1,4 +1,4 @@
-use super::migrate_exec::{self, Action, MigrateError, Report, Run};
+use super::migrate_exec::{self, Action, MigrateError, MigrationRef, Report, Run};
 use crate::deployer::manifest::ServiceManifest;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::registry::ServiceIdentity;
@@ -28,7 +28,7 @@ impl MigrationsReport {
             .run
             .pending
             .iter()
-            .map(|m| format!("V{}__{}", m.version, m.name))
+            .map(MigrationRef::file_stem)
             .collect();
         let locked = self.locked.then(|| {
             format!(
@@ -310,7 +310,6 @@ pub fn left_applied(left: &ServiceManifest, target: &ServiceManifest) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migrate_exec::MigrationRef;
 
     fn migration(version: u32, name: &str) -> SqlMigration {
         SqlMigration {

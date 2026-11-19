@@ -94,6 +94,12 @@ pub struct MigrationRef {
     pub no_transaction: bool,
 }
 
+impl MigrationRef {
+    pub fn file_stem(&self) -> String {
+        format!("V{}__{}", self.version, self.name)
+    }
+}
+
 impl From<&SqlMigration> for MigrationRef {
     fn from(migration: &SqlMigration) -> Self {
         Self {

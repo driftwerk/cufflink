@@ -76,6 +76,8 @@ pub struct AdoptionReport {
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub undeclared_columns: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
     #[serde(skip)]
     pub adopted: AdoptedSchema,
 }

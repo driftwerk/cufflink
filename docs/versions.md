@@ -1363,6 +1363,45 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.39.0
+
+Unreleased.
+
+A deploy checks the tables a service adopts after its own SQL migrations
+when those migrations are pending, so that a migration and the column or
+table it makes ship in one release
+([adopted tables and the deploy's migrations](schema-ownership.md#adopted-tables-and-the-deploys-migrations)).
+It changes no manifest, SDK or host function, needs no migration and adds
+no setting.
+
+- When the deploy adopts a table (`schema: adopted`, `managed = false` or
+  `private_tables`), its history is in `apply` mode and migrations are
+  pending, the adoption is checked on a fresh read after the migrations,
+  before `on_migrate`, the destructive changes and activation. A
+  declaration the migrations do not make true is refused (422) with the
+  migrations applied named; they stay applied and recorded, and the
+  previous version keeps serving. Every other deploy checks the adoption
+  before anything runs, as before.
+- A plan of such a deploy no longer fails on what the pending migrations
+  are to make. Its `adoption` carries `deferred: true` with those findings
+  in `errors`, and `cufflink deploy --plan` prints each as `adopted once
+  the pending migrations apply: …`. `deferred` is present only when true.
+
+**Behaviour changes:**
+
+- A deploy whose pending migrations drop, rename or retype a declared
+  column, or drop a declared table, is now refused after the migrations
+  ran. It used to be activated over a schema its version could not serve.
+- The snapshot of the adopted columns stored for a version deployed with
+  pending migrations in `apply` mode, which the data routes read their
+  casts and defaults from, is now read after the migrations. It used to
+  hold the columns as they were before them.
+- A plan whose history and adoption are both wrong reports the history's
+  error, as the deploy does.
+
+Rolling a platform back to v0.38 restores the old order and needs nothing
+undone.
+
 ## Changes in v0.38.2
 
 Unreleased.

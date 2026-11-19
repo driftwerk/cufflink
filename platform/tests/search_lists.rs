@@ -3,7 +3,7 @@ use cufflink_testkit as common;
 use common::{legacy, Deployment};
 use cufflink_platform::policy::PolicyMode;
 use cufflink_platform::schema_manager::executor::{
-    prepare_schema_changes, Direction, Guard, SchemaRequest, Tables,
+    prepare_schema_changes, AdoptionCheck, Direction, Guard, SchemaRequest, Tables,
 };
 use cufflink_platform::tenant_sessions::ServiceSessions;
 use cufflink_types::{SchemaOwnership, TableDefinition};
@@ -417,6 +417,7 @@ async fn an_adopted_table_is_searched_by_its_own_vector() {
                 leaving: 1,
                 allow_destructive: false,
                 direction: Direction::Forward,
+                adoption: AdoptionCheck::Now,
                 guard: Guard {
                     mode: PolicyMode::Off,
                     ..Guard::OFF

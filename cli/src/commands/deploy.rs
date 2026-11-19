@@ -1312,6 +1312,11 @@ fn plan_lines(plan: &serde_json::Value) -> Vec<String> {
             migrations["verified"]
         )
     });
+    let adoption = &plan["adoption"];
+    let deferred = texts(&adoption["errors"])
+        .into_iter()
+        .filter(|_| adoption["deferred"].as_bool() == Some(true))
+        .map(|error| format!("adopted once the pending migrations apply: {error}"));
     let private = texts(&plan["private_tables"]);
     let heading = (!private.is_empty()).then(|| format!("{PRIVATE_TABLES}:"));
     heading
@@ -1333,6 +1338,7 @@ fn plan_lines(plan: &serde_json::Value) -> Vec<String> {
                 .into_iter()
                 .map(|m| format!("pending: {m}")),
         )
+        .chain(deferred)
         .chain(guard.map(|mode| format!("Schema guard:   {mode}")))
         .chain(
             texts(&plan["satisfied"])
@@ -3590,6 +3596,40 @@ mod tests {
                 "  loan_tags",
                 "table loans: no longer served",
                 "warning: schema_guard could not read the schema: timeout",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plan_names_what_the_pending_migrations_are_to_make() {
+        let plan = |deferred: bool| {
+            serde_json::json!({
+                "schema_changes": [],
+                "sql_migrations": {
+                    "history": "loan_service.schema_history",
+                    "mode": "apply",
+                    "verified": 1,
+                    "pending": [{"version": 2, "name": "loan_state", "checksum": 42}]
+                },
+                "adoption": {
+                    "errors": ["loan_service.loans.state is missing"],
+                    "deferred": deferred
+                }
+            })
+        };
+        assert_eq!(
+            plan_lines(&plan(true)),
+            [
+                "SQL migrations: loan_service.schema_history (apply, 1 verified)",
+                "pending: V2__loan_state (42)",
+                "adopted once the pending migrations apply: loan_service.loans.state is missing",
+            ]
+        );
+        assert_eq!(
+            plan_lines(&plan(false)),
+            [
+                "SQL migrations: loan_service.schema_history (apply, 1 verified)",
+                "pending: V2__loan_state (42)",
             ]
         );
     }

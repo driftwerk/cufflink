@@ -9,10 +9,12 @@ use crate::repo::deployments::{Adoption, Snapshot};
 use crate::repo::services::Service;
 use crate::schema_manager::adopt::AdoptionReport;
 use crate::schema_manager::executor::{
-    apply_schema, ensure_schema, execute_online, execute_phase, prepare_schema_changes, Direction,
-    Guard, PreparedSchemaChanges, SchemaRequest, Tables,
+    apply_schema, check_adoption, ensure_schema, execute_online, execute_phase,
+    prepare_schema_changes, AdoptionCheck, Direction, Guard, PreparedSchemaChanges, SchemaRequest,
+    Tables,
 };
 use crate::schema_manager::guard::GuardReport;
+use crate::schema_manager::migrate_exec::MigrationRef;
 use crate::schema_manager::sql_migrations::{self, MigrationsReport};
 use crate::tenant_sessions::{Purpose, ServiceSessions};
 use crate::AppState;
@@ -140,7 +142,7 @@ impl SchemaReport {
         Self {
             schema_changes: phases.executed,
             guard: prepared.guard,
-            adoption: prepared.adoption,
+            adoption: phases.adoption.or(prepared.adoption),
             warnings: prepared.warnings.into_iter().chain(noted).collect(),
             sql_migrations: phases.migrations,
             unserved,
@@ -166,11 +168,21 @@ async fn guard(state: &AppState, tenant_id: Uuid, options: &Options) -> Platform
     })
 }
 
+fn adoption_check(verified: Option<&MigrationsReport>) -> AdoptionCheck {
+    match verified {
+        Some(report) if report.mode == HistoryMode::Apply && !report.run.pending.is_empty() => {
+            AdoptionCheck::AfterMigrations
+        }
+        _ => AdoptionCheck::Now,
+    }
+}
+
 async fn prepare(
     ctx: &DeployContext<'_>,
     tenant_pool: &ServiceSessions,
     leaving: i32,
     left: &Snapshot,
+    verified: Option<&MigrationsReport>,
 ) -> PlatformResult<PreparedSchemaChanges> {
     let (state, manifest) = (ctx.state, ctx.manifest);
     let tables = tables_of(manifest, left);
@@ -185,6 +197,7 @@ async fn prepare(
             leaving,
             allow_destructive: ctx.schema.allow_destructive,
             direction: Direction::Forward,
+            adoption: adoption_check(verified),
             guard: guard(state, ctx.identity.tenant_id, &ctx.schema).await?,
         },
     )
@@ -216,8 +229,8 @@ pub(crate) async fn plan(
         .tenant_sessions
         .service(&ctx.identity, Purpose::Ddl)
         .await?;
-    let prepared = prepare(ctx, &tenant_pool, leaving, left).await?;
     let migrations = sql_migrations::run(state, &migrations_of(ctx, left, true)).await?;
+    let prepared = prepare(ctx, &tenant_pool, leaving, left, migrations.as_ref()).await?;
     let executed = prepared
         .additive_sql
         .iter()
@@ -230,6 +243,7 @@ pub(crate) async fn plan(
         Phases {
             executed,
             migrations,
+            adoption: None,
         },
         unserved,
     ))
@@ -271,7 +285,7 @@ pub(crate) async fn apply(
         .service(&ctx.identity, Purpose::Ddl)
         .await?;
     ensure_schema(&tenant_pool, manifest.schema).await?;
-    let prepared = prepare(ctx, &tenant_pool, leaving, left).await?;
+    let prepared = prepare(ctx, &tenant_pool, leaving, left, verified.report.as_ref()).await?;
     ctx.schema
         .progress
         .phase(
@@ -383,6 +397,7 @@ pub(crate) async fn apply_rollback(
             leaving: service.current_version,
             allow_destructive,
             direction: Direction::Rollback,
+            adoption: AdoptionCheck::Now,
             guard: guard(state, service.tenant_id, &options).await?,
         },
     )
@@ -403,6 +418,7 @@ pub(crate) async fn apply_rollback(
         Phases {
             executed,
             migrations: None,
+            adoption: None,
         },
         Unserved::of(manifest, running.as_ref()),
     );
@@ -429,6 +445,7 @@ struct Verified<'a> {
 struct Phases {
     executed: Vec<String>,
     migrations: Option<MigrationsReport>,
+    adoption: Option<AdoptionReport>,
 }
 
 async fn run_phases(
@@ -445,6 +462,7 @@ async fn run_phases(
             executed: apply_schema(tenant_pool, prepared, &manifest.name, statement_timeout)
                 .await?,
             migrations: None,
+            adoption: None,
         });
     }
     let progress = &ctx.schema.progress;
@@ -466,6 +484,14 @@ async fn run_phases(
             )
             .await;
     }
+    let adoption = match (&prepared.adoption, &migrations) {
+        (Some(found), Some(report)) if found.deferred => Some(
+            check_adoption(tenant_pool, &tables_of(manifest, verified.left).adopted)
+                .await
+                .map_err(|error| applied_before(error, report))?,
+        ),
+        _ => None,
+    };
     if let Some(hook) = hook {
         progress.phase("on_migrate", json!({})).await;
         crate::router::crud::execute_hook_as(
@@ -497,7 +523,26 @@ async fn run_phases(
     Ok(Phases {
         executed,
         migrations,
+        adoption,
     })
+}
+
+fn applied_before(error: PlatformError, report: &MigrationsReport) -> PlatformError {
+    match error {
+        PlatformError::Validation(message) if !report.run.applied.is_empty() => {
+            PlatformError::Validation(format!(
+                "{message}; the migrations this deploy applied stay applied: {}",
+                report
+                    .run
+                    .applied
+                    .iter()
+                    .map(MigrationRef::file_stem)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+        error => error,
+    }
 }
 
 fn on_migrate_body(diff: &SchemaDiff) -> PlatformResult<Value> {
@@ -555,6 +600,85 @@ mod tests {
             }),
             r#"{"auth":null,"body":{"added_columns":[["sailings","min"]],"added_tables":["batches"],"dropped_columns":[["sailings","midpoint"]],"dropped_tables":["legacy_batches"],"nullability_changes":[["sailings","notes",true]],"type_changes":[["sailings","weight","integer","double"]]},"handler":"handle_on_migrate","headers":{},"method":"HOOK","service":"ferry-service","tenant":"acme"}"#
         );
+    }
+
+    use crate::schema_manager::migrate_exec::Report;
+
+    fn migrated(version: u32, name: &str) -> MigrationRef {
+        MigrationRef {
+            version,
+            name: name.into(),
+            checksum: 0,
+            no_transaction: false,
+        }
+    }
+
+    fn verified(
+        mode: HistoryMode,
+        pending: Vec<MigrationRef>,
+        applied: Vec<MigrationRef>,
+    ) -> MigrationsReport {
+        MigrationsReport {
+            mode,
+            run: Report {
+                pending,
+                applied,
+                ..Report::default()
+            },
+            ..MigrationsReport::default()
+        }
+    }
+
+    #[test]
+    fn adoption_waits_only_for_migrations_the_deploy_applies() {
+        let pending = || vec![migrated(2, "loan_state")];
+        for (report, check) in [
+            (None, AdoptionCheck::Now),
+            (
+                Some(verified(HistoryMode::Apply, vec![], vec![])),
+                AdoptionCheck::Now,
+            ),
+            (
+                Some(verified(HistoryMode::VerifyOnly, pending(), vec![])),
+                AdoptionCheck::Now,
+            ),
+            (
+                Some(verified(HistoryMode::Apply, pending(), vec![])),
+                AdoptionCheck::AfterMigrations,
+            ),
+        ] {
+            assert_eq!(adoption_check(report.as_ref()), check, "{report:?}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_after_the_migrations_names_those_it_applied() {
+        let refused = || {
+            PlatformError::Validation(
+                "the database does not hold what the manifest adopts: table loan_service.loan_notes is missing".into(),
+            )
+        };
+        let applied = verified(
+            HistoryMode::Apply,
+            vec![],
+            vec![migrated(2, "loan_state"), migrated(3, "loan_notes")],
+        );
+        assert_eq!(
+            applied_before(refused(), &applied).to_string(),
+            format!(
+                "{}; the migrations this deploy applied stay applied: V2__loan_state, V3__loan_notes",
+                refused()
+            )
+        );
+        assert_eq!(
+            applied_before(refused(), &verified(HistoryMode::Apply, vec![], vec![])).to_string(),
+            refused().to_string(),
+            "a check after a runner applied everything reads as it did"
+        );
+        assert!(matches!(
+            applied_before(PlatformError::Internal("introspection".into()), &applied),
+            PlatformError::Internal(message) if message == "introspection"
+        ));
     }
 
     use crate::repo::deployments::{parse_snapshot, stored};
@@ -627,6 +751,7 @@ mod tests {
                 leaving: 1,
                 allow_destructive: false,
                 direction,
+                adoption: AdoptionCheck::Now,
                 guard: Guard::OFF,
             },
             &Archives::default(),

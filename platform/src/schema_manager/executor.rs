@@ -20,6 +20,24 @@ pub enum Direction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionCheck {
+    Now,
+    AfterMigrations,
+}
+
+impl AdoptionCheck {
+    fn verdict(self, report: AdoptionReport) -> PlatformResult<AdoptionReport> {
+        match self {
+            Self::Now => report.accepted(),
+            Self::AfterMigrations => Ok(AdoptionReport {
+                deferred: true,
+                ..report
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Guard {
     pub mode: PolicyMode,
     pub accept_drift: bool,
@@ -112,6 +130,7 @@ pub struct SchemaRequest<'a> {
     pub leaving: i32,
     pub allow_destructive: bool,
     pub direction: Direction,
+    pub adoption: AdoptionCheck,
     pub guard: Guard,
 }
 
@@ -437,7 +456,11 @@ pub async fn prepare_schema_changes(
     let adoption = live
         .as_ref()
         .filter(|_| request.adopts())
-        .map(|live| validate_adoption(db.schema(), request.adopted, live).accepted())
+        .map(|live| {
+            request
+                .adoption
+                .verdict(validate_adoption(db.schema(), request.adopted, live))
+        })
         .transpose()?;
     if request.ownership == SchemaOwnership::Adopted {
         return Ok(PreparedSchemaChanges {
@@ -465,6 +488,14 @@ pub async fn prepare_schema_changes(
             .collect(),
         ..prepared
     })
+}
+
+pub async fn check_adoption(
+    db: &ServiceSessions,
+    adopted: &[TableDefinition],
+) -> PlatformResult<AdoptionReport> {
+    let live = introspect::live_schema(db).await?;
+    validate_adoption(db.schema(), adopted, &live).accepted()
 }
 
 pub async fn execute_phase(
@@ -601,6 +632,7 @@ mod tests {
             leaving: 7,
             allow_destructive: true,
             direction: Direction::Forward,
+            adoption: AdoptionCheck::Now,
             guard,
         }
     }
@@ -1076,6 +1108,32 @@ mod tests {
             "a table that is made has no rows to rewrite"
         );
         assert_eq!(made.additive_sql.len(), 4);
+    }
+
+    #[test]
+    fn an_adoption_checked_after_the_migrations_is_reported_not_refused() {
+        let found = AdoptionReport {
+            errors: vec!["table loan_service.loans is missing".into()],
+            ..AdoptionReport::default()
+        };
+        let deferred = AdoptionCheck::AfterMigrations
+            .verdict(found.clone())
+            .expect("deferred");
+        assert!(deferred.deferred);
+        assert_eq!(deferred.errors, found.errors);
+        assert_eq!(
+            serde_json::to_value(&deferred).expect("json")["deferred"],
+            true
+        );
+        assert!(AdoptionCheck::Now.verdict(found).is_err());
+        let accepted = AdoptionCheck::Now
+            .verdict(AdoptionReport::default())
+            .expect("accepted");
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("json"),
+            serde_json::json!({"errors": [], "warnings": [], "undeclared_columns": {}}),
+            "a report checked when it is found serializes as it always did"
+        );
     }
 
     #[test]
