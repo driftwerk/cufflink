@@ -536,7 +536,7 @@ the hand-back row applies):
 | Snapshots of adopted columns read after the migrations | Nothing to undo; v0.38.1 reads the snapshot before pending migrations again, so casts and defaults can be stale until a deploy with no pending migrations |
 | The hand-back of a consumer loop | Nothing to undo. v0.38.1 brings the old hand-back back: a consumer whose concurrency is at least its `max_deliver` can have a message's deliveries spent by one stop or restart, with no dead letter |
 | The plan's `deferred` adoption | Nothing: v0.38.1 never defers, and a CLI of v0.39.0 reads the key only when it is there |
-| Public documents (`public_docs`) | Nothing to undo, but every document goes: a version that declares them keeps running and serving its API, while v0.38.1 answers `404` under each mount. Its feature check refuses a deploy of a manifest built with this SDK that declares `docs`, since such a manifest requires `public_docs`, so deploy without them until the platform is on v0.39.0 again |
+| Public documents (`public_docs`) | Nothing to undo, but every document goes: a version that declares them keeps running and serving its API, while v0.38.1 answers `404` under each mount. A manifest built with this SDK that declares `docs` requires `public_docs`, so v0.38.1's feature check refuses its deploy. Deploy without them until the platform is on v0.39.0 again |
 | The database | Nothing: v0.39.0 has no migration |
 
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
