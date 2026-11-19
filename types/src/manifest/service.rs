@@ -149,6 +149,9 @@ pub struct OpenApiOptions {
     /// when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_scheme: Option<String>,
+    /// Public, unauthenticated documents, each a tag-selected subset of this spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs: Vec<PublicDoc>,
 }
 
 impl OpenApiOptions {
@@ -158,6 +161,87 @@ impl OpenApiOptions {
         self.security_scheme
             .as_deref()
             .unwrap_or(Self::DEFAULT_SECURITY_SCHEME)
+    }
+}
+
+/// A public document: the operations of the spec carrying any of
+/// `include_tags`, served without authentication under `mount`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicDoc {
+    /// Unique among the service's documents; `[a-z][a-z0-9-]{0,62}`.
+    pub name: String,
+    /// A literal service-relative path the document is served under.
+    pub mount: String,
+    /// The operations published: those tagged with any of these.
+    pub include_tags: Vec<String>,
+    pub info: PublicDocInfo,
+    /// Defaults to `OpenApiOptions::servers`, then to the service's own base.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<ServerDoc>,
+    /// The document's tag list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<TagDoc>,
+    /// Prepended to every path, for a gateway that publishes them under one; needs `servers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// How the `api_key` scheme is presented; the platform's `X-Api-Key` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<ApiKeyDoc>,
+    /// Cross-origin access to the document's answers; `Restricted` when unset.
+    #[serde(default, skip_serializing_if = "PublicDocCors::is_restricted")]
+    pub cors: PublicDocCors,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicDocInfo {
+    pub title: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<ContactDoc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactDoc {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// The `api_key` security scheme as a document presents it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyDoc {
+    /// The request header the key is sent in.
+    pub header: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Cross-origin access to a public document. A new mode is always a unit
+/// variant: `Unknown` catches only an unknown string, so a platform rolled
+/// back below a mode still decodes the manifest naming it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicDocCors {
+    /// The platform's own CORS policy, as for every route.
+    #[default]
+    Restricted,
+    /// `access-control-allow-origin: *`, without credentials.
+    Any,
+    /// The request's origin, methods and headers echoed, with credentials.
+    Mirror,
+    /// A mode this platform does not know; served as `Restricted`, refused at deploy.
+    #[serde(other)]
+    Unknown,
+}
+
+impl PublicDocCors {
+    pub fn is_restricted(&self) -> bool {
+        *self == PublicDocCors::Restricted
     }
 }
 
@@ -392,6 +476,11 @@ impl ServiceManifest {
         self
     }
 
+    /// The public documents the service declares.
+    pub fn public_docs(&self) -> impl Iterator<Item = &PublicDoc> {
+        self.openapi.iter().flat_map(|options| &options.docs)
+    }
+
     /// Platform features required by service-level fields.
     pub(crate) fn service_features(&self) -> impl Iterator<Item = &'static str> {
         let adopted = !self.schema.is_managed() || self.schema_name.is_some();
@@ -406,6 +495,10 @@ impl ServiceManifest {
             (!self.extensions.is_empty()).then_some(features::EXT_CALL),
             (self.mode == ServiceMode::Native).then_some(features::NATIVE_SERVICES),
             (!self.private_tables.is_empty()).then_some(features::PRIVATE_TABLES),
+            self.public_docs()
+                .next()
+                .is_some()
+                .then_some(features::PUBLIC_DOCS),
         ]
         .into_iter()
         .flatten()
@@ -1035,6 +1128,124 @@ mod tests {
         assert_ne!(
             moved.schema_hash().unwrap(),
             declaring.schema_hash().unwrap()
+        );
+    }
+
+    fn documented() -> ServiceManifest {
+        serde_json::from_value(serde_json::json!({
+            "name": "catalog-service",
+            "version": "0.1.0",
+            "mode": "wasm",
+            "tables": [],
+            "routing": "strict",
+            "openapi": {"title": "Catalog", "servers": [{"url": "https://api.example.com"}]},
+            "custom_routes": [{
+                "method": "GET",
+                "path": "/products",
+                "handler": "list_products",
+                "posture": {"kind": "public", "reason": "catalog"},
+                "doc": {"tags": ["Catalog"]}
+            }]
+        }))
+        .expect("parses")
+    }
+
+    fn public_api() -> PublicDoc {
+        PublicDoc {
+            name: "public-api".into(),
+            mount: "/docs/public-api".into(),
+            include_tags: vec!["Catalog".into()],
+            info: PublicDocInfo {
+                title: "Catalog Public API".into(),
+                version: "1.0.0".into(),
+                description: None,
+                contact: None,
+            },
+            servers: vec![],
+            tags: vec![],
+            path_prefix: None,
+            api_key: None,
+            cors: PublicDocCors::Restricted,
+        }
+    }
+
+    #[test]
+    fn a_documented_manifest_without_docs_keeps_its_deploy_hash() {
+        let manifest = documented();
+        assert_eq!(
+            manifest.deploy_hash().expect("hash"),
+            "1b1ec49a81e9ad3c3fb0dd276aaba2ce75c1d0a3d17667a08f3d940d2e75cd32",
+            "the hash v0.38.1 gave this manifest"
+        );
+        let schema_hash = "80a073df5167dc4b58a94bdec030b5991cc3d13d6896c3812d6434bdd70e0922";
+        assert_eq!(manifest.schema_hash().expect("schema hash"), schema_hash);
+        assert!(
+            serde_json::to_value(&manifest).expect("serializes")["openapi"]
+                .get("docs")
+                .is_none()
+        );
+
+        let mut declaring = manifest.clone();
+        declaring
+            .openapi
+            .as_mut()
+            .expect("openapi")
+            .docs
+            .push(public_api());
+        assert_ne!(declaring.deploy_hash().ok(), manifest.deploy_hash().ok());
+        assert_eq!(
+            declaring.schema_hash().expect("schema hash"),
+            schema_hash,
+            "documents change no schema"
+        );
+        let wire = serde_json::to_value(&declaring).expect("serializes");
+        assert_eq!(
+            wire["openapi"]["docs"],
+            serde_json::json!([{
+                "name": "public-api",
+                "mount": "/docs/public-api",
+                "include_tags": ["Catalog"],
+                "info": {"title": "Catalog Public API", "version": "1.0.0"}
+            }])
+        );
+        let parsed: ServiceManifest = serde_json::from_value(wire).expect("parses");
+        assert_eq!(parsed.public_docs().collect::<Vec<_>>(), [&public_api()]);
+    }
+
+    #[test]
+    fn a_cors_mode_this_platform_does_not_know_still_decodes_the_manifest() {
+        for (mode, decoded) in [
+            ("restricted", PublicDocCors::Restricted),
+            ("any", PublicDocCors::Any),
+            ("mirror", PublicDocCors::Mirror),
+            ("reflect", PublicDocCors::Unknown),
+            ("unknown", PublicDocCors::Unknown),
+        ] {
+            let mut wire = serde_json::to_value(documented()).expect("serializes");
+            let mut doc = serde_json::to_value(public_api()).expect("serializes");
+            doc["cors"] = mode.into();
+            wire["openapi"]["docs"] = serde_json::json!([doc]);
+            let manifest: ServiceManifest = serde_json::from_value(wire).expect("decodes whole");
+            assert_eq!(
+                manifest.public_docs().next().map(|doc| doc.cors),
+                Some(decoded),
+                "{mode}"
+            );
+            assert_eq!(manifest.custom_routes.len(), 1, "{mode}");
+        }
+        assert_eq!(
+            serde_json::to_value(PublicDocCors::Unknown).expect("serializes"),
+            "unknown"
+        );
+        let restricted = serde_json::to_value(public_api()).expect("serializes");
+        assert!(restricted.get("cors").is_none(), "{restricted}");
+        let mirrored = PublicDoc {
+            cors: PublicDocCors::Mirror,
+            ..public_api()
+        };
+        assert_eq!(
+            serde_json::to_value(mirrored).expect("serializes")["cors"],
+            "mirror"
         );
     }
 

@@ -156,7 +156,7 @@ fn parse_segment(raw: &str, last: bool) -> Result<Segment, RoutePathError> {
             Some(_) => Err(RoutePathError::InvalidParamName(inner.to_string())),
             None => param_name(inner).map(Segment::Param),
         },
-        None if raw.bytes().all(is_literal_byte) => Ok(Segment::Literal(raw.to_string())),
+        None if is_literal(raw) => Ok(Segment::Literal(raw.to_string())),
         None => Err(RoutePathError::InvalidLiteral(raw.to_string())),
     }
 }
@@ -172,6 +172,11 @@ fn param_name(name: &str) -> Result<String, RoutePathError> {
     } else {
         Err(RoutePathError::InvalidParamName(name.to_string()))
     }
+}
+
+/// Whether `segment` is a non-empty literal path segment.
+pub fn is_literal(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(is_literal_byte)
 }
 
 fn is_literal_byte(b: u8) -> bool {

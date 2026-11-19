@@ -1,0 +1,5 @@
+error: cors is restricted, any or mirror, not 'open'
+ --> tests/ui/fail/public_doc_unknown_cors.rs:7:121
+  |
+7 |             { name: "public-api", mount: "/docs/public-api", include_tags: ["Catalog"], title: "A", version: "1", cors: open },
+  |                                                                                                                         ^^^^

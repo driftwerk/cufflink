@@ -1,0 +1,5 @@
+error: a contact gives at least one of name, email or url
+ --> tests/ui/fail/public_doc_empty_contact.rs:7:124
+  |
+7 |             { name: "public-api", mount: "/docs/public-api", include_tags: ["Catalog"], title: "A", version: "1", contact: {} },
+  |                                                                                                                            ^^

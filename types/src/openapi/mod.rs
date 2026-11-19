@@ -6,11 +6,13 @@
 mod check;
 mod crud;
 mod custom;
+mod public;
 mod schema;
 
 pub use check::validate;
+pub use public::{mount_segments, public_doc, public_doc_spec, PublicDocError};
 
-use crate::{ServiceManifest, TableDefinition};
+use crate::{ServerDoc, ServiceManifest, TableDefinition};
 use custom::Components;
 use schema::Nullable;
 use serde_json::{json, Map, Value};
@@ -132,8 +134,28 @@ fn table_security(table: &TableDefinition, scheme: &str) -> Vec<Value> {
     }
 }
 
+/// The first non-empty list of `chain`, else the service's own base under
+/// `tenant`.
+fn servers_of(chain: &[&[ServerDoc]], service: &str, tenant: &str) -> Value {
+    chain
+        .iter()
+        .find(|servers| !servers.is_empty())
+        .map_or_else(
+            || {
+                json!([{
+                    "url": format!("{{origin}}/svc/{{tenant}}/{service}"),
+                    "variables": {
+                        "origin": { "default": "" },
+                        "tenant": { "default": tenant },
+                    },
+                }])
+            },
+            |servers| json!(servers),
+        )
+}
+
 fn server_relative(manifest: &ServiceManifest, tenant: &str) -> Result<Value, OpenApiError> {
-    validate(manifest)?;
+    check::spec(manifest)?;
     let options = manifest.openapi.clone().unwrap_or_default();
     let scheme = options.security_scheme();
     let components = Map::from_iter(manifest.components.clone());
@@ -224,17 +246,7 @@ fn server_relative(manifest: &ServiceManifest, tenant: &str) -> Result<Value, Op
     if let Some(description) = &options.description {
         info.insert("description".into(), json!(description));
     }
-    let servers = if options.servers.is_empty() {
-        json!([{
-            "url": format!("{{origin}}/svc/{{tenant}}/{}", manifest.name),
-            "variables": {
-                "origin": { "default": "" },
-                "tenant": { "default": tenant },
-            },
-        }])
-    } else {
-        json!(options.servers)
-    };
+    let servers = servers_of(&[&options.servers], &manifest.name, tenant);
     let mut document = Map::from_iter([
         ("openapi".to_string(), json!("3.1.0")),
         ("info".to_string(), Value::Object(info)),
@@ -623,6 +635,7 @@ mod tests {
                 description: Some("Loans Service API".into()),
             }],
             security_scheme: None,
+            docs: vec![],
         });
         let spec = relative(&manifest);
         assert_eq!(
@@ -763,6 +776,45 @@ mod tests {
             json!({"bearer_auth": {"type": "http", "scheme": "bearer"}})
         );
         assert_eq!(spec["components"]["schemas"]["ApiLoan"]["type"], "object");
+    }
+
+    #[test]
+    fn a_parameters_examples_move_from_its_schema_to_the_parameter() {
+        use crate::{RouteDoc, RoutingMode};
+        let mut manifest = test_manifest();
+        manifest.tables.clear();
+        manifest.routing = RoutingMode::Strict;
+        manifest.custom_routes = vec![documented_route(
+            "GET",
+            "/products/{sku}",
+            "product",
+            None,
+            RouteDoc {
+                path_params: Some(
+                    json!({"type": "object", "required": ["sku"], "properties": {
+                    "sku": {"type": "string", "examples": ["SKU-1"]}}}),
+                ),
+                query: Some(json!({"type": "object", "properties": {
+                    "currency": {"type": "string", "examples": ["EUR", "USD"]},
+                    "page": {"type": "integer", "examples": []},
+                    "size": {"type": "integer", "description": "Per page"}}})),
+                ..Default::default()
+            },
+        )];
+        let spec = relative(&manifest);
+        assert_eq!(
+            spec["paths"]["/products/{sku}"]["get"]["parameters"],
+            json!([
+                {"name": "sku", "in": "path", "required": true, "schema": {"type": "string"},
+                    "example": "SKU-1"},
+                {"name": "currency", "in": "query", "required": false, "schema": {"type": "string"},
+                    "examples": {"0": {"value": "EUR"}, "1": {"value": "USD"}}},
+                {"name": "page", "in": "query", "required": false,
+                    "schema": {"type": "integer", "examples": []}},
+                {"name": "size", "in": "query", "required": false, "schema": {"type": "integer"},
+                    "description": "Per page"},
+            ])
+        );
     }
 
     #[test]

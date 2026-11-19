@@ -32,13 +32,20 @@ pub(super) fn route_security<'a>(
     }
 }
 
-/// Check a documented manifest: operation ids unique across its published
-/// custom and CRUD operations, no two published routes documenting the same
-/// method and path, `path = T` naming exactly the route's path parameters,
-/// query and path parameters that are scalars or arrays, security schemes
-/// the document defines, and no DTO sharing a table schema's name. An
-/// undocumented manifest passes: its spec is today's.
+/// Check a documented manifest: its spec as [`spec`] does, and its public
+/// documents. An undocumented manifest passes: its spec is today's.
 pub fn validate(manifest: &ServiceManifest) -> Result<(), OpenApiError> {
+    spec(manifest)?;
+    super::public::check(manifest)
+}
+
+/// Check what a documented manifest's spec needs: operation ids unique
+/// across its published custom and CRUD operations, no two published routes
+/// documenting the same method and path, `path = T` naming exactly the
+/// route's path parameters, query and path parameters that are scalars or
+/// arrays, security schemes the document defines, and no DTO sharing a
+/// table schema's name.
+pub(super) fn spec(manifest: &ServiceManifest) -> Result<(), OpenApiError> {
     if matches!(default_style(manifest, ""), PathStyle::Absolute { .. }) {
         return Ok(());
     }

@@ -1,0 +1,5 @@
+error: public document is missing mount
+ --> tests/ui/fail/public_doc_missing_mount.rs:7:13
+  |
+7 |             { name: "public-api", include_tags: ["Catalog"], title: "A", version: "1" },
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
