@@ -188,38 +188,51 @@ to say what it expects, not to prove it.
 
 ## 5. Tests
 
-Platform integration tests, in `platform/tests/sql_migrations_deploys.rs`:
+Platform integration tests, in `platform/tests/sql_migrations_deploys.rs`.
+Each fails on the platform before this change, except the `verify_only`
+one, which pins what stays as it is:
 
-1. A `schema: adopted` service, history in `apply` mode, V1 applied by
-   another runner, deploying V1–V2 and declaring the column V2 adds. The
-   deploy succeeds, the history records V2, and a create through the data
-   route that omits the column succeeds, which proves the stored snapshot
-   comes from the read after V2 (the column has a default).
-2. The same with a table that a migration creates, declared in
-   `private_tables`.
-3. A managed schema whose private table a migration creates, in the same
-   release. The deploy succeeds.
-4. A `schema: adopted` deploy whose migration does not make the declared
-   column. The deploy is refused (422) with the finding and
-   `V…__…` of the migration applied. The previous version is still served
-   and the migration stays recorded. A second attempt finds nothing pending
-   and is refused with today's message, which names no migration.
-5. A managed schema, refused after its migrations. The additive phase and
-   the migration ran. `on_migrate` (a hook that writes a row) did not, nor
-   did the destructive phase (a dropped column is still there). The
-   previous version is still served.
-6. A failing migration under an adopted schema. The error is the
-   migration's, as today.
-7. A plan with a migration pending that makes a declared column. It
-   succeeds with `adoption.deferred: true`, the missing column is in
-   `adoption.errors`, and nothing is applied.
-8. A plan with nothing pending and a declared column missing. It is
-   refused (422), as today.
-9. `verify_only` with migrations pending and a declared column missing.
-   The deploy and the plan are refused before anything runs, as today.
-10. The migration lock is held by another runner, which applies the
-    pending migration itself, records it and releases the lock. The deploy
-    waits, applies nothing, and the check, made on a fresh read, passes.
+1. `an_adopted_schema_is_checked_after_the_migrations_that_make_it`: a
+   `schema: adopted` service, history in `apply` mode, V1 applied by
+   another runner. V2 adds an enum column with a default and creates a
+   table, and the manifest declares the column and, in `private_tables`,
+   the table.
+   - The plan succeeds with `adoption.deferred: true` and both findings in
+     `adoption.errors`, and applies nothing.
+   - The deploy succeeds, records V2 and reports an adoption that is not
+     deferred.
+   - Creates through the data route, one naming the enum value and one
+     omitting the column, store `closed` and `open`. Both depend on the
+     snapshot holding the column as V2 made it (the enum's cast, the
+     default), so they prove that the report read after the migrations is
+     the one stored.
+2. `an_adoption_the_migrations_do_not_make_is_refused_after_them`: the
+   migration does not make the declared column or table. The deploy is
+   refused (422) with both findings and `V2__loan_stage`. The previous
+   version is still served and V2 stays recorded. The same deploy again,
+   and its plan, find nothing pending and are refused with today's
+   message, which names no migration.
+3. `a_managed_schema_checks_the_private_table_its_migration_makes`: a
+   managed schema with `on_migrate` (a hook that writes a row), a column
+   dropped and a column added, and a private table its migration creates
+   without a declared column.
+   - The deploy is refused after the migration. The added column exists,
+     the dropped one is still there, the hook wrote nothing, and the
+     previous version is still served.
+   - A release whose migration makes the column then deploys, and its
+     hook runs.
+4. `a_failing_migration_under_an_adopted_schema_fails_as_it_did`: the
+   error is the migration's (500, `V2__broken`), with no adoption finding.
+5. `a_verified_history_checks_adoption_before_anything_runs`: under
+   `verify_only` with a migration pending, the deploy and the plan are
+   refused with the findings and run no DDL.
+6. `adoption_is_checked_on_what_a_runner_holding_the_lock_made`: another
+   runner holds the migration lock, applies and records V2 itself, then
+   releases it. The deploy waits, applies nothing, and passes on its fresh
+   read.
+
+The suite's other tests, which cover managed schemas, `verify_only` and
+the lock, pass unchanged.
 
 Unit tests:
 
@@ -232,9 +245,6 @@ Unit tests:
   today's message when none were applied.
 - `plan_lines` prints a deferred adoption's findings and nothing for one
   that is not deferred.
-
-The managed-schema tests that exist (`migrations_run_after_the_tables_the_manifest_adds`
-and the rest of the file) stay as they are and must pass unchanged.
 
 The SDK's test host (`cufflink_fn::testing::TestDb`) applies migrations but
 has no adoption check, so it has nothing to reorder, and this change leaves
