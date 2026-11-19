@@ -56,3 +56,13 @@ jobs:
         run: |
           echo "::error::The security scan found CRITICAL vulnerabilities with fixes, or end-of-life software. See the job summary."
           exit 1
+
+  audit-exceptions:
+    name: Check the audit exceptions still hold
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Check the audit exceptions still hold
+        run: .github/scripts/workspace-requirements.sh

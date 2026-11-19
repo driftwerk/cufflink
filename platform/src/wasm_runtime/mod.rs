@@ -2843,33 +2843,42 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_shared_memory_does_not_compile() {
-        let engine = engine();
-        assert!(
-            Module::new(&engine.engine, "(module (memory 1 2 shared))").is_err(),
-            "threads are off, so no guest memory escapes the ledger by being shared"
-        );
-    }
-
-    fn refusal(wat: &str) -> String {
+    fn compile_error(wat: &str) -> String {
         let engine = engine();
         let err = Module::new(&engine.engine, wat).expect_err("the module does not compile");
         format!("{err:?}")
     }
 
     #[tokio::test]
+    async fn a_shared_memory_does_not_compile() {
+        let err = compile_error("(module (memory 1 2 shared))");
+        assert!(
+            err.contains("threads must be enabled for shared memories"),
+            "threads are off, so no guest memory escapes the ledger by being shared: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_gc_type_does_not_compile() {
-        let err = refusal("(module (type (struct)))");
+        let err = compile_error("(module (type (struct)))");
         assert!(
             err.contains("not supported without the gc feature"),
-            "gc is off, so no guest allocates on a GC heap: {err}"
+            "the gc proposal is off, so no guest declares a GC type: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gc_reference_does_not_compile() {
+        let err = compile_error("(module (func (param externref)))");
+        assert!(
+            err.contains("gc types are disallowed but found type which requires gc"),
+            "wasmtime is built without its gc feature, so no guest holds a GC reference: {err}"
         );
     }
 
     #[tokio::test]
     async fn an_atomic_notify_on_an_unshared_memory_does_not_compile() {
-        let err = refusal(
+        let err = compile_error(
             "(module (memory 1) (func (drop (memory.atomic.notify (i32.const 0) (i32.const 1)))))",
         );
         assert!(

@@ -22,13 +22,20 @@ workspace() {
 }
 
 wasmtime() {
-  local version="$1" features="$2"
-  mkdir -p "$work/wasmtime/src"
+  local version="$1" features="$2" more="${3:-}"
+  mkdir -p "$work/wasmtime/src" "$work/gc-helper/src"
   printf '[package]\nname = "wasmtime"\nversion = "%s"\nedition = "2021"\n\n[features]\ngc = []\nthreads = []\n' \
     "$version" >"$work/wasmtime/Cargo.toml"
-  touch "$work/wasmtime/src/lib.rs"
+  printf '[package]\nname = "gc-helper"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nwasmtime = { path = "../wasmtime", features = ["gc"] }\n' \
+    >"$work/gc-helper/Cargo.toml"
+  touch "$work/wasmtime/src/lib.rs" "$work/gc-helper/src/lib.rs"
   workspace "$inherits" dependencies "cufflink-types = { workspace = true }
-wasmtime = { path = \"../../wasmtime\", version = \"$version\", features = [$features] }"
+wasmtime = { path = \"../../wasmtime\", version = \"$version\", features = [$features] }
+$more"
+}
+
+day() {
+  jq -nr --argjson offset "$1" '(now / 86400 | floor) + $offset | . * 86400 | strftime("%Y-%m-%d")'
 }
 
 audit() {
@@ -39,9 +46,9 @@ audit() {
 ignored() {
   local revisit="$1"
   audit '[advisories]' 'ignore = [' \
-    "    # revisit $revisit: GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0" \
+    "    # revisit $revisit: GHSA-2674-w29h-wqvj affects wasmtime >=39.0.0 <48.0.9" \
     '    "RUSTSEC-2026-0567",' \
-    "    # revisit $revisit: GHSA-wvgq-g5hf-6gm6 affects wasmtime >=47.0.0" \
+    "    # revisit $revisit: GHSA-wvgq-g5hf-6gm6 affects wasmtime >=47.0.0 <=48.0.8" \
     '    "RUSTSEC-2026-0573",' \
     ']'
 }
@@ -57,6 +64,17 @@ expect() {
   else
     printf 'FAILED: %s (exit %s, expected %s with "%s")\n%s\n' \
       "$case" "$got" "$status" "$line" "$output"
+    failures=$((failures + 1))
+  fi
+}
+
+quiet() {
+  local case="$1" output got=0
+  output=$("$script" "$2" 2>&1) || got=$?
+  if [ "$got" = 0 ] && ! grep -qF -- "::warning::" <<<"$output"; then
+    echo "ok: $case"
+  else
+    printf 'FAILED: %s (exit %s, expected 0 with no warning)\n%s\n' "$case" "$got" "$output"
     failures=$((failures + 1))
   fi
 }
@@ -102,43 +120,78 @@ expect "nothing to compare" 1 "no requirement on a workspace crate was found" \
   "$work/metadata.json"
 
 wasmtime 36.0.21 ""
-ignored 2999-12-31
+ignored "$(day 30)"
 expect "the audit exceptions on wasmtime 36 without gc or threads" 0 \
-  "the audit ignores RUSTSEC-2026-0567, RUSTSEC-2026-0573 hold for wasmtime 36.0.21 without gc or threads until 2999-12-31" \
+  "the audit ignores RUSTSEC-2026-0567, RUSTSEC-2026-0573 hold for wasmtime 36.0.21 without gc or threads until $(day 30)" \
   "$work/metadata.json"
+quiet "audit exceptions more than 14 days from their revisit date warn of nothing" "$work/metadata.json"
 
 wasmtime 48.0.9 '"gc", "threads"'
 expect "another wasmtime major and features with no audit exceptions" 0 "each of the 1 requirements" \
   "$work/metadata.json"
 
 wasmtime 48.0.9 ""
-ignored 2999-12-31
+ignored "$(day 30)"
 expect "the audit exceptions on another wasmtime major" 1 \
   "the audit exceptions hold for wasmtime 36 only, and the workspace builds wasmtime 48.0.9: drop them" \
   "$work/metadata.json"
 
 wasmtime 36.0.21 '"gc"'
-ignored 2999-12-31
+ignored "$(day 30)"
 expect "the audit exceptions with the gc feature" 1 \
   "the audit exceptions hold only while wasmtime builds without its gc feature, and the workspace enables it" \
   "$work/metadata.json"
 
 wasmtime 36.0.21 '"threads"'
-ignored 2999-12-31
+ignored "$(day 30)"
 expect "the audit exceptions with the threads feature" 1 \
   "the audit exceptions hold only while wasmtime builds without its threads feature, and the workspace enables it" \
   "$work/metadata.json"
 
 workspace "$inherits" dependencies 'cufflink-types = { workspace = true }'
-ignored 2999-12-31
+ignored "$(day 30)"
 expect "the audit exceptions with no wasmtime" 1 \
   "the audit exceptions are for wasmtime, which the workspace no longer builds: drop them" \
   "$work/metadata.json"
 
+wasmtime 36.0.21 "" '[features]
+wasm-gc = ["wasmtime/gc"]'
+ignored "$(day 30)"
+expect "the audit exceptions with gc behind a feature" 1 \
+  "the audit exceptions hold only while wasmtime builds without its gc feature, and the workspace enables it" \
+  "$work/metadata.json"
+
+wasmtime 36.0.21 "" 'gc-helper = { path = "../../gc-helper", optional = true }'
+ignored "$(day 30)"
+expect "the audit exceptions with gc behind an optional dependency" 1 \
+  "the audit exceptions hold only while wasmtime builds without its gc feature, and the workspace enables it" \
+  "$work/metadata.json"
+
 wasmtime 36.0.21 ""
-ignored 2000-01-01
-expect "audit exceptions past their revisit date" 1 \
-  "RUSTSEC-2026-0567 was to be revisited by 2000-01-01: check it still does not apply, then set a new date or drop the ignore" \
+ignored "$(day -1)"
+expect "audit exceptions the day after their revisit date" 1 \
+  "RUSTSEC-2026-0567 was to be revisited by $(day -1): check it still does not apply, then set a new date or drop the ignore" \
+  "$work/metadata.json"
+
+ignored "$(day 0)"
+expect "audit exceptions on their revisit date" 0 \
+  "::warning::RUSTSEC-2026-0567 is to be revisited by $(day 0), in 0 days" "$work/metadata.json"
+
+ignored "$(day 14)"
+expect "audit exceptions 14 days from their revisit date" 0 \
+  "::warning::RUSTSEC-2026-0573 is to be revisited by $(day 14), in 14 days: check it still does not apply, then set a new date or drop the ignore" \
+  "$work/metadata.json"
+
+ignored "$(day 15)"
+quiet "audit exceptions 15 days from their revisit date" "$work/metadata.json"
+
+ignored "$(day 60)"
+expect "audit exceptions revisited 60 days out" 0 "the audit ignores RUSTSEC-2026-0567, RUSTSEC-2026-0573" \
+  "$work/metadata.json"
+
+ignored "$(day 61)"
+expect "audit exceptions revisited more than 60 days out" 1 \
+  "RUSTSEC-2026-0567 is to be revisited on $(day 61), more than 60 days after $(day 0)" \
   "$work/metadata.json"
 
 wasmtime 36.0.21 ""
@@ -160,7 +213,7 @@ expect "an audit exception with no note" 1 \
   "$work/metadata.json"
 
 wasmtime 36.0.21 ""
-audit '[advisories]' 'ignore = [' '    # revisit 2999-12-31: unmaintained' '    "RUSTSEC-2024-0436",' ']'
+audit '[advisories]' 'ignore = [' "    # revisit $(day 30): unmaintained" '    "RUSTSEC-2024-0436",' ']'
 expect "an audit exception for another advisory" 1 \
   "RUSTSEC-2024-0436 is ignored, and only RUSTSEC-2026-0567 and RUSTSEC-2026-0573 may be" \
   "$work/metadata.json"

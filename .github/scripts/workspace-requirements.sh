@@ -27,18 +27,20 @@ checked=$(jq -c '
 
 root=$(jq -r '.workspace_root' "$metadata")
 config="$root/.cargo/audit.toml"
-exceptions='{"ignored": [], "refused": []}'
+exceptions='{"ignored": [], "refused": [], "warned": []}'
 if [ -f "$config" ]; then
-  cargo metadata --format-version 1 --manifest-path "$root/Cargo.toml" >"$resolved"
+  today=$(date -u +%F)
+  cargo metadata --all-features --format-version 1 --manifest-path "$root/Cargo.toml" >"$resolved"
   exceptions=$(jq -n -c --rawfile config "$config" --slurpfile metadata "$resolved" \
-    --arg today "$(date -u +%F)" '
+    --arg today "$today" '
     def held: ["RUSTSEC-2026-0567", "RUSTSEC-2026-0573"];
     def real_date: (try (strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")) catch null) == .;
+    def days_from_today: (strptime("%Y-%m-%d") | mktime) - ($today | strptime("%Y-%m-%d") | mktime) | . / 86400;
     $metadata[0] as $m
     | [$config | split("\n")[] | sub("\\s+$"; "") | select(length > 0)] as $lines
     | if ($lines | length) < 3 or ($lines | length) % 2 == 0 or $lines[0] != "[advisories]"
         or $lines[1] != "ignore = [" or $lines[-1] != "]"
-      then {ignored: [], refused: [".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note"]}
+      then {ignored: [], refused: [".cargo/audit.toml may hold only an [advisories] ignore list, each id under its revisit note"], warned: []}
       else
         [range(2; ($lines | length) - 1; 2) as $i
          | {note: $lines[$i], line: $lines[$i + 1]}
@@ -61,6 +63,8 @@ if [ -f "$config" ]; then
                    "\(.advisory) is to be revisited on \(.revisit), which is not a date"
                  elif .revisit < $today then
                    "\(.advisory) was to be revisited by \(.revisit): check it still does not apply, then set a new date or drop the ignore"
+                 elif (.revisit | days_from_today) > 60 then
+                   "\(.advisory) is to be revisited on \(.revisit), more than 60 days after \($today)"
                  else empty end]
               + if ($entries | length) == 0 then []
                 elif ($wasmtime | length) == 0 then
@@ -70,7 +74,12 @@ if [ -f "$config" ]; then
                    | "the audit exceptions hold for wasmtime 36 only, and the workspace builds wasmtime \(.version): drop them"]
                   + [$enabled[]
                      | "the audit exceptions hold only while wasmtime builds without its \(.) feature, and the workspace enables it"]
-                end)
+                end),
+            warned: [$entries[]
+              | select(.advisory != null and .revisit != null and (.revisit | real_date) and .revisit >= $today)
+              | (.revisit | days_from_today) as $left
+              | select($left <= 14)
+              | "\(.advisory) is to be revisited by \(.revisit), in \($left) days: check it still does not apply, then set a new date or drop the ignore"]
           }
       end')
 fi
@@ -82,6 +91,7 @@ if [ "$compared" = 0 ]; then
 fi
 jq -r '.refused[] | "::error::\(.)"' <<<"$checked"
 jq -r '.refused[] | "::error::\(.)"' <<<"$exceptions"
+jq -r '.warned[] | "::warning::\(.)"' <<<"$exceptions"
 if jq -se 'any(.[]; .refused | length > 0)' <<<"$checked $exceptions" >/dev/null; then
   exit 1
 fi
