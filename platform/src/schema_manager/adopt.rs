@@ -445,7 +445,16 @@ mod tests {
         }];
         assert!(
             settled(&unmanaged, &unmanaged, &AdoptedSchema::default()).is_empty(),
-            "a snapshot without records adopted nothing, whatever it declared"
+            "a snapshot without records settles nothing, whatever it declared"
+        );
+        assert!(
+            settled(
+                &left,
+                &left,
+                &AdoptedSchema([("notes".to_string(), AdoptedTable::new())].into())
+            )
+            .is_empty(),
+            "records that lack the table"
         );
         assert!(
             settled(&left, &[], &adopted).is_empty(),

@@ -215,14 +215,15 @@ migrations are pending, the adoption is checked in two steps:
    migration of the release was written to repair. A table that is new,
    whose declaration changed, or that the running version declared managed
    waits for the migrations: the platform made that one, and never checked
-   its shape as adopted, so a migration may bring it into line. A version
-   that adopted a table has always recorded it (since v0.31.0, which
-   brought both), so a running version stored without adoption records
-   adopted nothing. The search configuration a waiting table names waits
-   too, since a migration may create it. On a service's first deploy every
-   table waits, and so does its schema: the first plan of a service whose
-   schema the deploy makes reports the schema as missing, deferred, rather
-   than refusing.
+   its shape as adopted, so a migration may bring it into line. Since
+   v0.31.0 every version that adopted a table has recorded it. A running
+   version stored without adoption records, which only an earlier release
+   could have written, settles nothing: its tables wait for the migrations
+   and are checked after them. The search configuration a waiting table
+   names waits too, since a migration may create it. On a service's first
+   deploy every table waits, and so does its schema: the first plan of a
+   service whose schema the deploy makes reports the schema as missing,
+   deferred, rather than refusing.
 2. After the SQL migrations, on a fresh read of the database and before
    `on_migrate`, the destructive changes and activation, every adopted
    table is checked again.

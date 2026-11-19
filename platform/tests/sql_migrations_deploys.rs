@@ -1507,12 +1507,14 @@ async fn an_adopted_search_config_a_pending_migration_makes_is_checked_after_it(
         "a plan does not look for what the migrations are to create: {plan}"
     );
     assert!(
-        plan["plan"]["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .all(|warning| !warning.to_string().contains("loan_english")),
-        "{plan}"
+        match &plan["plan"]["warnings"] {
+            Value::Null => true,
+            Value::Array(warnings) => warnings
+                .iter()
+                .all(|warning| !warning.to_string().contains("loan_english")),
+            _ => false,
+        },
+        "warnings are absent or a list, and none names the configuration: {plan}"
     );
     let body = d.deployed(searched(&made)).await;
     assert_eq!(versions(&body["plan"]["sql_migrations"]["applied"]), [3]);

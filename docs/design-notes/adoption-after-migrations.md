@@ -71,9 +71,11 @@ When it holds, the check is made in two steps:
        the records are empty, and `StoredSnapshot::Adopting` otherwise;
        a module upload that keeps the running manifest keeps its
        records;
-     - the records and the check arrived together in the first public
-       commit, b85f228 (v0.31.0), so no release stored an adopted table
-       without its record.
+     - since v0.31.0 every version that adopted a table has recorded
+       it. A version stored without records, which only an earlier
+       release could have written, settles nothing: its tables wait for
+       the migrations and are checked after them
+       (`a_snapshot_without_records_settles_nothing`).
      `a_snapshot_that_adopts_nothing_is_stored_as_every_release_stored_it`,
      `a_table_adopted_with_no_column_recorded_keeps_the_snapshot_adopting`
      and `every_table_accepted_is_recorded_even_with_no_column_declared`
