@@ -271,7 +271,9 @@ pub(in crate::app) fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/api/services/{id}/web/artifacts/{sha256}/parts",
-            post(api::web::assemble_web_bundle),
+            post(api::web::assemble_web_bundle).layer(DefaultBodyLimit::max(
+                crate::deployer::web::ASSEMBLY_MAX_BYTES,
+            )),
         )
         .route(
             "/api/services/{id}/web/parts/{sha256}",

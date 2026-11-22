@@ -5,16 +5,25 @@ use crate::storage::S3Storage;
 use crate::AppState;
 use cufflink_types::features::{WEB_BUNDLE_PARTS, WEB_RELEASES};
 use cufflink_types::ServiceMode;
+use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 pub const FEATURES: &[&str] = &[WEB_RELEASES, WEB_BUNDLE_PARTS];
 
 pub(crate) const PART_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) const ASSEMBLY_MAX_BYTES: usize = 128 * 1024;
+
+const ASSEMBLY_MAX_PARTS: usize = 1024;
+
+const PARTS_READ_AHEAD: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,13 +118,7 @@ fn is_sha256(candidate: &str) -> bool {
 }
 
 pub(crate) fn require_sha256(candidate: &str) -> PlatformResult<()> {
-    if is_sha256(candidate) {
-        Ok(())
-    } else {
-        Err(PlatformError::BadRequest(format!(
-            "'{candidate}' is not a bundle's SHA-256 (64 lowercase hex digits)"
-        )))
-    }
+    Object::Bundle.require_sha256(candidate)
 }
 
 pub(crate) fn require_web(name: &str, running: Option<&ServiceMode>) -> PlatformResult<()> {
@@ -130,13 +133,7 @@ pub(crate) fn require_web(name: &str, running: Option<&ServiceMode>) -> Platform
 }
 
 pub(crate) fn require_content(sha256: &str, actual: &str) -> PlatformResult<()> {
-    if sha256 == actual {
-        Ok(())
-    } else {
-        Err(PlatformError::Validation(format!(
-            "the bundle's SHA-256 is {actual}, not {sha256}"
-        )))
-    }
+    Object::Bundle.require_content(sha256, actual)
 }
 
 async fn stored_size(storage: &S3Storage, key: &str) -> PlatformResult<Option<u64>> {
@@ -148,7 +145,7 @@ async fn stored_size(storage: &S3Storage, key: &str) -> PlatformResult<Option<u6
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Object {
+pub(crate) enum Object {
     Bundle,
     Part,
 }
@@ -158,6 +155,28 @@ impl Object {
         match self {
             Object::Bundle => "bundle",
             Object::Part => "part",
+        }
+    }
+
+    pub(crate) fn require_sha256(self, candidate: &str) -> PlatformResult<()> {
+        if is_sha256(candidate) {
+            Ok(())
+        } else {
+            Err(PlatformError::BadRequest(format!(
+                "'{candidate}' is not a {}'s SHA-256 (64 lowercase hex digits)",
+                self.name()
+            )))
+        }
+    }
+
+    pub(crate) fn require_content(self, sha256: &str, actual: &str) -> PlatformResult<()> {
+        if sha256 == actual {
+            Ok(())
+        } else {
+            Err(PlatformError::Validation(format!(
+                "the {}'s SHA-256 is {actual}, not {sha256}",
+                self.name()
+            )))
         }
     }
 
@@ -253,47 +272,20 @@ fn missing_part(part: &str, bundle: &str) -> PlatformError {
     ))
 }
 
-fn ordered(
-    assembly: &Assembly,
-    sha256: &str,
-    uploaded: Vec<Artifact>,
-) -> PlatformResult<Vec<Artifact>> {
-    let parts = assembly
-        .parts
-        .iter()
-        .map(|part| {
-            uploaded
-                .iter()
-                .find(|uploaded| &uploaded.hash == part)
-                .cloned()
-                .ok_or_else(|| missing_part(part, sha256))
-        })
-        .collect::<PlatformResult<Vec<_>>>()?;
-    let held = parts.iter().map(|part| part.size).sum::<i64>();
-    if u64::try_from(held).ok() == Some(assembly.size) {
-        Ok(parts)
-    } else {
-        Err(PlatformError::Validation(format!(
-            "the parts of bundle {sha256} hold {held} bytes, not {}",
-            assembly.size
-        )))
-    }
-}
-
-fn require_assembly(assembly: &Assembly) -> PlatformResult<usize> {
-    if assembly.parts.is_empty() {
-        return Err(PlatformError::BadRequest(
-            "a bundle is assembled from at least one part".into(),
-        ));
+fn require_assembly(assembly: &Assembly) -> PlatformResult<i64> {
+    if !(1..=ASSEMBLY_MAX_PARTS).contains(&assembly.parts.len()) {
+        return Err(PlatformError::BadRequest(format!(
+            "a bundle is assembled from 1 to {ASSEMBLY_MAX_PARTS} parts, not {}",
+            assembly.parts.len()
+        )));
     }
     assembly
         .parts
         .iter()
-        .map(String::as_str)
-        .try_for_each(require_sha256)?;
-    usize::try_from(assembly.size)
-        .ok()
-        .filter(|size| *size <= crate::app::layers::ARTIFACT_BODY_LIMIT)
+        .try_for_each(|part| Object::Part.require_sha256(part))?;
+    Some(assembly.size)
+        .filter(|size| *size <= crate::app::layers::ARTIFACT_BODY_LIMIT as u64)
+        .and_then(|size| i64::try_from(size).ok())
         .ok_or_else(|| {
             PlatformError::PayloadTooLarge(format!(
                 "a bundle of {} bytes is larger than the {} a bundle may hold",
@@ -303,103 +295,184 @@ fn require_assembly(assembly: &Assembly) -> PlatformResult<usize> {
         })
 }
 
-async fn read_part(storage: &S3Storage, part: &Artifact, bundle: &str) -> PlatformResult<Vec<u8>> {
-    let bytes = storage
-        .download(&part.s3_key)
-        .await
-        .map_err(|e| PlatformError::Internal(format!("Failed to read {}: {e}", part.s3_key)))?;
-    if i64::try_from(bytes.len()).ok() == Some(part.size) {
-        Ok(bytes)
+fn ordered(
+    assembly: &Assembly,
+    bundle: &Artifact,
+    recorded: &[Artifact],
+) -> PlatformResult<Vec<Artifact>> {
+    let recorded = recorded
+        .iter()
+        .map(|part| (part.hash.as_str(), part))
+        .collect::<HashMap<_, _>>();
+    let parts = assembly
+        .parts
+        .iter()
+        .map(|part| {
+            recorded
+                .get(part.as_str())
+                .map(|part| (*part).clone())
+                .ok_or_else(|| missing_part(part, &bundle.hash))
+        })
+        .collect::<PlatformResult<Vec<_>>>()?;
+    let held = parts.iter().map(|part| part.size).sum::<i64>();
+    if held == bundle.size {
+        Ok(parts)
     } else {
-        Err(missing_part(&part.hash, bundle))
+        Err(PlatformError::Validation(format!(
+            "the parts of bundle {} hold {held} bytes, not {}",
+            bundle.hash, bundle.size
+        )))
+    }
+}
+
+async fn opened(
+    storage: S3Storage,
+    part: Artifact,
+    bundle: String,
+) -> eyre::Result<BoxStream<'static, eyre::Result<bytes::Bytes>>> {
+    match storage
+        .open_read(storage.primary_bucket(), &part.s3_key)
+        .await?
+    {
+        Some(reader) if reader.size == u64::try_from(part.size).ok() => Ok(reader.stream),
+        _ => Err(eyre::Report::new(missing_part(&part.hash, &bundle))),
+    }
+}
+
+fn verified(
+    storage: &S3Storage,
+    bundle: &Artifact,
+    parts: Vec<Artifact>,
+) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
+    let (storage, sha256) = (storage.clone(), bundle.hash.clone());
+    let read = stream::iter(parts)
+        .map(move |part| opened(storage.clone(), part, sha256.clone()))
+        .buffered(PARTS_READ_AHEAD)
+        .try_flatten()
+        .boxed();
+    stream::try_unfold(
+        (read, Sha256::new(), bundle.hash.clone()),
+        |(mut read, mut digest, sha256)| async move {
+            match read.try_next().await? {
+                Some(chunk) => {
+                    digest.update(&chunk);
+                    Ok(Some((chunk, (read, digest, sha256))))
+                }
+                None => Object::Bundle
+                    .require_content(&sha256, &hex::encode(digest.finalize()))
+                    .map(|()| None)
+                    .map_err(eyre::Report::new),
+            }
+        },
+    )
+    .boxed()
+}
+
+async fn streamed(
+    storage: &S3Storage,
+    bundle: &Artifact,
+    parts: Vec<Artifact>,
+) -> PlatformResult<Stored> {
+    let streamed = storage
+        .upload_stream(
+            &bundle.s3_key,
+            verified(storage, bundle, parts),
+            Object::Bundle.content_type(),
+        )
+        .await;
+    match streamed {
+        Ok(_) => {
+            info!(key = %bundle.s3_key, size = bundle.size, "Web bundle assembled");
+            Ok(Stored::Uploaded)
+        }
+        Err(e) => match stored_size(storage, &bundle.s3_key).await? {
+            Some(stored) if i64::try_from(stored).ok() == Some(bundle.size) => Ok(Stored::Present),
+            _ => Err(e.downcast::<PlatformError>().unwrap_or_else(|e| {
+                PlatformError::Internal(format!("Failed to store {}: {e}", bundle.s3_key))
+            })),
+        },
+    }
+}
+
+async fn remove_parts(state: &AppState, service_id: Uuid, parts: Vec<Artifact>) {
+    let Ok(storage) = storage(state) else {
+        return;
+    };
+    let removed = stream::iter(parts)
+        .filter_map(|part| async move {
+            match storage
+                .delete_from_bucket(storage.primary_bucket(), &part.s3_key)
+                .await
+            {
+                Ok(()) => Some(part.hash),
+                Err(e) => {
+                    warn!(
+                        %service_id,
+                        key = %part.s3_key,
+                        error = %e,
+                        "Could not remove a web bundle's part; the sweep tries again once it is past its retention"
+                    );
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+    if removed.is_empty() {
+        return;
+    }
+    let forgotten = async {
+        crate::repo::web_upload_parts::forget(&state.platform_db.get().await?, service_id, &removed)
+            .await
+    }
+    .await;
+    if let Err(e) = forgotten {
+        warn!(%service_id, error = %e, "Could not forget the removed parts of a web bundle");
     }
 }
 
 async fn assembled(
-    storage: &S3Storage,
-    parts: &[Artifact],
-    sha256: &str,
-    size: usize,
-) -> PlatformResult<bytes::Bytes> {
-    let sizes = futures_util::future::try_join_all(
-        parts.iter().map(|part| stored_size(storage, &part.s3_key)),
-    )
-    .await?;
-    if let Some((part, _)) = parts
-        .iter()
-        .zip(sizes)
-        .find(|(part, stored)| stored.and_then(|size| i64::try_from(size).ok()) != Some(part.size))
-    {
-        return Err(missing_part(&part.hash, sha256));
-    }
-    let bundle = futures_util::stream::iter(parts)
-        .then(|part| read_part(storage, part, sha256))
-        .try_fold(Vec::with_capacity(size), |mut bundle, part| async move {
-            bundle.extend_from_slice(&part);
-            Ok(bundle)
-        })
-        .await?;
-    require_content(sha256, &crate::wasm_runtime::sha256_hex(&bundle))?;
-    Ok(bundle.into())
-}
-
-async fn forget_parts(state: &AppState, service_id: Uuid, parts: &[Artifact]) {
-    let hashes = parts
-        .iter()
-        .map(|part| part.hash.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let forgotten = async {
-        crate::repo::web_upload_parts::forget(&state.platform_db.get().await?, service_id, &hashes)
-            .await
-    }
-    .await;
-    match (forgotten, storage(state)) {
-        (Ok(keys), Ok(storage)) => {
-            for key in keys {
-                if let Err(e) = storage.delete(&key).await {
-                    warn!(%service_id, key, error = %e, "Could not remove an assembled bundle's part");
-                }
-            }
-        }
-        (Err(e), _) | (_, Err(e)) => warn!(
-            %service_id,
-            error = %e,
-            "Could not remove an assembled bundle's parts; the sweep removes them once past their retention"
-        ),
-    }
-}
-
-pub(crate) async fn assemble(
     state: &AppState,
     service_id: Uuid,
     sha256: &str,
     assembly: &Assembly,
     uploaded_by: &str,
 ) -> PlatformResult<(Artifact, Stored)> {
-    let size = require_assembly(assembly)?;
-    let storage = storage(state)?;
     let bundle = Artifact {
         s3_key: object_key(service_id, sha256),
         hash: sha256.to_string(),
-        size: i64::try_from(size)
-            .map_err(|_| PlatformError::BadRequest("the bundle is too large".into()))?,
+        size: require_assembly(assembly)?,
     };
-    if stored_size(storage, &bundle.s3_key).await? == Some(assembly.size) {
-        return record_upload(state, service_id, (bundle, Stored::Present), uploaded_by).await;
-    }
-    let uploaded = crate::repo::web_upload_parts::find(
+    let storage = storage(state)?;
+    let recorded = crate::repo::web_upload_parts::find(
         &state.platform_db.get().await?,
         service_id,
         &assembly.parts,
     )
     .await?;
-    let parts = ordered(assembly, sha256, uploaded)?;
-    let bytes = assembled(storage, &parts, sha256, size).await?;
-    let stored = store(state, service_id, sha256, bytes, uploaded_by).await?;
-    forget_parts(state, service_id, &parts).await;
+    let stored = if stored_size(storage, &bundle.s3_key).await? == Some(assembly.size) {
+        Stored::Present
+    } else {
+        streamed(storage, &bundle, ordered(assembly, &bundle, &recorded)?).await?
+    };
+    let stored = record_upload(state, service_id, (bundle, stored), uploaded_by).await?;
+    remove_parts(state, service_id, recorded).await;
     Ok(stored)
+}
+
+pub(crate) async fn assemble(
+    state: Arc<AppState>,
+    service_id: Uuid,
+    sha256: String,
+    assembly: Assembly,
+    uploaded_by: String,
+) -> PlatformResult<(Artifact, Stored)> {
+    let bundle = sha256.clone();
+    tokio::spawn(
+        async move { assembled(&state, service_id, &sha256, &assembly, &uploaded_by).await },
+    )
+    .await
+    .map_err(|e| PlatformError::Internal(format!("The assembly of bundle {bundle} stopped: {e}")))?
 }
 
 fn claimed(
@@ -452,9 +525,7 @@ pub(crate) async fn sweep(state: &AppState, service_id: Uuid) {
             for key in bundles {
                 super::artifacts::remove_orphan(state, &key, "unreleased upload").await;
             }
-            for key in parts {
-                super::artifacts::remove_orphan(state, &key, "unassembled part").await;
-            }
+            remove_parts(state, service_id, parts).await;
         }
         Err(e) => warn!(
             %service_id,

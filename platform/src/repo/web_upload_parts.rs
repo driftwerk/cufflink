@@ -52,34 +52,30 @@ pub async fn forget(
     client: &impl GenericClient,
     service_id: Uuid,
     sha256s: &[String],
-) -> PlatformResult<Vec<String>> {
-    Ok(client
-        .query(
-            "DELETE FROM web_upload_parts WHERE service_id = $1 AND sha256 = ANY($2)
-             RETURNING s3_key",
+) -> PlatformResult<()> {
+    client
+        .execute(
+            "DELETE FROM web_upload_parts WHERE service_id = $1 AND sha256 = ANY($2)",
             &[&service_id, &sha256s],
         )
-        .await?
-        .iter()
-        .map(|row| row.get(0))
-        .collect())
+        .await?;
+    Ok(())
 }
 
 pub async fn expired(
     client: &impl GenericClient,
     service_id: Uuid,
     retention: Duration,
-) -> PlatformResult<Vec<String>> {
+) -> PlatformResult<Vec<Artifact>> {
     Ok(client
         .query(
-            "DELETE FROM web_upload_parts
-             WHERE service_id = $1 AND uploaded_at < now() - make_interval(secs => $2::bigint)
-             RETURNING s3_key",
+            "SELECT s3_key, sha256, size FROM web_upload_parts
+             WHERE service_id = $1 AND uploaded_at < now() - make_interval(secs => $2::bigint)",
             &[&service_id, &super::web_uploads::seconds(retention)],
         )
         .await?
         .iter()
-        .map(|row| row.get(0))
+        .map(artifact)
         .collect())
 }
 
@@ -148,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_part_is_found_by_its_service_and_forgotten_once() {
+    async fn a_part_is_found_by_its_service_until_it_is_forgotten() {
         let Some((_db, pool, site, shop)) = migrated().await else {
             return;
         };
@@ -171,18 +167,12 @@ mod tests {
             "a part belongs to its service"
         );
 
-        assert_eq!(
-            forget(&client, site, &hashes(&[&first]))
-                .await
-                .expect("forgotten"),
-            vec![first.s3_key.clone()]
-        );
-        assert_eq!(
-            forget(&client, site, &hashes(&[&first]))
-                .await
-                .expect("forgotten again"),
-            Vec::<String>::new()
-        );
+        forget(&client, site, &hashes(&[&first]))
+            .await
+            .expect("forgotten");
+        forget(&client, site, &hashes(&[&first]))
+            .await
+            .expect("forgotten again");
         assert_eq!(
             find(&client, site, &wanted).await.expect("read"),
             vec![second]
@@ -190,7 +180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_removes_only_the_services_parts_past_the_retention() {
+    async fn expired_lists_only_the_services_parts_past_the_retention() {
         let Some((_db, pool, site, shop)) = migrated().await else {
             return;
         };
@@ -209,21 +199,24 @@ mod tests {
         assert_eq!(
             expired(&client, site, Duration::from_secs(86_400))
                 .await
-                .expect("swept"),
-            vec![old.s3_key.clone()]
+                .expect("listed"),
+            vec![old],
+            "only the service's own parts past the retention"
         );
         assert_eq!(
-            find(&client, site, &hashes(&[&old, &recent]))
+            expired(&client, shop, Duration::from_secs(86_400))
                 .await
-                .expect("read"),
-            vec![recent]
+                .expect("listed"),
+            vec![others]
         );
         assert_eq!(
-            find(&client, shop, &hashes(&[&others]))
-                .await
-                .expect("read"),
-            vec![others],
-            "another service's parts are its own sweep's"
+            sorted(
+                find(&client, site, &hashes(&[&part(site, 0x1a, 8), &recent]))
+                    .await
+                    .expect("read")
+            ),
+            vec![part(site, 0x1a, 8), recent],
+            "listing removes nothing"
         );
     }
 }

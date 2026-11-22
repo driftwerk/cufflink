@@ -427,6 +427,10 @@ A web app is released with its bundle from v0.38.0 on (`web_releases`):
 | older | new | works as before, but safer: the deploy that registers the app before its build is accepted with a warning and skipped by its manifest alone, and its upload never replaces a recorded bundle, releasing new content as a new version. A failed build after a changed `package.json` version can still leave a version with no bundle. Upgrade the CLI with the platform |
 | older | older | as before |
 
+The web runner is independent of both: a runner of any release reads the
+content keys as it reads the earlier ones, since they are opaque, and
+switches on the events of releases and rollbacks alike.
+
 A web bundle above 32 MiB goes up in parts from v0.40.0 on (`web_bundle_parts`):
 
 | CLI | Platform | Outcome |
@@ -438,10 +442,6 @@ A web bundle above 32 MiB goes up in parts from v0.40.0 on (`web_bundle_parts`):
 While replicas of both releases run, a part or assembly that reaches an
 older replica is answered `404` or `405`, the CLI says a platform upgrade
 may be in progress, and nothing is released.
-
-The web runner is independent of both: a runner of any release reads the
-content keys as it reads the earlier ones, since they are opaque, and
-switches on the events of releases and rollbacks alike.
 
 ## Rolling a platform back
 
@@ -1416,16 +1416,25 @@ variable.
   then asks the platform to assemble them with
   `POST /api/services/{id}/web/artifacts/{sha256}/parts`. Each part is its
   own request under the CLI's 120 s request timeout, so a slow link no
-  longer has to carry the whole bundle in 120 s. A part that fails stops
-  the upload and releases nothing.
+  longer has to carry the whole bundle in 120 s. A part or an assembly
+  that gets no answer, or a `5xx`, `408` or `429`, is sent again, up to
+  three times in all, and only that request is sent again. Any other
+  refusal stops the upload and releases nothing.
 - The platform takes a part of at most 16 MiB, stores it by content and
-  records it in `web_upload_parts`. Assembly reads the parts in order,
-  refuses them with a `422` unless their bytes are the bundle's hash, and
-  only then stores the bundle at its content key, as the single upload
-  does, with the same answer, audit record and
-  `cufflink_web_uploads_total` count. The parts are then removed; any left
-  behind are removed with the unreleased bundles, once older than
-  `WEB_UPLOAD_RETENTION_SECS`.
+  records it in `web_upload_parts`. Assembly names 1 to 1024 parts. It
+  streams them in order into the bundle's content key, through the same
+  multipart upload as a large single upload, hashing as it goes, and
+  completes the object only when the bytes are the bundle's hash;
+  otherwise it answers `422` and nothing is stored. It holds a few parts
+  in memory rather than the bundle, runs on even when its request is
+  dropped, and answers an assembly asked again once the bundle is stored
+  with `"stored": "present"`. Its answer, audit record and
+  `cufflink_web_uploads_total` count are the single upload's. The parts
+  are then removed; any left behind are removed with the unreleased
+  bundles, once older than `WEB_UPLOAD_RETENTION_SECS`.
+- `cufflink-storage`: `ObjectStorage::upload_stream` stores what a stream
+  yields, in parts above the multipart threshold, and stores nothing when
+  the stream yields an error.
 
 ## Changes in v0.39.0
 

@@ -958,12 +958,15 @@ steps, and only the last one changes what runs:
      body does not hash to the path), answering `sha256`, `size` and
      `stored`.
    - `POST /api/services/{id}/web/artifacts/{sha256}/parts` with
-     `{"size": 41234567, "parts": ["…", …]}` assembles the parts in order.
-     A part not uploaded, or no longer stored, is named in a `409`; parts
-     that do not add up to `size` or do not hash to `{sha256}` are refused
-     with a `422`, and nothing is stored at the bundle's key. Otherwise the
-     bundle is stored and answered as the single upload is, and its parts
-     are removed. Parts never assembled are removed once older than
+     `{"size": 41234567, "parts": ["…", …]}`, naming 1 to 1024 parts,
+     streams the parts in order into the bundle's key. A part not
+     uploaded, or no longer stored, is named in a `409`; parts that do not
+     add up to `size` or do not hash to `{sha256}` are refused with a
+     `422`, and nothing is stored at the bundle's key. Otherwise the bundle
+     is stored and answered as the single upload is, and its parts are
+     removed. The assembly runs on when its request is dropped, and asked
+     again once the bundle is stored it answers `"stored": "present"`.
+     Parts never assembled are removed once older than
      `WEB_UPLOAD_RETENTION_SECS`.
 4. **Release.** `POST /api/services/deploy` with the manifest and
    `"web_artifact": {"sha256": "…", "size": 41234567}`. Under the
@@ -995,8 +998,10 @@ steps, and only the last one changes what runs:
 5. It uploads the bundle by its SHA-256, unless the running version
    already records that bundle. On a platform with `web_bundle_parts`, a
    bundle above 32 MiB goes up as parts of 8 MiB, four at a time, each
-   under the CLI's 120 s request timeout, and is then assembled; the first
-   part that fails stops the upload, and nothing is released.
+   under the CLI's 120 s request timeout, and is then assembled. A part or
+   assembly that gets no answer, a `5xx`, `408` or `429` is sent again, up
+   to three times in all; any other refusal stops the upload, and nothing
+   is released.
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
    bundle not uploaded, or no longer stored, or another deploy holding the
    lock) is answered by one more upload and one more release; a second

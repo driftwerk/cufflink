@@ -1207,6 +1207,14 @@ async fn a_bundle_assembled_from_its_parts_is_stored_released_and_its_parts_remo
     for part in PARTED {
         assert_eq!(w.stored(&World::part_key(&service_id, part)).await, None);
     }
+    let (status, again) = w
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts)
+        .await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(
+        again["stored"], "present",
+        "an assembly asked again once it is stored needs none of its parts"
+    );
     w.heard_nothing().await;
 
     let (status, released) = w
@@ -1224,17 +1232,111 @@ async fn a_bundle_already_stored_is_assembled_without_reading_a_part() {
     let service_id = w.reserved().await;
     let bundle = whole(&PARTED);
     w.uploaded(&service_id, &bundle).await;
+    let mut named = w.sent_in_parts(&service_id, &PARTED[..1]).await;
+    named.push(sha256_hex(b"never uploaded"));
 
     let (status, assembled) = w
-        .assemble(
-            &service_id,
-            &sha256_hex(&bundle),
-            bundle.len(),
-            &[sha256_hex(b"never uploaded")],
-        )
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &named)
         .await;
     assert_eq!(status, 200, "{assembled}");
     assert_eq!(assembled["stored"], "present");
+    assert!(
+        w.parts(&service_id).await.is_empty(),
+        "the parts it names are removed"
+    );
+    assert_eq!(
+        w.stored(&World::part_key(&service_id, PARTED[0])).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_bundle_above_the_multipart_threshold_streams_from_its_parts_only_when_it_is_its_hash() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let parts = [b'a', b'b', b'c'].map(|byte| vec![byte; 12 * 1024 * 1024]);
+    let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let bundle = whole(&slices);
+    let hashes = w.sent_in_parts(&service_id, &slices).await;
+
+    let claimed = sha256_hex(b"a bundle of other bytes");
+    let (status, refused) = w
+        .assemble(&service_id, &claimed, bundle.len(), &hashes)
+        .await;
+    assert_eq!(status, 422, "{refused}");
+    assert_eq!(
+        w.stored(&format!("web/{service_id}/{claimed}.tar.gz"))
+            .await,
+        None,
+        "a stream that is not its hash is never completed"
+    );
+    assert_eq!(w.parts(&service_id).await.len(), slices.len());
+
+    let (status, assembled) = w
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &hashes)
+        .await;
+    assert_eq!(status, 200, "{assembled}");
+    assert_eq!(assembled["stored"], "uploaded");
+    assert!(
+        w.stored(&World::key(&service_id, &bundle)).await == Some(bundle),
+        "the bundle is its parts in order"
+    );
+    assert!(w.parts(&service_id).await.is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_assemblies_of_the_same_bundle_both_answer_and_store_it_once() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = whole(&PARTED);
+    let parts = w.sent_in_parts(&service_id, &PARTED).await;
+
+    let ((first, a), (second, b)) = tokio::join!(
+        w.assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts),
+        w.assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts)
+    );
+    assert_eq!((first, second), (200, 200), "{a} {b}");
+    assert_eq!(
+        w.stored(&World::key(&service_id, &bundle)).await,
+        Some(bundle.clone())
+    );
+    assert_eq!(
+        w.uploads(&service_id).await,
+        [(sha256_hex(&bundle), World::key(&service_id, &bundle))]
+    );
+    assert!(w.parts(&service_id).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_part_recorded_but_no_longer_stored_is_named_in_a_conflict() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = whole(&PARTED);
+    let parts = w.sent_in_parts(&service_id, &PARTED).await;
+    w.storage
+        .delete(&World::part_key(&service_id, PARTED[2]))
+        .await
+        .expect("deleted");
+
+    let (status, refused) = w
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts)
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused.to_string().contains(&format!(
+            "part {} of bundle {} was not uploaded, or is no longer stored",
+            parts[2],
+            sha256_hex(&bundle)
+        )),
+        "{refused}"
+    );
+    assert_eq!(w.stored(&World::key(&service_id, &bundle)).await, None);
 }
 
 #[tokio::test]
@@ -1305,6 +1407,27 @@ async fn an_assembly_of_parts_that_are_not_the_bundle_stores_nothing() {
         )
         .await;
     assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("'3F9A' is not a part's SHA-256"),
+        "{refused}"
+    );
+    let (status, refused) = w
+        .assemble(
+            &service_id,
+            &sha256_hex(&bundle),
+            bundle.len(),
+            &vec![parts[0].clone(); 1025],
+        )
+        .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("a bundle is assembled from 1 to 1024 parts, not 1025"),
+        "{refused}"
+    );
     let (status, refused) = w
         .assemble(
             &service_id,

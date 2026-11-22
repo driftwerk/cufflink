@@ -60,12 +60,13 @@ pub async fn reserve_web_app(
     })))
 }
 
-async fn require_web_bundle(
+async fn require_web_object(
     state: &AppState,
     service: &crate::repo::services::Service,
+    object: web::Object,
     sha256: &str,
 ) -> PlatformResult<()> {
-    web::require_sha256(sha256)?;
+    object.require_sha256(sha256)?;
     let running = crate::repo::deployments::current_mode(&state.platform_db, service.id).await?;
     web::require_web(&service.name, running.as_ref())
 }
@@ -118,7 +119,7 @@ pub async fn upload_web_bundle(
     let service =
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     let stored = async {
-        require_web_bundle(&state, &service, &sha256).await?;
+        require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
         web::require_content(&sha256, &sha256_hex(&body))?;
         web::store(&state, service_id, &sha256, body, &user.subject).await
     }
@@ -135,8 +136,8 @@ pub async fn upload_web_part(
     let service_id = service_id(&id)?;
     let service =
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
-    require_web_bundle(&state, &service, &sha256).await?;
-    web::require_content(&sha256, &sha256_hex(&body))?;
+    require_web_object(&state, &service, web::Object::Part, &sha256).await?;
+    web::Object::Part.require_content(&sha256, &sha256_hex(&body))?;
     let (part, stored) = web::store_part(&state, service_id, &sha256, body).await?;
     Ok(Json(json!({
         "sha256": part.hash,
@@ -155,8 +156,15 @@ pub async fn assemble_web_bundle(
     let service =
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     let stored = async {
-        require_web_bundle(&state, &service, &sha256).await?;
-        web::assemble(&state, service_id, &sha256, &assembly, &user.subject).await
+        require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
+        web::assemble(
+            Arc::clone(&state),
+            service_id,
+            sha256,
+            assembly,
+            user.subject.clone(),
+        )
+        .await
     }
     .await;
     uploaded(&state, &user, &service, stored).await
