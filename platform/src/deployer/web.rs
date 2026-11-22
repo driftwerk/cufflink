@@ -465,10 +465,12 @@ async fn remove_parts(state: &AppState, service_id: Uuid, parts: Vec<Artifact>) 
     }
 }
 
+type Running = Arc<std::sync::Mutex<HashMap<(Uuid, String), Arc<tokio::sync::Mutex<()>>>>>;
+
 #[derive(Clone)]
 pub(crate) struct Assemblies {
     slots: Arc<tokio::sync::Semaphore>,
-    running: Arc<std::sync::Mutex<HashMap<(Uuid, String), Arc<tokio::sync::Mutex<()>>>>>,
+    running: Running,
 }
 
 impl Default for Assemblies {
@@ -481,7 +483,7 @@ impl Default for Assemblies {
 }
 
 struct Turn {
-    running: Arc<std::sync::Mutex<HashMap<(Uuid, String), Arc<tokio::sync::Mutex<()>>>>>,
+    running: Running,
     key: (Uuid, String),
     held: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
