@@ -45,7 +45,7 @@ pub(super) async fn read(body: Body, limit: usize) -> Result<Bytes, Response> {
     })
 }
 
-fn refusal(e: &(dyn std::error::Error + Send + Sync)) -> Response {
+fn refusal(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response {
     if e.downcast_ref::<LengthLimitError>().is_some() {
         too_large()
     } else {
