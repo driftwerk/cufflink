@@ -1411,6 +1411,40 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.40.1
+
+Unreleased.
+
+Timings of a web upload, in the deploy's output and the platform's log
+([design](design-notes/web-bundle-parts.md#9-timings-of-an-upload)), so
+that a slow upload says where its time went: the parts on the network,
+the platform's writes to object storage, the wait for an assembly or the
+assembly's reads and writes. It changes no manifest, SDK or host function,
+needs no migration and adds no setting.
+
+- `cufflink deploy` of a web app prints a line for every attempt at a part
+  or an assembly: a part's bytes, time and rate, an assembly's time, or a
+  failed attempt's reason and how long it waited for it. The retry line
+  keeps its words and gains that time, and the last attempt of a request
+  that fails for good prints it too. The upload ends with `Sent {MB} in
+  {s} ({MB/s})`, followed for a bundle in parts by the time spent sending
+  the parts and on the assembly. A part is numbered by its place in the
+  bundle in every line, a part sent again included.
+- The CLI adds `?bundle={sha256}&index={n}` to a part's request, which the
+  platform logs and otherwise ignores; an older platform ignores it.
+- The platform logs each part as `Web part stored`, with the time to
+  receive its body (`receive_ms`), to store it (`store_ms`) and in all
+  (`elapsed_ms`), and each assembly as `Web bundle assembly answered`,
+  with its outcome and the time spent waiting for its turn (`turn_ms`) and
+  a slot (`slot_ms`), streaming the bundle (`stream_ms`) and, within that,
+  waiting for the parts' reads (`read_wait_ms`). A part not received, not
+  stored or whose request was dropped, and an assembly that failed or
+  whose request was dropped, are logged at warn with the times they
+  reached ([observability](observability.md#web-uploads)). The lines the
+  store wrote for each part and bundle it stored are gone: the part's line
+  above replaces the first, and the single upload's unchanged `Web bundle
+  uploaded` line the second.
+
 ## Changes in v0.40.0
 
 Web bundles uploaded in parts. One new platform feature,

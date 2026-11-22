@@ -6,14 +6,17 @@ use crate::repo::services::Status;
 use crate::wasm_runtime::sha256_hex;
 use crate::AppState;
 use axum::{
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Query, State},
+    response::{IntoResponse, Response},
     Json,
 };
 use cufflink_types::ServiceMode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -127,23 +130,143 @@ pub async fn upload_web_bundle(
     uploaded(&state, &user, &service, stored).await
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PartHint {
+    bundle: Option<String>,
+    index: Option<String>,
+}
+
+impl PartHint {
+    fn bundle(&self) -> Option<&str> {
+        self.bundle
+            .as_deref()
+            .filter(|bundle| web::is_sha256(bundle))
+            .map(web::short)
+    }
+
+    fn index(&self) -> Option<u32> {
+        self.index.as_deref().and_then(|index| index.parse().ok())
+    }
+}
+
+struct Unanswered<F: FnOnce(Duration)> {
+    started: Instant,
+    dropped: Option<F>,
+}
+
+impl<F: FnOnce(Duration)> Unanswered<F> {
+    fn new(started: Instant, dropped: F) -> Self {
+        Self {
+            started,
+            dropped: Some(dropped),
+        }
+    }
+
+    fn answered(mut self) {
+        self.dropped = None;
+    }
+}
+
+impl<F: FnOnce(Duration)> Drop for Unanswered<F> {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            dropped(self.started.elapsed());
+        }
+    }
+}
+
 pub async fn upload_web_part(
     State(state): State<Arc<AppState>>,
     DeployAuth(user): DeployAuth,
     Path((id, sha256)): Path<(String, String)>,
-    body: axum::body::Bytes,
-) -> PlatformResult<Json<Value>> {
-    let service_id = service_id(&id)?;
-    let service =
-        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
-    require_web_object(&state, &service, web::Object::Part, &sha256).await?;
-    web::Object::Part.require_content(&sha256, &sha256_hex(&body))?;
-    let (part, stored) = web::store_part(&state, service_id, &sha256, body).await?;
-    Ok(Json(json!({
-        "sha256": part.hash,
-        "size": part.size,
-        "stored": stored.as_str(),
-    })))
+    Query(hint): Query<PartHint>,
+    body: Body,
+) -> Result<Json<Value>, Response> {
+    let started = Instant::now();
+    let (part, bundle, index) = (web::short(&sha256), hint.bundle(), hint.index());
+    let body = crate::router::custom::body::received(body, web::PART_MAX_BYTES)
+        .await
+        .map_err(|unread| {
+            warn!(
+                service_id = %id,
+                part,
+                bundle,
+                index,
+                received = unread.received,
+                receive_ms = web::millis(started.elapsed()),
+                status = unread.refusal.status().as_u16(),
+                "Web part not received"
+            );
+            unread.refusal
+        })?;
+    let (size, receive_ms) = (body.len(), web::millis(started.elapsed()));
+    let unanswered = Unanswered::new(started, |elapsed| {
+        warn!(
+            service_id = %id,
+            part,
+            bundle,
+            index,
+            size,
+            receive_ms,
+            elapsed_ms = web::millis(elapsed),
+            "Web part request dropped before its answer"
+        );
+    });
+    let checked = async {
+        let service_id = service_id(&id)?;
+        let service =
+            super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
+        require_web_object(&state, &service, web::Object::Part, &sha256).await?;
+        web::Object::Part.require_content(&sha256, &sha256_hex(&body))?;
+        Ok::<_, PlatformError>(service_id)
+    }
+    .await;
+    let (stored, store_ms) = match checked {
+        Ok(service_id) => {
+            let storing = Instant::now();
+            let stored = web::store_part(&state, service_id, &sha256, body).await;
+            (stored, Some(web::millis(storing.elapsed())))
+        }
+        Err(e) => (Err(e), None),
+    };
+    let elapsed_ms = web::millis(started.elapsed());
+    unanswered.answered();
+    match stored {
+        Ok((part_stored, stored)) => {
+            info!(
+                service_id = %id,
+                part,
+                bundle,
+                index,
+                size,
+                stored = stored.as_str(),
+                receive_ms,
+                store_ms,
+                elapsed_ms,
+                "Web part stored"
+            );
+            Ok(Json(json!({
+                "sha256": part_stored.hash,
+                "size": part_stored.size,
+                "stored": stored.as_str(),
+            })))
+        }
+        Err(e) => {
+            warn!(
+                service_id = %id,
+                part,
+                bundle,
+                index,
+                size,
+                receive_ms,
+                store_ms,
+                elapsed_ms,
+                error = %e,
+                "Web part not stored"
+            );
+            Err(e.into_response())
+        }
+    }
 }
 
 pub async fn assemble_web_bundle(
@@ -154,7 +277,15 @@ pub async fn assemble_web_bundle(
 ) -> PlatformResult<Json<Value>> {
     let service_id = service_id(&id)?;
     let bundle = sha256.clone();
-    tokio::spawn(async move {
+    let unanswered = Unanswered::new(Instant::now(), |elapsed| {
+        warn!(
+            %service_id,
+            bundle = web::short(&bundle),
+            elapsed_ms = web::millis(elapsed),
+            "Web bundle assembly request dropped before its answer; the assembly runs on"
+        );
+    });
+    let assembled = tokio::spawn(async move {
         let service =
             super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
         let assembled = async {
@@ -170,8 +301,11 @@ pub async fn assemble_web_bundle(
             Err(e) => uploaded(&state, &user, &service, Err(e)).await,
         }
     })
-    .await
-    .map_err(|e| PlatformError::Internal(format!("The assembly of bundle {bundle} stopped: {e}")))?
+    .await;
+    unanswered.answered();
+    assembled.map_err(|e| {
+        PlatformError::Internal(format!("The assembly of bundle {bundle} stopped: {e}"))
+    })?
 }
 
 pub async fn upload_web_artifact(

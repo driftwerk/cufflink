@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -92,6 +94,14 @@ enum Legacy {
     Replace,
 }
 
+pub(crate) fn short(sha256: &str) -> &str {
+    sha256.get(..12).unwrap_or(sha256)
+}
+
+pub(crate) fn millis(spent: Duration) -> u64 {
+    u64::try_from(spent.as_millis()).unwrap_or(u64::MAX)
+}
+
 pub(crate) fn object_prefix(service_id: Uuid) -> String {
     format!("web/{service_id}/")
 }
@@ -112,7 +122,7 @@ pub(crate) fn storage(state: &AppState) -> PlatformResult<&S3Storage> {
     })
 }
 
-fn is_sha256(candidate: &str) -> bool {
+pub(crate) fn is_sha256(candidate: &str) -> bool {
     candidate.len() == 64
         && candidate
             .bytes()
@@ -217,7 +227,6 @@ async fn put(
         .upload(&stored.s3_key, Vec::from(bytes), object.content_type())
         .await
         .map_err(|e| PlatformError::Internal(format!("Failed to store {}: {e}", stored.s3_key)))?;
-    info!(%service_id, key = %stored.s3_key, size = stored.size, "Web {} stored", object.name());
     Ok((stored, Stored::Uploaded))
 }
 
@@ -289,6 +298,30 @@ impl From<Missing> for PlatformError {
 pub(crate) enum Assembled {
     Stored((Artifact, Stored)),
     Incomplete(Missing),
+}
+
+impl Assembled {
+    fn outcome(&self) -> &'static str {
+        match self {
+            Assembled::Stored((_, stored)) => stored.as_str(),
+            Assembled::Incomplete(_) => "incomplete",
+        }
+    }
+
+    fn missing(&self) -> Option<usize> {
+        match self {
+            Assembled::Stored(_) => None,
+            Assembled::Incomplete(missing) => Some(missing.parts.len()),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Spent {
+    turn: Duration,
+    slot: Duration,
+    read_wait: Duration,
+    stream: Duration,
 }
 
 fn require_assembly(assembly: &Assembly) -> PlatformResult<i64> {
@@ -374,6 +407,7 @@ fn verified(
     storage: &S3Storage,
     bundle: &Artifact,
     parts: Vec<Artifact>,
+    waited: Arc<AtomicU64>,
 ) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
     let (storage, sha256) = (storage.clone(), bundle.hash.clone());
     let read = stream::iter(parts)
@@ -381,12 +415,18 @@ fn verified(
         .try_flatten()
         .boxed();
     stream::try_unfold(
-        (read, Sha256::new(), bundle.hash.clone()),
-        |(mut read, mut digest, sha256)| async move {
-            match read.try_next().await? {
+        (read, Sha256::new(), bundle.hash.clone(), waited),
+        |(mut read, mut digest, sha256, waited)| async move {
+            let asked = Instant::now();
+            let next = read.try_next().await;
+            waited.fetch_add(
+                u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            match next? {
                 Some(chunk) => {
                     digest.update(&chunk);
-                    Ok(Some((chunk, (read, digest, sha256))))
+                    Ok(Some((chunk, (read, digest, sha256, waited))))
                 }
                 None => Object::Bundle
                     .require_content(&sha256, &hex::encode(digest.finalize()))
@@ -402,19 +442,17 @@ async fn streamed(
     storage: &S3Storage,
     bundle: &Artifact,
     parts: Vec<Artifact>,
+    waited: Arc<AtomicU64>,
 ) -> PlatformResult<Stored> {
     let streamed = storage
         .upload_stream(
             &bundle.s3_key,
-            verified(storage, bundle, parts),
+            verified(storage, bundle, parts, waited),
             Object::Bundle.content_type(),
         )
         .await;
     match streamed {
-        Ok(_) => {
-            info!(key = %bundle.s3_key, size = bundle.size, "Web bundle assembled");
-            Ok(Stored::Uploaded)
-        }
+        Ok(_) => Ok(Stored::Uploaded),
         Err(e) => match stored_size(storage, &bundle.s3_key).await {
             Ok(Some(stored)) if i64::try_from(stored).ok() == Some(bundle.size) => {
                 Ok(Stored::Present)
@@ -528,15 +566,68 @@ pub(crate) async fn assemble(
     assembly: &Assembly,
     uploaded_by: &str,
 ) -> PlatformResult<Assembled> {
+    let started = Instant::now();
+    let mut spent = Spent::default();
+    let assembled = assembling(state, service_id, sha256, assembly, uploaded_by, &mut spent).await;
+    let (bundle, parts, size) = (short(sha256), assembly.parts.len(), assembly.size);
+    let (turn_ms, slot_ms, read_wait_ms, stream_ms, elapsed_ms) = (
+        millis(spent.turn),
+        millis(spent.slot),
+        millis(spent.read_wait),
+        millis(spent.stream),
+        millis(started.elapsed()),
+    );
+    match &assembled {
+        Ok(answered) => info!(
+            %service_id,
+            bundle,
+            parts,
+            size,
+            outcome = answered.outcome(),
+            missing = answered.missing(),
+            turn_ms,
+            slot_ms,
+            read_wait_ms,
+            stream_ms,
+            elapsed_ms,
+            "Web bundle assembly answered"
+        ),
+        Err(e) => warn!(
+            %service_id,
+            bundle,
+            parts,
+            size,
+            turn_ms,
+            slot_ms,
+            read_wait_ms,
+            stream_ms,
+            elapsed_ms,
+            error = %e,
+            "Web bundle not assembled"
+        ),
+    }
+    assembled
+}
+
+async fn assembling(
+    state: &AppState,
+    service_id: Uuid,
+    sha256: &str,
+    assembly: &Assembly,
+    uploaded_by: &str,
+    spent: &mut Spent,
+) -> PlatformResult<Assembled> {
     let bundle = Artifact {
         s3_key: object_key(service_id, sha256),
         hash: sha256.to_string(),
         size: require_assembly(assembly)?,
     };
+    let asked = Instant::now();
     let _turn = state
         .web_assemblies
         .turn((service_id, sha256.to_string()))
         .await;
+    spent.turn = asked.elapsed();
     let storage = storage(state)?;
     let recorded = crate::repo::web_upload_parts::find(
         &state.platform_db.get().await?,
@@ -552,13 +643,20 @@ pub(crate) async fn assemble(
             Err(missing) => return Ok(Assembled::Incomplete(missing)),
         };
         require_held(&bundle, &parts)?;
+        let asked = Instant::now();
         let _slot = state
             .web_assemblies
             .slots
             .acquire()
             .await
             .map_err(|e| PlatformError::Internal(format!("No assembly can start: {e}")))?;
-        streamed(storage, &bundle, parts).await?
+        spent.slot = asked.elapsed();
+        let waited = Arc::new(AtomicU64::new(0));
+        let streaming = Instant::now();
+        let streamed = streamed(storage, &bundle, parts, Arc::clone(&waited)).await;
+        spent.stream = streaming.elapsed();
+        spent.read_wait = Duration::from_micros(waited.load(Ordering::Relaxed));
+        streamed?
     };
     let stored = record_upload(state, service_id, (bundle, stored), uploaded_by).await?;
     remove_parts(state, service_id, recorded).await;

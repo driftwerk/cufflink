@@ -1574,6 +1574,7 @@ async fn deploy_web(
         client: &client,
         name: service_name,
         parts: web_release::Parts::offered(&platform),
+        out: &|line: String| println!("{line}"),
     };
     app.deploy(request, async |service_id: &str| {
         maybe_sync_configs(config, service_id, project, env, Some(&platform)).await?;

@@ -1,4 +1,4 @@
-mod body;
+pub(crate) mod body;
 mod dispatch;
 mod request;
 mod stream;

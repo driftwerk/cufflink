@@ -2,6 +2,7 @@ use crate::errors::PlatformError;
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::BytesMut;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::convert::Infallible;
 
@@ -15,26 +16,48 @@ pub(super) struct Part {
     pub data: Bytes,
 }
 
+pub(crate) struct Unread {
+    pub(crate) received: usize,
+    pub(crate) refusal: Response,
+}
+
+pub(crate) async fn received(body: Body, limit: usize) -> Result<Bytes, Unread> {
+    let mut body = Limited::new(body, limit);
+    let mut buffer = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| Unread {
+            received: buffer.len(),
+            refusal: refusal(&*e),
+        })?;
+        if let Ok(data) = frame.into_data() {
+            buffer.extend_from_slice(&data);
+        }
+    }
+    Ok(buffer.freeze())
+}
+
 pub(super) async fn read(body: Body, limit: usize) -> Result<Bytes, Response> {
-    Limited::new(body, limit)
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .map_err(|e| {
-            if e.downcast_ref::<LengthLimitError>().is_some() {
-                too_large()
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to buffer the request body: {e}"),
-                )
-                    .into_response()
-            }
-        })
+    received(body, limit).await.map_err(|unread| {
+        if unread.refusal.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            rejected("too_large");
+        }
+        unread.refusal
+    })
+}
+
+fn refusal(e: &(dyn std::error::Error + Send + Sync)) -> Response {
+    if e.downcast_ref::<LengthLimitError>().is_some() {
+        too_large()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to buffer the request body: {e}"),
+        )
+            .into_response()
+    }
 }
 
 fn too_large() -> Response {
-    rejected("too_large");
     (
         StatusCode::PAYLOAD_TOO_LARGE,
         "Failed to buffer the request body: length limit exceeded",
@@ -127,6 +150,37 @@ mod tests {
         assert_eq!(body(ours).await.expect("body"), expected_body);
         assert_eq!(
             read(Body::from("1234"), 4).await.expect("fits"),
+            Bytes::from_static(b"1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_or_over_its_limit_says_how_much_of_it_arrived() {
+        let frames = |second: Result<Bytes, std::io::Error>| {
+            Body::from_stream(futures_util::stream::iter([
+                Ok(Bytes::from_static(b"12")),
+                second,
+            ]))
+        };
+        let cut = received(frames(Err(std::io::Error::other("reset"))), 16)
+            .await
+            .expect_err("cut short");
+        assert_eq!(
+            (cut.received, cut.refusal.status()),
+            (2, StatusCode::BAD_REQUEST)
+        );
+        let over = received(frames(Ok(Bytes::from_static(b"345"))), 4)
+            .await
+            .expect_err("over the limit");
+        assert_eq!(
+            (over.received, over.refusal.status()),
+            (2, StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        assert_eq!(
+            received(frames(Ok(Bytes::from_static(b"34"))), 4)
+                .await
+                .map_err(|unread| unread.received)
+                .expect("fits"),
             Bytes::from_static(b"1234")
         );
     }

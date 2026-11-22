@@ -340,11 +340,15 @@ impl World {
     }
 
     async fn put_part(&self, service_id: &str, part: &[u8]) -> (u16, Value) {
+        self.put_part_hinted(service_id, part, "").await
+    }
+
+    async fn put_part_hinted(&self, service_id: &str, part: &[u8], hint: &str) -> (u16, Value) {
         let response = self
             .platform
             .http
             .put(format!(
-                "{}/api/services/{service_id}/web/parts/{}",
+                "{}/api/services/{service_id}/web/parts/{}{hint}",
                 self.platform.base_url,
                 sha256_hex(part)
             ))
@@ -433,6 +437,16 @@ impl World {
 
     fn part_key(service_id: &str, part: &[u8]) -> String {
         format!("web/{service_id}/parts/{}", sha256_hex(part))
+    }
+
+    fn logged(&self, message: &str) -> Vec<Value> {
+        self.platform
+            .output_tail()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|line| line.get("fields").cloned().unwrap_or(line))
+            .filter(|fields| fields["message"] == message)
+            .collect()
     }
 
     async fn stored(&self, key: &str) -> Option<Vec<u8>> {
@@ -1574,5 +1588,196 @@ async fn parts_never_assembled_are_removed_after_their_retention_and_fresh_ones_
     assert_eq!(
         w.parts(&service_id).await,
         [(sha256_hex(fresh), World::part_key(&service_id, fresh))]
+    );
+}
+
+fn short(sha256: &str) -> &str {
+    &sha256[..12]
+}
+
+fn timed(fields: &Value, timings: &[&str]) -> bool {
+    timings.iter().all(|timing| fields[*timing].is_u64())
+}
+
+#[tokio::test]
+async fn each_part_and_assembly_logs_what_it_waited_for() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = whole(&PARTED);
+    let sha256 = sha256_hex(&bundle);
+    let parts = PARTED.map(sha256_hex).to_vec();
+
+    let (status, lacking) = w.assemble(&service_id, &sha256, bundle.len(), &parts).await;
+    assert_eq!(status, 409, "{lacking}");
+    let lacked = w.logged("Web bundle assembly answered");
+    assert_eq!(lacked.len(), 1, "{lacked:?}");
+    assert_eq!(
+        (
+            &lacked[0]["service_id"],
+            &lacked[0]["bundle"],
+            &lacked[0]["parts"],
+            &lacked[0]["size"],
+            &lacked[0]["outcome"],
+            &lacked[0]["missing"],
+        ),
+        (
+            &json!(service_id),
+            &json!(short(&sha256)),
+            &json!(3),
+            &json!(bundle.len()),
+            &json!("incomplete"),
+            &json!(3),
+        )
+    );
+    assert!(timed(&lacked[0], &["turn_ms", "elapsed_ms"]), "{lacked:?}");
+
+    for (part, hint) in PARTED.iter().zip([
+        format!("?bundle={sha256}&index=1"),
+        "?bundle=not-a-hash&index=two".to_string(),
+        String::new(),
+    ]) {
+        let (status, stored) = w.put_part_hinted(&service_id, part, &hint).await;
+        assert_eq!(status, 200, "{stored}");
+    }
+    let stored = w.logged("Web part stored");
+    assert_eq!(stored.len(), 3, "{stored:?}");
+    for (fields, part) in stored.iter().zip(PARTED) {
+        assert_eq!(
+            (
+                &fields["service_id"],
+                &fields["part"],
+                &fields["size"],
+                &fields["stored"]
+            ),
+            (
+                &json!(service_id),
+                &json!(short(&sha256_hex(part))),
+                &json!(part.len()),
+                &json!("uploaded")
+            )
+        );
+        assert!(
+            timed(fields, &["receive_ms", "store_ms", "elapsed_ms"]),
+            "{fields}"
+        );
+    }
+    assert_eq!(
+        (&stored[0]["bundle"], &stored[0]["index"]),
+        (&json!(short(&sha256)), &json!(1)),
+        "a part names the bundle and place its uploader gave"
+    );
+    for unhinted in &stored[1..] {
+        assert!(
+            unhinted.get("bundle").is_none() && unhinted.get("index").is_none(),
+            "a hint that is not a hash and an index is left out: {unhinted}"
+        );
+    }
+
+    let (status, assembled) = w.assemble(&service_id, &sha256, bundle.len(), &parts).await;
+    assert_eq!(status, 200, "{assembled}");
+    let answered = w.logged("Web bundle assembly answered");
+    assert_eq!(answered.len(), 2, "{answered:?}");
+    assert_eq!(
+        (&answered[1]["outcome"], answered[1].get("missing")),
+        (&json!("uploaded"), None)
+    );
+    assert!(
+        timed(
+            &answered[1],
+            &[
+                "turn_ms",
+                "slot_ms",
+                "read_wait_ms",
+                "stream_ms",
+                "elapsed_ms"
+            ]
+        ),
+        "{answered:?}"
+    );
+    assert!(
+        answered[1]["read_wait_ms"].as_u64() <= answered[1]["stream_ms"].as_u64()
+            && answered[1]["stream_ms"].as_u64() <= answered[1]["elapsed_ms"].as_u64(),
+        "the reads are waited on within the stream, and the stream within the assembly: {answered:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_part_or_assembly_that_fails_logs_how_long_it_took() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let claimed = sha256_hex(b"built");
+    let status = w
+        .platform
+        .http
+        .put(format!(
+            "{}/api/services/{service_id}/web/parts/{claimed}?bundle={claimed}&index=4",
+            w.platform.base_url
+        ))
+        .header("authorization", w.deployer())
+        .body(b"something else".to_vec())
+        .send()
+        .await
+        .expect("an answer")
+        .status();
+    assert_eq!(status, 422);
+    let failed = w.logged("Web part not stored");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(
+        (
+            &failed[0]["part"],
+            &failed[0]["bundle"],
+            &failed[0]["index"],
+            &failed[0]["size"]
+        ),
+        (
+            &json!(short(&claimed)),
+            &json!(short(&claimed)),
+            &json!(4),
+            &json!(b"something else".len())
+        )
+    );
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("SHA-256")),
+        "{failed:?}"
+    );
+    assert!(
+        timed(&failed[0], &["receive_ms", "elapsed_ms"]),
+        "{failed:?}"
+    );
+    assert!(
+        failed[0].get("store_ms").is_none(),
+        "a part refused before its write has no write to time: {failed:?}"
+    );
+
+    let parts = w.sent_in_parts(&service_id, &PARTED).await;
+    let other = sha256_hex(b"a bundle of other bytes");
+    let (status, refused) = w
+        .assemble(&service_id, &other, whole(&PARTED).len(), &parts)
+        .await;
+    assert_eq!(status, 422, "{refused}");
+    let failed = w.logged("Web bundle not assembled");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(
+        (&failed[0]["bundle"], &failed[0]["parts"]),
+        (&json!(short(&other)), &json!(3))
+    );
+    assert!(
+        timed(
+            &failed[0],
+            &[
+                "turn_ms",
+                "slot_ms",
+                "read_wait_ms",
+                "stream_ms",
+                "elapsed_ms"
+            ]
+        ),
+        "{failed:?}"
     );
 }
