@@ -557,6 +557,15 @@ the hand-back row applies):
 | Public documents (`public_docs`) | Nothing to undo, but every document goes: a version that declares them keeps running and serving its API, while v0.38.1 answers `404` under each mount. A manifest built with this SDK that declares `docs` requires `public_docs`, so v0.38.1's feature check refuses its deploy. Deploy without them until the platform is on v0.39.0 again |
 | The database | Nothing: v0.39.0 has no migration |
 
+Rolling a platform back from v0.40.0 to v0.39.0:
+
+| What v0.40.0 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Web bundles uploaded in parts (`web_bundle_parts`) | Nothing to undo: a bundle assembled from its parts is stored at its content key and released as any other. v0.39.0 does not offer `web_bundle_parts`, so a CLI of v0.40.0 sends each bundle in one request again, which needs the bandwidth to finish within the CLI's 120 s once more. A deploy in flight when the platform rolls back fails with a `404` or `405` on a part or its assembly and releases nothing; run it again |
+| Parts in storage | Nothing: parts never assembled stay under `web/{service_id}/parts/` until the service is deleted, since v0.39.0's sweep does not know them; they are never served |
+| `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
+| The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -580,7 +589,7 @@ Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
 `V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
-v0.35.0, `V8__tenant_buckets` on v0.36.0, `V9__web_uploads` on v0.38.0): expected and harmless, as migrations are
+v0.35.0, `V8__tenant_buckets` on v0.36.0, `V9__web_uploads` on v0.38.0, `V10__web_upload_parts` on v0.40.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist
@@ -1409,7 +1418,20 @@ Web bundles uploaded in parts. One new platform feature,
 ([features added in v0.40.0](#features-added-in-v0400)). A service built for
 v0.39.0 deploys and runs on this platform unchanged. New migration:
 `V10__web_upload_parts`, additive only. There is no new environment
-variable.
+variable. A CLI of this release deploys to a v0.39.0 platform as a v0.39.0
+CLI does, sending each web bundle in one request.
+
+Crates: a minor release for the new feature and the CLI's new upload, so
+the crate set moves minor as it did at v0.36.0 to v0.39.0. cufflink-types
+0.24.0, which gains `features::WEB_BUNDLE_PARTS`, with cufflink-migrate,
+cufflink-pgcodec, cufflink-sdk-macros and cufflink at 0.24.0 beside it;
+cufflink-fn 0.40.0; cufflink-cli 0.31.0, which uploads a large web bundle
+in parts and sends a part or its assembly again; cufflink-native 0.12.0
+and cufflink-sql-parse 0.4.0, unchanged but exposing cufflink-types items
+in their public API; cufflink-nats 0.9.5 and cufflink-model 0.1.7,
+unchanged. `cufflink init` scaffolds `cufflink = "0.24"` and `cufflink-fn
+= "0.40"`. cufflink-storage, which gains `ObjectStorage::upload_stream`,
+is not published.
 
 - `cufflink deploy` of a web app sends a bundle above 32 MiB as parts of
   8 MiB, four at a time, to `PUT /api/services/{id}/web/parts/{sha256}`,
@@ -1435,6 +1457,10 @@ variable.
 - `cufflink-storage`: `ObjectStorage::upload_stream` stores what a stream
   yields, in parts above the multipart threshold, and stores nothing when
   the stream yields an error.
+
+Rolling a platform back from v0.40.0 to v0.39.0 needs nothing undone
+first, though a CLI of v0.40.0 then sends each web bundle in one request
+again ([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.39.0
 
