@@ -570,7 +570,7 @@ Rolling a platform back from v0.40.1 to v0.40.0:
 
 | What v0.40.1 changed | Before rolling the platform back |
 |----------------------|----------------------------------|
-| Timings of a web upload in the platform's log | Nothing: v0.40.0 logs a part and an assembly as before, without their times. An alert or query on the new lines finds none |
+| Timings of a web upload in the platform's log | Nothing: v0.40.0 logs `Web part stored` with `key` and `size` only, `Web bundle stored` for each bundle it stores and `Web bundle assembled` for an assembly. A query on the timing fields, on `Web bundle assembly answered` or on the warn lines finds none |
 | A part's `?bundle=…&index=…` query | Nothing: v0.40.0 ignores the query, and a CLI of v0.40.1 deploys to it unchanged, printing its own timings |
 | The database | Nothing: v0.40.1 has no migration |
 
@@ -1431,12 +1431,12 @@ new environment variable. A CLI of this release deploys to a v0.40.0
 platform as a v0.40.0 CLI does; that platform ignores the part's query and
 logs no timings.
 
-Crates: a patch release of every published crate. cufflink-types,
+Crates: a patch release of every published crate. cufflink-cli 0.31.1,
+the only crate that changes, prints the timings; cufflink-types,
 cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink
-0.24.1; cufflink-fn 0.40.1; cufflink-cli 0.31.1, which prints the
-timings; cufflink-nats 0.9.6, cufflink-native 0.12.1, cufflink-model 0.1.8
-and cufflink-sql-parse 0.4.1, unchanged and bumped so the tagged commit
-publishes them. `cufflink init` still scaffolds `cufflink = "0.24"` and
+0.24.1, cufflink-fn 0.40.1, cufflink-nats 0.9.6, cufflink-native 0.12.1,
+cufflink-model 0.1.8 and cufflink-sql-parse 0.4.1 are unchanged and bumped
+so the tagged commit publishes them. `cufflink init` still scaffolds `cufflink = "0.24"` and
 `cufflink-fn = "0.40"`.
 
 - `cufflink deploy` of a web app prints a line for every attempt at a part
