@@ -1294,10 +1294,11 @@ async fn concurrent_assemblies_of_the_same_bundle_both_answer_and_store_it_once(
     let service_id = w.reserved().await;
     let bundle = whole(&PARTED);
     let parts = w.sent_in_parts(&service_id, &PARTED).await;
+    let sha256 = sha256_hex(&bundle);
 
     let ((first, a), (second, b)) = tokio::join!(
-        w.assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts),
-        w.assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts)
+        w.assemble(&service_id, &sha256, bundle.len(), &parts),
+        w.assemble(&service_id, &sha256, bundle.len(), &parts)
     );
     assert_eq!((first, second), (200, 200), "{a} {b}");
     assert_eq!(
