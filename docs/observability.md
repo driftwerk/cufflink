@@ -339,6 +339,41 @@ curl -s https://api.example.com/svc/acme/audit-service/_meta/health | jq .
 
 These routes return 404 for unknown `(tenant, service)` pairs and don't require auth, so deploy-verification scripts and external probes can hit them directly.
 
+## Web uploads
+
+A web deploy says how long each step of its upload took, and so does the
+platform's log, so a slow upload over a slow network path to the platform
+shows where its time went without a dashboard
+([design](design-notes/web-bundle-parts.md#9-timings-of-an-upload)).
+
+The CLI prints a line for every attempt at a part (`Uploading part 7 of 20
+of bundle 3f9a1c2b4d5e: 8388608 bytes in 4.0 s (2.0 MB/s)`) or an assembly
+(`Assembling bundle 3f9a1c2b4d5e: answered in 6.5 s`), the reason and wait
+of each failed attempt (`no answer after 120.0 s; trying again (2 of 3)`),
+and a summary: `Sent 156.0 MB in 190.3 s (0.8 MB/s): parts 183.6 s,
+assembly 6.7 s`. A part's time is its request's: its bytes on the network
+and the platform's write of them.
+
+The platform logs these lines, each with `service_id` and the 12-digit
+short hash of the part (`part`) or bundle (`bundle`). A part also carries
+`bundle` and `index`, its place in the bundle counted from 1, when its
+uploader named them, as the CLI does from v0.40.1 on. Times are whole
+milliseconds.
+
+| Message | Level | Fields | What it tells |
+|---------|-------|--------|---------------|
+| `Web part stored` | info | `size`, `stored`, `receive_ms`, `store_ms`, `elapsed_ms` | `receive_ms` is the body's arrival, the network; `store_ms` its check, write and record in object storage; `elapsed_ms` the whole request. A `receive_ms` close to the CLI's time for the part puts the time on the network, a large `store_ms` on object storage |
+| `Web part not received` | warn | `received`, `receive_ms`, `status` | The body was cut short, or was over 16 MiB (`413`): how many bytes arrived, and after how long |
+| `Web part not stored` | warn | `size`, `receive_ms`, `store_ms` (once the write was reached), `elapsed_ms`, `error` | The part was refused, or its write failed |
+| `Web part request dropped before its answer` | warn | `size`, `receive_ms`, `elapsed_ms` | The client went away, for instance at its timeout, while the platform checked or stored the part; one that leaves while its body is still arriving ends the body, logged as `Web part not received` |
+| `Web bundle assembly answered` | info | `parts`, `size`, `outcome` (`uploaded`, `present`, `incomplete`), `missing` (for `incomplete`), `turn_ms`, `slot_ms`, `read_wait_ms`, `stream_ms`, `elapsed_ms` | `turn_ms` waited for an assembly of the same bundle, `slot_ms` for one of the replica's two assembly slots; `stream_ms` streamed the parts into the bundle, `read_wait_ms` of it waiting for the parts' reads. Reads and the bundle's write overlap, so `stream_ms` less `read_wait_ms` is the time the write held the stream up |
+| `Web bundle not assembled` | warn | `parts`, `size`, the five times, `error` | The assembly failed, with the times it reached (zero for those it did not) |
+| `Web bundle assembly request dropped before its answer; the assembly runs on` | warn | `elapsed_ms` | The CLI's assembly request ended first; the assembly finishes, and the CLI's next attempt is answered `present` |
+
+A reverse proxy that buffers request bodies before passing them on makes
+`receive_ms` near zero: the time on the network is then in the CLI's
+number alone.
+
 ## Metrics
 
 The platform serves Prometheus metrics on `/metrics` (`:8080`) and each worker on `:8081/metrics` (`WORKER_HTTP_PORT`). The web runner serves its own on `/_cufflink/metrics` (`:3100`), new in R2, only with `Authorization: Bearer $WEB_STATUS_TOKEN` and not at all without the variable; a scrape of it needs the token. The extension runner does the same on its port (`RUNNER_PORT`, 3200) with `EXT_STATUS_TOKEN`. Prometheus (`infra/monitoring/prometheus.yml`) scrapes `platform:8080` and `wasm-worker:8081` every 15 seconds, and neither runner: add a scrape with its token for the runners' series. The NATS server's own metrics are not collected: its monitoring port serves JSON, which Prometheus reads only through an exporter.

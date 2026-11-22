@@ -956,7 +956,10 @@ steps, and only the last one changes what runs:
    - `PUT /api/services/{id}/web/parts/{sha256}` with at most 16 MiB of the
      bundle stores that part by content (`413` above it, `422` when the
      body does not hash to the path), answering `sha256`, `size` and
-     `stored`.
+     `stored`. The query may name the part's bundle and its place in it,
+     counted from 1 (`?bundle={sha256}&index=3`), which the platform logs
+     with the part's timings and otherwise ignores
+     ([web uploads](observability.md#web-uploads)).
    - `POST /api/services/{id}/web/artifacts/{sha256}/parts` with
      `{"size": 41234567, "parts": ["…", …]}`, naming 1 to 1024 parts,
      streams the parts in order into the bundle's key. A part not
@@ -1006,6 +1009,16 @@ steps, and only the last one changes what runs:
    answer, a `5xx` (except `501` and `505`), `408` or `429` is sent again, up
    to three times in all, after `Retry-After` when it is longer than the
    pause; any other refusal stops the upload, and nothing is released.
+   Each attempt prints how long it took: a part its bytes, time and rate
+   (`Uploading part 7 of 20 of bundle 3f9a1c2b4d5e: 8388608 bytes in 4.0 s
+   (2.0 MB/s)`), an assembly its time, and a failed attempt its reason and
+   wait (`no answer after 120.0 s; trying again (2 of 3)`). A part is
+   numbered by its place in the bundle. The upload ends with a summary,
+   `Sent 156.0 MB in 190.3 s (0.8 MB/s)`, followed for a bundle in parts
+   by `: parts 183.6 s, assembly 6.7 s`, the time spent sending the parts
+   and on the assembly; an upload whose first assembly request is answered
+   sends no part and prints none
+   ([web uploads](observability.md#web-uploads)).
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
    bundle not uploaded, or no longer stored, or another deploy holding the
    lock) is answered by one more upload and one more release; a second

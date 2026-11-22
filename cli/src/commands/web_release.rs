@@ -4,7 +4,8 @@ use cufflink_types::features::{WEB_BUNDLE_PARTS, WEB_RELEASES};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 fn unrouted(status: StatusCode) -> &'static str {
     match status {
@@ -109,12 +110,98 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn distinct(parts: &[Bundle]) -> Vec<&Bundle> {
+fn distinct(parts: &[Bundle]) -> Vec<(usize, &Bundle)> {
     let mut seen = std::collections::HashSet::new();
     parts
         .iter()
-        .filter(|part| seen.insert(part.sha256.as_str()))
+        .enumerate()
+        .filter(|(_, part)| seen.insert(part.sha256.as_str()))
         .collect()
+}
+
+fn carried(parts: &[(usize, &Bundle)]) -> usize {
+    parts.iter().map(|(_, part)| part.size()).sum()
+}
+
+async fn timed<T>(work: impl Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    let done = work.await;
+    (done, started.elapsed())
+}
+
+fn megabytes(bytes: usize) -> f64 {
+    bytes as f64 / 1_048_576.0
+}
+
+fn seconds(took: Duration) -> String {
+    format!("{:.1} s", took.as_secs_f64())
+}
+
+fn rate(bytes: usize, took: Duration) -> String {
+    if took.is_zero() {
+        String::new()
+    } else {
+        format!(" ({:.1} MB/s)", megabytes(bytes) / took.as_secs_f64())
+    }
+}
+
+fn answered_line(
+    label: &str,
+    carrying: Option<usize>,
+    took: Duration,
+    (attempt, attempts): (u32, u32),
+) -> String {
+    let answered = match carrying {
+        Some(bytes) => format!("{bytes} bytes in {}{}", seconds(took), rate(bytes, took)),
+        None => format!("answered in {}", seconds(took)),
+    };
+    let retried = if attempt > 1 {
+        format!(", on attempt {attempt} of {attempts}")
+    } else {
+        String::new()
+    };
+    format!("  {label}: {answered}{retried}")
+}
+
+fn failed_line(label: &str, reason: &str, took: Duration, again: Option<(u32, u32)>) -> String {
+    let again = again.map_or_else(String::new, |(attempt, attempts)| {
+        format!("; trying again ({attempt} of {attempts})")
+    });
+    format!("  {label}: {reason} after {}{again}", seconds(took))
+}
+
+#[derive(Clone, Copy)]
+struct Sent {
+    bytes: usize,
+    phases: Option<Phases>,
+}
+
+#[derive(Clone, Copy)]
+struct Phases {
+    parts: Duration,
+    assembly: Duration,
+}
+
+fn sent_line(sent: Sent, total: Duration) -> String {
+    let phases = sent.phases.map_or_else(String::new, |phases| {
+        format!(
+            ": parts {}, assembly {}",
+            seconds(phases.parts),
+            seconds(phases.assembly)
+        )
+    });
+    format!(
+        "  Sent {:.1} MB in {}{}{phases}",
+        megabytes(sent.bytes),
+        seconds(total),
+        rate(sent.bytes, total)
+    )
+}
+
+struct Asking<'a> {
+    doing: &'a str,
+    label: &'a str,
+    carrying: Option<usize>,
 }
 
 impl Parts {
@@ -194,6 +281,7 @@ pub(crate) struct WebApp<'a> {
     pub(crate) client: &'a reqwest::Client,
     pub(crate) name: &'a str,
     pub(crate) parts: Option<Parts>,
+    pub(crate) out: &'a (dyn Fn(String) + Sync),
 }
 
 enum Release {
@@ -204,6 +292,10 @@ enum Release {
 impl WebApp<'_> {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.config.api_url)
+    }
+
+    fn say(&self, line: String) {
+        (self.out)(line)
     }
 
     async fn exchanged(
@@ -319,19 +411,20 @@ impl WebApp<'_> {
         &self,
         parts: Parts,
         request: impl Fn() -> reqwest::RequestBuilder,
-        (doing, label): (&str, &str),
+        asking: Asking<'_>,
         reserved: &Reserved,
     ) -> Result<Value, Failed> {
         let mut attempt = 1;
         loop {
-            match self.answered(request(), doing, reserved).await {
-                Err(failed) if failed.transient() && attempt < parts.attempts => {
+            match timed(self.answered(request(), asking.doing, reserved)).await {
+                (Err(failed), took) if failed.transient() && attempt < parts.attempts => {
                     attempt += 1;
-                    println!(
-                        "  {label}: {}; trying again ({attempt} of {})",
-                        failed.reason(),
-                        parts.attempts
-                    );
+                    self.say(failed_line(
+                        asking.label,
+                        &failed.reason(),
+                        took,
+                        Some((attempt, parts.attempts)),
+                    ));
                     let backoff = parts.backoff * (attempt - 1);
                     tokio::time::sleep(
                         failed
@@ -340,7 +433,18 @@ impl WebApp<'_> {
                     )
                     .await;
                 }
-                answered => return answered,
+                (answered, took) => {
+                    self.say(match &answered {
+                        Ok(_) => answered_line(
+                            asking.label,
+                            asking.carrying,
+                            took,
+                            (attempt, parts.attempts),
+                        ),
+                        Err(failed) => failed_line(asking.label, &failed.reason(), took, None),
+                    });
+                    return answered;
+                }
             }
         }
     }
@@ -359,14 +463,22 @@ impl WebApp<'_> {
             .body(bundle.bytes.clone())
     }
 
-    fn part_request(&self, reserved: &Reserved, part: &Bundle) -> reqwest::RequestBuilder {
+    fn part_request(
+        &self,
+        reserved: &Reserved,
+        bundle: &Bundle,
+        (position, part): (usize, &Bundle),
+    ) -> reqwest::RequestBuilder {
         self.config
             .auth_request(
                 self.client,
                 Method::PUT,
                 &self.url(&format!(
-                    "/api/services/{}/web/parts/{}",
-                    reserved.service_id, part.sha256
+                    "/api/services/{}/web/parts/{}?bundle={}&index={}",
+                    reserved.service_id,
+                    part.sha256,
+                    bundle.sha256,
+                    position + 1
                 )),
             )
             .header("Content-Type", "application/octet-stream")
@@ -400,19 +512,20 @@ impl WebApp<'_> {
         &self,
         reserved: &Reserved,
         bundle: &Bundle,
-        parts: Parts,
-        sent: &[&Bundle],
+        (parts, of): (Parts, usize),
+        sent: &[(usize, &Bundle)],
     ) -> eyre::Result<()> {
-        futures_util::stream::iter(sent.iter().enumerate())
-            .map(|(index, part)| async move {
-                let place = format!("part {} of {} of bundle", index + 1, sent.len());
+        futures_util::stream::iter(sent)
+            .map(|&(position, part)| async move {
+                let place = format!("part {} of {of} of bundle", position + 1);
                 self.persisted(
                     parts,
-                    || self.part_request(reserved, part),
-                    (
-                        &format!("Uploading {place} {}", bundle.sha256),
-                        &format!("Uploading {place} {}", short(&bundle.sha256)),
-                    ),
+                    || self.part_request(reserved, bundle, (position, part)),
+                    Asking {
+                        doing: &format!("Uploading {place} {}", bundle.sha256),
+                        label: &format!("Uploading {place} {}", short(&bundle.sha256)),
+                        carrying: Some(part.size()),
+                    },
                     reserved,
                 )
                 .await
@@ -430,70 +543,115 @@ impl WebApp<'_> {
         bundle: &Bundle,
         parts: Parts,
         split: &[Bundle],
-    ) -> eyre::Result<Value> {
+    ) -> eyre::Result<(Value, Option<Sent>)> {
         let (doing, label) = (
             format!("Assembling bundle {}", bundle.sha256),
             format!("Assembling bundle {}", short(&bundle.sha256)),
         );
         let assemble = || {
-            self.persisted(
+            timed(self.persisted(
                 parts,
                 || self.assembly_request(reserved, bundle, split, parts),
-                (&doing, &label),
+                Asking {
+                    doing: &doing,
+                    label: &label,
+                    carrying: None,
+                },
                 reserved,
-            )
+            ))
         };
-        match assemble().await {
+        let (asked, mut assembly) = assemble().await;
+        match asked {
             Err(failed) if failed.status == Some(StatusCode::CONFLICT) => {}
-            answered => return answered.map_err(|failed| failed.report),
+            answered => {
+                return answered
+                    .map(|answer| (answer, None))
+                    .map_err(|failed| failed.report)
+            }
         }
         let unique = distinct(split);
-        println!("  In {} parts", unique.len());
-        self.put_parts(reserved, bundle, parts, &unique).await?;
-        match assemble().await {
+        self.say(if unique.len() == split.len() {
+            format!("  In {} parts", split.len())
+        } else {
+            format!("  In {} parts ({} distinct)", split.len(), unique.len())
+        });
+        let (put_all, mut parts_took) =
+            timed(self.put_parts(reserved, bundle, (parts, split.len()), &unique)).await;
+        put_all?;
+        let (asked, took) = assemble().await;
+        assembly += took;
+        let (answer, bytes) = match asked {
             Err(failed) if failed.status == Some(StatusCode::CONFLICT) => {
                 let missing = unique
-                    .into_iter()
-                    .filter(|part| failed.body.contains(&part.sha256))
+                    .iter()
+                    .copied()
+                    .filter(|(_, part)| failed.body.contains(&part.sha256))
                     .collect::<Vec<_>>();
                 if missing.is_empty() {
                     return Err(failed.report);
                 }
-                println!(
+                self.say(format!(
                     "  The platform no longer stores {} of them; uploading again",
                     missing.len()
-                );
-                self.put_parts(reserved, bundle, parts, &missing).await?;
-                assemble().await.map_err(|failed| failed.report)
+                ));
+                let (put_missing, took) =
+                    timed(self.put_parts(reserved, bundle, (parts, split.len()), &missing)).await;
+                parts_took += took;
+                put_missing?;
+                let (asked, took) = assemble().await;
+                assembly += took;
+                (
+                    asked.map_err(|failed| failed.report)?,
+                    carried(&unique) + carried(&missing),
+                )
             }
-            answered => answered.map_err(|failed| failed.report),
-        }
+            answered => (answered.map_err(|failed| failed.report)?, carried(&unique)),
+        };
+        Ok((
+            answer,
+            Some(Sent {
+                bytes,
+                phases: Some(Phases {
+                    parts: parts_took,
+                    assembly,
+                }),
+            }),
+        ))
     }
 
     async fn upload(&self, reserved: &Reserved, bundle: &Bundle) -> eyre::Result<()> {
-        println!("Uploading bundle {}...", short(&bundle.sha256));
+        self.say(format!("Uploading bundle {}...", short(&bundle.sha256)));
+        let started = Instant::now();
         let split = self
             .parts
             .and_then(|parts| parts.of(bundle).map(|split| (parts, split)));
-        let answer = match split {
+        let (answer, sent) = match split {
             Some((parts, split)) => self.assembled(reserved, bundle, parts, &split).await?,
-            None => self
-                .answered(
+            None => (
+                self.answered(
                     self.whole_request(reserved, bundle),
                     &format!("Uploading bundle {}", bundle.sha256),
                     reserved,
                 )
                 .await
                 .map_err(|failed| failed.report)?,
+                Some(Sent {
+                    bytes: bundle.size(),
+                    phases: None,
+                }),
+            ),
         };
-        println!(
-            "  {}",
+        self.say(
             if answer["stored"].as_str() == Some("present") {
-                "Already stored"
+                "  Already stored"
             } else {
-                "Stored"
+                "  Stored"
             }
+            .to_string(),
         );
+        if let Some(sent) = sent {
+            self.say(sent_line(sent, started.elapsed()));
+        }
         Ok(())
     }
 
@@ -554,26 +712,28 @@ impl WebApp<'_> {
                     reserved.unreleased(self.name)
                 ))
             })?;
-        println!(
+        self.say(format!(
             "  Bundle {}: {} bytes ({:.1} MB)",
             short(&bundle.sha256),
             bundle.size(),
-            bundle.size() as f64 / 1_048_576.0
-        );
+            megabytes(bundle.size())
+        ));
         match reserved.runs(&bundle) {
-            Some(version) => println!(
+            Some(version) => self.say(format!(
                 "  {} v{version} already runs this bundle; not uploading it again",
                 self.name
-            ),
+            )),
             None => self.upload(&reserved, &bundle).await?,
         }
 
         let request = released_with(request, &bundle);
-        println!("Releasing {}...", self.name);
+        self.say(format!("Releasing {}...", self.name));
         let answer = match self.release(&reserved, &request).await? {
             Release::Answered(answer) => answer,
             Release::NotClaimed(refusal) => {
-                println!("  The platform refused the release ({refusal}); uploading again");
+                self.say(format!(
+                    "  The platform refused the release ({refusal}); uploading again"
+                ));
                 self.upload(&reserved, &bundle).await?;
                 match self.release(&reserved, &request).await? {
                     Release::Answered(answer) => answer,
@@ -586,8 +746,8 @@ impl WebApp<'_> {
             }
         };
         reported(self.name, &bundle, &answer)?
-            .iter()
-            .for_each(|line| println!("{line}"));
+            .into_iter()
+            .for_each(|line| self.say(line));
         Ok(())
     }
 }
@@ -727,13 +887,33 @@ mod tests {
         answers: Vec<Option<(u16, Value)>>,
         build: eyre::Result<Vec<u8>>,
     ) -> (eyre::Result<()>, Asked, Option<(String, usize)>) {
+        let (ended, asked, built, _) = deployed_saying(parts, answers, build).await;
+        (ended, asked, built)
+    }
+
+    async fn deployed_saying(
+        parts: Option<Parts>,
+        answers: Vec<Option<(u16, Value)>>,
+        build: eyre::Result<Vec<u8>>,
+    ) -> (
+        eyre::Result<()>,
+        Asked,
+        Option<(String, usize)>,
+        Vec<String>,
+    ) {
         let (config, asked) = answering(answers).await;
         let client = config.http_client();
+        let said = std::sync::Mutex::new(Vec::new());
         let app = WebApp {
             config: &config,
             client: &client,
             name: "site",
             parts,
+            out: &|line: String| {
+                said.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line)
+            },
         };
         let mut built = None;
         let ended = app
@@ -742,7 +922,37 @@ mod tests {
                 build
             })
             .await;
-        (ended, asked, built)
+        let said = said
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (ended, asked, built, said)
+    }
+
+    fn timeless(line: &str) -> String {
+        let mut out = String::new();
+        let mut rest = line;
+        while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+            out.push_str(&rest[..start]);
+            let digits = |from: &str| {
+                from.find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(from.len())
+            };
+            let tail = &rest[start..];
+            let whole = digits(tail);
+            let fraction = tail[whole..]
+                .strip_prefix('.')
+                .map(digits)
+                .filter(|fraction| *fraction > 0);
+            let end = fraction.map_or(whole, |fraction| whole + 1 + fraction);
+            out.push_str(if fraction.is_some() {
+                "_"
+            } else {
+                &tail[..end]
+            });
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        out
     }
 
     #[tokio::test]
@@ -1064,10 +1274,12 @@ mod tests {
         BUNDLE.chunks(IN_PARTS.size).collect()
     }
 
-    fn put_part(slice: &[u8]) -> String {
+    fn put_part(index: usize, slice: &[u8]) -> String {
         format!(
-            "PUT /api/services/7/web/parts/{}",
-            crate::digest::sha256_hex(slice)
+            "PUT /api/services/7/web/parts/{}?bundle={}&index={}",
+            crate::digest::sha256_hex(slice),
+            sha(),
+            index + 1
         )
     }
 
@@ -1084,7 +1296,11 @@ mod tests {
     }
 
     fn parts_put() -> Vec<String> {
-        slices().into_iter().map(put_part).collect()
+        slices()
+            .into_iter()
+            .enumerate()
+            .map(|(index, slice)| put_part(index, slice))
+            .collect()
     }
 
     fn assemble() -> String {
@@ -1515,9 +1731,13 @@ mod tests {
         assert_eq!(
             distinct(&parts)
                 .into_iter()
-                .map(|part| part.bytes.to_vec())
+                .map(|(position, part)| (position, part.bytes.to_vec()))
                 .collect::<Vec<_>>(),
-            [b"same, 8!".to_vec(), b"tail of ".to_vec(), b"it".to_vec()]
+            [
+                (0, b"same, 8!".to_vec()),
+                (1, b"tail of ".to_vec()),
+                (3, b"it".to_vec())
+            ]
         );
     }
 
@@ -1675,6 +1895,193 @@ mod tests {
                 .to_string(),
             "platform v0.37.1 cannot release a web app with its bundle (needs web_releases). \
              Upgrade the platform, or deploy with a CLI older than v0.38.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_attempt_of_a_part_or_assembly_says_how_long_it_took_and_the_upload_sums_up() {
+        let (ended, _, _, said) = deployed_saying(
+            Some(IN_PARTS),
+            answers(vec![
+                vec![missing(slices()[0])],
+                vec![
+                    part_stored(slices()[0]),
+                    None,
+                    part_stored(slices()[1]),
+                    part_stored(slices()[2]),
+                ],
+                vec![Some(stored("uploaded")), Some(released(1, false))],
+            ]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released");
+        let bundle = short(&sha()).to_string();
+        let part = |index: usize| format!("  Uploading part {index} of 3 of bundle {bundle}: ");
+        assert_eq!(
+            said.iter().map(|line| timeless(line)).collect::<Vec<_>>(),
+            [
+                format!("  Bundle {bundle}: 22 bytes (_ MB)"),
+                format!("Uploading bundle {bundle}..."),
+                format!("  Assembling bundle {bundle}: 409 Conflict after _ s"),
+                "  In 3 parts".to_string(),
+                format!("{}8 bytes in _ s (_ MB/s)", part(1)),
+                format!("{}no answer after _ s; trying again (2 of 3)", part(2)),
+                format!("{}8 bytes in _ s (_ MB/s), on attempt 2 of 3", part(2)),
+                format!("{}6 bytes in _ s (_ MB/s)", part(3)),
+                format!("  Assembling bundle {bundle}: answered in _ s"),
+                "  Stored".to_string(),
+                "  Sent _ MB in _ s (_ MB/s): parts _ s, assembly _ s".to_string(),
+                "Releasing site...".to_string(),
+                format!("Released site v1 (bundle {bundle})"),
+                "  Deployment ID: d".to_string(),
+                "  Tenant:        acme".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_that_fails_for_good_says_how_long_its_last_attempt_took() {
+        let (ended, _, _, said) = deployed_saying(
+            Some(IN_PARTS),
+            answers(vec![vec![missing(slices()[0]), None, None, None]]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        let failed = ended.expect_err("no answer").to_string();
+        assert!(
+            failed.starts_with(&format!(
+                "Uploading part 1 of 3 of bundle {} got no answer",
+                sha()
+            )),
+            "{failed}"
+        );
+        let part = format!("  Uploading part 1 of 3 of bundle {}: ", short(&sha()));
+        assert_eq!(
+            said[4..]
+                .iter()
+                .map(|line| timeless(line))
+                .collect::<Vec<_>>(),
+            [
+                format!("{part}no answer after _ s; trying again (2 of 3)"),
+                format!("{part}no answer after _ s; trying again (3 of 3)"),
+                format!("{part}no answer after _ s"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bundle_sent_whole_says_how_long_it_took_and_one_already_stored_sends_nothing() {
+        let (ended, _, _, said) = deployed_saying(
+            None,
+            answers(vec![vec![
+                Some(stored("uploaded")),
+                Some(released(1, false)),
+            ]]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        ended.expect("released");
+        assert_eq!(
+            said[1..4]
+                .iter()
+                .map(|line| timeless(line))
+                .collect::<Vec<_>>(),
+            [
+                format!("Uploading bundle {}...", short(&sha())),
+                "  Stored".to_string(),
+                "  Sent _ MB in _ s (_ MB/s)".to_string(),
+            ]
+        );
+
+        let (ended, _, _, said) = deployed_saying(
+            Some(IN_PARTS),
+            answers(vec![vec![
+                Some(stored("present")),
+                Some(released(1, false)),
+            ]]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        ended.expect("released");
+        assert_eq!(
+            said[2..4]
+                .iter()
+                .map(|line| timeless(line))
+                .collect::<Vec<_>>(),
+            [
+                format!("  Assembling bundle {}: answered in _ s", short(&sha())),
+                "  Already stored".to_string(),
+            ]
+        );
+        assert_eq!(said[4], "Releasing site...", "nothing was sent to sum up");
+    }
+
+    #[test]
+    fn an_attempt_reads_as_its_bytes_time_and_rate_or_its_reason() {
+        let label = "Uploading part 7 of 20 of bundle 3f9a1c2b4d5e";
+        let took = Duration::from_millis(4_000);
+        assert_eq!(
+            answered_line(label, Some(8_388_608), took, (1, 3)),
+            format!("  {label}: 8388608 bytes in 4.0 s (2.0 MB/s)")
+        );
+        assert_eq!(
+            answered_line(label, Some(8_388_608), took, (2, 3)),
+            format!("  {label}: 8388608 bytes in 4.0 s (2.0 MB/s), on attempt 2 of 3")
+        );
+        assert_eq!(
+            answered_line(label, Some(8_388_608), Duration::ZERO, (1, 3)),
+            format!("  {label}: 8388608 bytes in 0.0 s"),
+            "no rate for an attempt that took no time"
+        );
+        assert_eq!(
+            answered_line("Assembling bundle 3f9a1c2b4d5e", None, took, (1, 3)),
+            "  Assembling bundle 3f9a1c2b4d5e: answered in 4.0 s"
+        );
+        assert_eq!(
+            failed_line(label, "no answer", Duration::from_secs(120), Some((2, 3))),
+            format!("  {label}: no answer after 120.0 s; trying again (2 of 3)")
+        );
+        assert_eq!(
+            failed_line(label, "503 Service Unavailable", took, None),
+            format!("  {label}: 503 Service Unavailable after 4.0 s")
+        );
+    }
+
+    #[test]
+    fn an_upload_sums_up_its_bytes_time_rate_and_phases() {
+        assert_eq!(
+            sent_line(
+                Sent {
+                    bytes: 100 * 1_048_576,
+                    phases: Some(Phases {
+                        parts: Duration::from_millis(45_300),
+                        assembly: Duration::from_secs(4),
+                    }),
+                },
+                Duration::from_secs(50),
+            ),
+            "  Sent 100.0 MB in 50.0 s (2.0 MB/s): parts 45.3 s, assembly 4.0 s"
+        );
+        assert_eq!(
+            sent_line(
+                Sent {
+                    bytes: 3 * 1_048_576,
+                    phases: None,
+                },
+                Duration::from_millis(1_500),
+            ),
+            "  Sent 3.0 MB in 1.5 s (2.0 MB/s)"
+        );
+    }
+
+    #[test]
+    fn timeless_erases_only_decimals() {
+        assert_eq!(
+            timeless("  Part 12 of 3f9a1c2b4d52...: 8 bytes in 0.31 s (25.0 MB/s) v1"),
+            "  Part 12 of 3f9a1c2b4d52...: 8 bytes in _ s (_ MB/s) v1"
         );
     }
 }
