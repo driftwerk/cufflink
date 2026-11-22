@@ -566,6 +566,14 @@ Rolling a platform back from v0.40.0 to v0.39.0:
 | `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
 | The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
 
+Rolling a platform back from v0.40.1 to v0.40.0:
+
+| What v0.40.1 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Timings of a web upload in the platform's log | Nothing: v0.40.0 logs `Web part stored` with `key` and `size` only, `Web bundle stored` for each bundle it stores and `Web bundle assembled` for an assembly. A query on the timing fields, on `Web bundle assembly answered` or on the warn lines finds none |
+| A part's `?bundle=…&index=…` query | Nothing: v0.40.0 ignores the query, and a CLI of v0.40.1 deploys to it unchanged, printing its own timings |
+| The database | Nothing: v0.40.1 has no migration |
+
 A v0.30.0 CLI keeps working against the rolled-back platform: `--inactive`
 is refused by the feature check, `cufflink config apply` likewise, a
 deploy's config step falls back to a request for each key, `deploy
@@ -1413,14 +1421,23 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.40.1
 
-Unreleased.
-
 Timings of a web upload, in the deploy's output and the platform's log
 ([design](design-notes/web-bundle-parts.md#9-timings-of-an-upload)), so
 that a slow upload says where its time went: the parts on the network,
 the platform's writes to object storage, the wait for an assembly or the
-assembly's reads and writes. It changes no manifest, SDK or host function,
-needs no migration and adds no setting.
+assembly's reads and writes. No new feature. A service built for v0.40.0
+deploys and runs on this platform unchanged. There is no migration and no
+new environment variable. A CLI of this release deploys to a v0.40.0
+platform as a v0.40.0 CLI does; that platform ignores the part's query and
+logs no timings.
+
+Crates: a patch release of every published crate. cufflink-cli 0.31.1,
+the only crate that changes, prints the timings; cufflink-types,
+cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink
+0.24.1, cufflink-fn 0.40.1, cufflink-nats 0.9.6, cufflink-native 0.12.1,
+cufflink-model 0.1.8 and cufflink-sql-parse 0.4.1 are unchanged and bumped
+so the tagged commit publishes them. `cufflink init` still scaffolds
+`cufflink = "0.24"` and `cufflink-fn = "0.40"`.
 
 - `cufflink deploy` of a web app prints a line for every attempt at a part
   or an assembly: a part's bytes, time and rate, an assembly's time, or a
@@ -1445,6 +1462,10 @@ needs no migration and adds no setting.
   above replaces the first, and the single upload's unchanged `Web bundle
   uploaded` line the second. `Web bundle assembly answered` replaces `Web
   bundle assembled`.
+
+Rolling a platform back from v0.40.1 to v0.40.0 needs nothing undone
+first; its log then has no timings of an upload
+([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.40.0
 
