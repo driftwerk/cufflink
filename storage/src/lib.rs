@@ -45,6 +45,15 @@ pub trait ObjectStorage: Send + Sync {
         options: &UploadOptions,
     ) -> Result<Uploaded>;
 
+    /// Stores what `data` yields at `key` once it ends. When `data` yields an
+    /// error nothing is stored, and that error is returned as it was yielded.
+    async fn upload_stream(
+        &self,
+        key: &str,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded>;
+
     async fn download(&self, key: &str) -> Result<Vec<u8>>;
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>>;

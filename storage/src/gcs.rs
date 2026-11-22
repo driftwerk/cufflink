@@ -2,8 +2,10 @@ use crate::common::{self, Keys};
 use crate::gcs_v4::{sign_url, BlobSigner, IamSignBlobSigner};
 use crate::{Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use eyre::{Result, WrapErr};
+use futures_util::stream::BoxStream;
 use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
 use std::sync::Arc;
 
@@ -132,6 +134,17 @@ impl ObjectStorage for GcsBackend {
         let store = self.store_for(bucket)?;
         common::no_acl(BACKEND, options)?;
         common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
+    }
+
+    async fn upload_stream(
+        &self,
+        key: &str,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        let store = self.store_for(&self.bucket)?;
+        let options = UploadOptions::content_type(content_type);
+        common::put_stream(store.as_ref(), BACKEND, self.keys, key, data, &options).await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {

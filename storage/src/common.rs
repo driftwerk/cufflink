@@ -1,7 +1,8 @@
 use crate::{ObjectMeta, ObjectReader, UploadOptions, Uploaded};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use eyre::{Result, WrapErr};
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::stream::BoxStream;
+use futures_util::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::{
     path::Path as OsPath, Attribute, AttributeValue, Attributes, ClientOptions, GetOptions,
     MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions,
@@ -219,13 +220,13 @@ async fn put_in(
     backend: &'static str,
     keys: Keys,
     key: &str,
-    data: Vec<u8>,
+    data: impl Into<Bytes>,
     opts: PutOptions,
     multipart: Multipart,
 ) -> Result<Uploaded> {
     let path = keys.path(key)?;
+    let data = data.into();
     let size = data.len() as u64;
-    let data = Bytes::from(data);
     let stored = match multipart.put(data.len(), opts) {
         Put::Whole(opts) => store.put_opts(&path, PutPayload::from(data), opts).await,
         Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart).await,
@@ -236,6 +237,109 @@ async fn put_in(
         size,
         etag: stored.e_tag,
     })
+}
+
+pub(crate) async fn put_stream(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    keys: Keys,
+    key: &str,
+    data: BoxStream<'static, Result<Bytes>>,
+    options: &UploadOptions,
+) -> Result<Uploaded> {
+    let opts = PutOptions {
+        attributes: attributes(options),
+        ..Default::default()
+    };
+    put_stream_with(store, backend, keys, key, data, opts).await
+}
+
+pub(crate) async fn put_stream_with(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    keys: Keys,
+    key: &str,
+    data: BoxStream<'static, Result<Bytes>>,
+    opts: PutOptions,
+) -> Result<Uploaded> {
+    put_stream_in(store, backend, keys, key, data, opts, Multipart::DEFAULT).await
+}
+
+async fn gathered(data: &mut BoxStream<'static, Result<Bytes>>, limit: usize) -> Result<BytesMut> {
+    let mut head = BytesMut::new();
+    while head.len() < limit {
+        match data.try_next().await? {
+            Some(chunk) => head.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    Ok(head)
+}
+
+async fn put_stream_in(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    keys: Keys,
+    key: &str,
+    mut data: BoxStream<'static, Result<Bytes>>,
+    opts: PutOptions,
+    multipart: Multipart,
+) -> Result<Uploaded> {
+    let head = gathered(&mut data, multipart.threshold + 1).await?;
+    match multipart.put(head.len(), opts) {
+        Put::Whole(opts) => {
+            let whole = data
+                .try_fold(head, |mut whole, chunk| {
+                    whole.extend_from_slice(&chunk);
+                    future::ready(Ok(whole))
+                })
+                .await?;
+            put_in(store, backend, keys, key, whole.freeze(), opts, multipart).await
+        }
+        Put::InParts(opts) => {
+            let failed = |e: object_store::Error| {
+                eyre::Report::new(e).wrap_err(format!("{backend} upload failed for {key}"))
+            };
+            let upload = store
+                .put_multipart_opts(&keys.path(key)?, opts)
+                .await
+                .map_err(failed)?;
+            let (size, stored) = Pending::new(upload, backend, key)
+                .finish_stream(head, data, multipart, failed)
+                .await?;
+            tracing::info!(backend, key = %key, size, "Uploaded");
+            Ok(Uploaded {
+                size,
+                etag: stored.e_tag,
+            })
+        }
+    }
+}
+
+fn rechunked(
+    head: BytesMut,
+    data: BoxStream<'static, Result<Bytes>>,
+    part_size: usize,
+) -> impl futures_util::Stream<Item = Result<Bytes>> {
+    stream::try_unfold(
+        (data, head, false),
+        move |(mut data, mut buffer, mut ended)| async move {
+            loop {
+                if buffer.len() >= part_size {
+                    let part = buffer.split_to(part_size).freeze();
+                    return Ok(Some((part, (data, buffer, ended))));
+                }
+                if ended {
+                    return Ok((!buffer.is_empty())
+                        .then(|| (buffer.split().freeze(), (data, buffer, ended))));
+                }
+                match data.try_next().await? {
+                    Some(chunk) => buffer.extend_from_slice(&chunk),
+                    None => ended = true,
+                }
+            }
+        },
+    )
 }
 
 async fn put_parts(
@@ -285,14 +389,64 @@ impl Pending {
         completed
     }
 
+    async fn finish_stream(
+        mut self,
+        head: BytesMut,
+        data: BoxStream<'static, Result<Bytes>>,
+        multipart: Multipart,
+        failed: impl Fn(object_store::Error) -> eyre::Report,
+    ) -> Result<(u64, PutResult)> {
+        let completed = self.send_stream(head, data, multipart, failed).await;
+        if completed.is_ok() {
+            self.upload = None;
+        }
+        completed
+    }
+
+    async fn send_stream(
+        &mut self,
+        head: BytesMut,
+        data: BoxStream<'static, Result<Bytes>>,
+        multipart: Multipart,
+        failed: impl Fn(object_store::Error) -> eyre::Report,
+    ) -> Result<(u64, PutResult)> {
+        let upload = unfinished(&mut self.upload, self.backend, &self.key).map_err(&failed)?;
+        let key = &self.key;
+        let size = rechunked(head, data, multipart.min_part_size)
+            .enumerate()
+            .map(|(index, part)| {
+                part.and_then(|part| {
+                    if index < MAX_PARTS {
+                        Ok(part)
+                    } else {
+                        Err(eyre::eyre!(
+                            "the upload of {key} needs more than {MAX_PARTS} parts of {} bytes",
+                            multipart.min_part_size
+                        ))
+                    }
+                })
+            })
+            .map_ok(|part| {
+                let size = part.len() as u64;
+                upload
+                    .put_part(PutPayload::from(part))
+                    .map_ok(move |()| size)
+                    .map_err(&failed)
+            })
+            .try_buffer_unordered(multipart.concurrency)
+            .try_fold(0, |total, size| future::ready(Ok(total + size)))
+            .await?;
+        self.completing = true;
+        unfinished(&mut self.upload, self.backend, &self.key)
+            .map_err(&failed)?
+            .complete()
+            .await
+            .map(|stored| (size, stored))
+            .map_err(&failed)
+    }
+
     async fn send(&mut self, data: Bytes, multipart: Multipart) -> object_store::Result<PutResult> {
-        let upload = self
-            .upload
-            .as_mut()
-            .ok_or_else(|| object_store::Error::Generic {
-                store: self.backend,
-                source: format!("the multipart upload of {} has finished", self.key).into(),
-            })?;
+        let upload = unfinished(&mut self.upload, self.backend, &self.key)?;
         stream::iter(
             multipart
                 .parts(data)
@@ -304,6 +458,17 @@ impl Pending {
         self.completing = true;
         upload.complete().await
     }
+}
+
+fn unfinished<'a>(
+    upload: &'a mut Option<Box<dyn MultipartUpload>>,
+    backend: &'static str,
+    key: &str,
+) -> object_store::Result<&'a mut Box<dyn MultipartUpload>> {
+    upload.as_mut().ok_or_else(|| object_store::Error::Generic {
+        store: backend,
+        source: format!("the multipart upload of {key} has finished").into(),
+    })
 }
 
 impl Drop for Pending {
@@ -553,13 +718,14 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::{
-        already_aborted, put_in, request_timeout, retry_timeout, timed_out_requests_cannot_retry,
-        Keys, Multipart, Put, ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
+        already_aborted, put_in, put_stream_in, rechunked, request_timeout, retry_timeout,
+        timed_out_requests_cannot_retry, Keys, Multipart, Put, ENV_REQUEST_TIMEOUT_SECS,
+        ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
     };
     use async_trait::async_trait;
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use futures_util::stream::BoxStream;
-    use futures_util::FutureExt;
+    use futures_util::{FutureExt, StreamExt, TryStreamExt};
     use object_store::memory::InMemory;
     use object_store::path::Path as OsPath;
     use object_store::{
@@ -940,6 +1106,98 @@ mod tests {
         .expect("uploaded");
         tokio::task::yield_now().await;
         assert_eq!(store.counts.get(), [0, 1, 0]);
+    }
+
+    fn streamed(
+        data: &[u8],
+        chunk: usize,
+        end: Option<&'static str>,
+    ) -> BoxStream<'static, eyre::Result<Bytes>> {
+        let chunks = data
+            .chunks(chunk)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .chain(end.map(|end| Err(eyre::eyre!(end))))
+            .collect::<Vec<_>>();
+        futures_util::stream::iter(chunks).boxed()
+    }
+
+    #[tokio::test]
+    async fn a_stream_is_cut_into_parts_of_the_part_size_in_order() {
+        let data = payload(700);
+        let parts = rechunked(BytesMut::new(), streamed(&data, 100, None), 256)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("cut");
+        assert_eq!(
+            parts.iter().map(Bytes::len).collect::<Vec<_>>(),
+            [256, 256, 188]
+        );
+        assert_eq!(parts.concat(), data);
+        let seeded = rechunked(
+            BytesMut::from(&data[..300]),
+            streamed(&data[300..], 100, None),
+            256,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("cut");
+        assert_eq!(seeded, parts, "what is gathered first comes first");
+        assert!(rechunked(BytesMut::new(), streamed(&[], 100, None), 256)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("cut")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_large_stream_goes_up_in_parts_and_a_small_one_whole_both_byte_identical() {
+        let store = Probe::default();
+        for (key, size) in [("large.tar.gz", 5000), ("small.tar.gz", 1024), ("empty", 0)] {
+            let data = payload(size);
+            let uploaded = put_stream_in(
+                &store,
+                "memory",
+                Keys::Encoded,
+                key,
+                streamed(&data, 300, None),
+                typed("application/gzip"),
+                SMALL,
+            )
+            .await
+            .expect("uploaded");
+            assert_eq!(uploaded.size, size as u64);
+            let got = store.get(&OsPath::from(key)).await.expect("stored");
+            assert_eq!(
+                got.attributes
+                    .get(&Attribute::ContentType)
+                    .map(|v| v.as_ref()),
+                Some("application/gzip")
+            );
+            assert_eq!(got.bytes().await.expect("read"), data);
+        }
+        assert_eq!(store.counts.get(), [2, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_in_an_error_stores_nothing_and_returns_that_error() {
+        let store = Probe::default();
+        for (key, size) in [("large", 5000), ("small", 500)] {
+            let refused = put_stream_in(
+                &store,
+                "memory",
+                Keys::Encoded,
+                key,
+                streamed(&payload(size), 300, Some("not the content it claims")),
+                PutOptions::default(),
+                SMALL,
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(refused.to_string(), "not the content it claims");
+            assert!(store.get(&OsPath::from(key)).await.is_err(), "{key}");
+        }
+        assert_eq!(store.aborted().await, 1);
+        assert_eq!(store.counts.get(), [0, 1, 1]);
     }
 
     #[test]

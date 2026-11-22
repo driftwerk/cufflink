@@ -1573,6 +1573,7 @@ async fn deploy_web(
         config,
         client: &client,
         name: service_name,
+        parts: web_release::Parts::offered(&platform),
     };
     app.deploy(request, async |service_id: &str| {
         maybe_sync_configs(config, service_id, project, env, Some(&platform)).await?;

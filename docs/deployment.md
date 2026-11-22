@@ -950,6 +950,26 @@ steps, and only the last one changes what runs:
    lowercase hex digits (`400`). An object of that size already stored is
    not written again (`"stored": "present"` rather than `"uploaded"`).
    Audited as `web.upload`.
+
+   From v0.40.0 (feature `web_bundle_parts`) a bundle can instead go up in
+   parts, each its own request:
+   - `PUT /api/services/{id}/web/parts/{sha256}` with at most 16 MiB of the
+     bundle stores that part by content (`413` above it, `422` when the
+     body does not hash to the path), answering `sha256`, `size` and
+     `stored`.
+   - `POST /api/services/{id}/web/artifacts/{sha256}/parts` with
+     `{"size": 41234567, "parts": ["…", …]}`, naming 1 to 1024 parts,
+     streams the parts in order into the bundle's key. A part not
+     uploaded, or no longer stored, is named in a `409`; parts that do not
+     add up to `size` or do not hash to `{sha256}` are refused with a
+     `422`, and nothing is stored at the bundle's key. Otherwise the bundle
+     is stored and answered as the single upload is, and its parts are
+     removed. A replica runs at most two assemblies at once, and one of a
+     bundle already being assembled waits for it. The assembly runs on,
+     audited, when its request is dropped, and asked again once the bundle
+     is stored it answers `"stored": "present"`.
+     Parts never assembled are removed once older than
+     `WEB_UPLOAD_RETENTION_SECS`.
 4. **Release.** `POST /api/services/deploy` with the manifest and
    `"web_artifact": {"sha256": "…", "size": 41234567}`. Under the
    service's deploy lock the platform finds the upload, checks that it and
@@ -978,7 +998,14 @@ steps, and only the last one changes what runs:
 4. It syncs the project's configs, builds the app with the service's
    configs, and tars `.next`, `node_modules`, `package.json` and `public`.
 5. It uploads the bundle by its SHA-256, unless the running version
-   already records that bundle.
+   already records that bundle. On a platform with `web_bundle_parts`, a
+   bundle above 32 MiB goes up as parts of 8 MiB, four at a time, each
+   under the CLI's 120 s request timeout, and is then assembled. The CLI
+   asks for the assembly first and sends its parts only when the platform
+   lacks them, each distinct part once. A part or assembly that gets no
+   answer, a `5xx` (except `501` and `505`), `408` or `429` is sent again, up
+   to three times in all, after `Retry-After` when it is longer than the
+   pause; any other refusal stops the upload, and nothing is released.
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
    bundle not uploaded, or no longer stored, or another deploy holding the
    lock) is answered by one more upload and one more release; a second

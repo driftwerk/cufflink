@@ -72,6 +72,7 @@ pub struct AppState {
     pub outbox_seal: Option<outbox::OutboxSeal>,
     pub audit_reads: audit::ReadAudit,
     pub sql_parser: std::sync::Arc<sql_parser::SqlParser>,
+    pub(crate) web_assemblies: deployer::web::Assemblies,
 }
 
 pub struct Assembly {
@@ -133,6 +134,7 @@ impl AppState {
             webhooks: webhooks::Webhooks::new(&config.webhook_delivery),
             sse_limiter: router::sse::SseLimiter::new(config.sse_max_streams_per_principal),
             sql_parser: std::sync::Arc::new(sql_parser::SqlParser::new(config.sql_parse.clone())),
+            web_assemblies: deployer::web::Assemblies::default(),
             seen_identities: auth::delegation::SeenIdentities::new(
                 config.service_identity_replay_max,
             ),

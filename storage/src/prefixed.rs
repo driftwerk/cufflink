@@ -1,7 +1,9 @@
 use crate::common::{self, Keys};
 use crate::{Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
 use async_trait::async_trait;
+use bytes::Bytes;
 use eyre::{Result, WrapErr};
+use futures_util::stream::BoxStream;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::prefix::PrefixStore;
@@ -108,6 +110,23 @@ impl ObjectStorage for PrefixedBackend {
             key,
             data,
             self.put_options(options),
+        )
+        .await
+    }
+
+    async fn upload_stream(
+        &self,
+        key: &str,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        common::put_stream_with(
+            &self.primary(),
+            self.kind,
+            self.keys,
+            key,
+            data,
+            self.put_options(&UploadOptions::content_type(content_type)),
         )
         .await
     }

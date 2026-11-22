@@ -356,6 +356,12 @@ Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 |---------|-------------|----------|
 | `public_docs` | the manifest's `openapi` block declares `docs` | named, unauthenticated API documents, each a tagged subset of the service's spec, served with an embedded Swagger UI under a mount the service chooses ([public documents](openapi.md#public-documents)) |
 
+## Features added in v0.40.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `web_bundle_parts` | `cufflink deploy` of a web app whose bundle is above 32 MiB, from a CLI of v0.40.0; never demanded by a manifest | a web bundle uploaded as parts of at most 16 MiB, each its own request, and assembled by the platform, which stores it only when its bytes are its hash ([design](design-notes/web-bundle-parts.md)) |
+
 ## Changes in v0.33.0
 
 No new module-declared feature. Spec and client changes:
@@ -424,6 +430,18 @@ A web app is released with its bundle from v0.38.0 on (`web_releases`):
 The web runner is independent of both: a runner of any release reads the
 content keys as it reads the earlier ones, since they are opaque, and
 switches on the events of releases and rollbacks alike.
+
+A web bundle above 32 MiB goes up in parts from v0.40.0 on (`web_bundle_parts`):
+
+| CLI | Platform | Outcome |
+|-----|----------|---------|
+| new | new | the bundle in parts of 8 MiB, four at a time, each under the CLI's 120 s request timeout, then assembled; a bundle of at most 32 MiB in one request |
+| new | older | the bundle in one request, as before |
+| older | new | the bundle in one request, as before: the single upload is unchanged |
+
+While replicas of both releases run, a part or assembly that reaches an
+older replica is answered `404` or `405`, the CLI says a platform upgrade
+may be in progress, and nothing is released.
 
 ## Rolling a platform back
 
@@ -1383,6 +1401,46 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.40.0
+
+Web bundles uploaded in parts. One new platform feature,
+`web_bundle_parts`, which no manifest demands
+([features added in v0.40.0](#features-added-in-v0400)). A service built for
+v0.39.0 deploys and runs on this platform unchanged. New migration:
+`V10__web_upload_parts`, additive only. There is no new environment
+variable.
+
+- `cufflink deploy` of a web app sends a bundle above 32 MiB as parts of
+  8 MiB, four at a time, to `PUT /api/services/{id}/web/parts/{sha256}`,
+  then asks the platform to assemble them with
+  `POST /api/services/{id}/web/artifacts/{sha256}/parts`. Each part is its
+  own request under the CLI's 120 s request timeout, so a slow link no
+  longer has to carry the whole bundle in 120 s. The CLI asks for the
+  assembly first, so a bundle the platform already stores sends no part,
+  sends each distinct part once, and sends again, once, a part the
+  platform no longer stores when it assembles. A part or an assembly that
+  gets no answer, or a `5xx` (except `501` and `505`), `408` or `429`, is
+  sent again, up to three times in all, after the answer's `Retry-After`
+  when it is longer than the pause; only that request is sent again. Any
+  other refusal stops the upload and releases nothing.
+- The platform takes a part of at most 16 MiB, stores it by content and
+  records it in `web_upload_parts`. Assembly names 1 to 1024 parts. It
+  streams them in order into the bundle's content key, through the same
+  multipart upload as a large single upload, hashing as it goes, and
+  completes the object only when the bytes are the bundle's hash;
+  otherwise it answers `422` and nothing is stored. It holds a few parts
+  in memory rather than the bundle, runs at most two assemblies at once a
+  replica, lets an assembly of the same bundle wait for the one running,
+  runs on, audited, even when its request is dropped, and answers an
+  assembly asked again once the bundle is stored with
+  `"stored": "present"`. Its answer, audit record and
+  `cufflink_web_uploads_total` count are the single upload's. The parts
+  are then removed; any left behind are removed with the unreleased
+  bundles, once older than `WEB_UPLOAD_RETENTION_SECS`.
+- `cufflink-storage`: `ObjectStorage::upload_stream` stores what a stream
+  yields, in parts above the multipart threshold (at most 10,000 of
+  them), and stores nothing when the stream yields an error.
 
 ## Changes in v0.39.0
 

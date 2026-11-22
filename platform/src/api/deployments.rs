@@ -308,7 +308,7 @@ fn admit_web_artifact(
 ) -> PlatformResult<Option<WebArtifactRef>> {
     match (mode, web_artifact) {
         (ServiceMode::Web, Some(bundle)) => {
-            web::require_sha256(&bundle.sha256)?;
+            web::Object::Bundle.require_sha256(&bundle.sha256)?;
             Ok(Some(bundle))
         }
         (

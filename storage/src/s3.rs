@@ -4,7 +4,9 @@ use crate::{
     Uploaded,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use eyre::{Result, WrapErr};
+use futures_util::stream::BoxStream;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -149,6 +151,17 @@ impl ObjectStorage for S3Backend {
     ) -> Result<Uploaded> {
         let store = self.store_for(bucket, options.acl)?;
         common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
+    }
+
+    async fn upload_stream(
+        &self,
+        key: &str,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        let store = self.store_for(&self.bucket, None)?;
+        let options = UploadOptions::content_type(content_type);
+        common::put_stream(store.as_ref(), BACKEND, self.keys, key, data, &options).await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
