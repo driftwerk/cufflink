@@ -13,7 +13,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-const ARTIFACT_BODY_LIMIT: usize = 250 * 1024 * 1024;
+pub(crate) const ARTIFACT_BODY_LIMIT: usize = 250 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpProfile {

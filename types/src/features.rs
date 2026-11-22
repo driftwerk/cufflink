@@ -57,6 +57,7 @@ pub const GUEST_MEMORY_BUDGET: &str = "guest_memory_budget";
 pub const GUEST_STATEMENT_TIMEOUT: &str = "guest_statement_timeout";
 pub const SQL_PARSE: &str = "sql_parse";
 pub const WEB_RELEASES: &str = "web_releases";
+pub const WEB_BUNDLE_PARTS: &str = "web_bundle_parts";
 pub const PUBLIC_DOCS: &str = "public_docs";
 
 impl ServiceManifest {

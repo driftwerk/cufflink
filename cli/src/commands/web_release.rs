@@ -1,6 +1,7 @@
 use crate::commands::version::PlatformVersion;
 use crate::config::CliConfig;
-use cufflink_types::features::WEB_RELEASES;
+use cufflink_types::features::{WEB_BUNDLE_PARTS, WEB_RELEASES};
+use futures_util::{StreamExt, TryStreamExt};
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 
@@ -42,6 +43,46 @@ impl Bundle {
 
     fn size(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Parts {
+    threshold: usize,
+    size: usize,
+    in_flight: usize,
+}
+
+impl Default for Parts {
+    fn default() -> Self {
+        Self {
+            threshold: 32 * 1024 * 1024,
+            size: 8 * 1024 * 1024,
+            in_flight: 4,
+        }
+    }
+}
+
+impl Parts {
+    pub(crate) fn offered(platform: &PlatformVersion) -> Option<Self> {
+        platform.offers(WEB_BUNDLE_PARTS).then(Self::default)
+    }
+
+    fn of(self, bundle: &Bundle) -> Option<Vec<Bundle>> {
+        (bundle.size() > self.threshold).then(|| {
+            (0..bundle.size())
+                .step_by(self.size)
+                .map(|start| {
+                    let part = bundle
+                        .bytes
+                        .slice(start..(start + self.size).min(bundle.size()));
+                    Bundle {
+                        sha256: crate::digest::sha256_hex(&part),
+                        bytes: part,
+                    }
+                })
+                .collect()
+        })
     }
 }
 
@@ -98,6 +139,7 @@ pub(crate) struct WebApp<'a> {
     pub(crate) config: &'a CliConfig,
     pub(crate) client: &'a reqwest::Client,
     pub(crate) name: &'a str,
+    pub(crate) parts: Option<Parts>,
 }
 
 enum Release {
@@ -178,23 +220,108 @@ impl WebApp<'_> {
         }
     }
 
-    async fn upload(&self, reserved: &Reserved, bundle: &Bundle) -> eyre::Result<()> {
-        println!("Uploading bundle {}...", short(&bundle.sha256));
+    async fn put_part(
+        &self,
+        reserved: &Reserved,
+        bundle: &Bundle,
+        part: &Bundle,
+        (place, count): (usize, usize),
+    ) -> eyre::Result<()> {
         let request = self
             .config
             .auth_request(
                 self.client,
                 Method::PUT,
                 &self.url(&format!(
-                    "/api/services/{}/web/artifacts/{}",
+                    "/api/services/{}/web/parts/{}",
+                    reserved.service_id, part.sha256
+                )),
+            )
+            .header("Content-Type", "application/octet-stream")
+            .body(part.bytes.clone());
+        let doing = || {
+            format!(
+                "Uploading part {place} of {count} of bundle {}",
+                bundle.sha256
+            )
+        };
+        match self
+            .sent(request, || {
+                format!(
+                    "{} got no answer; {}",
+                    doing(),
+                    reserved.unreleased(self.name)
+                )
+            })
+            .await?
+        {
+            (_, Ok(_)) => Ok(()),
+            (status, Err(body)) => eyre::bail!(
+                "{} failed ({status}): {body}{}; {}",
+                doing(),
+                unrouted(status),
+                reserved.unreleased(self.name)
+            ),
+        }
+    }
+
+    async fn assembly(
+        &self,
+        reserved: &Reserved,
+        bundle: &Bundle,
+        parts: &[Bundle],
+        in_flight: usize,
+    ) -> eyre::Result<reqwest::RequestBuilder> {
+        println!("  In {} parts", parts.len());
+        futures_util::stream::iter(parts.iter().enumerate())
+            .map(|(index, part)| self.put_part(reserved, bundle, part, (index + 1, parts.len())))
+            .buffer_unordered(in_flight)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(self
+            .config
+            .auth_request(
+                self.client,
+                Method::POST,
+                &self.url(&format!(
+                    "/api/services/{}/web/artifacts/{}/parts",
                     reserved.service_id, bundle.sha256
                 )),
             )
-            .header("Content-Type", "application/gzip")
-            .body(bundle.bytes.clone());
+            .json(&json!({
+                "size": bundle.size(),
+                "parts": parts.iter().map(|part| &part.sha256).collect::<Vec<_>>(),
+            })))
+    }
+
+    async fn upload(&self, reserved: &Reserved, bundle: &Bundle) -> eyre::Result<()> {
+        println!("Uploading bundle {}...", short(&bundle.sha256));
+        let split = self
+            .parts
+            .and_then(|parts| parts.of(bundle).map(|split| (split, parts.in_flight)));
+        let (request, doing) = match split {
+            Some((parts, in_flight)) => (
+                self.assembly(reserved, bundle, &parts, in_flight).await?,
+                "Assembling",
+            ),
+            None => (
+                self.config
+                    .auth_request(
+                        self.client,
+                        Method::PUT,
+                        &self.url(&format!(
+                            "/api/services/{}/web/artifacts/{}",
+                            reserved.service_id, bundle.sha256
+                        )),
+                    )
+                    .header("Content-Type", "application/gzip")
+                    .body(bundle.bytes.clone()),
+                "Uploading",
+            ),
+        };
         let unanswered = || {
             format!(
-                "Uploading bundle {} got no answer; {}",
+                "{doing} bundle {} got no answer; {}",
                 bundle.sha256,
                 reserved.unreleased(self.name)
             )
@@ -209,7 +336,7 @@ impl WebApp<'_> {
                 Ok(())
             }
             (status, Err(body)) => eyre::bail!(
-                "Uploading bundle {} failed ({status}): {body}{}; {}",
+                "{doing} bundle {} failed ({status}): {body}{}; {}",
                 bundle.sha256,
                 unrouted(status),
                 reserved.unreleased(self.name)
@@ -439,12 +566,21 @@ mod tests {
         answers: Vec<Option<(u16, Value)>>,
         build: eyre::Result<Vec<u8>>,
     ) -> (eyre::Result<()>, Asked, Option<(String, usize)>) {
+        deployed_with(None, answers, build).await
+    }
+
+    async fn deployed_with(
+        parts: Option<Parts>,
+        answers: Vec<Option<(u16, Value)>>,
+        build: eyre::Result<Vec<u8>>,
+    ) -> (eyre::Result<()>, Asked, Option<(String, usize)>) {
         let (config, asked) = answering(answers).await;
         let client = config.http_client();
         let app = WebApp {
             config: &config,
             client: &client,
             name: "site",
+            parts,
         };
         let mut built = None;
         let ended = app
@@ -760,6 +896,341 @@ mod tests {
             assert_eq!(asked.requests(), [RESERVE]);
             assert_eq!(built, None, "nothing is built");
         }
+    }
+
+    const IN_PARTS: Parts = Parts {
+        threshold: 8,
+        size: 8,
+        in_flight: 1,
+    };
+
+    fn slices() -> Vec<&'static [u8]> {
+        BUNDLE.chunks(IN_PARTS.size).collect()
+    }
+
+    fn put_part(slice: &[u8]) -> String {
+        format!(
+            "PUT /api/services/7/web/parts/{}",
+            crate::digest::sha256_hex(slice)
+        )
+    }
+
+    fn part_stored(slice: &[u8]) -> Option<(u16, Value)> {
+        Some((
+            200,
+            json!({"sha256": crate::digest::sha256_hex(slice), "size": slice.len(),
+                   "stored": "uploaded"}),
+        ))
+    }
+
+    fn parts_stored() -> Vec<Option<(u16, Value)>> {
+        slices().into_iter().map(part_stored).collect()
+    }
+
+    fn parts_put() -> Vec<String> {
+        slices().into_iter().map(put_part).collect()
+    }
+
+    fn assemble() -> String {
+        format!("POST /api/services/7/web/artifacts/{}/parts", sha())
+    }
+
+    fn in_parts(
+        before: Vec<(u16, Value)>,
+        parts: Vec<Option<(u16, Value)>>,
+        after: Vec<Option<(u16, Value)>>,
+    ) -> Vec<Option<(u16, Value)>> {
+        before
+            .into_iter()
+            .map(Some)
+            .chain(parts)
+            .chain(after)
+            .collect()
+    }
+
+    fn requests(groups: &[&[String]]) -> Vec<String> {
+        groups.concat()
+    }
+
+    fn fixed(requests: &[&str]) -> Vec<String> {
+        requests.iter().map(|request| request.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_bundle_above_the_threshold_goes_up_in_parts_and_is_assembled_before_the_release() {
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            in_parts(
+                vec![reserved(), running(1, None)],
+                parts_stored(),
+                vec![Some(stored("uploaded")), Some(released(1, false))],
+            ),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released");
+        assert_eq!(
+            asked.requests(),
+            requests(&[
+                &fixed(&[RESERVE, STATUS]),
+                &parts_put(),
+                &[assemble()],
+                &fixed(&[RELEASE]),
+            ])
+        );
+        let hashes = slices()
+            .into_iter()
+            .map(crate::digest::sha256_hex)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            asked.bodies()[5],
+            json!({"size": BUNDLE.len(), "parts": hashes}),
+            "the assembly names the parts in order"
+        );
+        assert_eq!(
+            asked.bodies()[6]["web_artifact"],
+            json!({"sha256": sha(), "size": BUNDLE.len()}),
+            "the release names the assembled bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn parts_in_flight_together_all_reach_the_platform_before_the_assembly() {
+        let (ended, asked, _) = deployed_with(
+            Some(Parts {
+                in_flight: 3,
+                ..IN_PARTS
+            }),
+            in_parts(
+                vec![reserved(), running(1, None)],
+                parts_stored(),
+                vec![Some(stored("uploaded")), Some(released(1, false))],
+            ),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released");
+        let asked = asked.requests();
+        let mut sent = asked[2..5].to_vec();
+        sent.sort();
+        let mut expected = parts_put();
+        expected.sort();
+        assert_eq!(sent, expected);
+        assert_eq!(asked[5..], [assemble(), RELEASE.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_at_the_threshold_or_on_a_platform_without_parts_goes_in_one_request() {
+        for parts in [
+            Some(Parts {
+                threshold: BUNDLE.len(),
+                ..IN_PARTS
+            }),
+            None,
+        ] {
+            let (ended, asked, _) = deployed_with(
+                parts,
+                vec![
+                    Some(reserved()),
+                    Some(running(1, None)),
+                    Some(stored("uploaded")),
+                    Some(released(1, false)),
+                ],
+                Ok(BUNDLE.to_vec()),
+            )
+            .await;
+
+            ended.expect("released");
+            assert_eq!(asked.requests(), [RESERVE, STATUS, &upload(), RELEASE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_part_lost_or_refused_stops_the_upload_and_releases_nothing() {
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            in_parts(
+                vec![reserved(), running(7, Some(&"3f".repeat(32)))],
+                vec![part_stored(slices()[0]), None],
+                vec![],
+            ),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        assert_eq!(
+            ended.expect_err("no answer").to_string(),
+            format!(
+                "Uploading part 2 of 3 of bundle {} got no answer; nothing was released; site                  still runs v7 (bundle 3f3f3f3f3f3f)",
+                sha()
+            )
+        );
+        assert_eq!(
+            asked.requests(),
+            requests(&[&fixed(&[RESERVE, STATUS]), &parts_put()[..2]])
+        );
+
+        for (status, refusal, hint) in [
+            (422, "the part's SHA-256 is not its path's", ""),
+            (404, "", " (a platform replica"),
+        ] {
+            let (ended, asked, _) = deployed_with(
+                Some(IN_PARTS),
+                in_parts(
+                    vec![reserved(), running(1, None), refused(status, refusal)],
+                    vec![],
+                    vec![],
+                ),
+                Ok(BUNDLE.to_vec()),
+            )
+            .await;
+            let failed = ended.expect_err("refused").to_string();
+            assert!(
+                failed.starts_with(&format!(
+                    "Uploading part 1 of 3 of bundle {} failed ({status} ",
+                    sha()
+                )),
+                "{failed}"
+            );
+            assert!(
+                failed.contains(refusal) && failed.contains(hint),
+                "{failed}"
+            );
+            assert!(failed.ends_with("; nothing was released"), "{failed}");
+            assert_eq!(
+                asked.requests(),
+                requests(&[&fixed(&[RESERVE, STATUS]), &parts_put()[..1]])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_assembly_lost_or_refused_releases_nothing() {
+        let missing = format!(
+            "part {} of bundle {} was not uploaded, or is no longer stored; upload it again",
+            crate::digest::sha256_hex(slices()[1]),
+            sha()
+        );
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            in_parts(
+                vec![reserved(), running(1, None)],
+                parts_stored(),
+                vec![Some(refused(409, &missing))],
+            ),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        let failed = ended.expect_err("refused").to_string();
+        assert!(
+            failed.starts_with(&format!(
+                "Assembling bundle {} failed (409 Conflict): ",
+                sha()
+            )),
+            "{failed}"
+        );
+        assert!(failed.contains(&missing), "{failed}");
+        assert!(failed.ends_with("; nothing was released"), "{failed}");
+        assert_eq!(
+            asked.requests(),
+            requests(&[&fixed(&[RESERVE, STATUS]), &parts_put(), &[assemble()]])
+        );
+
+        let (ended, _, _) = deployed_with(
+            Some(IN_PARTS),
+            in_parts(
+                vec![reserved(), running(1, None)],
+                parts_stored(),
+                vec![None],
+            ),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        assert_eq!(
+            ended.expect_err("no answer").to_string(),
+            format!(
+                "Assembling bundle {} got no answer; nothing was released",
+                sha()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_refused_as_not_claimed_uploads_the_parts_again() {
+        let not_stored = format!(
+            "bundle {} of site was not uploaded, or is no longer stored; upload it again",
+            sha()
+        );
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            in_parts(
+                vec![reserved(), running(1, None)],
+                parts_stored(),
+                [
+                    vec![Some(stored("uploaded")), Some(refused(409, &not_stored))],
+                    parts_stored(),
+                    vec![Some(stored("present")), Some(released(2, false))],
+                ]
+                .concat(),
+            ),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released after uploading the parts again");
+        assert_eq!(
+            asked.requests(),
+            requests(&[
+                &fixed(&[RESERVE, STATUS]),
+                &parts_put(),
+                &[assemble()],
+                &fixed(&[RELEASE]),
+                &parts_put(),
+                &[assemble()],
+                &fixed(&[RELEASE]),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_bundle_splits_into_slices_in_order_of_which_only_the_last_is_shorter() {
+        let parts = |bytes: &[u8]| {
+            IN_PARTS.of(&Bundle::of(bytes.to_vec())).map(|parts| {
+                parts
+                    .into_iter()
+                    .map(|part| (part.bytes.to_vec(), part.sha256))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let expected = |slices: &[&[u8]]| {
+            Some(
+                slices
+                    .iter()
+                    .map(|slice| (slice.to_vec(), crate::digest::sha256_hex(slice)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(parts(BUNDLE), expected(&slices()));
+        assert_eq!(
+            parts(&b"sixteen bytes!!!"[..]),
+            expected(&[&b"sixteen "[..], &b"bytes!!!"[..]])
+        );
+        assert_eq!(parts(&b"8 bytes!"[..]), None, "a bundle at the threshold");
+    }
+
+    #[test]
+    fn parts_are_used_only_on_a_platform_that_offers_them() {
+        let platform = |supports: &[&str]| PlatformVersion {
+            api_version: 1,
+            platform_version: Some("0.40.0".into()),
+            supports: supports.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            Parts::offered(&platform(&[WEB_RELEASES, WEB_BUNDLE_PARTS])),
+            Some(Parts::default())
+        );
+        assert_eq!(Parts::offered(&platform(&[WEB_RELEASES])), None);
     }
 
     fn answer(answer: Value) -> eyre::Result<Vec<String>> {

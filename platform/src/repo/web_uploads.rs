@@ -4,7 +4,7 @@ use deadpool_postgres::GenericClient;
 use std::time::Duration;
 use uuid::Uuid;
 
-fn seconds(retention: Duration) -> i64 {
+pub(crate) fn seconds(retention: Duration) -> i64 {
     let bounded = retention
         .as_secs()
         .min(crate::config::MAX_WEB_UPLOAD_RETENTION_SECS);

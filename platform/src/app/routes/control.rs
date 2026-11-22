@@ -1,4 +1,5 @@
 use crate::{api, AppState};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use std::sync::Arc;
@@ -267,6 +268,15 @@ pub(in crate::app) fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/services/{id}/web/artifacts/{sha256}",
             put(api::web::upload_web_bundle),
+        )
+        .route(
+            "/api/services/{id}/web/artifacts/{sha256}/parts",
+            post(api::web::assemble_web_bundle),
+        )
+        .route(
+            "/api/services/{id}/web/parts/{sha256}",
+            put(api::web::upload_web_part)
+                .layer(DefaultBodyLimit::max(crate::deployer::web::PART_MAX_BYTES)),
         )
         .route("/api/services/{id}/web/status", get(api::web::web_status))
         .route("/api/services/{id}/wasm", post(api::wasm::upload_wasm))

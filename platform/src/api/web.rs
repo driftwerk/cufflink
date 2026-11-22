@@ -1,6 +1,7 @@
-use crate::auth::DeployAuth;
+use crate::auth::{AuthUser, DeployAuth};
 use crate::deployer::web;
 use crate::errors::{PlatformError, PlatformResult};
+use crate::repo::deployments::Artifact;
 use crate::repo::services::Status;
 use crate::wasm_runtime::sha256_hex;
 use crate::AppState;
@@ -59,24 +60,22 @@ pub async fn reserve_web_app(
     })))
 }
 
-pub async fn upload_web_bundle(
-    State(state): State<Arc<AppState>>,
-    DeployAuth(user): DeployAuth,
-    Path((id, sha256)): Path<(String, String)>,
-    body: axum::body::Bytes,
+async fn require_web_bundle(
+    state: &AppState,
+    service: &crate::repo::services::Service,
+    sha256: &str,
+) -> PlatformResult<()> {
+    web::require_sha256(sha256)?;
+    let running = crate::repo::deployments::current_mode(&state.platform_db, service.id).await?;
+    web::require_web(&service.name, running.as_ref())
+}
+
+async fn uploaded(
+    state: &AppState,
+    user: &AuthUser,
+    service: &crate::repo::services::Service,
+    stored: PlatformResult<(Artifact, web::Stored)>,
 ) -> PlatformResult<Json<Value>> {
-    let service_id = service_id(&id)?;
-    let service =
-        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
-    let stored = async {
-        web::require_sha256(&sha256)?;
-        let running =
-            crate::repo::deployments::current_mode(&state.platform_db, service_id).await?;
-        web::require_web(&service.name, running.as_ref())?;
-        web::require_content(&sha256, &sha256_hex(&body))?;
-        web::store(&state, service_id, &sha256, body, &user.subject).await
-    }
-    .await;
     metrics::counter!("cufflink_web_uploads_total", "result" => web::upload_result(&stored))
         .increment(1);
     let (upload, stored) = stored?;
@@ -89,7 +88,7 @@ pub async fn upload_web_bundle(
             credential: user.credential(),
             action: "web.upload",
             resource_type: "service",
-            resource_id: Some(&service_id.to_string()),
+            resource_id: Some(&service.id.to_string()),
             details: Some(json!({ "sha256": upload.hash, "size": upload.size })),
         },
     )
@@ -107,6 +106,60 @@ pub async fn upload_web_bundle(
         "s3_key": upload.s3_key,
         "stored": stored.as_str(),
     })))
+}
+
+pub async fn upload_web_bundle(
+    State(state): State<Arc<AppState>>,
+    DeployAuth(user): DeployAuth,
+    Path((id, sha256)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> PlatformResult<Json<Value>> {
+    let service_id = service_id(&id)?;
+    let service =
+        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
+    let stored = async {
+        require_web_bundle(&state, &service, &sha256).await?;
+        web::require_content(&sha256, &sha256_hex(&body))?;
+        web::store(&state, service_id, &sha256, body, &user.subject).await
+    }
+    .await;
+    uploaded(&state, &user, &service, stored).await
+}
+
+pub async fn upload_web_part(
+    State(state): State<Arc<AppState>>,
+    DeployAuth(user): DeployAuth,
+    Path((id, sha256)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> PlatformResult<Json<Value>> {
+    let service_id = service_id(&id)?;
+    let service =
+        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
+    require_web_bundle(&state, &service, &sha256).await?;
+    web::require_content(&sha256, &sha256_hex(&body))?;
+    let (part, stored) = web::store_part(&state, service_id, &sha256, body).await?;
+    Ok(Json(json!({
+        "sha256": part.hash,
+        "size": part.size,
+        "stored": stored.as_str(),
+    })))
+}
+
+pub async fn assemble_web_bundle(
+    State(state): State<Arc<AppState>>,
+    DeployAuth(user): DeployAuth,
+    Path((id, sha256)): Path<(String, String)>,
+    Json(assembly): Json<web::Assembly>,
+) -> PlatformResult<Json<Value>> {
+    let service_id = service_id(&id)?;
+    let service =
+        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
+    let stored = async {
+        require_web_bundle(&state, &service, &sha256).await?;
+        web::assemble(&state, service_id, &sha256, &assembly, &user.subject).await
+    }
+    .await;
+    uploaded(&state, &user, &service, stored).await
 }
 
 pub async fn upload_web_artifact(

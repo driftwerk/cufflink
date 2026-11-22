@@ -356,6 +356,12 @@ Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 |---------|-------------|----------|
 | `public_docs` | the manifest's `openapi` block declares `docs` | named, unauthenticated API documents, each a tagged subset of the service's spec, served with an embedded Swagger UI under a mount the service chooses ([public documents](openapi.md#public-documents)) |
 
+## Features added in v0.40.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `web_bundle_parts` | `cufflink deploy` of a web app whose bundle is above 32 MiB, from a CLI of v0.40.0; never demanded by a manifest | a web bundle uploaded as parts of at most 16 MiB, each its own request, and assembled by the platform, which stores it only when its bytes are its hash ([design](design-notes/web-bundle-parts.md)) |
+
 ## Changes in v0.33.0
 
 No new module-declared feature. Spec and client changes:
@@ -420,6 +426,18 @@ A web app is released with its bundle from v0.38.0 on (`web_releases`):
 | new | older | refused before building, naming `web_releases`. An older platform would also refuse the release itself with a `422` for the unknown `web_artifact` |
 | older | new | works as before, but safer: the deploy that registers the app before its build is accepted with a warning and skipped by its manifest alone, and its upload never replaces a recorded bundle, releasing new content as a new version. A failed build after a changed `package.json` version can still leave a version with no bundle. Upgrade the CLI with the platform |
 | older | older | as before |
+
+A web bundle above 32 MiB goes up in parts from v0.40.0 on (`web_bundle_parts`):
+
+| CLI | Platform | Outcome |
+|-----|----------|---------|
+| new | new | the bundle in parts of 8 MiB, four at a time, each under the CLI's 120 s request timeout, then assembled; a bundle of at most 32 MiB in one request |
+| new | older | the bundle in one request, as before |
+| older | new | the bundle in one request, as before: the single upload is unchanged |
+
+While replicas of both releases run, a part or assembly that reaches an
+older replica is answered `404` or `405`, the CLI says a platform upgrade
+may be in progress, and nothing is released.
 
 The web runner is independent of both: a runner of any release reads the
 content keys as it reads the earlier ones, since they are opaque, and
@@ -1383,6 +1401,31 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.40.0
+
+Web bundles uploaded in parts. One new platform feature,
+`web_bundle_parts`, which no manifest demands
+([features added in v0.40.0](#features-added-in-v0400)). A service built for
+v0.39.0 deploys and runs on this platform unchanged. New migration:
+`V10__web_upload_parts`, additive only. There is no new environment
+variable.
+
+- `cufflink deploy` of a web app sends a bundle above 32 MiB as parts of
+  8 MiB, four at a time, to `PUT /api/services/{id}/web/parts/{sha256}`,
+  then asks the platform to assemble them with
+  `POST /api/services/{id}/web/artifacts/{sha256}/parts`. Each part is its
+  own request under the CLI's 120 s request timeout, so a slow link no
+  longer has to carry the whole bundle in 120 s. A part that fails stops
+  the upload and releases nothing.
+- The platform takes a part of at most 16 MiB, stores it by content and
+  records it in `web_upload_parts`. Assembly reads the parts in order,
+  refuses them with a `422` unless their bytes are the bundle's hash, and
+  only then stores the bundle at its content key, as the single upload
+  does, with the same answer, audit record and
+  `cufflink_web_uploads_total` count. The parts are then removed; any left
+  behind are removed with the unreleased bundles, once older than
+  `WEB_UPLOAD_RETENTION_SECS`.
 
 ## Changes in v0.39.0
 

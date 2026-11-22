@@ -950,6 +950,21 @@ steps, and only the last one changes what runs:
    lowercase hex digits (`400`). An object of that size already stored is
    not written again (`"stored": "present"` rather than `"uploaded"`).
    Audited as `web.upload`.
+
+   From v0.40.0 (feature `web_bundle_parts`) a bundle can instead go up in
+   parts, each its own request:
+   - `PUT /api/services/{id}/web/parts/{sha256}` with at most 16 MiB of the
+     bundle stores that part by content (`413` above it, `422` when the
+     body does not hash to the path), answering `sha256`, `size` and
+     `stored`.
+   - `POST /api/services/{id}/web/artifacts/{sha256}/parts` with
+     `{"size": 41234567, "parts": ["…", …]}` assembles the parts in order.
+     A part not uploaded, or no longer stored, is named in a `409`; parts
+     that do not add up to `size` or do not hash to `{sha256}` are refused
+     with a `422`, and nothing is stored at the bundle's key. Otherwise the
+     bundle is stored and answered as the single upload is, and its parts
+     are removed. Parts never assembled are removed once older than
+     `WEB_UPLOAD_RETENTION_SECS`.
 4. **Release.** `POST /api/services/deploy` with the manifest and
    `"web_artifact": {"sha256": "…", "size": 41234567}`. Under the
    service's deploy lock the platform finds the upload, checks that it and
@@ -978,7 +993,10 @@ steps, and only the last one changes what runs:
 4. It syncs the project's configs, builds the app with the service's
    configs, and tars `.next`, `node_modules`, `package.json` and `public`.
 5. It uploads the bundle by its SHA-256, unless the running version
-   already records that bundle.
+   already records that bundle. On a platform with `web_bundle_parts`, a
+   bundle above 32 MiB goes up as parts of 8 MiB, four at a time, each
+   under the CLI's 120 s request timeout, and is then assembled; the first
+   part that fails stops the upload, and nothing is released.
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
    bundle not uploaded, or no longer stored, or another deploy holding the
    lock) is answered by one more upload and one more release; a second

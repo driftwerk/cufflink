@@ -214,6 +214,7 @@ mod tests {
                 (7, "capacity_deferrals"),
                 (8, "tenant_buckets"),
                 (9, "web_uploads"),
+                (10, "web_upload_parts"),
             ]
         );
     }

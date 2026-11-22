@@ -126,6 +126,16 @@ fn service_routes() -> Vec<Route> {
             "/web/artifacts/3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
             Body::None,
         ),
+        route(
+            Method::POST,
+            "/web/artifacts/3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a/parts",
+            Body::Json(json!({"size": 1, "parts": ["3f".repeat(32)]})),
+        ),
+        route(
+            Method::PUT,
+            "/web/parts/3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+            Body::None,
+        ),
         route(Method::GET, "/web/status", Body::None),
         route(
             Method::POST,
