@@ -1634,7 +1634,7 @@ async fn each_part_and_assembly_logs_what_it_waited_for() {
     assert!(timed(&lacked[0], &["turn_ms", "elapsed_ms"]), "{lacked:?}");
 
     for (part, hint) in PARTED.iter().zip([
-        format!("?bundle={sha256}&index=1"),
+        format!("?bundle={sha256}&index=1&bundle=not-a-hash&index=9"),
         "?bundle=not-a-hash&index=two".to_string(),
         String::new(),
     ]) {
@@ -1666,7 +1666,7 @@ async fn each_part_and_assembly_logs_what_it_waited_for() {
     assert_eq!(
         (&stored[0]["bundle"], &stored[0]["index"]),
         (&json!(short(&sha256)), &json!(1)),
-        "a part names the bundle and place its uploader gave"
+        "a part names the bundle and place its uploader gave first"
     );
     for unhinted in &stored[1..] {
         assert!(

@@ -170,13 +170,13 @@ fn failed_line(label: &str, reason: &str, took: Duration, again: Option<(u32, u3
     format!("  {label}: {reason} after {}{again}", seconds(took))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct Sent {
     bytes: usize,
     phases: Option<Phases>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct Phases {
     parts: Duration,
     assembly: Duration,
@@ -570,7 +570,11 @@ impl WebApp<'_> {
             }
         }
         let unique = distinct(split);
-        self.say(format!("  In {} parts", unique.len()));
+        self.say(if unique.len() == split.len() {
+            format!("  In {} parts", split.len())
+        } else {
+            format!("  In {} parts ({} distinct)", split.len(), unique.len())
+        });
         let (put_all, mut parts_took) =
             timed(self.put_parts(reserved, bundle, (parts, split.len()), &unique)).await;
         put_all?;
@@ -1946,7 +1950,13 @@ mod tests {
         )
         .await;
 
-        ended.expect_err("no answer");
+        assert!(ended
+            .expect_err("no answer")
+            .to_string()
+            .starts_with(&format!(
+                "Uploading part 1 of 3 of bundle {} got no answer",
+                sha()
+            )),);
         let part = format!("  Uploading part 1 of 3 of bundle {}: ", short(&sha()));
         assert_eq!(
             said[4..]

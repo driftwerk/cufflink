@@ -3,6 +3,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
+use http_body::Body as _;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::convert::Infallible;
 
@@ -22,8 +23,10 @@ pub(crate) struct Unread {
 }
 
 pub(crate) async fn received(body: Body, limit: usize) -> Result<Bytes, Unread> {
+    let expected =
+        usize::try_from(body.size_hint().lower()).map_or(limit, |lower| lower.min(limit));
     let mut body = Limited::new(body, limit);
-    let mut buffer = BytesMut::new();
+    let mut buffer = BytesMut::with_capacity(expected);
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| Unread {
             received: buffer.len(),

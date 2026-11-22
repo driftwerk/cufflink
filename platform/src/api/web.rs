@@ -7,7 +7,7 @@ use crate::wasm_runtime::sha256_hex;
 use crate::AppState;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, RawQuery, State},
     response::{IntoResponse, Response},
     Json,
 };
@@ -130,22 +130,28 @@ pub async fn upload_web_bundle(
     uploaded(&state, &user, &service, stored).await
 }
 
-#[derive(Debug, Deserialize)]
-pub struct PartHint {
+#[derive(Debug, Default)]
+struct PartHint {
     bundle: Option<String>,
-    index: Option<String>,
+    index: Option<u32>,
 }
 
 impl PartHint {
-    fn bundle(&self) -> Option<&str> {
-        self.bundle
-            .as_deref()
-            .filter(|bundle| web::is_sha256(bundle))
-            .map(web::short)
-    }
-
-    fn index(&self) -> Option<u32> {
-        self.index.as_deref().and_then(|index| index.parse().ok())
+    fn of(query: Option<&str>) -> Self {
+        form_urlencoded::parse(query.unwrap_or_default().as_bytes()).fold(
+            Self::default(),
+            |hint, (key, value)| match key.as_ref() {
+                "bundle" if hint.bundle.is_none() => Self {
+                    bundle: web::is_sha256(&value).then(|| web::short(&value).to_string()),
+                    ..hint
+                },
+                "index" if hint.index.is_none() => Self {
+                    index: value.parse().ok(),
+                    ..hint
+                },
+                _ => hint,
+            },
+        )
     }
 }
 
@@ -179,11 +185,16 @@ pub async fn upload_web_part(
     State(state): State<Arc<AppState>>,
     DeployAuth(user): DeployAuth,
     Path((id, sha256)): Path<(String, String)>,
-    Query(hint): Query<PartHint>,
+    RawQuery(query): RawQuery,
     body: Body,
 ) -> Result<Json<Value>, Response> {
     let started = Instant::now();
-    let (part, bundle, index) = (web::short(&sha256), hint.bundle(), hint.index());
+    let hint = PartHint::of(query.as_deref());
+    let (part, bundle, index) = (
+        web::is_sha256(&sha256).then(|| web::short(&sha256)),
+        hint.bundle.as_deref(),
+        hint.index,
+    );
     let body = crate::router::custom::body::received(body, web::PART_MAX_BYTES)
         .await
         .map_err(|unread| {

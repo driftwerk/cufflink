@@ -1016,7 +1016,8 @@ steps, and only the last one changes what runs:
    numbered by its place in the bundle. The upload ends with a summary,
    `Sent 156.0 MB in 190.3 s (0.8 MB/s)`, followed for a bundle in parts
    by `: parts 183.6 s, assembly 6.7 s`, the time spent sending the parts
-   and on the assembly; a bundle the platform already stores prints none
+   and on the assembly; an upload whose first assembly request is answered
+   sends no part and prints none
    ([web uploads](observability.md#web-uploads)).
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
    bundle not uploaded, or no longer stored, or another deploy holding the

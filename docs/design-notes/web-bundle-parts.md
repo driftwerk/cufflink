@@ -397,12 +397,16 @@ Uploading bundle 3f9a1c2b4d5e...
   again", before the error that ends the deploy.
 - Every assembly request prints its time, the first one included: it
   tells a wait for an assembly's turn apart from the reads and writes.
-- The summary counts the bytes sent, each distinct part and each part
-  sent again. `parts` is the wall time of sending them, pauses before an
-  attempt again included; `assembly` is that of every assembly request;
-  the total runs from the start of the upload. A bundle sent whole prints
-  the summary without its phases. A bundle the platform already stores
-  sends nothing and prints no summary.
+- The summary counts the bytes of the parts stored: each distinct part,
+  and each part sent again because the platform no longer stored it.
+  `parts` is the wall time of sending them, pauses before an attempt
+  again included; `assembly` is that of every assembly request; the total
+  runs from the start of the upload. A bundle sent whole prints the
+  summary without its phases. When the first assembly request is
+  answered, because the platform already stores the bundle or all its
+  parts, no part is sent and no summary prints.
+- `In N parts` counts the bundle's parts, and adds `(K distinct)` when
+  some repeat, since each distinct part is sent once.
 - `WebApp` prints through `out`, so the tests read what a deploy says.
   They erase the decimals, which are times and rates, and compare the
   rest line for line; the formatting functions are tested with fixed
@@ -413,9 +417,11 @@ Uploading bundle 3f9a1c2b4d5e...
 A part is stored by content, so its route names no bundle. The CLI adds
 `?bundle={sha256}&index={n}` to a part's request, the bundle's hash and the
 part's place in it, counted from 1. The platform logs them only: they
-change nothing it stores, answers or refuses. A `bundle` that is not 64
-lowercase hex digits, or an `index` that is not a number, is left out of
-the log, and a platform older than this one ignores both.
+change nothing it stores, answers or refuses. It reads the raw query, so
+no query refuses a part; the first of a repeated key counts. A `bundle`
+that is not 64 lowercase hex digits, or an `index` that is not a number,
+is left out of the log, as is a `part` whose path is not a hash, and a
+platform older than this one ignores both.
 
 ### 9.3 The platform
 
@@ -444,10 +450,13 @@ platform's other timings are.
 - A part's body is read in the handler, under the same 16 MiB limit and
   with the same `413`, so its time is measured and the bytes that arrived
   are known when it fails. The "Web part stored" line replaces the line
-  the store wrote for each part and bundle; the single upload's "Web
+  the store wrote for each part and bundle, "Web bundle assembly
+  answered" the "Web bundle assembled" line; the single upload's "Web
   bundle uploaded" line is unchanged.
-- A drop guard logs a request that ends before its answer: a client that
-  gives up mid-write would otherwise leave no line at all.
+- A drop guard logs a request that ends before its answer once its body
+  has arrived: a client that gives up mid-write would otherwise leave no
+  line at all. A client that gives up while its body is still arriving
+  ends that body, which the handler logs as "Web part not received".
 - A reverse proxy that buffers request bodies before passing them on makes
   `receive_ms` near zero; the time on the network is then in the CLI's
   number alone.

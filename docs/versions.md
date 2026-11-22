@@ -1443,7 +1443,8 @@ needs no migration and adds no setting.
   reached ([observability](observability.md#web-uploads)). The lines the
   store wrote for each part and bundle it stored are gone: the part's line
   above replaces the first, and the single upload's unchanged `Web bundle
-  uploaded` line the second.
+  uploaded` line the second. `Web bundle assembly answered` replaces `Web
+  bundle assembled`.
 
 ## Changes in v0.40.0
 
