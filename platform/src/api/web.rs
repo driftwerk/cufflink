@@ -120,7 +120,7 @@ pub async fn upload_web_bundle(
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     let stored = async {
         require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
-        web::require_content(&sha256, &sha256_hex(&body))?;
+        web::Object::Bundle.require_content(&sha256, &sha256_hex(&body))?;
         web::store(&state, service_id, &sha256, body, &user.subject).await
     }
     .await;
@@ -153,21 +153,25 @@ pub async fn assemble_web_bundle(
     Json(assembly): Json<web::Assembly>,
 ) -> PlatformResult<Json<Value>> {
     let service_id = service_id(&id)?;
-    let service =
-        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
-    let stored = async {
-        require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
-        web::assemble(
-            Arc::clone(&state),
-            service_id,
-            sha256,
-            assembly,
-            user.subject.clone(),
-        )
-        .await
-    }
-    .await;
-    uploaded(&state, &user, &service, stored).await
+    let bundle = sha256.clone();
+    tokio::spawn(async move {
+        let service =
+            super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
+        let assembled = async {
+            require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
+            web::assemble(&state, service_id, &sha256, &assembly, &user.subject).await
+        }
+        .await;
+        match assembled {
+            Ok(web::Assembled::Incomplete(missing)) => Err(missing.into()),
+            Ok(web::Assembled::Stored(stored)) => {
+                uploaded(&state, &user, &service, Ok(stored)).await
+            }
+            Err(e) => uploaded(&state, &user, &service, Err(e)).await,
+        }
+    })
+    .await
+    .map_err(|e| PlatformError::Internal(format!("The assembly of bundle {bundle} stopped: {e}")))?
 }
 
 pub async fn upload_web_artifact(

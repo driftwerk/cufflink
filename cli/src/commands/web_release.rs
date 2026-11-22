@@ -54,7 +54,10 @@ pub(crate) struct Parts {
     in_flight: usize,
     attempts: u32,
     backoff: Duration,
+    assembly_timeout: Duration,
 }
+
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 impl Default for Parts {
     fn default() -> Self {
@@ -64,22 +67,54 @@ impl Default for Parts {
             in_flight: 4,
             attempts: 3,
             backoff: Duration::from_secs(2),
+            assembly_timeout: Duration::from_secs(600),
         }
     }
 }
 
 struct Failed {
-    transient: bool,
-    reason: String,
+    status: Option<StatusCode>,
+    retry_after: Option<Duration>,
+    body: String,
     report: eyre::Report,
 }
 
+impl Failed {
+    fn transient(&self) -> bool {
+        self.status.is_none_or(transient)
+    }
+
+    fn reason(&self) -> String {
+        self.status
+            .map_or_else(|| "no answer".to_string(), |status| status.to_string())
+    }
+}
+
 fn transient(status: StatusCode) -> bool {
-    status.is_server_error()
-        || matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
-        )
+    match status {
+        StatusCode::NOT_IMPLEMENTED | StatusCode::HTTP_VERSION_NOT_SUPPORTED => false,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => true,
+        status => status.is_server_error(),
+    }
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn distinct(parts: &[Bundle]) -> Vec<&Bundle> {
+    let mut seen = std::collections::HashSet::new();
+    parts
+        .iter()
+        .filter(|part| seen.insert(part.sha256.as_str()))
+        .collect()
 }
 
 impl Parts {
@@ -171,22 +206,33 @@ impl WebApp<'_> {
         format!("{}{path}", self.config.api_url)
     }
 
+    async fn exchanged(
+        &self,
+        request: reqwest::RequestBuilder,
+        unanswered: impl FnOnce() -> String,
+    ) -> eyre::Result<(StatusCode, Option<Duration>, Result<Value, String>)> {
+        let answered = async {
+            let answer = request.send().await?;
+            let status = answer.status();
+            let after = retry_after(answer.headers());
+            if status.is_success() {
+                Ok((status, after, Ok(answer.json().await?)))
+            } else {
+                Ok((status, after, Err(answer.text().await.unwrap_or_default())))
+            }
+        }
+        .await;
+        answered.map_err(|lost: reqwest::Error| eyre::Report::new(lost).wrap_err(unanswered()))
+    }
+
     async fn sent(
         &self,
         request: reqwest::RequestBuilder,
         unanswered: impl FnOnce() -> String,
     ) -> eyre::Result<(StatusCode, Result<Value, String>)> {
-        let answered = async {
-            let answer = request.send().await?;
-            let status = answer.status();
-            if status.is_success() {
-                Ok((status, Ok(answer.json().await?)))
-            } else {
-                Ok((status, Err(answer.text().await.unwrap_or_default())))
-            }
-        }
-        .await;
-        answered.map_err(|lost: reqwest::Error| eyre::Report::new(lost).wrap_err(unanswered()))
+        self.exchanged(request, unanswered)
+            .await
+            .map(|(status, _, answer)| (status, answer))
     }
 
     async fn reserve(&self) -> eyre::Result<Reserved> {
@@ -247,21 +293,23 @@ impl WebApp<'_> {
     ) -> Result<Value, Failed> {
         let unreleased = reserved.unreleased(self.name);
         match self
-            .sent(request, || format!("{doing} got no answer; {unreleased}"))
+            .exchanged(request, || format!("{doing} got no answer; {unreleased}"))
             .await
         {
-            Ok((_, Ok(body))) => Ok(body),
-            Ok((status, Err(body))) => Err(Failed {
-                transient: transient(status),
-                reason: status.to_string(),
+            Ok((_, _, Ok(body))) => Ok(body),
+            Ok((status, retry_after, Err(body))) => Err(Failed {
+                status: Some(status),
+                retry_after,
                 report: eyre::eyre!(
                     "{doing} failed ({status}): {body}{}; {unreleased}",
                     unrouted(status)
                 ),
+                body,
             }),
             Err(report) => Err(Failed {
-                transient: true,
-                reason: "no answer".into(),
+                status: None,
+                retry_after: None,
+                body: String::new(),
                 report,
             }),
         }
@@ -271,22 +319,28 @@ impl WebApp<'_> {
         &self,
         parts: Parts,
         request: impl Fn() -> reqwest::RequestBuilder,
-        doing: &str,
+        (doing, label): (&str, &str),
         reserved: &Reserved,
-    ) -> eyre::Result<Value> {
+    ) -> Result<Value, Failed> {
         let mut attempt = 1;
         loop {
             match self.answered(request(), doing, reserved).await {
-                Ok(body) => return Ok(body),
-                Err(failed) if failed.transient && attempt < parts.attempts => {
+                Err(failed) if failed.transient() && attempt < parts.attempts => {
                     attempt += 1;
                     println!(
-                        "  {doing}: {}; trying again ({attempt} of {})",
-                        failed.reason, parts.attempts
+                        "  {label}: {}; trying again ({attempt} of {})",
+                        failed.reason(),
+                        parts.attempts
                     );
-                    tokio::time::sleep(parts.backoff * (attempt - 1)).await;
+                    let backoff = parts.backoff * (attempt - 1);
+                    tokio::time::sleep(
+                        failed
+                            .retry_after
+                            .map_or(backoff, |after| after.min(MAX_RETRY_AFTER).max(backoff)),
+                    )
+                    .await;
                 }
-                Err(failed) => return Err(failed.report),
+                answered => return answered,
             }
         }
     }
@@ -324,6 +378,7 @@ impl WebApp<'_> {
         reserved: &Reserved,
         bundle: &Bundle,
         split: &[Bundle],
+        parts: Parts,
     ) -> reqwest::RequestBuilder {
         self.config
             .auth_request(
@@ -334,6 +389,7 @@ impl WebApp<'_> {
                     reserved.service_id, bundle.sha256
                 )),
             )
+            .timeout(parts.assembly_timeout)
             .json(&json!({
                 "size": bundle.size(),
                 "parts": split.iter().map(|part| &part.sha256).collect::<Vec<_>>(),
@@ -345,29 +401,73 @@ impl WebApp<'_> {
         reserved: &Reserved,
         bundle: &Bundle,
         parts: Parts,
-        split: &[Bundle],
+        sent: &[&Bundle],
     ) -> eyre::Result<()> {
-        println!("  In {} parts", split.len());
-        futures_util::stream::iter(split.iter().enumerate())
+        futures_util::stream::iter(sent.iter().enumerate())
             .map(|(index, part)| async move {
-                let doing = format!(
-                    "Uploading part {} of {} of bundle {}",
-                    index + 1,
-                    split.len(),
-                    bundle.sha256
-                );
+                let place = format!("part {} of {} of bundle", index + 1, sent.len());
                 self.persisted(
                     parts,
                     || self.part_request(reserved, part),
-                    &doing,
+                    (
+                        &format!("Uploading {place} {}", bundle.sha256),
+                        &format!("Uploading {place} {}", short(&bundle.sha256)),
+                    ),
                     reserved,
                 )
                 .await
                 .map(drop)
+                .map_err(|failed| failed.report)
             })
             .buffer_unordered(parts.in_flight)
             .try_collect()
             .await
+    }
+
+    async fn assembled(
+        &self,
+        reserved: &Reserved,
+        bundle: &Bundle,
+        parts: Parts,
+        split: &[Bundle],
+    ) -> eyre::Result<Value> {
+        let (doing, label) = (
+            format!("Assembling bundle {}", bundle.sha256),
+            format!("Assembling bundle {}", short(&bundle.sha256)),
+        );
+        let assemble = || {
+            self.persisted(
+                parts,
+                || self.assembly_request(reserved, bundle, split, parts),
+                (&doing, &label),
+                reserved,
+            )
+        };
+        match assemble().await {
+            Err(failed) if failed.status == Some(StatusCode::CONFLICT) => {}
+            answered => return answered.map_err(|failed| failed.report),
+        }
+        let unique = distinct(split);
+        println!("  In {} parts", unique.len());
+        self.put_parts(reserved, bundle, parts, &unique).await?;
+        match assemble().await {
+            Err(failed) if failed.status == Some(StatusCode::CONFLICT) => {
+                let missing = unique
+                    .into_iter()
+                    .filter(|part| failed.body.contains(&part.sha256))
+                    .collect::<Vec<_>>();
+                if missing.is_empty() {
+                    return Err(failed.report);
+                }
+                println!(
+                    "  The platform no longer stores {} of them; uploading again",
+                    missing.len()
+                );
+                self.put_parts(reserved, bundle, parts, &missing).await?;
+                assemble().await.map_err(|failed| failed.report)
+            }
+            answered => answered.map_err(|failed| failed.report),
+        }
     }
 
     async fn upload(&self, reserved: &Reserved, bundle: &Bundle) -> eyre::Result<()> {
@@ -376,16 +476,7 @@ impl WebApp<'_> {
             .parts
             .and_then(|parts| parts.of(bundle).map(|split| (parts, split)));
         let answer = match split {
-            Some((parts, split)) => {
-                self.put_parts(reserved, bundle, parts, &split).await?;
-                self.persisted(
-                    parts,
-                    || self.assembly_request(reserved, bundle, &split),
-                    &format!("Assembling bundle {}", bundle.sha256),
-                    reserved,
-                )
-                .await?
-            }
+            Some((parts, split)) => self.assembled(reserved, bundle, parts, &split).await?,
             None => self
                 .answered(
                     self.whole_request(reserved, bundle),
@@ -966,6 +1057,7 @@ mod tests {
         in_flight: 1,
         attempts: 3,
         backoff: Duration::ZERO,
+        assembly_timeout: Duration::from_secs(5),
     };
 
     fn slices() -> Vec<&'static [u8]> {
@@ -999,16 +1091,22 @@ mod tests {
         format!("POST /api/services/7/web/artifacts/{}/parts", sha())
     }
 
-    fn in_parts(
-        before: Vec<(u16, Value)>,
-        parts: Vec<Option<(u16, Value)>>,
-        after: Vec<Option<(u16, Value)>>,
-    ) -> Vec<Option<(u16, Value)>> {
-        before
+    fn missing(part: &[u8]) -> Option<(u16, Value)> {
+        Some(refused(
+            409,
+            &format!(
+                "part {} of bundle {} was not uploaded, or is no longer stored; upload it again",
+                crate::digest::sha256_hex(part),
+                sha()
+            ),
+        ))
+    }
+
+    fn answers(groups: Vec<Vec<Option<(u16, Value)>>>) -> Vec<Option<(u16, Value)>> {
+        [vec![Some(reserved()), Some(running(1, None))]]
             .into_iter()
-            .map(Some)
-            .chain(parts)
-            .chain(after)
+            .chain(groups)
+            .flatten()
             .collect()
     }
 
@@ -1020,15 +1118,22 @@ mod tests {
         requests.iter().map(|request| request.to_string()).collect()
     }
 
+    fn hashes() -> Vec<String> {
+        slices()
+            .into_iter()
+            .map(crate::digest::sha256_hex)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_bundle_above_the_threshold_goes_up_in_parts_and_is_assembled_before_the_release() {
+    async fn a_bundle_above_the_threshold_is_asked_for_then_sent_in_parts_and_assembled() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(
-                vec![reserved(), running(1, None)],
+            answers(vec![
+                vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(released(1, false))],
-            ),
+            ]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1038,24 +1143,46 @@ mod tests {
             asked.requests(),
             requests(&[
                 &fixed(&[RESERVE, STATUS]),
+                &[assemble()],
                 &parts_put(),
                 &[assemble()],
                 &fixed(&[RELEASE]),
             ])
         );
-        let hashes = slices()
-            .into_iter()
-            .map(crate::digest::sha256_hex)
-            .collect::<Vec<_>>();
+        for at in [2, 6] {
+            assert_eq!(
+                asked.bodies()[at],
+                json!({"size": BUNDLE.len(), "parts": hashes()}),
+                "the assembly names the parts in order"
+            );
+        }
         assert_eq!(
-            asked.bodies()[5],
-            json!({"size": BUNDLE.len(), "parts": hashes}),
-            "the assembly names the parts in order"
-        );
-        assert_eq!(
-            asked.bodies()[6]["web_artifact"],
+            asked.bodies()[7]["web_artifact"],
             json!({"sha256": sha(), "size": BUNDLE.len()}),
             "the release names the assembled bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bundle_the_platform_already_stores_sends_no_part() {
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            answers(vec![vec![
+                Some(stored("present")),
+                Some(released(1, false)),
+            ]]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released");
+        assert_eq!(
+            asked.requests(),
+            requests(&[
+                &fixed(&[RESERVE, STATUS]),
+                &[assemble()],
+                &fixed(&[RELEASE])
+            ])
         );
     }
 
@@ -1066,23 +1193,23 @@ mod tests {
                 in_flight: 3,
                 ..IN_PARTS
             }),
-            in_parts(
-                vec![reserved(), running(1, None)],
+            answers(vec![
+                vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(released(1, false))],
-            ),
+            ]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
 
         ended.expect("released");
         let asked = asked.requests();
-        let mut sent = asked[2..5].to_vec();
+        let mut sent = asked[3..6].to_vec();
         sent.sort();
         let mut expected = parts_put();
         expected.sort();
         assert_eq!(sent, expected);
-        assert_eq!(asked[5..], [assemble(), RELEASE.to_string()]);
+        assert_eq!(asked[6..], [assemble(), RELEASE.to_string()]);
     }
 
     #[tokio::test]
@@ -1096,12 +1223,10 @@ mod tests {
         ] {
             let (ended, asked, _) = deployed_with(
                 parts,
-                vec![
-                    Some(reserved()),
-                    Some(running(1, None)),
+                answers(vec![vec![
                     Some(stored("uploaded")),
                     Some(released(1, false)),
-                ],
+                ]]),
                 Ok(BUNDLE.to_vec()),
             )
             .await;
@@ -1112,14 +1237,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_part_lost_or_refused_stops_the_upload_and_releases_nothing() {
+    async fn a_part_lost_three_times_or_refused_stops_the_upload_and_releases_nothing() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(
-                vec![reserved(), running(7, Some(&"3f".repeat(32)))],
-                vec![part_stored(slices()[0]), None, None, None],
-                vec![],
-            ),
+            [
+                vec![
+                    Some(reserved()),
+                    Some(running(7, Some(&"3f".repeat(32)))),
+                    missing(slices()[0]),
+                    part_stored(slices()[0]),
+                ],
+                vec![None; 3],
+            ]
+            .concat(),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1131,12 +1261,13 @@ mod tests {
                 sha()
             )
         );
+        let parts = parts_put();
         assert_eq!(
             asked.requests(),
             requests(&[
                 &fixed(&[RESERVE, STATUS]),
-                &parts_put()[..2],
-                &[parts_put()[1].clone(), parts_put()[1].clone()],
+                &[assemble(), parts[0].clone()],
+                &[parts[1].clone(), parts[1].clone(), parts[1].clone()],
             ]),
             "a part that gets no answer is sent three times in all"
         );
@@ -1145,14 +1276,14 @@ mod tests {
             (422, "the part's SHA-256 is not its path's", ""),
             (409, "service 'site' is not a web app", ""),
             (404, "", " (a platform replica without this route"),
+            (501, "", ""),
         ] {
             let (ended, asked, _) = deployed_with(
                 Some(IN_PARTS),
-                in_parts(
-                    vec![reserved(), running(1, None), refused(status, refusal)],
-                    vec![],
-                    vec![],
-                ),
+                answers(vec![vec![
+                    missing(slices()[0]),
+                    Some(refused(status, refusal)),
+                ]]),
                 Ok(BUNDLE.to_vec()),
             )
             .await;
@@ -1171,50 +1302,131 @@ mod tests {
             assert!(failed.ends_with("; nothing was released"), "{failed}");
             assert_eq!(
                 asked.requests(),
-                requests(&[&fixed(&[RESERVE, STATUS]), &parts_put()[..1]])
+                requests(&[&fixed(&[RESERVE, STATUS]), &[assemble()], &parts_put()[..1]])
             );
         }
     }
 
     #[tokio::test]
-    async fn an_assembly_lost_or_refused_releases_nothing() {
-        let missing = format!(
-            "part {} of bundle {} was not uploaded, or is no longer stored; upload it again",
-            crate::digest::sha256_hex(slices()[1]),
-            sha()
-        );
+    async fn a_part_the_platform_no_longer_stores_at_the_assembly_is_sent_again_once() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(
-                vec![reserved(), running(1, None)],
+            answers(vec![
+                vec![missing(slices()[0])],
                 parts_stored(),
-                vec![Some(refused(409, &missing))],
-            ),
+                vec![
+                    missing(slices()[1]),
+                    part_stored(slices()[1]),
+                    Some(stored("uploaded")),
+                    Some(released(1, false)),
+                ],
+            ]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
-        let failed = ended.expect_err("refused").to_string();
-        assert!(
-            failed.starts_with(&format!(
-                "Assembling bundle {} failed (409 Conflict): ",
-                sha()
-            )),
-            "{failed}"
-        );
-        assert!(failed.contains(&missing), "{failed}");
-        assert!(failed.ends_with("; nothing was released"), "{failed}");
+
+        ended.expect("released after sending the part again");
+        let parts = parts_put();
         assert_eq!(
             asked.requests(),
-            requests(&[&fixed(&[RESERVE, STATUS]), &parts_put(), &[assemble()]])
+            requests(&[
+                &fixed(&[RESERVE, STATUS]),
+                &[assemble()],
+                &parts,
+                &[assemble(), parts[1].clone(), assemble()],
+                &fixed(&[RELEASE]),
+            ])
         );
+    }
+
+    #[tokio::test]
+    async fn every_part_a_conflict_names_is_sent_again() {
+        let hashes = hashes();
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            answers(vec![
+                vec![missing(slices()[0])],
+                parts_stored(),
+                vec![
+                    Some(refused(
+                        409,
+                        &format!(
+                            "parts {}, {} of bundle {} were not uploaded, or are no longer \
+                             stored; upload them again",
+                            hashes[0],
+                            hashes[2],
+                            sha()
+                        ),
+                    )),
+                    part_stored(slices()[0]),
+                    part_stored(slices()[2]),
+                    Some(stored("uploaded")),
+                    Some(released(1, false)),
+                ],
+            ]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released after sending both parts again");
+        let parts = parts_put();
+        assert_eq!(
+            asked.requests(),
+            requests(&[
+                &fixed(&[RESERVE, STATUS]),
+                &[assemble()],
+                &parts,
+                &[assemble(), parts[0].clone(), parts[2].clone(), assemble()],
+                &fixed(&[RELEASE]),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_refused_lost_or_missing_a_part_twice_releases_nothing() {
+        let mismatch = format!("the bundle's SHA-256 is {}, not {}", "cd".repeat(32), sha());
+        let cases = [
+            (
+                vec![Some(refused(422, &mismatch))],
+                format!(
+                    "Assembling bundle {} failed (422 Unprocessable Entity): ",
+                    sha()
+                ),
+                requests(&[&[assemble()], &parts_put(), &[assemble()]]),
+            ),
+            (
+                vec![
+                    missing(slices()[1]),
+                    part_stored(slices()[1]),
+                    missing(slices()[1]),
+                ],
+                format!("Assembling bundle {} failed (409 Conflict): ", sha()),
+                requests(&[
+                    &[assemble()],
+                    &parts_put(),
+                    &[assemble(), parts_put()[1].clone(), assemble()],
+                ]),
+            ),
+        ];
+        for (after, starts, sent) in cases {
+            let (ended, asked, _) = deployed_with(
+                Some(IN_PARTS),
+                answers(vec![vec![missing(slices()[0])], parts_stored(), after]),
+                Ok(BUNDLE.to_vec()),
+            )
+            .await;
+            let failed = ended.expect_err("refused").to_string();
+            assert!(failed.starts_with(&starts), "{failed}");
+            assert!(failed.ends_with("; nothing was released"), "{failed}");
+            assert_eq!(
+                asked.requests(),
+                requests(&[&fixed(&[RESERVE, STATUS]), &sent])
+            );
+        }
 
         let (ended, _, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(
-                vec![reserved(), running(1, None)],
-                parts_stored(),
-                vec![None, None, None],
-            ),
+            answers(vec![vec![None; 3]]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1231,8 +1443,8 @@ mod tests {
     async fn a_part_or_assembly_lost_or_unavailable_is_sent_again_and_released() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(
-                vec![reserved(), running(1, None)],
+            answers(vec![
+                vec![missing(slices()[0])],
                 vec![
                     part_stored(slices()[0]),
                     None,
@@ -1241,7 +1453,7 @@ mod tests {
                     part_stored(slices()[2]),
                 ],
                 vec![None, Some(stored("present")), Some(released(2, false))],
-            ),
+            ]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1252,6 +1464,7 @@ mod tests {
             asked.requests(),
             requests(&[
                 &fixed(&[RESERVE, STATUS]),
+                &[assemble()],
                 &[
                     parts[0].clone(),
                     parts[1].clone(),
@@ -1268,13 +1481,44 @@ mod tests {
     #[test]
     fn only_a_lost_answer_or_a_passing_refusal_is_worth_sending_again() {
         let worth = [500, 502, 503, 504, 408, 429];
-        let lasting = [400, 401, 403, 404, 405, 409, 413, 422];
+        let lasting = [400, 401, 403, 404, 405, 409, 413, 422, 501, 505];
         assert!(worth
             .into_iter()
             .all(|status| transient(StatusCode::from_u16(status).expect("a status"))));
         assert!(!lasting
             .into_iter()
             .any(|status| transient(StatusCode::from_u16(status).expect("a status"))));
+    }
+
+    #[test]
+    fn a_retry_after_in_seconds_is_read_and_any_other_form_ignored() {
+        let after = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                value.parse().expect("a header value"),
+            );
+            retry_after(&headers)
+        };
+        assert_eq!(after("7"), Some(Duration::from_secs(7)));
+        assert_eq!(after(" 30 "), Some(Duration::from_secs(30)));
+        assert_eq!(after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn each_distinct_part_is_sent_once_in_the_order_it_first_appears() {
+        let parts = IN_PARTS
+            .of(&Bundle::of(b"same, 8!tail of same, 8!it".to_vec()))
+            .expect("in parts");
+        assert_eq!(parts.len(), 4);
+        assert_eq!(
+            distinct(&parts)
+                .into_iter()
+                .map(|part| part.bytes.to_vec())
+                .collect::<Vec<_>>(),
+            [b"same, 8!".to_vec(), b"tail of ".to_vec(), b"it".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -1285,32 +1529,28 @@ mod tests {
         );
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(
-                vec![reserved(), running(1, None)],
+            answers(vec![
+                vec![missing(slices()[0])],
                 parts_stored(),
-                [
-                    vec![Some(stored("uploaded")), Some(refused(409, &not_stored))],
-                    parts_stored(),
-                    vec![Some(stored("present")), Some(released(2, false))],
-                ]
-                .concat(),
-            ),
+                vec![Some(stored("uploaded")), Some(refused(409, &not_stored))],
+                vec![missing(slices()[0])],
+                parts_stored(),
+                vec![Some(stored("present")), Some(released(2, false))],
+            ]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
 
         ended.expect("released after uploading the parts again");
+        let once = requests(&[
+            &[assemble()],
+            &parts_put(),
+            &[assemble()],
+            &fixed(&[RELEASE]),
+        ]);
         assert_eq!(
             asked.requests(),
-            requests(&[
-                &fixed(&[RESERVE, STATUS]),
-                &parts_put(),
-                &[assemble()],
-                &fixed(&[RELEASE]),
-                &parts_put(),
-                &[assemble()],
-                &fixed(&[RELEASE]),
-            ])
+            requests(&[&fixed(&[RESERVE, STATUS]), &once, &once])
         );
     }
 

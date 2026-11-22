@@ -220,13 +220,13 @@ async fn put_in(
     backend: &'static str,
     keys: Keys,
     key: &str,
-    data: Vec<u8>,
+    data: impl Into<Bytes>,
     opts: PutOptions,
     multipart: Multipart,
 ) -> Result<Uploaded> {
     let path = keys.path(key)?;
+    let data = data.into();
     let size = data.len() as u64;
-    let data = Bytes::from(data);
     let stored = match multipart.put(data.len(), opts) {
         Put::Whole(opts) => store.put_opts(&path, PutPayload::from(data), opts).await,
         Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart).await,
@@ -294,7 +294,7 @@ async fn put_stream_in(
                     future::ready(Ok(whole))
                 })
                 .await?;
-            put_in(store, backend, keys, key, whole.to_vec(), opts, multipart).await
+            put_in(store, backend, keys, key, whole.freeze(), opts, multipart).await
         }
         Put::InParts(opts) => {
             let failed = |e: object_store::Error| {
@@ -304,9 +304,8 @@ async fn put_stream_in(
                 .put_multipart_opts(&keys.path(key)?, opts)
                 .await
                 .map_err(failed)?;
-            let data = stream::once(future::ready(Ok(head.freeze()))).chain(data);
             let (size, stored) = Pending::new(upload, backend, key)
-                .finish_stream(data, multipart, failed)
+                .finish_stream(head, data, multipart, failed)
                 .await?;
             tracing::info!(backend, key = %key, size, "Uploaded");
             Ok(Uploaded {
@@ -318,11 +317,12 @@ async fn put_stream_in(
 }
 
 fn rechunked(
-    data: impl futures_util::Stream<Item = Result<Bytes>> + Send + 'static,
+    head: BytesMut,
+    data: BoxStream<'static, Result<Bytes>>,
     part_size: usize,
 ) -> impl futures_util::Stream<Item = Result<Bytes>> {
     stream::try_unfold(
-        (data.boxed(), BytesMut::new(), false),
+        (data, head, false),
         move |(mut data, mut buffer, mut ended)| async move {
             loop {
                 if buffer.len() >= part_size {
@@ -391,11 +391,12 @@ impl Pending {
 
     async fn finish_stream(
         mut self,
-        data: impl futures_util::Stream<Item = Result<Bytes>> + Send + 'static,
+        head: BytesMut,
+        data: BoxStream<'static, Result<Bytes>>,
         multipart: Multipart,
         failed: impl Fn(object_store::Error) -> eyre::Report,
     ) -> Result<(u64, PutResult)> {
-        let completed = self.send_stream(data, multipart, failed).await;
+        let completed = self.send_stream(head, data, multipart, failed).await;
         if completed.is_ok() {
             self.upload = None;
         }
@@ -404,12 +405,27 @@ impl Pending {
 
     async fn send_stream(
         &mut self,
-        data: impl futures_util::Stream<Item = Result<Bytes>> + Send + 'static,
+        head: BytesMut,
+        data: BoxStream<'static, Result<Bytes>>,
         multipart: Multipart,
         failed: impl Fn(object_store::Error) -> eyre::Report,
     ) -> Result<(u64, PutResult)> {
         let upload = unfinished(&mut self.upload, self.backend, &self.key).map_err(&failed)?;
-        let size = rechunked(data, multipart.min_part_size)
+        let key = &self.key;
+        let size = rechunked(head, data, multipart.min_part_size)
+            .enumerate()
+            .map(|(index, part)| {
+                part.and_then(|part| {
+                    if index < MAX_PARTS {
+                        Ok(part)
+                    } else {
+                        Err(eyre::eyre!(
+                            "the upload of {key} needs more than {MAX_PARTS} parts of {} bytes",
+                            multipart.min_part_size
+                        ))
+                    }
+                })
+            })
             .map_ok(|part| {
                 let size = part.len() as u64;
                 upload
@@ -707,7 +723,7 @@ mod tests {
         ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
     };
     use async_trait::async_trait;
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use futures_util::stream::BoxStream;
     use futures_util::{FutureExt, StreamExt, TryStreamExt};
     use object_store::memory::InMemory;
@@ -1108,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_is_cut_into_parts_of_the_part_size_in_order() {
         let data = payload(700);
-        let parts = rechunked(streamed(&data, 100, None), 256)
+        let parts = rechunked(BytesMut::new(), streamed(&data, 100, None), 256)
             .try_collect::<Vec<_>>()
             .await
             .expect("cut");
@@ -1117,7 +1133,16 @@ mod tests {
             [256, 256, 188]
         );
         assert_eq!(parts.concat(), data);
-        assert!(rechunked(streamed(&[], 100, None), 256)
+        let seeded = rechunked(
+            BytesMut::from(&data[..300]),
+            streamed(&data[300..], 100, None),
+            256,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("cut");
+        assert_eq!(seeded, parts, "what is gathered first comes first");
+        assert!(rechunked(BytesMut::new(), streamed(&[], 100, None), 256)
             .try_collect::<Vec<_>>()
             .await
             .expect("cut")

@@ -98,13 +98,17 @@ any order, is the same as uploading it once.
 - When the bundle is already stored at its key at `size`, the platform
   reads no part: it records the upload and answers `"stored": "present"`,
   as the single upload does.
-- Otherwise every part must be recorded for this service (`409`, naming it:
-  `part {sha256} of bundle {sha256} was not uploaded, or is no longer
-  stored; upload it again`), and the recorded sizes must add up to `size`
+- Otherwise every part must be recorded for this service. One `409` names
+  every part that is not, each once (`part {sha256} of bundle {sha256} was
+  not uploaded, or is no longer stored; upload it again`, or `parts {sha256},
+  {sha256} of bundle …` for several). This answer is the expected first
+  answer to a new bundle (section 5), so it is not counted in
+  `cufflink_web_uploads_total`. The recorded sizes must add up to `size`
   (`422`).
-- The platform streams the parts in order, opening up to four ahead, into
-  `ObjectStorage::upload_stream` at the bundle's key, and hashes them as
-  they pass. A part whose object is missing, or of another size than
+- The platform streams the parts in order, opening each only once the one
+  before it is read, so no opened part waits out the store's request
+  timeout, into `ObjectStorage::upload_stream` at the bundle's key, and
+  hashes them as they pass. A part whose object is missing, or of another size than
   recorded, ends the stream with the same `409`. When the parts end, a hash
   that is not `sha256` ends the stream with `web::require_content`'s `422`.
   An error from the stream means the object is never completed, so a
@@ -113,9 +117,11 @@ any order, is the same as uploading it once.
   `size`, another assembly of the same bundle stored it, and the answer is
   `"stored": "present"`.
 - After the bundle is recorded, the platform removes the parts the
-  assembly named: each object first, then the rows of the objects it
-  removed. A part whose object it could not remove keeps its row, and the
-  sweep removes it later.
+  assembly named, four at a time: each object first, then the rows of the
+  objects it removed. A part whose object it could not remove keeps its
+  row, and the sweep removes it later. A part another deploy of the same
+  service shares may go with them; that deploy's assembly then names it
+  in a `409`, and its CLI sends it again (section 5).
 - The answer, its audit record (`web.upload`), its log line and the
   `cufflink_web_uploads_total{result}` count are the single upload's, built
   by the same function.
@@ -132,18 +138,29 @@ part since #88) already assume. An asynchronous assembly with a status to
 poll would need a lease shared between replicas and recovery for a replica
 that dies mid-assembly.
 
-The assembly runs in a task of its own, which the request awaits. When the
-request is dropped, the CLI's timeout or a lost connection, the assembly
-still finishes, and the CLI's next attempt finds the bundle stored and is
-answered `present`. Two assemblies of the same bundle at once write the
-same bytes to the same key, and both answer.
+The assembly runs in a task of its own, which the request awaits. The task
+starts as soon as the request's body is read, before anything else is
+awaited, and it also looks up the service, writes the audit record and
+counts the upload. When the request
+is dropped, the CLI's timeout or a lost connection, the assembly still
+finishes and is audited.
+
+Each replica streams at most two assemblies at once (`ASSEMBLIES_AT_ONCE`);
+others wait for a turn without holding memory. Only the stream waits for
+one: an assembly answered `present`, or with a `409` naming parts, never
+waits behind others. Assemblies of the same
+bundle on one replica take turns, so an attempt sent again while the first
+still runs waits for it and is then answered `present` without reading a
+part. Two replicas assembling the same bundle at once write the same bytes
+to the same key, and both answer.
 
 ### 3.4 Memory
 
 The platform holds the multipart threshold's worth of the stream before it
 decides between one write and a multipart upload, then at most four parts
-in flight to the bucket and the part being cut: about 64 MiB at the
-defaults, for a bundle of any size. The single upload is unchanged. The
+in flight to the bucket and the part being cut: about 72 MiB at the
+defaults, for a bundle of any size, and so at most about 144 MiB a replica
+for its two assemblies. The single upload is unchanged. The
 CLI keeps the bundle as `Bytes`, as today, and sends zero-copy slices of
 it.
 
@@ -160,7 +177,8 @@ stream of `Result<Bytes>` yields, on every backend:
 - A longer stream goes up through #88's multipart upload: the stream is cut
   into parts of the minimum part size, whatever sizes it arrives in, so
   every part but the last meets S3's and GCS's minimum, and the parts go
-  up with #88's concurrency.
+  up with #88's concurrency. A stream that needs more than S3's 10,000
+  parts is refused, and nothing is stored.
 - An error from the stream stops the write and is returned as it was
   yielded, so a caller can tell its own refusal from a storage failure. A
   multipart upload that does not complete is aborted by #88's guard, and
@@ -198,20 +216,30 @@ can never claim a part as a bundle.
 - `deploy_web` already asks the platform for its version and features. It
   passes whether the platform offers `web_bundle_parts` into `WebApp`, as
   `parts: Option<Parts>`.
-- `Parts { threshold, size, in_flight, attempts, backoff }` defaults to
-  32 MiB, 8 MiB, 4, 3 and 2 s. Tests construct smaller values. Nothing
-  reads them from the environment.
+- `Parts { threshold, size, in_flight, attempts, backoff, assembly_timeout }`
+  defaults to 32 MiB, 8 MiB, 4, 3, 2 s and 600 s. Tests construct smaller
+  values. Nothing reads them from the environment.
 - `WebApp::upload` is the one place that sends a bundle, both for the first
   upload and for the upload again after a release refused as not claimed.
   It sends one request when `parts` is `None` or the bundle is at most
-  `threshold`. Otherwise it slices the `Bytes` into `size` parts, hashes
-  each, sends them `in_flight` at a time and stops at the first that fails
-  for good, then asks the platform to assemble them.
+  `threshold`. Otherwise it slices the `Bytes` into `size` parts and hashes
+  each, then:
+  1. asks the platform to assemble them. A bundle it already stores is
+     answered `present`, and no part is sent;
+  2. on a `409`, sends each distinct part once, `in_flight` at a time,
+     stopping at the first that fails for good, and asks again;
+  3. on a second `409`, sends once more every part its body names, which
+     the platform no longer stores, and asks a last time.
+- The assembly request has its own timeout, `assembly_timeout`: it carries
+  no bulk over the link, but may wait for a turn and reads and writes the
+  bundle next to the bucket.
 - A part or an assembly that gets no answer, or a `5xx`, `408` or `429`, is
-  sent again after `backoff`, then twice `backoff`, up to `attempts` in
-  all, and each attempt again is printed with its reason. A `4xx` other
-  than `408` and `429`, the `404`/`405` of a replica mid-upgrade included,
-  is final. The single request is not sent again: it is only used for
+  sent again after `backoff`, then twice `backoff`, or after the answer's
+  `Retry-After` in seconds when that is longer (at most 60 s), up to
+  `attempts` in all, and each attempt again is printed with its reason and
+  the bundle's short hash. A `4xx` other than `408` and `429`, the
+  `404`/`405` of a replica mid-upgrade included, and a `501` or `505`, are
+  final. The single request is not sent again: it is only used for
   bundles of at most 32 MiB and for older platforms.
 - One function, `answered`, turns every upload request's outcome into its
   error, ending as every upload error does today:
@@ -246,6 +274,8 @@ whole writes, multipart uploads and aborts):
 - A stream ending in an error returns that error unchanged and stores
   nothing: below the threshold nothing is written, above it the multipart
   upload is aborted.
+- What is gathered before the multipart upload starts is cut first, in
+  order.
 
 Platform (`platform/tests/web_releases.rs`, against the local backend):
 
@@ -254,10 +284,11 @@ Platform (`platform/tests/web_releases.rs`, against the local backend):
   and the same assembly asked again answers `present`.
 - Uploading a part twice answers `present` the second time.
 - A part whose bytes are not its hash is refused with `422`, an empty one
-  with `400`, one above `PART_MAX_BYTES` with `413`, and one of exactly
-  that size is taken.
+  with `400`, one above `PART_MAX_BYTES` with `413` or its connection
+  closed unread, and one of exactly that size is taken.
 - An assembly naming a part never uploaded is refused with `409` naming it;
-  one whose part was recorded but is no longer stored likewise.
+  one whose part was recorded but is no longer stored likewise. Every
+  missing part is named once, in the order the assembly names them.
 - An assembly whose parts are not the bundle's hash is refused with `422`;
   one whose part sizes do not add up with `422`; one naming no parts, more
   than 1024 parts, a malformed hash or an oversized bundle with `400` or
@@ -267,6 +298,7 @@ Platform (`platform/tests/web_releases.rs`, against the local backend):
   is stored byte-identical.
 - Two assemblies of the same bundle at once both answer, and it is stored
   and recorded once.
+- A part stored at another size than recorded is named in a `409`.
 - Assembling a bundle already stored answers `present`, reads no part and
   removes the parts it names.
 - Parts past retention are removed by the sweep, and parts within it are
@@ -278,10 +310,15 @@ Platform (`platform/tests/web_releases.rs`, against the local backend):
 
 CLI (`web_release.rs`, against `commands::stub`):
 
-- A bundle above the threshold, on a platform offering the feature, is sent
-  as its parts and then assembled. The assembly names the parts' hashes in
-  order, and the release names the bundle. Parts in flight together all
-  reach the platform before the assembly.
+- A bundle above the threshold, on a platform offering the feature, is
+  asked for, sent as its parts and then assembled. The assembly names the
+  parts' hashes in order, and the release names the bundle. Parts in
+  flight together all reach the platform before the assembly.
+- A bundle the platform already stores sends no part.
+- A part the platform no longer stores at the assembly is sent again once,
+  and a second such refusal releases nothing.
+- Each distinct part is sent once.
+- A `Retry-After` in seconds is read, and an HTTP date is ignored.
 - A bundle at or below the threshold, or on a platform without the feature,
   is sent in one request.
 - A part that gets no answer three times releases nothing, and the error
@@ -292,7 +329,8 @@ CLI (`web_release.rs`, against `commands::stub`):
   follows.
 - A refused assembly and an assembly lost three times release nothing.
 - A release refused as not claimed uploads again in parts, then releases.
-- Only no answer, `5xx`, `408` and `429` are worth sending again.
+- Only no answer, `5xx` except `501` and `505`, `408` and `429` are worth
+  sending again.
 - Splitting: slices cover the bundle in order and only the last is shorter.
 
 ## 7. Documentation

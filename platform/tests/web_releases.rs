@@ -414,6 +414,23 @@ impl World {
             .expect("aged");
     }
 
+    async fn audited(&self, service_id: &str) -> Vec<(String, Value)> {
+        self.db
+            .pool()
+            .get()
+            .await
+            .expect("checkout")
+            .query(
+                "SELECT action, details FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
+                &[&service_id],
+            )
+            .await
+            .expect("audit")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
     fn part_key(service_id: &str, part: &[u8]) -> String {
         format!("web/{service_id}/parts/{}", sha256_hex(part))
     }
@@ -840,20 +857,7 @@ async fn a_web_release_records_its_bundle_in_the_deploy_audit() {
     };
     let bundle = b"bundle of the first".as_slice();
     let (service_id, shipped) = w.ship("0.1.0", bundle).await;
-    let actions: Vec<(String, Value)> =
-        w.db.pool()
-            .get()
-            .await
-            .expect("checkout")
-            .query(
-                "SELECT action, details FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
-                &[&service_id],
-            )
-            .await
-            .expect("audit")
-            .iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
+    let actions = w.audited(&service_id).await;
     let upload = actions
         .iter()
         .find(|(action, _)| action == "web.upload")
@@ -1313,6 +1317,38 @@ async fn concurrent_assemblies_of_the_same_bundle_both_answer_and_store_it_once(
 }
 
 #[tokio::test]
+async fn a_part_stored_at_another_size_than_recorded_is_named_in_a_conflict() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = whole(&PARTED);
+    let parts = w.sent_in_parts(&service_id, &PARTED).await;
+    w.storage
+        .upload(
+            &World::part_key(&service_id, PARTED[1]),
+            b"other bytes of another length".to_vec(),
+            "application/octet-stream",
+        )
+        .await
+        .expect("replaced");
+
+    let (status, refused) = w
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts)
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused.to_string().contains(&format!(
+            "part {} of bundle {} was not uploaded, or is no longer stored",
+            parts[1],
+            sha256_hex(&bundle)
+        )),
+        "{refused}"
+    );
+    assert_eq!(w.stored(&World::key(&service_id, &bundle)).await, None);
+}
+
+#[tokio::test]
 async fn a_part_recorded_but_no_longer_stored_is_named_in_a_conflict() {
     let Some(w) = World::start().await else {
         return;
@@ -1367,6 +1403,29 @@ async fn an_assembly_of_parts_that_are_not_the_bundle_stores_nothing() {
              upload it again"
         )),
         "{refused}"
+    );
+
+    let unsent = sha256_hex(b"also never uploaded");
+    let (status, refused) = w
+        .assemble(
+            &service_id,
+            &claimed,
+            bundle.len(),
+            &[
+                never.clone(),
+                parts[0].clone(),
+                unsent.clone(),
+                never.clone(),
+            ],
+        )
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused.to_string().contains(&format!(
+            "parts {never}, {unsent} of bundle {claimed} were not uploaded, or are no longer \
+             stored; upload them again"
+        )),
+        "every missing part is named once: {refused}"
     );
 
     let (status, refused) = w
@@ -1468,20 +1527,28 @@ async fn a_part_must_be_its_hash_not_empty_and_at_most_its_limit() {
             .header("authorization", w.deployer())
             .body(part);
         async move {
-            let response = request.send().await.expect("a part");
-            response.status().as_u16()
+            request
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
         }
     };
 
     assert_eq!(
-        put(sha256_hex(b"built"), b"something else".to_vec()).await,
-        422
+        put(sha256_hex(b"built"), b"something else".to_vec())
+            .await
+            .ok(),
+        Some(422)
     );
-    assert_eq!(put(sha256_hex(b""), Vec::new()).await, 400);
+    assert_eq!(put(sha256_hex(b""), Vec::new()).await.ok(), Some(400));
     let oversized = vec![b'x'; 16 * 1024 * 1024 + 1];
-    assert_eq!(put(sha256_hex(&oversized), oversized).await, 413);
+    let refused = put(sha256_hex(&oversized), oversized).await;
+    assert!(
+        matches!(refused, Ok(413)) || refused.as_ref().is_err_and(|e| !e.is_connect()),
+        "a part above the limit is refused with a 413, or its connection closed before it is read: {refused:?}"
+    );
     let largest = vec![b'x'; 16 * 1024 * 1024];
-    assert_eq!(put(sha256_hex(&largest), largest).await, 200);
+    assert_eq!(put(sha256_hex(&largest), largest).await.ok(), Some(200));
     assert_eq!(w.parts(&service_id).await.len(), 1);
 }
 
