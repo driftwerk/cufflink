@@ -1436,8 +1436,8 @@ the only crate that changes, prints the timings; cufflink-types,
 cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros and cufflink
 0.24.1, cufflink-fn 0.40.1, cufflink-nats 0.9.6, cufflink-native 0.12.1,
 cufflink-model 0.1.8 and cufflink-sql-parse 0.4.1 are unchanged and bumped
-so the tagged commit publishes them. `cufflink init` still scaffolds `cufflink = "0.24"` and
-`cufflink-fn = "0.40"`.
+so the tagged commit publishes them. `cufflink init` still scaffolds
+`cufflink = "0.24"` and `cufflink-fn = "0.40"`.
 
 - `cufflink deploy` of a web app prints a line for every attempt at a part
   or an assembly: a part's bytes, time and rate, an assembly's time, or a

@@ -80,8 +80,8 @@ trade-offs; a future reader should understand the change from the message alone.
 
 Published crates (`cufflink-types`, `cufflink-model`, `cufflink-sdk-macros`,
 `cufflink`, `cufflink-migrate`, `cufflink-pgcodec`, `cufflink-sql-parse`,
-`cufflink-fn`, `cufflink-cli`, `cufflink-nats`, `cufflink-native`) follow semver. Don't bump versions in a feature PR;
-maintainers cut releases by tagging `v*`, which publishes to crates.io and
+`cufflink-fn`, `cufflink-cli`, `cufflink-nats`, `cufflink-native`) follow semver.
+Don't bump versions in a feature PR; maintainers cut releases by tagging `v*`, which publishes to crates.io and
 pushes Docker images.
 
 ## License
