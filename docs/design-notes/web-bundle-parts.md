@@ -138,8 +138,10 @@ part since #88) already assume. An asynchronous assembly with a status to
 poll would need a lease shared between replicas and recovery for a replica
 that dies mid-assembly.
 
-The assembly runs in a task of its own, which the request awaits, and that
-task also writes the audit record and counts the upload. When the request
+The assembly runs in a task of its own, which the request awaits. The task
+starts as soon as the request's body is read, before anything else is
+awaited, and it also looks up the service, writes the audit record and
+counts the upload. When the request
 is dropped, the CLI's timeout or a lost connection, the assembly still
 finishes and is audited.
 

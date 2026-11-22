@@ -153,10 +153,10 @@ pub async fn assemble_web_bundle(
     Json(assembly): Json<web::Assembly>,
 ) -> PlatformResult<Json<Value>> {
     let service_id = service_id(&id)?;
-    let service =
-        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     let bundle = sha256.clone();
     tokio::spawn(async move {
+        let service =
+            super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
         let assembled = async {
             require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
             web::assemble(&state, service_id, &sha256, &assembly, &user.subject).await

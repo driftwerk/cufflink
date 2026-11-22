@@ -323,16 +323,13 @@ fn ordered(
         .iter()
         .map(|part| (part.hash.as_str(), part))
         .collect::<HashMap<_, _>>();
+    let mut named = std::collections::HashSet::new();
     let missing = assembly
         .parts
         .iter()
-        .filter(|part| !recorded.contains_key(part.as_str()))
-        .fold(Vec::<String>::new(), |mut missing, part| {
-            if !missing.contains(part) {
-                missing.push(part.clone());
-            }
-            missing
-        });
+        .filter(|part| !recorded.contains_key(part.as_str()) && named.insert(part.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     if missing.is_empty() {
         Ok(assembly
             .parts
