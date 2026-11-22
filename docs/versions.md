@@ -1464,6 +1464,12 @@ is not published.
   yields, in parts above the multipart threshold (at most 10,000 of
   them), and stores nothing when the stream yields an error.
 
+**Security.**
+
+- The lockfile takes url 2.5.9 (with form_urlencoded 1.2.3), the first
+  release patched for RUSTSEC-2026-0592, a stack overflow in
+  `Url::origin()` on nested `blob:` URLs.
+
 Rolling a platform back from v0.40.0 to v0.39.0 needs nothing undone
 first, though a CLI of v0.40.0 then sends each web bundle in one request
 again ([rolling a platform back](#rolling-a-platform-back)).
