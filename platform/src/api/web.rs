@@ -120,7 +120,7 @@ pub async fn upload_web_bundle(
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
     let stored = async {
         require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
-        web::require_content(&sha256, &sha256_hex(&body))?;
+        web::Object::Bundle.require_content(&sha256, &sha256_hex(&body))?;
         web::store(&state, service_id, &sha256, body, &user.subject).await
     }
     .await;
@@ -155,19 +155,16 @@ pub async fn assemble_web_bundle(
     let service_id = service_id(&id)?;
     let service =
         super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
-    let stored = async {
-        require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
-        web::assemble(
-            Arc::clone(&state),
-            service_id,
-            sha256,
-            assembly,
-            user.subject.clone(),
-        )
-        .await
-    }
-    .await;
-    uploaded(&state, &user, &service, stored).await
+    tokio::spawn(async move {
+        let stored = async {
+            require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
+            web::assemble(&state, service_id, &sha256, &assembly, &user.subject).await
+        }
+        .await;
+        uploaded(&state, &user, &service, stored).await
+    })
+    .await
+    .map_err(|e| PlatformError::Internal(format!("The assembly stopped: {e}")))?
 }
 
 pub async fn upload_web_artifact(

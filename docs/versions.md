@@ -1416,25 +1416,31 @@ variable.
   then asks the platform to assemble them with
   `POST /api/services/{id}/web/artifacts/{sha256}/parts`. Each part is its
   own request under the CLI's 120 s request timeout, so a slow link no
-  longer has to carry the whole bundle in 120 s. A part or an assembly
-  that gets no answer, or a `5xx`, `408` or `429`, is sent again, up to
-  three times in all, and only that request is sent again. Any other
-  refusal stops the upload and releases nothing.
+  longer has to carry the whole bundle in 120 s. The CLI asks for the
+  assembly first, so a bundle the platform already stores sends no part,
+  sends each distinct part once, and sends again, once, a part the
+  platform no longer stores when it assembles. A part or an assembly that
+  gets no answer, or a `5xx` (but `501` and `505`), `408` or `429`, is
+  sent again, up to three times in all, after the answer's `Retry-After`
+  when it is longer than the pause; only that request is sent again. Any
+  other refusal stops the upload and releases nothing.
 - The platform takes a part of at most 16 MiB, stores it by content and
   records it in `web_upload_parts`. Assembly names 1 to 1024 parts. It
   streams them in order into the bundle's content key, through the same
   multipart upload as a large single upload, hashing as it goes, and
   completes the object only when the bytes are the bundle's hash;
   otherwise it answers `422` and nothing is stored. It holds a few parts
-  in memory rather than the bundle, runs on even when its request is
-  dropped, and answers an assembly asked again once the bundle is stored
-  with `"stored": "present"`. Its answer, audit record and
+  in memory rather than the bundle, runs at most two assemblies at once a
+  replica, lets an assembly of the same bundle wait for the one running,
+  runs on, audited, even when its request is dropped, and answers an
+  assembly asked again once the bundle is stored with
+  `"stored": "present"`. Its answer, audit record and
   `cufflink_web_uploads_total` count are the single upload's. The parts
   are then removed; any left behind are removed with the unreleased
   bundles, once older than `WEB_UPLOAD_RETENTION_SECS`.
 - `cufflink-storage`: `ObjectStorage::upload_stream` stores what a stream
-  yields, in parts above the multipart threshold, and stores nothing when
-  the stream yields an error.
+  yields, in parts above the multipart threshold (at most 10,000 of
+  them), and stores nothing when the stream yields an error.
 
 ## Changes in v0.39.0
 

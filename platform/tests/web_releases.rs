@@ -414,6 +414,51 @@ impl World {
             .expect("aged");
     }
 
+    async fn audited(&self, service_id: &str) -> Vec<(String, Value)> {
+        self.db
+            .pool()
+            .get()
+            .await
+            .expect("checkout")
+            .query(
+                "SELECT action, details FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
+                &[&service_id],
+            )
+            .await
+            .expect("audit")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    async fn abandoned_assembly(
+        &self,
+        service_id: &str,
+        sha256: &str,
+        size: usize,
+        parts: &[String],
+    ) {
+        let body = json!({"size": size, "parts": parts}).to_string();
+        let request = format!(
+            "POST /api/services/{service_id}/web/artifacts/{sha256}/parts HTTP/1.1\r\n\
+             host: localhost\r\nauthorization: {}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n{body}",
+            self.deployer(),
+            body.len()
+        );
+        let address = self
+            .platform
+            .base_url
+            .trim_start_matches("http://")
+            .to_string();
+        let mut connection = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("a connection");
+        tokio::io::AsyncWriteExt::write_all(&mut connection, request.as_bytes())
+            .await
+            .expect("the request");
+    }
+
     fn part_key(service_id: &str, part: &[u8]) -> String {
         format!("web/{service_id}/parts/{}", sha256_hex(part))
     }
@@ -840,20 +885,7 @@ async fn a_web_release_records_its_bundle_in_the_deploy_audit() {
     };
     let bundle = b"bundle of the first".as_slice();
     let (service_id, shipped) = w.ship("0.1.0", bundle).await;
-    let actions: Vec<(String, Value)> =
-        w.db.pool()
-            .get()
-            .await
-            .expect("checkout")
-            .query(
-                "SELECT action, details FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
-                &[&service_id],
-            )
-            .await
-            .expect("audit")
-            .iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
+    let actions = w.audited(&service_id).await;
     let upload = actions
         .iter()
         .find(|(action, _)| action == "web.upload")
@@ -1313,6 +1345,91 @@ async fn concurrent_assemblies_of_the_same_bundle_both_answer_and_store_it_once(
 }
 
 #[tokio::test]
+async fn an_assembly_whose_request_is_dropped_finishes_is_audited_and_is_then_present() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let parts = [b'd', b'e', b'f'].map(|byte| vec![byte; 12 * 1024 * 1024]);
+    let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let bundle = whole(&slices);
+    let hashes = w.sent_in_parts(&service_id, &slices).await;
+
+    w.abandoned_assembly(&service_id, &sha256_hex(&bundle), bundle.len(), &hashes)
+        .await;
+    let mut waited = Duration::ZERO;
+    while w.uploads(&service_id).await.is_empty() && waited < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+    }
+    assert_eq!(
+        w.uploads(&service_id).await,
+        [(sha256_hex(&bundle), World::key(&service_id, &bundle))],
+        "the assembly finishes without its request"
+    );
+    let mut audited = Vec::new();
+    while audited.is_empty() && waited < Duration::from_secs(10) {
+        audited = w
+            .audited(&service_id)
+            .await
+            .into_iter()
+            .filter(|(action, _)| action == "web.upload")
+            .collect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+    }
+    assert_eq!(
+        audited
+            .first()
+            .map(|(_, details)| details["sha256"].clone()),
+        Some(json!(sha256_hex(&bundle))),
+        "the assembly is audited without its request"
+    );
+
+    let (status, again) = w
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &hashes)
+        .await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["stored"], "present");
+    assert_eq!(
+        w.stored(&World::key(&service_id, &bundle)).await,
+        Some(bundle)
+    );
+}
+
+#[tokio::test]
+async fn a_part_stored_at_another_size_than_recorded_is_named_in_a_conflict() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = whole(&PARTED);
+    let parts = w.sent_in_parts(&service_id, &PARTED).await;
+    w.storage
+        .upload(
+            &World::part_key(&service_id, PARTED[1]),
+            b"other bytes of another length".to_vec(),
+            "application/octet-stream",
+        )
+        .await
+        .expect("replaced");
+
+    let (status, refused) = w
+        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &parts)
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused.to_string().contains(&format!(
+            "part {} of bundle {} was not uploaded, or is no longer stored",
+            parts[1],
+            sha256_hex(&bundle)
+        )),
+        "{refused}"
+    );
+    assert_eq!(w.stored(&World::key(&service_id, &bundle)).await, None);
+}
+
+#[tokio::test]
 async fn a_part_recorded_but_no_longer_stored_is_named_in_a_conflict() {
     let Some(w) = World::start().await else {
         return;
@@ -1468,20 +1585,28 @@ async fn a_part_must_be_its_hash_not_empty_and_at_most_its_limit() {
             .header("authorization", w.deployer())
             .body(part);
         async move {
-            let response = request.send().await.expect("a part");
-            response.status().as_u16()
+            request
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
         }
     };
 
     assert_eq!(
-        put(sha256_hex(b"built"), b"something else".to_vec()).await,
-        422
+        put(sha256_hex(b"built"), b"something else".to_vec())
+            .await
+            .ok(),
+        Some(422)
     );
-    assert_eq!(put(sha256_hex(b""), Vec::new()).await, 400);
+    assert_eq!(put(sha256_hex(b""), Vec::new()).await.ok(), Some(400));
     let oversized = vec![b'x'; 16 * 1024 * 1024 + 1];
-    assert_eq!(put(sha256_hex(&oversized), oversized).await, 413);
+    let refused = put(sha256_hex(&oversized), oversized).await;
+    assert!(
+        matches!(refused, Ok(413) | Err(_)),
+        "a part above the limit is refused with a 413, or its connection closed before it is read: {refused:?}"
+    );
     let largest = vec![b'x'; 16 * 1024 * 1024];
-    assert_eq!(put(sha256_hex(&largest), largest).await, 200);
+    assert_eq!(put(sha256_hex(&largest), largest).await.ok(), Some(200));
     assert_eq!(w.parts(&service_id).await.len(), 1);
 }
 

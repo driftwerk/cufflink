@@ -23,7 +23,9 @@ pub(crate) const ASSEMBLY_MAX_BYTES: usize = 128 * 1024;
 
 const ASSEMBLY_MAX_PARTS: usize = 1024;
 
-const PARTS_READ_AHEAD: usize = 4;
+const PARTS_REMOVED_AT_ONCE: usize = 4;
+
+const ASSEMBLIES_AT_ONCE: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,10 +119,6 @@ fn is_sha256(candidate: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-pub(crate) fn require_sha256(candidate: &str) -> PlatformResult<()> {
-    Object::Bundle.require_sha256(candidate)
-}
-
 pub(crate) fn require_web(name: &str, running: Option<&ServiceMode>) -> PlatformResult<()> {
     match running {
         None | Some(ServiceMode::Web) => Ok(()),
@@ -130,10 +128,6 @@ pub(crate) fn require_web(name: &str, running: Option<&ServiceMode>) -> Platform
             "service '{name}' is not a web app; delete it before deploying it as one"
         ))),
     }
-}
-
-pub(crate) fn require_content(sha256: &str, actual: &str) -> PlatformResult<()> {
-    Object::Bundle.require_content(sha256, actual)
 }
 
 async fn stored_size(storage: &S3Storage, key: &str) -> PlatformResult<Option<u64>> {
@@ -346,8 +340,7 @@ fn verified(
 ) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
     let (storage, sha256) = (storage.clone(), bundle.hash.clone());
     let read = stream::iter(parts)
-        .map(move |part| opened(storage.clone(), part, sha256.clone()))
-        .buffered(PARTS_READ_AHEAD)
+        .then(move |part| opened(storage.clone(), part, sha256.clone()))
         .try_flatten()
         .boxed();
     stream::try_unfold(
@@ -385,10 +378,12 @@ async fn streamed(
             info!(key = %bundle.s3_key, size = bundle.size, "Web bundle assembled");
             Ok(Stored::Uploaded)
         }
-        Err(e) => match stored_size(storage, &bundle.s3_key).await? {
-            Some(stored) if i64::try_from(stored).ok() == Some(bundle.size) => Ok(Stored::Present),
+        Err(e) => match stored_size(storage, &bundle.s3_key).await {
+            Ok(Some(stored)) if i64::try_from(stored).ok() == Some(bundle.size) => {
+                Ok(Stored::Present)
+            }
             _ => Err(e.downcast::<PlatformError>().unwrap_or_else(|e| {
-                PlatformError::Internal(format!("Failed to store {}: {e}", bundle.s3_key))
+                PlatformError::Internal(format!("Failed to assemble {}: {e}", bundle.s3_key))
             })),
         },
     }
@@ -399,7 +394,7 @@ async fn remove_parts(state: &AppState, service_id: Uuid, parts: Vec<Artifact>) 
         return;
     };
     let removed = stream::iter(parts)
-        .filter_map(|part| async move {
+        .map(|part| async move {
             match storage
                 .delete_from_bucket(storage.primary_bucket(), &part.s3_key)
                 .await
@@ -416,6 +411,8 @@ async fn remove_parts(state: &AppState, service_id: Uuid, parts: Vec<Artifact>) 
                 }
             }
         })
+        .buffer_unordered(PARTS_REMOVED_AT_ONCE)
+        .filter_map(futures_util::future::ready)
         .collect::<Vec<_>>()
         .await;
     if removed.is_empty() {
@@ -460,19 +457,78 @@ async fn assembled(
     Ok(stored)
 }
 
+#[derive(Clone)]
+pub(crate) struct Assemblies {
+    slots: Arc<tokio::sync::Semaphore>,
+    running: Arc<std::sync::Mutex<HashMap<(Uuid, String), Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Default for Assemblies {
+    fn default() -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(ASSEMBLIES_AT_ONCE)),
+            running: Arc::default(),
+        }
+    }
+}
+
+struct Turn {
+    running: Arc<std::sync::Mutex<HashMap<(Uuid, String), Arc<tokio::sync::Mutex<()>>>>>,
+    key: (Uuid, String),
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        drop(self.held.take());
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if running
+            .get(&self.key)
+            .is_some_and(|gate| Arc::strong_count(gate) == 1)
+        {
+            running.remove(&self.key);
+        }
+    }
+}
+
+impl Assemblies {
+    async fn turn(&self, key: (Uuid, String)) -> Turn {
+        let gate = Arc::clone(
+            self.running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        Turn {
+            running: Arc::clone(&self.running),
+            key,
+            held: Some(gate.lock_owned().await),
+        }
+    }
+}
+
 pub(crate) async fn assemble(
-    state: Arc<AppState>,
+    state: &AppState,
     service_id: Uuid,
-    sha256: String,
-    assembly: Assembly,
-    uploaded_by: String,
+    sha256: &str,
+    assembly: &Assembly,
+    uploaded_by: &str,
 ) -> PlatformResult<(Artifact, Stored)> {
-    let bundle = sha256.clone();
-    tokio::spawn(
-        async move { assembled(&state, service_id, &sha256, &assembly, &uploaded_by).await },
-    )
-    .await
-    .map_err(|e| PlatformError::Internal(format!("The assembly of bundle {bundle} stopped: {e}")))?
+    let _turn = state
+        .web_assemblies
+        .turn((service_id, sha256.to_string()))
+        .await;
+    let _slot = state
+        .web_assemblies
+        .slots
+        .acquire()
+        .await
+        .map_err(|e| PlatformError::Internal(format!("No assembly can start: {e}")))?;
+    assembled(state, service_id, sha256, assembly, uploaded_by).await
 }
 
 fn claimed(
@@ -752,7 +808,9 @@ mod tests {
 
     #[test]
     fn a_bundle_hash_is_sixty_four_lowercase_hex_digits() {
-        assert!(require_sha256(&"0123456789abcdef".repeat(4)).is_ok());
+        assert!(Object::Bundle
+            .require_sha256(&"0123456789abcdef".repeat(4))
+            .is_ok());
         for refused in [
             "",
             "ab",
@@ -761,12 +819,15 @@ mod tests {
             &"ab".repeat(33),
         ] {
             assert!(
-                matches!(require_sha256(refused), Err(PlatformError::BadRequest(_))),
+                matches!(
+                    Object::Bundle.require_sha256(refused),
+                    Err(PlatformError::BadRequest(_))
+                ),
                 "{refused}"
             );
         }
         assert!(matches!(
-            require_content(&"ab".repeat(32), &"cd".repeat(32)),
+            Object::Bundle.require_content(&"ab".repeat(32), &"cd".repeat(32)),
             Err(PlatformError::Validation(message))
                 if message == format!("the bundle's SHA-256 is {}, not {}", "cd".repeat(32), "ab".repeat(32))
         ));
