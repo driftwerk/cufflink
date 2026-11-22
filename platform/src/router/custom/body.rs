@@ -22,11 +22,13 @@ pub(crate) struct Unread {
     pub(crate) refusal: Response,
 }
 
-pub(crate) async fn received(body: Body, limit: usize) -> Result<Bytes, Unread> {
-    let expected =
-        usize::try_from(body.size_hint().lower()).map_or(limit, |lower| lower.min(limit));
+pub(crate) fn declared(body: &Body) -> usize {
+    usize::try_from(body.size_hint().lower()).unwrap_or(usize::MAX)
+}
+
+pub(crate) async fn received(body: Body, limit: usize, reserve: usize) -> Result<Bytes, Unread> {
     let mut body = Limited::new(body, limit);
-    let mut buffer = BytesMut::with_capacity(expected);
+    let mut buffer = BytesMut::with_capacity(reserve.min(limit));
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| Unread {
             received: buffer.len(),
@@ -40,7 +42,7 @@ pub(crate) async fn received(body: Body, limit: usize) -> Result<Bytes, Unread> 
 }
 
 pub(super) async fn read(body: Body, limit: usize) -> Result<Bytes, Response> {
-    received(body, limit).await.map_err(|unread| {
+    received(body, limit, 0).await.map_err(|unread| {
         if unread.refusal.status() == StatusCode::PAYLOAD_TOO_LARGE {
             rejected("too_large");
         }
@@ -165,14 +167,14 @@ mod tests {
                 second,
             ]))
         };
-        let cut = received(frames(Err(std::io::Error::other("reset"))), 16)
+        let cut = received(frames(Err(std::io::Error::other("reset"))), 16, 16)
             .await
             .expect_err("cut short");
         assert_eq!(
             (cut.received, cut.refusal.status()),
             (2, StatusCode::BAD_REQUEST)
         );
-        let over = received(frames(Ok(Bytes::from_static(b"345"))), 4)
+        let over = received(frames(Ok(Bytes::from_static(b"345"))), 4, usize::MAX)
             .await
             .expect_err("over the limit");
         assert_eq!(
@@ -180,11 +182,26 @@ mod tests {
             (2, StatusCode::PAYLOAD_TOO_LARGE)
         );
         assert_eq!(
-            received(frames(Ok(Bytes::from_static(b"34"))), 4)
+            received(frames(Ok(Bytes::from_static(b"34"))), 4, 0)
                 .await
                 .map_err(|unread| unread.received)
                 .expect("fits"),
             Bytes::from_static(b"1234")
+        );
+    }
+
+    #[test]
+    fn a_body_declares_the_length_it_is_known_to_have_and_nothing_otherwise() {
+        assert_eq!(declared(&Body::from("1234")), 4);
+        assert_eq!(declared(&Body::empty()), 0);
+        assert_eq!(
+            declared(&Body::from_stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"12"),
+            )]))),
+            0
         );
     }
 

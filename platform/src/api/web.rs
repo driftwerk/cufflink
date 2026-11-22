@@ -195,7 +195,8 @@ pub async fn upload_web_part(
         hint.bundle.as_deref(),
         hint.index,
     );
-    let body = crate::router::custom::body::received(body, web::PART_MAX_BYTES)
+    let reserve = crate::router::custom::body::declared(&body);
+    let body = crate::router::custom::body::received(body, web::PART_MAX_BYTES, reserve)
         .await
         .map_err(|unread| {
             warn!(

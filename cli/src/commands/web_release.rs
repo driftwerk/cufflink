@@ -1950,13 +1950,14 @@ mod tests {
         )
         .await;
 
-        assert!(ended
-            .expect_err("no answer")
-            .to_string()
-            .starts_with(&format!(
+        let failed = ended.expect_err("no answer").to_string();
+        assert!(
+            failed.starts_with(&format!(
                 "Uploading part 1 of 3 of bundle {} got no answer",
                 sha()
-            )),);
+            )),
+            "{failed}"
+        );
         let part = format!("  Uploading part 1 of 3 of bundle {}: ", short(&sha()));
         assert_eq!(
             said[4..]

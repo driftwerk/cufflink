@@ -418,10 +418,13 @@ A part is stored by content, so its route names no bundle. The CLI adds
 `?bundle={sha256}&index={n}` to a part's request, the bundle's hash and the
 part's place in it, counted from 1. The platform logs them only: they
 change nothing it stores, answers or refuses. It reads the raw query, so
-no query refuses a part; the first of a repeated key counts. A `bundle`
-that is not 64 lowercase hex digits, or an `index` that is not a number,
-is left out of the log, as is a `part` whose path is not a hash, and a
-platform older than this one ignores both.
+no query refuses a part; of a repeated key, the first valid value counts.
+A `bundle` that is not 64 lowercase hex digits, or an `index` that is not
+a number, is left out of the log, as is a `part` whose path is not a hash,
+and a platform older than this one ignores both. The part's handler sizes
+its buffer from the length its body declares, up to 16 MiB; the custom
+routes' reader, which serves unauthenticated callers too, reserves
+nothing ahead of the bytes.
 
 ### 9.3 The platform
 
