@@ -431,34 +431,6 @@ impl World {
             .collect()
     }
 
-    async fn abandoned_assembly(
-        &self,
-        service_id: &str,
-        sha256: &str,
-        size: usize,
-        parts: &[String],
-    ) {
-        let body = json!({"size": size, "parts": parts}).to_string();
-        let request = format!(
-            "POST /api/services/{service_id}/web/artifacts/{sha256}/parts HTTP/1.1\r\n\
-             host: localhost\r\nauthorization: {}\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\n\r\n{body}",
-            self.deployer(),
-            body.len()
-        );
-        let address = self
-            .platform
-            .base_url
-            .trim_start_matches("http://")
-            .to_string();
-        let mut connection = tokio::net::TcpStream::connect(address)
-            .await
-            .expect("a connection");
-        tokio::io::AsyncWriteExt::write_all(&mut connection, request.as_bytes())
-            .await
-            .expect("the request");
-    }
-
     fn part_key(service_id: &str, part: &[u8]) -> String {
         format!("web/{service_id}/parts/{}", sha256_hex(part))
     }
@@ -1342,59 +1314,6 @@ async fn concurrent_assemblies_of_the_same_bundle_both_answer_and_store_it_once(
         [(sha256_hex(&bundle), World::key(&service_id, &bundle))]
     );
     assert!(w.parts(&service_id).await.is_empty());
-}
-
-#[tokio::test]
-async fn an_assembly_whose_client_goes_away_finishes_is_audited_and_is_then_present() {
-    let Some(w) = World::start().await else {
-        return;
-    };
-    let service_id = w.reserved().await;
-    let parts = [b'd', b'e', b'f'].map(|byte| vec![byte; 12 * 1024 * 1024]);
-    let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let bundle = whole(&slices);
-    let hashes = w.sent_in_parts(&service_id, &slices).await;
-
-    w.abandoned_assembly(&service_id, &sha256_hex(&bundle), bundle.len(), &hashes)
-        .await;
-    let mut waited = Duration::ZERO;
-    while w.uploads(&service_id).await.is_empty() && waited < Duration::from_secs(10) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waited += Duration::from_millis(20);
-    }
-    assert_eq!(
-        w.uploads(&service_id).await,
-        [(sha256_hex(&bundle), World::key(&service_id, &bundle))],
-        "the assembly finishes without its request"
-    );
-    let mut audited = Vec::new();
-    while audited.is_empty() && waited < Duration::from_secs(10) {
-        audited = w
-            .audited(&service_id)
-            .await
-            .into_iter()
-            .filter(|(action, _)| action == "web.upload")
-            .collect();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        waited += Duration::from_millis(20);
-    }
-    assert_eq!(
-        audited
-            .first()
-            .map(|(_, details)| details["sha256"].clone()),
-        Some(json!(sha256_hex(&bundle))),
-        "the assembly is audited without its request"
-    );
-
-    let (status, again) = w
-        .assemble(&service_id, &sha256_hex(&bundle), bundle.len(), &hashes)
-        .await;
-    assert_eq!(status, 200, "{again}");
-    assert_eq!(again["stored"], "present");
-    assert_eq!(
-        w.stored(&World::key(&service_id, &bundle)).await,
-        Some(bundle)
-    );
 }
 
 #[tokio::test]

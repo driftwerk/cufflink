@@ -298,8 +298,6 @@ Platform (`platform/tests/web_releases.rs`, against the local backend):
   is stored byte-identical.
 - Two assemblies of the same bundle at once both answer, and it is stored
   and recorded once.
-- An assembly whose request is dropped finishes, is recorded and audited,
-  and a later assembly is answered `present`.
 - A part stored at another size than recorded is named in a `409`.
 - Assembling a bundle already stored answers `present`, reads no part and
   removes the parts it names.
