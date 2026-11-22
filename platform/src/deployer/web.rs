@@ -266,6 +266,31 @@ fn missing_part(part: &str, bundle: &str) -> PlatformError {
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Missing {
+    bundle: String,
+    parts: Vec<String>,
+}
+
+impl From<Missing> for PlatformError {
+    fn from(Missing { bundle, parts }: Missing) -> Self {
+        match parts.as_slice() {
+            [part] => missing_part(part, &bundle),
+            parts => PlatformError::Conflict(format!(
+                "parts {} of bundle {bundle} were not uploaded, or are no longer stored; upload \
+                 them again",
+                parts.join(", ")
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum Assembled {
+    Stored((Artifact, Stored)),
+    Incomplete(Missing),
+}
+
 fn require_assembly(assembly: &Assembly) -> PlatformResult<i64> {
     if !(1..=ASSEMBLY_MAX_PARTS).contains(&assembly.parts.len()) {
         return Err(PlatformError::BadRequest(format!(
@@ -291,26 +316,41 @@ fn require_assembly(assembly: &Assembly) -> PlatformResult<i64> {
 
 fn ordered(
     assembly: &Assembly,
-    bundle: &Artifact,
+    bundle: &str,
     recorded: &[Artifact],
-) -> PlatformResult<Vec<Artifact>> {
+) -> Result<Vec<Artifact>, Missing> {
     let recorded = recorded
         .iter()
         .map(|part| (part.hash.as_str(), part))
         .collect::<HashMap<_, _>>();
-    let parts = assembly
+    let missing = assembly
         .parts
         .iter()
-        .map(|part| {
-            recorded
-                .get(part.as_str())
-                .map(|part| (*part).clone())
-                .ok_or_else(|| missing_part(part, &bundle.hash))
+        .filter(|part| !recorded.contains_key(part.as_str()))
+        .fold(Vec::<String>::new(), |mut missing, part| {
+            if !missing.contains(part) {
+                missing.push(part.clone());
+            }
+            missing
+        });
+    if missing.is_empty() {
+        Ok(assembly
+            .parts
+            .iter()
+            .filter_map(|part| recorded.get(part.as_str()).map(|part| (*part).clone()))
+            .collect())
+    } else {
+        Err(Missing {
+            bundle: bundle.to_string(),
+            parts: missing,
         })
-        .collect::<PlatformResult<Vec<_>>>()?;
+    }
+}
+
+fn require_held(bundle: &Artifact, parts: &[Artifact]) -> PlatformResult<()> {
     let held = parts.iter().map(|part| part.size).sum::<i64>();
     if held == bundle.size {
-        Ok(parts)
+        Ok(())
     } else {
         Err(PlatformError::Validation(format!(
             "the parts of bundle {} hold {held} bytes, not {}",
@@ -428,35 +468,6 @@ async fn remove_parts(state: &AppState, service_id: Uuid, parts: Vec<Artifact>) 
     }
 }
 
-async fn assembled(
-    state: &AppState,
-    service_id: Uuid,
-    sha256: &str,
-    assembly: &Assembly,
-    uploaded_by: &str,
-) -> PlatformResult<(Artifact, Stored)> {
-    let bundle = Artifact {
-        s3_key: object_key(service_id, sha256),
-        hash: sha256.to_string(),
-        size: require_assembly(assembly)?,
-    };
-    let storage = storage(state)?;
-    let recorded = crate::repo::web_upload_parts::find(
-        &state.platform_db.get().await?,
-        service_id,
-        &assembly.parts,
-    )
-    .await?;
-    let stored = if stored_size(storage, &bundle.s3_key).await? == Some(assembly.size) {
-        Stored::Present
-    } else {
-        streamed(storage, &bundle, ordered(assembly, &bundle, &recorded)?).await?
-    };
-    let stored = record_upload(state, service_id, (bundle, stored), uploaded_by).await?;
-    remove_parts(state, service_id, recorded).await;
-    Ok(stored)
-}
-
 #[derive(Clone)]
 pub(crate) struct Assemblies {
     slots: Arc<tokio::sync::Semaphore>,
@@ -517,18 +528,42 @@ pub(crate) async fn assemble(
     sha256: &str,
     assembly: &Assembly,
     uploaded_by: &str,
-) -> PlatformResult<(Artifact, Stored)> {
+) -> PlatformResult<Assembled> {
+    let bundle = Artifact {
+        s3_key: object_key(service_id, sha256),
+        hash: sha256.to_string(),
+        size: require_assembly(assembly)?,
+    };
     let _turn = state
         .web_assemblies
         .turn((service_id, sha256.to_string()))
         .await;
-    let _slot = state
-        .web_assemblies
-        .slots
-        .acquire()
-        .await
-        .map_err(|e| PlatformError::Internal(format!("No assembly can start: {e}")))?;
-    assembled(state, service_id, sha256, assembly, uploaded_by).await
+    let storage = storage(state)?;
+    let recorded = crate::repo::web_upload_parts::find(
+        &state.platform_db.get().await?,
+        service_id,
+        &assembly.parts,
+    )
+    .await?;
+    let stored = if stored_size(storage, &bundle.s3_key).await? == Some(assembly.size) {
+        Stored::Present
+    } else {
+        let parts = match ordered(assembly, sha256, &recorded) {
+            Ok(parts) => parts,
+            Err(missing) => return Ok(Assembled::Incomplete(missing)),
+        };
+        require_held(&bundle, &parts)?;
+        let _slot = state
+            .web_assemblies
+            .slots
+            .acquire()
+            .await
+            .map_err(|e| PlatformError::Internal(format!("No assembly can start: {e}")))?;
+        streamed(storage, &bundle, parts).await?
+    };
+    let stored = record_upload(state, service_id, (bundle, stored), uploaded_by).await?;
+    remove_parts(state, service_id, recorded).await;
+    Ok(Assembled::Stored(stored))
 }
 
 fn claimed(
@@ -787,6 +822,68 @@ mod tests {
             PlatformError::Conflict(message) => message,
             other => panic!("a conflict, not {other}"),
         }
+    }
+
+    #[test]
+    fn an_assembly_takes_its_parts_in_order_or_names_every_missing_one_once() {
+        let part = |byte: u8, size: i64| Artifact {
+            s3_key: format!("web/parts/{byte:02x}"),
+            hash: format!("{byte:02x}").repeat(32),
+            size,
+        };
+        let (first, second, third) = (part(0x1a, 4), part(0x2b, 3), part(0x3c, 2));
+        let assembly = |parts: &[&Artifact]| Assembly {
+            size: 0,
+            parts: parts.iter().map(|part| part.hash.clone()).collect(),
+        };
+        let recorded = [third.clone(), first.clone()];
+
+        assert_eq!(
+            ordered(&assembly(&[&first, &third, &first]), "b", &recorded),
+            Ok(vec![first.clone(), third.clone(), first.clone()])
+        );
+        let missing = ordered(
+            &assembly(&[&second, &first, &part(0x4d, 1), &second]),
+            "b",
+            &recorded,
+        )
+        .expect_err("missing");
+        assert_eq!(
+            missing,
+            Missing {
+                bundle: "b".into(),
+                parts: vec![second.hash.clone(), "4d".repeat(32)],
+            }
+        );
+        assert_eq!(
+            conflict(missing.into()),
+            format!(
+                "parts {}, {} of bundle b were not uploaded, or are no longer stored; upload them \
+                 again",
+                second.hash,
+                "4d".repeat(32)
+            )
+        );
+        assert_eq!(
+            conflict(
+                Missing {
+                    bundle: "b".into(),
+                    parts: vec![second.hash.clone()],
+                }
+                .into()
+            ),
+            format!(
+                "part {} of bundle b was not uploaded, or is no longer stored; upload it again",
+                second.hash
+            )
+        );
+
+        let bundle = part(0x5e, 9);
+        assert!(require_held(&bundle, &[first.clone(), second.clone(), third.clone()]).is_ok());
+        assert!(matches!(
+            require_held(&bundle, &[first, third]),
+            Err(PlatformError::Validation(_))
+        ));
     }
 
     #[test]

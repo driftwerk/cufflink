@@ -1345,7 +1345,7 @@ async fn concurrent_assemblies_of_the_same_bundle_both_answer_and_store_it_once(
 }
 
 #[tokio::test]
-async fn an_assembly_whose_request_is_dropped_finishes_is_audited_and_is_then_present() {
+async fn an_assembly_whose_client_goes_away_finishes_is_audited_and_is_then_present() {
     let Some(w) = World::start().await else {
         return;
     };
@@ -1486,6 +1486,29 @@ async fn an_assembly_of_parts_that_are_not_the_bundle_stores_nothing() {
         "{refused}"
     );
 
+    let unsent = sha256_hex(b"also never uploaded");
+    let (status, refused) = w
+        .assemble(
+            &service_id,
+            &claimed,
+            bundle.len(),
+            &[
+                never.clone(),
+                parts[0].clone(),
+                unsent.clone(),
+                never.clone(),
+            ],
+        )
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused.to_string().contains(&format!(
+            "parts {never}, {unsent} of bundle {claimed} were not uploaded, or are no longer \
+             stored; upload them again"
+        )),
+        "every missing part is named once: {refused}"
+    );
+
     let (status, refused) = w
         .assemble(&service_id, &claimed, bundle.len(), &parts)
         .await;
@@ -1602,7 +1625,7 @@ async fn a_part_must_be_its_hash_not_empty_and_at_most_its_limit() {
     let oversized = vec![b'x'; 16 * 1024 * 1024 + 1];
     let refused = put(sha256_hex(&oversized), oversized).await;
     assert!(
-        matches!(refused, Ok(413) | Err(_)),
+        matches!(refused, Ok(413)) || refused.as_ref().is_err_and(|e| !e.is_connect()),
         "a part above the limit is refused with a 413, or its connection closed before it is read: {refused:?}"
     );
     let largest = vec![b'x'; 16 * 1024 * 1024];

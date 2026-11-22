@@ -448,7 +448,7 @@ impl WebApp<'_> {
             answered => return answered.map_err(|failed| failed.report),
         }
         let unique = distinct(split);
-        println!("  In {} parts", split.len());
+        println!("  In {} parts", unique.len());
         self.put_parts(reserved, bundle, parts, &unique).await?;
         match assemble().await {
             Err(failed) if failed.status == Some(StatusCode::CONFLICT) => {
@@ -460,7 +460,7 @@ impl WebApp<'_> {
                     return Err(failed.report);
                 }
                 println!(
-                    "  The platform no longer stores {} of them; uploading it again",
+                    "  The platform no longer stores {} of them; uploading again",
                     missing.len()
                 );
                 self.put_parts(reserved, bundle, parts, &missing).await?;
@@ -1334,6 +1334,49 @@ mod tests {
                 &[assemble()],
                 &parts,
                 &[assemble(), parts[1].clone(), assemble()],
+                &fixed(&[RELEASE]),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn every_part_a_conflict_names_is_sent_again() {
+        let hashes = hashes();
+        let (ended, asked, _) = deployed_with(
+            Some(IN_PARTS),
+            answers(vec![
+                vec![missing(slices()[0])],
+                parts_stored(),
+                vec![
+                    Some(refused(
+                        409,
+                        &format!(
+                            "parts {}, {} of bundle {} were not uploaded, or are no longer \
+                             stored; upload them again",
+                            hashes[0],
+                            hashes[2],
+                            sha()
+                        ),
+                    )),
+                    part_stored(slices()[0]),
+                    part_stored(slices()[2]),
+                    Some(stored("uploaded")),
+                    Some(released(1, false)),
+                ],
+            ]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released after sending both parts again");
+        let parts = parts_put();
+        assert_eq!(
+            asked.requests(),
+            requests(&[
+                &fixed(&[RESERVE, STATUS]),
+                &[assemble()],
+                &parts,
+                &[assemble(), parts[0].clone(), parts[2].clone(), assemble()],
                 &fixed(&[RELEASE]),
             ])
         );

@@ -98,9 +98,12 @@ any order, is the same as uploading it once.
 - When the bundle is already stored at its key at `size`, the platform
   reads no part: it records the upload and answers `"stored": "present"`,
   as the single upload does.
-- Otherwise every part must be recorded for this service (`409`, naming it:
-  `part {sha256} of bundle {sha256} was not uploaded, or is no longer
-  stored; upload it again`), and the recorded sizes must add up to `size`
+- Otherwise every part must be recorded for this service. One `409` names
+  every part that is not, each once (`part {sha256} of bundle {sha256} was
+  not uploaded, or is no longer stored; upload it again`, or `parts {sha256},
+  {sha256} of bundle …` for several). This answer is the expected first
+  answer to a new bundle (section 5), so it is not counted in
+  `cufflink_web_uploads_total`. The recorded sizes must add up to `size`
   (`422`).
 - The platform streams the parts in order, opening each only once the one
   before it is read, so no opened part waits out the store's request
@@ -140,8 +143,10 @@ task also writes the audit record and counts the upload. When the request
 is dropped, the CLI's timeout or a lost connection, the assembly still
 finishes and is audited.
 
-Each replica runs at most two assemblies at once (`ASSEMBLIES_AT_ONCE`);
-others wait for a turn without holding memory. Assemblies of the same
+Each replica streams at most two assemblies at once (`ASSEMBLIES_AT_ONCE`);
+others wait for a turn without holding memory. Only the stream waits for
+one: an assembly answered `present`, or with a `409` naming parts, never
+waits behind others. Assemblies of the same
 bundle on one replica take turns, so an attempt sent again while the first
 still runs waits for it and is then answered `present` without reading a
 part. Two replicas assembling the same bundle at once write the same bytes
@@ -221,7 +226,7 @@ can never claim a part as a bundle.
      answered `present`, and no part is sent;
   2. on a `409`, sends each distinct part once, `in_flight` at a time,
      stopping at the first that fails for good, and asks again;
-  3. on a second `409`, sends once more the parts its body names, which
+  3. on a second `409`, sends once more every part its body names, which
      the platform no longer stores, and asks a last time.
 - The assembly request has its own timeout, `assembly_timeout`: it carries
   no bulk over the link, but may wait for a turn and reads and writes the
@@ -280,7 +285,8 @@ Platform (`platform/tests/web_releases.rs`, against the local backend):
   with `400`, one above `PART_MAX_BYTES` with `413` or its connection
   closed unread, and one of exactly that size is taken.
 - An assembly naming a part never uploaded is refused with `409` naming it;
-  one whose part was recorded but is no longer stored likewise.
+  one whose part was recorded but is no longer stored likewise. Every
+  missing part is named once, in the order the assembly names them.
 - An assembly whose parts are not the bundle's hash is refused with `422`;
   one whose part sizes do not add up with `422`; one naming no parts, more
   than 1024 parts, a malformed hash or an oversized bundle with `400` or
@@ -323,7 +329,7 @@ CLI (`web_release.rs`, against `commands::stub`):
   follows.
 - A refused assembly and an assembly lost three times release nothing.
 - A release refused as not claimed uploads again in parts, then releases.
-- Only no answer, `5xx` but `501` and `505`, `408` and `429` are worth
+- Only no answer, `5xx` except `501` and `505`, `408` and `429` are worth
   sending again.
 - Splitting: slices cover the bundle in order and only the last is shorter.
 

@@ -1420,7 +1420,7 @@ variable.
   assembly first, so a bundle the platform already stores sends no part,
   sends each distinct part once, and sends again, once, a part the
   platform no longer stores when it assembles. A part or an assembly that
-  gets no answer, or a `5xx` (but `501` and `505`), `408` or `429`, is
+  gets no answer, or a `5xx` (except `501` and `505`), `408` or `429`, is
   sent again, up to three times in all, after the answer's `Retry-After`
   when it is longer than the pause; only that request is sent again. Any
   other refusal stops the upload and releases nothing.

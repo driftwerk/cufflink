@@ -1003,7 +1003,7 @@ steps, and only the last one changes what runs:
    under the CLI's 120 s request timeout, and is then assembled. The CLI
    asks for the assembly first and sends its parts only when the platform
    lacks them, each distinct part once. A part or assembly that gets no
-   answer, a `5xx` (but `501` and `505`), `408` or `429` is sent again, up
+   answer, a `5xx` (except `501` and `505`), `408` or `429` is sent again, up
    to three times in all, after `Retry-After` when it is longer than the
    pause; any other refusal stops the upload, and nothing is released.
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
