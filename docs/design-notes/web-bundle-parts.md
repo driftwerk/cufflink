@@ -353,3 +353,115 @@ CLI (`web_release.rs`, against `commands::stub`):
   for every upload request's errors.
 - Idiomatic, functional Rust in the style of the surrounding code, with no
   `unwrap` outside tests.
+
+## 9. Timings of an upload
+
+A deploy over a slow network path to the platform can take minutes, and a
+part can go unanswered within the CLI's 120 s timeout before it succeeds
+again. Without timings nobody can tell where that time went: the parts on
+the network, the platform's write of each part to object storage, the
+wait for an assembly to start, or the assembly's reads and writes. The CLI
+and the platform therefore each say how long every step took, in the
+deploy's own output and the platform's log, with no metric to set up.
+
+### 9.1 The CLI
+
+Every attempt at a part or an assembly prints one line, and the upload
+ends with one line summing it up:
+
+```
+Uploading bundle 3f9a1c2b4d5e...
+  Assembling bundle 3f9a1c2b4d5e: 409 Conflict after 0.2 s
+  In 20 parts
+  Uploading part 2 of 20 of bundle 3f9a1c2b4d5e: 8388608 bytes in 3.1 s (2.6 MB/s)
+  Uploading part 1 of 20 of bundle 3f9a1c2b4d5e: 8388608 bytes in 3.4 s (2.4 MB/s)
+  Uploading part 7 of 20 of bundle 3f9a1c2b4d5e: no answer after 120.0 s; trying again (2 of 3)
+  Uploading part 7 of 20 of bundle 3f9a1c2b4d5e: 8388608 bytes in 4.0 s (2.0 MB/s), on attempt 2 of 3
+  ...
+  Assembling bundle 3f9a1c2b4d5e: answered in 6.5 s
+  Stored
+  Sent 156.0 MB in 190.3 s (0.8 MB/s): parts 183.6 s, assembly 6.7 s
+```
+
+- One line a part rather than a roll-up: the slow part is what is looked
+  for, and four in flight finish out of order, so each names its place.
+  A part's place is its position in the bundle, the same in every line,
+  in the platform's log and when it is sent again.
+- A part's time is its request's, from send to answer: its bytes on the
+  network and the platform's write of them. Its rate is its bytes over
+  that time, in MB of 1,048,576 bytes as the bundle's size line uses, and
+  is left out when the time is zero.
+- An attempt that fails says its reason and how long it waited for it.
+  The retry line keeps its words and gains the time; the last attempt of
+  a request that fails for good prints the same line without "trying
+  again", before the error that ends the deploy.
+- Every assembly request prints its time, the first one included: it
+  tells a wait for an assembly's turn apart from the reads and writes.
+- The summary counts the bytes sent, each distinct part and each part
+  sent again. `parts` is the wall time of sending them, pauses before an
+  attempt again included; `assembly` is that of every assembly request;
+  the total runs from the start of the upload. A bundle sent whole prints
+  the summary without its phases. A bundle the platform already stores
+  sends nothing and prints no summary.
+- `WebApp` prints through `out`, so the tests read what a deploy says.
+  They erase the decimals, which are times and rates, and compare the
+  rest line for line; the formatting functions are tested with fixed
+  durations.
+
+### 9.2 The part's place on the platform
+
+A part is stored by content, so its route names no bundle. The CLI adds
+`?bundle={sha256}&index={n}` to a part's request, the bundle's hash and the
+part's place in it, counted from 1. The platform logs them only: they
+change nothing it stores, answers or refuses. A `bundle` that is not 64
+lowercase hex digits, or an `index` that is not a number, is left out of
+the log, and a platform older than this one ignores both.
+
+### 9.3 The platform
+
+Each line carries `service_id` and the short hash (12 digits) of what it is
+about, `part` and, when its uploader named them, `bundle` and `index` for a
+part; `bundle` for an assembly. Times are whole milliseconds, `_ms` as the
+platform's other timings are.
+
+| Line | Level | Fields | Tells |
+|------|-------|--------|-------|
+| `Web part stored` | info | `size`, `stored`, `receive_ms`, `store_ms`, `elapsed_ms` | `receive_ms`: from the handler's start to the body's last byte, the network. `store_ms`: the part's check in object storage, its write and its record. `elapsed_ms`: the whole request |
+| `Web part not received` | warn | `received`, `receive_ms`, `status` | The body was cut short or was over 16 MiB: the bytes that arrived, and when it ended |
+| `Web part not stored` | warn | `size`, `receive_ms`, `store_ms` (when the write was reached), `elapsed_ms`, `error` | The part was refused or its write failed |
+| `Web part request dropped before its answer` | warn | `size`, `receive_ms`, `elapsed_ms` | The request ended, its client gone, while the platform checked or stored the part |
+| `Web bundle assembly answered` | info | `parts`, `size`, `outcome` (`uploaded`, `present`, `incomplete`), `missing`, `turn_ms`, `slot_ms`, `read_wait_ms`, `stream_ms`, `elapsed_ms` | `turn_ms`: waiting for an assembly of the same bundle; `slot_ms`: for one of the replica's two assembly slots; `stream_ms`: streaming the parts into the bundle; `read_wait_ms`: the part of it spent waiting for the parts' reads, so `stream_ms` less `read_wait_ms` is the time the bundle's write held the stream up |
+| `Web bundle not assembled` | warn | `parts`, `size`, the five times, `error` | The assembly failed, with the times it reached |
+| `Web bundle assembly request dropped before its answer; the assembly runs on` | warn | `elapsed_ms` | The CLI gave up on the request, which it then sends again |
+
+- Reading and writing overlap: the writer keeps parts of the bundle in
+  flight while the next part is read, so there is no separate write
+  time to report. What the stream waited for its reads is measured where
+  it asks for the next bytes.
+- `assemble` logs once, from one place, whatever it ends with: every
+  refusal, a missing part and a failure alike, with the times it reached
+  and zero for those it did not.
+- A part's body is read in the handler, under the same 16 MiB limit and
+  with the same `413`, so its time is measured and the bytes that arrived
+  are known when it fails. The "Web part stored" line replaces the line
+  the store wrote for each part and bundle; the single upload's "Web
+  bundle uploaded" line is unchanged.
+- A drop guard logs a request that ends before its answer: a client that
+  gives up mid-write would otherwise leave no line at all.
+- A reverse proxy that buffers request bodies before passing them on makes
+  `receive_ms` near zero; the time on the network is then in the CLI's
+  number alone.
+
+### 9.4 Tests
+
+- CLI: a deploy in parts, with a part sent again, prints each attempt and
+  the summary in order; a part that fails for good prints each attempt;
+  a bundle sent whole prints its summary, and one already stored prints
+  none. The line functions are tested with fixed durations, a zero one
+  included.
+- Platform: a part with a hint, with a malformed one and with none logs
+  the fields it should; an assembly that lacks its parts and one that
+  stores the bundle log their outcomes and times; a part refused and an
+  assembly refused log their errors with the times they reached. The body
+  reader reports the bytes that arrived when a body is cut short or over
+  its limit.
