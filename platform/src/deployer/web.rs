@@ -330,12 +330,15 @@ struct Spent {
 
 /// What an assembly's stream spent waiting on: `read`, its parts' reads,
 /// while the upload asked for bytes, and `write`, the upload's writes while
-/// it asked for none; `ended` is when its last byte was handed over.
+/// it asked for none. From `ended`, when its last byte was handed over, to
+/// `answered`, when the upload answered, it waited on its last parts and
+/// its completion.
 #[derive(Debug, Default)]
 struct Waits {
     read: AtomicU64,
     write: AtomicU64,
     ended: std::sync::OnceLock<Instant>,
+    answered: std::sync::OnceLock<Instant>,
 }
 
 impl Waits {
@@ -350,13 +353,12 @@ impl Waits {
         Duration::from_micros(spent.load(Ordering::Relaxed))
     }
 
-    /// The upload's writes: those it waited on while it held bytes, and
-    /// those after its last byte, its last parts, up to its completion.
     fn writing(&self, complete: Duration) -> Duration {
         let after_last_byte = self
             .ended
             .get()
-            .map(Instant::elapsed)
+            .zip(self.answered.get())
+            .map(|(ended, answered)| answered.saturating_duration_since(*ended))
             .unwrap_or_default()
             .saturating_sub(complete);
         Self::of(&self.write) + after_last_byte
@@ -526,10 +528,11 @@ async fn streamed(
     let streamed = storage
         .upload_stream(
             &bundle.s3_key,
-            verified(storage, bundle, parts, waits),
+            verified(storage, bundle, parts, Arc::clone(&waits)),
             Object::Bundle.content_type(),
         )
         .await;
+    let _ = waits.answered.set(Instant::now());
     match streamed {
         Ok(uploaded) => Ok((Stored::Uploaded, uploaded.completion)),
         Err(e) => match stored_size(storage, &bundle.s3_key).await {

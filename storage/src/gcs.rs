@@ -33,7 +33,7 @@ impl GcsBackend {
         let sa_key_path = vars(ENV_SA_KEY_PATH);
         let stall = common::Stall::configured();
         let primary = build_store(&bucket, sa_key_path.as_deref())?;
-        let writes = build_writer(Arc::clone(&primary), &bucket, sa_key_path.as_deref(), stall)?;
+        let writes = Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall));
         let iam_signer = match sa_key_path.as_deref() {
             Some(_) => None,
             None => Some(Arc::new(IamSignBlobSigner::new()?)),
@@ -74,13 +74,11 @@ impl GcsBackend {
         if bucket == self.bucket {
             return Ok(Arc::clone(&self.writes));
         }
-        let sa_key_path = self.sa_key_path.as_deref();
-        build_writer(
-            build_store(bucket, sa_key_path)?,
-            bucket,
-            sa_key_path,
+        Ok(Arc::new(Parted::new(
+            build_store(bucket, self.sa_key_path.as_deref())?,
+            BACKEND,
             self.stall,
-        )
+        )))
     }
 
     async fn presign(
@@ -114,37 +112,10 @@ impl GcsBackend {
 }
 
 fn build_store(bucket: &str, sa_key_path: Option<&str>) -> Result<Arc<GoogleCloudStorage>> {
-    built(
-        bucket,
-        sa_key_path,
-        common::client_options(),
-        common::retry_config(),
-    )
-}
-
-fn build_writer(
-    store: Arc<GoogleCloudStorage>,
-    bucket: &str,
-    sa_key_path: Option<&str>,
-    stall: common::Stall,
-) -> Result<Arc<Parted<GoogleCloudStorage>>> {
-    let cut = stall
-        .part_client()
-        .map(|(options, retry)| built(bucket, sa_key_path, options, retry))
-        .transpose()?;
-    Ok(Arc::new(Parted::new(store, cut, BACKEND, stall)))
-}
-
-fn built(
-    bucket: &str,
-    sa_key_path: Option<&str>,
-    options: object_store::ClientOptions,
-    retry: object_store::RetryConfig,
-) -> Result<Arc<GoogleCloudStorage>> {
     let mut builder = GoogleCloudStorageBuilder::new()
         .with_bucket_name(bucket)
-        .with_client_options(options)
-        .with_retry(retry);
+        .with_client_options(common::client_options())
+        .with_retry(common::retry_config());
     if let Some(path) = sa_key_path {
         builder = builder.with_service_account_path(path);
     }
@@ -336,6 +307,10 @@ mod tests {
     use cufflink_settings::process_var as var;
 
     fn emulated(server: &str) -> GcsBackend {
+        emulated_with(server, common::Stall::configured())
+    }
+
+    fn emulated_with(server: &str, stall: common::Stall) -> GcsBackend {
         let key = serde_json::json!({
             "gcs_base_url": server,
             "disable_oauth": true,
@@ -352,9 +327,8 @@ mod tests {
                 .build()
                 .expect("store"),
         );
-        let stall = common::Stall::configured();
         GcsBackend {
-            writes: Arc::new(Parted::new(Arc::clone(&store), None, BACKEND, stall)),
+            writes: Arc::new(Parted::new(Arc::clone(&store), BACKEND, stall)),
             primary: store,
             bucket: "example-documents".into(),
             sa_key_path: None,
@@ -414,6 +388,81 @@ mod tests {
             (data.len() as u64, Some("\"whole-5\""))
         );
         assert!(uploaded.completion.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_part_whose_answer_stalls_is_cut_at_the_stall_timeout_and_sent_again() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OBJECT: &str = "/example%2Ddocuments/bundles%2Fapp%2Etar%2Egz";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(OBJECT))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(OBJECT))
+            .and(query_param("partNumber", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"stalled\"")
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(OBJECT))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"part\""))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(OBJECT))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole-5\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let stall = common::Stall::of(
+            Duration::from_secs(1),
+            3,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        );
+        let uploaded = emulated_with(&server.uri(), stall)
+            .upload_to_bucket_with(
+                "example-documents",
+                "bundles/app.tar.gz",
+                vec![7; 40 * 1024 * 1024],
+                &UploadOptions::content_type("application/gzip"),
+            )
+            .await
+            .expect("uploaded");
+        assert_eq!(uploaded.etag.as_deref(), Some("\"whole-5\""));
+        let first_part_sent = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PUT"
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(name, number)| name == "partNumber" && number == "1")
+            })
+            .count();
+        assert_eq!(first_part_sent, 2);
     }
 
     #[test]

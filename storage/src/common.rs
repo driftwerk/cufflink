@@ -90,8 +90,6 @@ const DEFAULT_STALL_ATTEMPTS: u64 = 3;
 
 pub(crate) const ENV_STALL_ATTEMPTS: &str = "OBJECT_STORE_STALL_ATTEMPTS";
 
-const DEFAULT_COMPLETION_TIMEOUT_SECS: u64 = 60;
-
 pub(crate) const ENV_COMPLETION_TIMEOUT_SECS: &str = "OBJECT_STORE_COMPLETION_TIMEOUT_SECS";
 
 fn env_positive(name: &'static str, default: u64) -> u64 {
@@ -124,11 +122,11 @@ pub(crate) fn request_timeout() -> Duration {
 }
 
 /// How a storage request that makes no progress is cut short and tried
-/// again: a write that has not finished within `timeout` for each part's
-/// worth of its bytes, a part of a multipart upload not answered within
-/// `timeout`, the completion of one not answered within `completion`, an open
-/// with no answer within `timeout`, and a read that receives nothing for it,
-/// which resumes from its next byte. A request is tried at most `attempts`
+/// again: a write, whole or one part of a multipart upload, that has not
+/// finished within `timeout` for each part's worth of its bytes, the
+/// completion of a multipart upload not answered within `completion`, an
+/// open with no answer within `timeout`, and a read that receives nothing for
+/// it, which resumes from its next byte. A request is tried at most `attempts`
 /// times in a row, and its last attempt is bounded only by the request
 /// timeout, the `ceiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,13 +139,18 @@ pub(crate) struct Stall {
 
 impl Stall {
     pub(crate) fn configured() -> Self {
+        let timeout = env_secs(ENV_STALL_TIMEOUT_SECS, DEFAULT_STALL_TIMEOUT_SECS);
         Self {
-            timeout: env_secs(ENV_STALL_TIMEOUT_SECS, DEFAULT_STALL_TIMEOUT_SECS),
+            timeout,
             attempts: u32::try_from(env_positive(ENV_STALL_ATTEMPTS, DEFAULT_STALL_ATTEMPTS))
                 .unwrap_or(u32::MAX),
             ceiling: request_timeout(),
-            completion: env_secs(ENV_COMPLETION_TIMEOUT_SECS, DEFAULT_COMPLETION_TIMEOUT_SECS),
+            completion: env_secs(ENV_COMPLETION_TIMEOUT_SECS, timeout.as_secs()),
         }
+    }
+
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
     }
 
     pub(crate) fn completion(self) -> Duration {
@@ -169,32 +172,16 @@ impl Stall {
         }
     }
 
-    /// The client options and retries a multipart upload's parts are sent
-    /// with first, when a stalled part can be cut short: the storage
-    /// library's read timeout cuts an answer not received within `timeout`,
-    /// and the library sends the part again until it has been tried
-    /// `attempts - 1` times. Its last attempt goes through the store's own
-    /// client, bounded by the ceiling.
-    pub(crate) fn part_client(self) -> Option<(ClientOptions, object_store::RetryConfig)> {
-        self.cuts(self.timeout).then(|| {
-            (
-                client_options().with_read_timeout(self.timeout),
-                object_store::RetryConfig {
-                    max_retries: usize::try_from(self.attempts.saturating_sub(2))
-                        .unwrap_or(usize::MAX),
-                    retry_timeout: self.timeout.saturating_mul(self.attempts),
-                    ..Default::default()
-                },
-            )
-        })
-    }
-
     fn cuts(self, deadline: Duration) -> bool {
         self.attempts > 1 && deadline < self.ceiling
     }
 
     fn outlasts_ceiling(self) -> bool {
         self.attempts > 1 && self.timeout >= self.ceiling
+    }
+
+    pub(crate) fn for_write(self, size: usize) -> Self {
+        self.for_upload(size, Multipart::DEFAULT.min_part_size)
     }
 
     fn for_upload(self, size: usize, part_size: usize) -> Self {
@@ -1895,10 +1882,11 @@ mod tests {
                         timeout: Duration::from_secs(20),
                         attempts: 3,
                         ceiling: Duration::from_secs(30),
-                        completion: Duration::from_secs(60),
+                        completion: Duration::from_secs(20),
                     }
                 );
                 assert!(stall.cuts(stall.timeout));
+                assert!(stall.cuts(stall.completion));
                 assert!(!stall.outlasts_ceiling());
             },
         );
@@ -1912,39 +1900,27 @@ mod tests {
             || {
                 assert_eq!(Stall::configured().timeout, Duration::from_secs(20));
                 assert_eq!(Stall::configured().attempts, 3);
-                assert_eq!(Stall::configured().completion, Duration::from_secs(60));
+                assert_eq!(Stall::configured().completion, Duration::from_secs(20));
             },
         );
-        super::test_env::with(&[(ENV_COMPLETION_TIMEOUT_SECS, Some("90"))], || {
-            assert_eq!(Stall::configured().completion, Duration::from_secs(90));
+        super::test_env::with(
+            &[
+                (ENV_STALL_TIMEOUT_SECS, Some("7")),
+                (ENV_COMPLETION_TIMEOUT_SECS, None),
+            ],
+            || assert_eq!(Stall::configured().completion, Duration::from_secs(7)),
+        );
+        super::test_env::with(&[(ENV_COMPLETION_TIMEOUT_SECS, Some("25"))], || {
+            assert_eq!(Stall::configured().completion, Duration::from_secs(25));
         });
     }
 
     #[test]
-    fn a_part_is_sent_first_on_a_client_that_cuts_its_answer_at_the_stall_timeout() {
-        let (options, retry) = STALL.part_client().expect("parts are cut");
-        assert_eq!(
-            options.get_config_value(&object_store::ClientConfigKey::ReadTimeout),
-            Some("1s".to_string())
-        );
-        assert_eq!(retry.max_retries, 1);
-        assert_eq!(retry.retry_timeout, Duration::from_secs(3));
-        assert_eq!(
-            Stall {
-                attempts: 2,
-                ..STALL
-            }
-            .part_client()
-            .map(|(_, retry)| retry.max_retries),
-            Some(0)
-        );
-        assert!(UNCUT.part_client().is_none());
-        assert!(Stall {
-            timeout: CEILING,
-            ..STALL
-        }
-        .part_client()
-        .is_none());
+    fn a_part_is_given_the_stall_timeout_for_each_part_of_its_bytes() {
+        let part = 8 * 1024 * 1024;
+        assert_eq!(STALL.for_write(1).timeout(), Duration::from_secs(1));
+        assert_eq!(STALL.for_write(part).timeout(), Duration::from_secs(1));
+        assert_eq!(STALL.for_write(part + 1).timeout(), Duration::from_secs(2));
     }
 
     #[test]

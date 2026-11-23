@@ -570,10 +570,10 @@ Rolling a platform back from v0.40.3 to v0.40.2:
 
 | What v0.40.3 changed | Before rolling the platform back |
 |----------------------|----------------------------------|
-| A part of a multipart upload sent again | Nothing to undo: an object uploaded this way reads back as any other. v0.40.2 sends each part once more, bounded by the request timeout alone, so a part whose answer stalls holds its upload up to that timeout again |
+| A part of a multipart upload sent again | Nothing to undo: an object uploaded this way reads back as any other. v0.40.2 sends each part once, bounded by the request timeout alone, so a part whose answer stalls holds its upload up to that timeout again |
 | `OBJECT_STORE_COMPLETION_TIMEOUT_SECS` | Nothing: v0.40.2 ignores it, and a multipart upload's completion is bounded by the request timeout alone again |
 | `write_wait_ms` and `complete_ms` in the assembly's log lines | Nothing: v0.40.2 logs neither, so a query on them finds none |
-| The part warn line, and `complete` as a stalled request | Nothing: v0.40.2 logs neither |
+| `part` and `complete` as a stalled request | Nothing: v0.40.2 logs neither |
 | The database | Nothing: v0.40.3 has no migration |
 
 Rolling a platform back from v0.40.2 to v0.40.1:
@@ -1448,33 +1448,26 @@ for v0.40.2 deploys and runs on this platform unchanged. There is no
 migration. New environment variable: `OBJECT_STORE_COMPLETION_TIMEOUT_SECS`
 on the platform, the worker and the web runner ([setup](setup.md)).
 
-- Each part of a multipart upload to S3 or GCS is sent first on a client
-  of the same store whose read timeout, the storage library's
-  (`ClientOptions::with_read_timeout`), is the stall timeout: a part not
-  answered within `OBJECT_STORE_STALL_TIMEOUT_SECS` (default `20`) of being
-  sent is cut and sent again by the library, under the same part number,
-  until it has been tried `OBJECT_STORE_STALL_ATTEMPTS` − 1 times. Its last
-  attempt goes through the store's own client, bounded only by
-  `OBJECT_STORE_REQUEST_TIMEOUT_SECS`, so a slow but healthy part still
-  succeeds. The read timeout runs from the request's start until its
-  answer, so it bounds a part's send as well as its answer: a part needs
-  the bandwidth to send 8 MiB within the stall timeout, as a whole upload
-  does for each 8 MiB. A part refused outright (a missing upload, a denied
-  permission) is not sent again. Reads keep their own client, so their
-  resume is unchanged.
-- A multipart upload's completion is not cut by the read timeout, since a
-  store may take a while to answer it for a large object. It is cut after
-  `OBJECT_STORE_COMPLETION_TIMEOUT_SECS` (default `60`) and sent again, at
-  most `OBJECT_STORE_STALL_ATTEMPTS` times, the last bounded by the request
-  timeout. A completion sent again that finds the upload no longer open
-  (the store completed it before its answer was lost) stands only when the
-  object stored at the key holds the bytes sent; otherwise it fails.
+- A part of a multipart upload to S3 or GCS is cut short and sent again
+  as a whole write is: a part that has not finished within
+  `OBJECT_STORE_STALL_TIMEOUT_SECS` (default `20`) for each 8 MiB it holds
+  is sent again under its own part number, so the resend replaces it, at
+  most `OBJECT_STORE_STALL_ATTEMPTS` times, the last bounded only by
+  `OBJECT_STORE_REQUEST_TIMEOUT_SECS`. A slow but healthy part still
+  succeeds on its last attempt.
+- A multipart upload's completion is cut after
+  `OBJECT_STORE_COMPLETION_TIMEOUT_SECS` (default: the stall timeout) and
+  sent again, at most `OBJECT_STORE_STALL_ATTEMPTS` times, the last bounded
+  by the request timeout. A completion that finds the upload no longer
+  open, because one sent before it, by the platform or by the storage
+  library, completed the upload and its answer was lost, stands only when
+  the object stored at the key is the size sent; otherwise it fails.
 - The web bundle's assembly logs `write_wait_ms`, the time it waited on the
   bundle's writes, and `complete_ms`, the time the store took to complete
   the bundle, beside `read_wait_ms` ([observability](observability.md)).
-- A part sent again logs a warning, and a completion cut short logs
+- A part or completion cut short logs
   `A storage request made no progress in time; trying it again` with
-  `request` `complete`.
+  `request` `part` or `complete`.
 
 ## Changes in v0.40.2
 

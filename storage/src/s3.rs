@@ -33,45 +33,7 @@ struct Connection {
 
 impl Connection {
     fn store(&self, bucket: &str, acl: Option<CannedAcl>) -> Result<Arc<AmazonS3>> {
-        self.built(
-            bucket,
-            acl,
-            common::client_options(),
-            common::retry_config(),
-        )
-    }
-
-    fn writer(
-        &self,
-        bucket: &str,
-        acl: Option<CannedAcl>,
-        stall: common::Stall,
-    ) -> Result<Arc<Parted<AmazonS3>>> {
-        self.writer_over(self.store(bucket, acl)?, bucket, acl, stall)
-    }
-
-    fn writer_over(
-        &self,
-        store: Arc<AmazonS3>,
-        bucket: &str,
-        acl: Option<CannedAcl>,
-        stall: common::Stall,
-    ) -> Result<Arc<Parted<AmazonS3>>> {
-        let cut = stall
-            .part_client()
-            .map(|(options, retry)| self.built(bucket, acl, options, retry))
-            .transpose()?;
-        Ok(Arc::new(Parted::new(store, cut, BACKEND, stall)))
-    }
-
-    fn built(
-        &self,
-        bucket: &str,
-        acl: Option<CannedAcl>,
-        options: object_store::ClientOptions,
-        retry: object_store::RetryConfig,
-    ) -> Result<Arc<AmazonS3>> {
-        let options = options.with_allow_http(self.allow_http);
+        let options = common::client_options().with_allow_http(self.allow_http);
         let options = match acl {
             Some(acl) => options.with_default_headers(http::HeaderMap::from_iter([(
                 ACL_HEADER,
@@ -86,10 +48,23 @@ impl Connection {
             .with_secret_access_key(self.secret_key.as_str())
             .with_bucket_name(bucket)
             .with_client_options(options)
-            .with_retry(retry)
+            .with_retry(common::retry_config())
             .build()
             .wrap_err("Failed to build S3 client")?;
         Ok(Arc::new(store))
+    }
+
+    fn writer(
+        &self,
+        bucket: &str,
+        acl: Option<CannedAcl>,
+        stall: common::Stall,
+    ) -> Result<Arc<Parted<AmazonS3>>> {
+        Ok(Arc::new(Parted::new(
+            self.store(bucket, acl)?,
+            BACKEND,
+            stall,
+        )))
     }
 }
 
@@ -155,7 +130,7 @@ impl S3Backend {
     ) -> Result<Self> {
         let primary = connection.store(&bucket, None)?;
         Ok(Self {
-            writes: connection.writer_over(Arc::clone(&primary), &bucket, None, stall)?,
+            writes: Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall)),
             primary,
             connection,
             bucket,
@@ -522,7 +497,15 @@ mod tests {
     }
 
     fn backend_with(endpoint: &str, timeouts: &[(&str, Option<&str>)]) -> S3Backend {
-        let mut backend = None;
+        built_with(endpoint, timeouts, |backend| backend)
+    }
+
+    fn built_with<T>(
+        endpoint: &str,
+        timeouts: &[(&str, Option<&str>)],
+        build: impl FnOnce(S3Backend) -> T,
+    ) -> T {
+        let mut built = None;
         let vars = [
             (ENV_ENDPOINT, Some(endpoint)),
             (ENV_REGION, Some("us-east-1")),
@@ -531,9 +514,9 @@ mod tests {
             (ENV_BUCKET, Some("cufflink")),
         ];
         with_env(&[&vars[..], timeouts].concat(), || {
-            backend = Some(S3Backend::from_vars(var).expect("should build"))
+            built = Some(build(S3Backend::from_vars(var).expect("should build")))
         });
-        backend.unwrap()
+        built.expect("built")
     }
 
     #[tokio::test]
@@ -885,15 +868,22 @@ mod tests {
     const BUNDLE: &str = "/example-documents/bundles/app.tar.gz";
 
     async fn initiates_upload(server: &wiremock::MockServer) {
+        initiates_upload_with(server, Some("public-read")).await;
+    }
+
+    async fn initiates_upload_with(server: &wiremock::MockServer, acl: Option<&'static str>) {
         use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
-        Mock::given(method("POST"))
+        let initiate = Mock::given(method("POST"))
             .and(path(BUNDLE))
             .and(query_param("uploads", ""))
-            .and(header("content-type", "application/gzip"))
-            .and(header("x-amz-acl", "public-read"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
+            .and(header("content-type", "application/gzip"));
+        match acl {
+            Some(acl) => initiate.and(header("x-amz-acl", acl)),
+            None => initiate,
+        }
+        .respond_with(ResponseTemplate::new(200).set_body_string(
                 "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
             ))
             .expect(1)
@@ -1029,12 +1019,15 @@ mod tests {
     }
 
     fn cut_at_a_second(server: &str, timeouts: &[(&str, Option<&str>)]) -> Arc<dyn ObjectStorage> {
-        backend_with(
+        built_with(
             server,
             &[&[(common::ENV_STALL_TIMEOUT_SECS, Some("1"))][..], timeouts].concat(),
+            |backend| {
+                backend
+                    .tenant_bucket("example-documents", None)
+                    .expect("tenant bucket")
+            },
         )
-        .tenant_bucket("example-documents", None)
-        .expect("tenant bucket")
     }
 
     async fn parts_answered(server: &wiremock::MockServer, stalled: u64) {
@@ -1049,7 +1042,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("etag", "\"stalled\"")
-                    .set_delay(Duration::from_secs(3)),
+                    .set_delay(Duration::from_secs(10)),
             )
             .up_to_n_times(stalled)
             .with_priority(1)
@@ -1080,7 +1073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_part_whose_answer_stalls_is_cut_at_the_read_timeout_and_sent_again() {
+    async fn a_part_whose_answer_stalls_is_cut_at_the_stall_timeout_and_sent_again() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1119,7 +1112,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        initiates_upload(&server).await;
+        initiates_upload_with(&server, None).await;
         parts_answered(&server, u64::MAX).await;
         Mock::given(method("DELETE"))
             .and(path(BUNDLE))
@@ -1146,7 +1139,7 @@ mod tests {
             "example-documents",
             "bundles/app.tar.gz",
             large_payload(),
-            &public_bundle(),
+            &UploadOptions::content_type("application/gzip"),
         )
         .await
         .expect_err("refused");

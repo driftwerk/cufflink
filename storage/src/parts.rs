@@ -1,5 +1,5 @@
-//! A store whose multipart uploads send each part first on a client that
-//! cuts a stalled answer short, and bound their completion on its own.
+//! A store whose multipart uploads send each part under its own number, so a
+//! part or completion whose answer stalls is cut short and sent again.
 
 use crate::common::{self, Stall};
 use async_trait::async_trait;
@@ -12,33 +12,20 @@ use object_store::{
     ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     UploadPart,
 };
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// Serves every request through `store`, except a multipart upload's parts,
-/// which go first through `cut` when there is one: a client of the same
-/// store whose read timeout cuts an answer not received in time. A part
-/// `cut` could not send goes once more through `store`, bounded by the
-/// request timeout. The upload is started, completed and aborted through
-/// `store`, its completion cut short after the stall's completion timeout.
 #[derive(Debug)]
 pub(crate) struct Parted<S> {
     store: Arc<S>,
-    cut: Option<Arc<S>>,
     backend: &'static str,
     stall: Stall,
 }
 
 impl<S> Parted<S> {
-    pub(crate) fn new(
-        store: Arc<S>,
-        cut: Option<Arc<S>>,
-        backend: &'static str,
-        stall: Stall,
-    ) -> Self {
+    pub(crate) fn new(store: Arc<S>, backend: &'static str, stall: Stall) -> Self {
         Self {
             store,
-            cut,
             backend,
             stall,
         }
@@ -70,7 +57,6 @@ impl<S: ObjectStore + MultipartStore> ObjectStore for Parted<S> {
         let id = self.store.create_multipart_opts(location, opts).await?;
         Ok(Box::new(Upload {
             store: Arc::clone(&self.store),
-            cut: self.cut.clone(),
             backend: self.backend,
             stall: self.stall,
             path: location.clone(),
@@ -117,7 +103,6 @@ impl<S: ObjectStore + MultipartStore> ObjectStore for Parted<S> {
 #[derive(Debug)]
 struct Upload<S> {
     store: Arc<S>,
-    cut: Option<Arc<S>>,
     backend: &'static str,
     stall: Stall,
     path: Path,
@@ -149,41 +134,9 @@ impl<S> Upload<S> {
     }
 }
 
-/// Whether sending a part again can answer what its last attempt did not: a
-/// refusal of the request itself (a missing upload, a failed precondition,
-/// a denied permission or an unsupported operation) answers the same again.
-fn worth_resending(error: &object_store::Error) -> bool {
-    matches!(error, object_store::Error::Generic { .. })
-}
-
-async fn send_part<S: MultipartStore>(
-    store: &S,
-    cut: Option<&S>,
-    backend: &'static str,
-    (path, id, index): (&Path, &MultipartId, usize),
-    data: PutPayload,
-) -> object_store::Result<PartId> {
-    match cut {
-        None => store.put_part(path, id, index, data).await,
-        Some(cut) => match cut.put_part(path, id, index, data.clone()).await {
-            Err(error) if worth_resending(&error) => {
-                tracing::warn!(
-                    backend,
-                    location = %path,
-                    part = index,
-                    error = %error,
-                    "A part of a storage upload was not answered in time; sending it once more"
-                );
-                store.put_part(path, id, index, data).await
-            }
-            answered => answered,
-        },
-    }
-}
-
-/// What a completion answers when it was sent again: a store that completed
-/// the upload before its answer was lost no longer knows it, and the upload
-/// stands completed only when the object it stored is the size sent.
+/// A completion the store no longer knows the upload for, because a resend
+/// (ours or the storage library's) followed one that completed it, stands
+/// when the object stored at the key is the size sent.
 async fn completed_before<S: ObjectStore>(
     store: &S,
     backend: &'static str,
@@ -215,17 +168,19 @@ impl<S: ObjectStore + MultipartStore> MultipartUpload for Upload<S> {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let index = self.next;
         self.next += 1;
-        let (store, cut, backend) = (Arc::clone(&self.store), self.cut.clone(), self.backend);
+        let (store, backend) = (Arc::clone(&self.store), self.backend);
+        let stall = self.stall.for_write(data.content_length());
         let (path, id) = (self.path.clone(), self.id.clone());
         let (parts, sent_bytes) = (Arc::clone(&self.parts), Arc::clone(&self.sent));
         async move {
             let size = u64::try_from(data.content_length()).unwrap_or(u64::MAX);
-            let part = send_part(
-                store.as_ref(),
-                cut.as_deref(),
+            let part = common::attempted(
+                stall,
+                stall.timeout(),
                 backend,
-                (&path, &id, index),
-                data,
+                "part",
+                path.as_ref(),
+                || store.put_part(&path, &id, index, data.clone()),
             )
             .await?;
             let mut parts = parts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -244,20 +199,18 @@ impl<S: ObjectStore + MultipartStore> MultipartUpload for Upload<S> {
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let parts = self.sent_parts()?;
         let sent = self.sent.load(Ordering::Relaxed);
-        let tried = AtomicU32::new(0);
         let (store, backend, path, id) = (self.store.as_ref(), self.backend, &self.path, &self.id);
         common::attempted(
             self.stall,
             self.stall.completion(),
-            self.backend,
+            backend,
             "complete",
             path.as_ref(),
             || {
-                let again = tried.fetch_add(1, Ordering::Relaxed) > 0;
                 let parts = parts.clone();
                 async move {
                     match store.complete_multipart(path, id, parts).await {
-                        Err(missing @ object_store::Error::NotFound { .. }) if again => {
+                        Err(missing @ object_store::Error::NotFound { .. }) => {
                             completed_before(store, backend, path, sent, missing).await
                         }
                         answered => answered,
@@ -302,7 +255,7 @@ mod tests {
     enum Fault {
         #[default]
         None,
-        PartsTimeOut,
+        PartsHang(usize),
         PartsRefused,
         CompletionHangs(usize),
         CompletionAnswerLost,
@@ -341,13 +294,6 @@ mod tests {
     impl std::fmt::Display for Faulty {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "Faulty({})", self.inner)
-        }
-    }
-
-    fn generic(message: &'static str) -> object_store::Error {
-        object_store::Error::Generic {
-            store: "faulty",
-            source: message.into(),
         }
     }
 
@@ -437,9 +383,9 @@ mod tests {
             part_idx: usize,
             data: PutPayload,
         ) -> object_store::Result<PartId> {
-            self.counts.parts.fetch_add(1, Ordering::SeqCst);
+            let asked = self.counts.parts.fetch_add(1, Ordering::SeqCst);
             match self.fault {
-                Fault::PartsTimeOut => Err(generic("the request timed out")),
+                Fault::PartsHang(hung) if asked < hung => futures_util::future::pending().await,
                 Fault::PartsRefused => Err(object_store::Error::PermissionDenied {
                     path: path.to_string(),
                     source: "the request was refused".into(),
@@ -499,65 +445,53 @@ mod tests {
         got.bytes().await.ok().map(|bytes| bytes.to_vec())
     }
 
-    #[tokio::test]
-    async fn a_part_the_cutting_client_could_not_send_goes_once_more_through_the_store() {
+    #[tokio::test(start_paused = true)]
+    async fn a_part_that_never_answers_is_sent_again_under_its_number_after_the_stall_timeout() {
         let memory = Arc::new(InMemory::new());
-        let (store, cut) = (
-            Faulty::over(&memory, Fault::None),
-            Faulty::over(&memory, Fault::PartsTimeOut),
-        );
-        let parted = Parted::new(Arc::clone(&store), Some(Arc::clone(&cut)), "faulty", STALL);
+        let store = Faulty::over(&memory, Fault::PartsHang(1));
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
+        let started = tokio::time::Instant::now();
         uploaded(&parted).await.expect("uploaded");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(store.count(|c| &c.parts), 3);
         assert_eq!(stored(&memory).await, Some(parts().concat()));
-        assert_eq!([cut.count(|c| &c.parts), store.count(|c| &c.parts)], [2, 2]);
     }
 
-    #[tokio::test]
-    async fn every_part_goes_through_the_cutting_client_when_it_answers() {
+    #[tokio::test(start_paused = true)]
+    async fn a_part_that_never_answers_is_tried_at_most_the_stall_attempts() {
         let memory = Arc::new(InMemory::new());
-        let (store, cut) = (
-            Faulty::over(&memory, Fault::None),
-            Faulty::over(&memory, Fault::None),
-        );
-        let parted = Parted::new(Arc::clone(&store), Some(Arc::clone(&cut)), "faulty", STALL);
-        uploaded(&parted).await.expect("uploaded");
-        assert_eq!(stored(&memory).await, Some(parts().concat()));
-        assert_eq!([cut.count(|c| &c.parts), store.count(|c| &c.parts)], [2, 0]);
-        assert_eq!(store.count(|c| &c.completions), 1);
+        let store = Faulty::over(&memory, Fault::PartsHang(usize::MAX));
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
+        let waited = tokio::time::timeout(Duration::from_secs(600), uploaded(&parted)).await;
+        assert!(waited.is_err(), "the last attempt is left to the ceiling");
+        assert_eq!(store.count(|c| &c.parts), 2 * 3);
     }
 
     #[tokio::test]
     async fn a_refused_part_is_not_sent_again() {
         let memory = Arc::new(InMemory::new());
-        let (store, cut) = (
-            Faulty::over(&memory, Fault::None),
-            Faulty::over(&memory, Fault::PartsRefused),
-        );
-        let parted = Parted::new(Arc::clone(&store), Some(Arc::clone(&cut)), "faulty", STALL);
-        let refused = uploaded(&parted).await.expect_err("refused");
+        let store = Faulty::over(&memory, Fault::PartsRefused);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
+        let mut upload = parted
+            .put_multipart_opts(&Path::from(KEY), PutMultipartOptions::default())
+            .await
+            .expect("started");
+        let refused = upload
+            .put_part(PutPayload::from(vec![7; 300]))
+            .await
+            .expect_err("refused");
         assert!(matches!(
             refused,
             object_store::Error::PermissionDenied { .. }
         ));
-        assert_eq!(store.count(|c| &c.parts), 0);
-        assert_eq!(stored(&memory).await, None);
-    }
-
-    #[tokio::test]
-    async fn without_a_cutting_client_every_part_goes_through_the_store() {
-        let memory = Arc::new(InMemory::new());
-        let store = Faulty::over(&memory, Fault::None);
-        let parted = Parted::new(Arc::clone(&store), None, "faulty", STALL);
-        uploaded(&parted).await.expect("uploaded");
-        assert_eq!(stored(&memory).await, Some(parts().concat()));
-        assert_eq!(store.count(|c| &c.parts), 2);
+        assert_eq!(store.count(|c| &c.parts), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_completion_that_never_answers_is_sent_again_after_its_own_timeout() {
         let memory = Arc::new(InMemory::new());
         let store = Faulty::over(&memory, Fault::CompletionHangs(1));
-        let parted = Parted::new(Arc::clone(&store), None, "faulty", STALL);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
         let started = tokio::time::Instant::now();
         uploaded(&parted).await.expect("uploaded");
         assert_eq!(started.elapsed(), COMPLETION);
@@ -569,7 +503,7 @@ mod tests {
     async fn a_completion_that_never_answers_is_tried_at_most_the_stall_attempts() {
         let memory = Arc::new(InMemory::new());
         let store = Faulty::over(&memory, Fault::CompletionHangs(usize::MAX));
-        let parted = Parted::new(Arc::clone(&store), None, "faulty", STALL);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
         let waited = tokio::time::timeout(Duration::from_secs(600), uploaded(&parted)).await;
         assert!(waited.is_err(), "the last attempt is left to the ceiling");
         assert_eq!(store.count(|c| &c.completions), 3);
@@ -579,7 +513,7 @@ mod tests {
     async fn a_completion_whose_answer_was_lost_stands_when_the_object_is_the_size_sent() {
         let memory = Arc::new(InMemory::new());
         let store = Faulty::over(&memory, Fault::CompletionAnswerLost);
-        let parted = Parted::new(Arc::clone(&store), None, "faulty", STALL);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
         let completed = uploaded(&parted).await.expect("uploaded");
         let head = memory.head(&Path::from(KEY)).await.expect("stored");
         assert_eq!(completed.e_tag, head.e_tag);
@@ -595,7 +529,7 @@ mod tests {
             .await
             .expect("stored");
         let store = Faulty::over(&memory, Fault::CompletionHangsThenGone);
-        let parted = Parted::new(Arc::clone(&store), None, "faulty", STALL);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
         let failed = uploaded(&parted).await.expect_err("failed");
         assert_eq!(
             failed.to_string(),
@@ -606,14 +540,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_first_completion_that_finds_no_upload_fails_even_over_an_object_of_its_size() {
+    async fn a_completion_that_finds_no_upload_stands_over_an_object_of_its_size() {
         let memory = Arc::new(InMemory::new());
         memory
             .put(&Path::from(KEY), PutPayload::from(parts().concat()))
             .await
             .expect("stored");
         let store = Faulty::over(&memory, Fault::CompletionGone);
-        let parted = Parted::new(Arc::clone(&store), None, "faulty", STALL);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
+        let completed = uploaded(&parted).await.expect("uploaded");
+        let head = memory.head(&Path::from(KEY)).await.expect("stored");
+        assert_eq!(completed.e_tag, head.e_tag);
+        assert_eq!(store.count(|c| &c.completions), 1);
+    }
+
+    #[tokio::test]
+    async fn a_completion_that_finds_neither_its_upload_nor_an_object_fails_as_not_found() {
+        let memory = Arc::new(InMemory::new());
+        let store = Faulty::over(&memory, Fault::CompletionGone);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
         let failed = uploaded(&parted).await.expect_err("failed");
         assert!(matches!(failed, object_store::Error::NotFound { .. }));
         assert_eq!(store.count(|c| &c.completions), 1);
@@ -622,19 +567,13 @@ mod tests {
     #[tokio::test]
     async fn an_aborted_upload_is_aborted_through_the_store() {
         let memory = Arc::new(InMemory::new());
-        let (store, cut) = (
-            Faulty::over(&memory, Fault::None),
-            Faulty::over(&memory, Fault::None),
-        );
-        let parted = Parted::new(Arc::clone(&store), Some(Arc::clone(&cut)), "faulty", STALL);
+        let store = Faulty::over(&memory, Fault::None);
+        let parted = Parted::new(Arc::clone(&store), "faulty", STALL);
         let mut upload = parted
             .put_multipart_opts(&Path::from(KEY), PutMultipartOptions::default())
             .await
             .expect("started");
         upload.abort().await.expect("aborted");
-        assert_eq!(
-            [store.count(|c| &c.aborts), cut.count(|c| &c.aborts)],
-            [1, 0]
-        );
+        assert_eq!(store.count(|c| &c.aborts), 1);
     }
 }
