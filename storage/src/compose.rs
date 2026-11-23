@@ -3,7 +3,7 @@
 //! objects beside the key, removed once the object is stored or has failed.
 
 use crate::common::{self, Completed, Keys, PartClock, Stall};
-use crate::copied::{self, COPIES_AT_ONCE};
+use crate::copied::{self, Refused, COPIES_AT_ONCE};
 use crate::{StoredPart, Uploaded};
 use bytes::Bytes;
 use eyre::Result;
@@ -192,17 +192,20 @@ impl Composer {
             .body(HttpRequestBody::from(body.to_string()))
             .map_err(|e| copied::generic(BACKEND, e))
         };
-        let location = format!(
-            "{} composed into {into}",
-            sources
-                .iter()
-                .map(Path::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let answer = copied::sent(&self.api.client, BACKEND, &location, request).await?;
+        let location = match sources {
+            [source] => format!("{source} composed into {into}"),
+            [first, .., last] => format!(
+                "{} sources, {first} to {last}, composed into {into}",
+                sources.len()
+            ),
+            [] => format!("nothing composed into {into}"),
+        };
         let composed: Composed =
-            serde_json::from_slice(&answer).map_err(|e| copied::generic(BACKEND, e))?;
+            copied::sent(&self.api.client, BACKEND, &location, request, |answer| {
+                serde_json::from_slice(answer)
+                    .map_err(|e| Refused::Final(copied::generic(BACKEND, e)))
+            })
+            .await?;
         Ok(PutResult {
             e_tag: composed.etag,
             version: composed.generation,

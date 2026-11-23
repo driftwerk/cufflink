@@ -1,5 +1,5 @@
 use crate::common::{self, Keys};
-use crate::copied;
+use crate::copied::{self, Refused};
 use crate::parts::{CopyPart, Parted};
 use crate::{
     is_bucket_name, CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, StoredPart,
@@ -139,27 +139,42 @@ impl CopyPart for PartCopier {
             Ok::<_, object_store::Error>(request)
         };
         let location = format!("{from} copied into {path}");
-        let answer = copied::sent(&self.client, BACKEND, &location, request).await?;
-        copied_part(path, &String::from_utf8_lossy(&answer))
+        copied::sent(&self.client, BACKEND, &location, request, |answer| {
+            copied_part(path, &String::from_utf8_lossy(answer))
+        })
+        .await
     }
 }
 
 /// The part an UploadPartCopy answer names, by its ETag as the store
 /// quotes it. S3 can answer a copy that failed after it began with `200`
 /// and an `<Error>` body.
-fn copied_part(path: &Path, answer: &str) -> object_store::Result<PartId> {
+/// The part S3 copied, or why it did not: S3 can answer `200` with an
+/// `<Error>`, one of whose codes says to ask again.
+fn copied_part(path: &Path, answer: &str) -> Result<PartId, Refused> {
     let tagged = |tag: &str| {
         answer
             .split_once(&format!("<{tag}>"))
             .and_then(|(_, rest)| rest.split_once(&format!("</{tag}>")))
             .map(|(value, _)| value.replace("&quot;", "\"").replace("&#34;", "\""))
     };
-    match (answer.contains("<Error>"), tagged("ETag")) {
-        (false, Some(content_id)) => Ok(PartId { content_id }),
-        _ => Err(copied::generic(
+    let refused = || {
+        copied::generic(
             BACKEND,
             format!("the copy of a part of {path} was not stored: {answer}"),
-        )),
+        )
+    };
+    match (answer.contains("<Error>"), tagged("ETag")) {
+        (false, Some(content_id)) => Ok(PartId { content_id }),
+        (true, _)
+            if matches!(
+                tagged("Code").as_deref(),
+                Some("InternalError" | "SlowDown" | "ServiceUnavailable")
+            ) =>
+        {
+            Err(Refused::Transient(refused()))
+        }
+        _ => Err(Refused::Final(refused())),
     }
 }
 
@@ -1677,10 +1692,22 @@ mod tests {
         }
         for answer in [
             "<Error><Code>InternalError</Code></Error>",
+            "<Error><Code>SlowDown</Code></Error>",
+        ] {
+            assert!(
+                matches!(copied_part(&path, answer), Err(Refused::Transient(_))),
+                "{answer}"
+            );
+        }
+        for answer in [
+            "<Error><Code>AccessDenied</Code></Error>",
             "<CopyPartResult></CopyPartResult>",
             "",
         ] {
-            assert!(copied_part(&path, answer).is_err(), "{answer}");
+            assert!(
+                matches!(copied_part(&path, answer), Err(Refused::Final(_))),
+                "{answer}"
+            );
         }
     }
 
@@ -1821,5 +1848,93 @@ mod tests {
             )
             .await
             .expect("assembled");
+    }
+
+    #[tokio::test]
+    async fn a_copy_answered_with_an_internal_error_body_is_sent_again() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<Error><Code>InternalError</Code><Message>try again</Message></Error>",
+            ))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[3]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the part"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+    }
+
+    #[tokio::test]
+    async fn a_refused_copy_is_answered_without_waiting_for_the_read_to_end() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .mount(&server)
+            .await;
+        aborts_assembly(&server).await;
+        never_completes(&server).await;
+        let read = futures_util::stream::iter([Ok(Bytes::from_static(b"the parts"))])
+            .chain(futures_util::stream::pending());
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend_at(&server.uri()).assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 3]),
+                Box::pin(read),
+                "application/gzip",
+            ),
+        )
+        .await
+        .expect("answered before the read ends")
+        .expect_err("failed");
+        assert!(
+            matches!(
+                failed.downcast_ref::<object_store::Error>(),
+                Some(object_store::Error::PermissionDenied { .. })
+            ),
+            "{failed:?}"
+        );
     }
 }

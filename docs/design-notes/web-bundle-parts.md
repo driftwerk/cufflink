@@ -219,8 +219,9 @@ stores, and any layout a store cannot copy, store `data` as
 `upload_stream` does. S3 and GCS copy the parts inside the store, so the
 platform sends none of the bundle's bytes, and read `data` to its end
 alongside. An error `data` yields is returned as it was yielded, ahead of
-any error of the copies, so a part the read finds missing is answered with
-the read's `409`, not as the copy's failure:
+a copy's missing source, so a part the read finds missing is answered with
+the read's `409`, not as the copy's `404`; any other failed copy is
+answered at once, without reading the rest of `data`:
 
 - S3 copies each part into the bundle's multipart upload with
   UploadPartCopy, eight at a time, signed with object_store's own
@@ -243,7 +244,9 @@ the read's `409`, not as the copy's failure:
   again stores the same object.
 - A copy or compose is cut short and sent again as a part is; the
   completion, or GCS's last compose, as a completion is. A copy or
-  compose answered with a `5xx` or `429`, or whose connection fails, is
+  compose answered with a `5xx` or `429` (or, on S3, a `200` whose
+  `<Error>` is `InternalError`, `SlowDown` or `ServiceUnavailable`), or
+  whose connection fails, is
   sent again after a pause, with object_store's backoff and within its
   retry budget (`OBJECT_STORE_RETRY_TIMEOUT_SECS`), as object_store
   retries its own requests.

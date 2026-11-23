@@ -33,14 +33,16 @@ pub(crate) fn generic(
 }
 
 /// Runs `copies` while `data` is read to its end. An error `data` yields is
-/// returned as it was yielded, before any error of the copies, so a part
-/// the read finds missing is answered as the read answers it.
+/// returned as it was yielded, before a copy's missing source, so a part
+/// the read finds missing is answered as the read answers it; any other
+/// failed copy is answered at once.
 pub(crate) async fn alongside<T>(
     copies: impl std::future::Future<Output = Result<T>>,
     data: BoxStream<'static, Result<Bytes>>,
 ) -> Result<T> {
     let drained = data.try_for_each(|_| future::ready(Ok(())));
     match future::select(std::pin::pin!(copies), std::pin::pin!(drained)).await {
+        Either::Left((Err(e), _)) if !missing(&e) => Err(e),
         Either::Left((copied, drained)) => drained.await.and(copied),
         Either::Right((drained, copies)) => {
             drained?;
@@ -49,20 +51,28 @@ pub(crate) async fn alongside<T>(
     }
 }
 
+fn missing(e: &eyre::Report) -> bool {
+    matches!(
+        e.downcast_ref::<object_store::Error>(),
+        Some(object_store::Error::NotFound { .. })
+    )
+}
+
 pub(crate) fn client(options: &object_store::ClientOptions) -> object_store::Result<HttpClient> {
     ReqwestConnector::default().connect(options)
 }
 
 /// Sends the request `request` builds, again after a pause while the store
 /// answers with a server error or the connection fails, as object_store
-/// retries its own requests, and answers its body or the store's refusal
-/// as the storage error it stands for.
-pub(crate) async fn sent<Fut>(
+/// retries its own requests, and answers what `read` makes of its body or
+/// the store's refusal as the storage error it stands for.
+pub(crate) async fn sent<T, Fut>(
     client: &HttpClient,
     backend: &'static str,
     location: &str,
     request: impl Fn() -> Fut,
-) -> object_store::Result<Bytes>
+    read: impl Fn(&[u8]) -> std::result::Result<T, Refused>,
+) -> object_store::Result<T>
 where
     Fut: std::future::Future<Output = object_store::Result<HttpRequest>>,
 {
@@ -71,7 +81,10 @@ where
     let mut pause = retry.backoff.init_backoff;
     let mut retried = 0;
     loop {
-        match answered(client, backend, location, request().await?).await {
+        match answered(client, backend, location, request().await?)
+            .await
+            .and_then(|body| read(&body))
+        {
             Err(Refused::Transient(_))
                 if retried < retry.max_retries
                     && started.elapsed() + pause <= retry.retry_timeout =>
@@ -87,7 +100,10 @@ where
     }
 }
 
-enum Refused {
+/// Why the store did not do what it was asked: for a while, so asking
+/// again may succeed, or for good.
+#[derive(Debug)]
+pub(crate) enum Refused {
     Transient(object_store::Error),
     Final(object_store::Error),
 }
