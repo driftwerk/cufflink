@@ -306,6 +306,8 @@ mod tests {
     use crate::common::test_env::with as with_env;
     use cufflink_settings::process_var as var;
 
+    const OBJECT: &str = "/example%2Ddocuments/bundles%2Fapp%2Etar%2Egz";
+
     fn emulated(server: &str) -> GcsBackend {
         emulated_with(server, common::Stall::configured())
     }
@@ -343,7 +345,6 @@ mod tests {
         use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        const OBJECT: &str = "/example%2Ddocuments/bundles%2Fapp%2Etar%2Egz";
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(OBJECT))
@@ -396,7 +397,6 @@ mod tests {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        const OBJECT: &str = "/example%2Ddocuments/bundles%2Fapp%2Etar%2Egz";
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(OBJECT))
@@ -449,20 +449,7 @@ mod tests {
             .await
             .expect("uploaded");
         assert_eq!(uploaded.etag.as_deref(), Some("\"whole-5\""));
-        let first_part_sent = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|request| {
-                request.method.as_str() == "PUT"
-                    && request
-                        .url
-                        .query_pairs()
-                        .any(|(name, number)| name == "partNumber" && number == "1")
-            })
-            .count();
-        assert_eq!(first_part_sent, 2);
+        assert_eq!(common::test_wire::first_part_sent(&server).await, 2);
     }
 
     #[test]

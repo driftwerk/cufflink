@@ -1056,22 +1056,6 @@ mod tests {
             .await;
     }
 
-    async fn sent_first_part(server: &wiremock::MockServer) -> usize {
-        server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|request| {
-                request.method.as_str() == "PUT"
-                    && request
-                        .url
-                        .query_pairs()
-                        .any(|(name, number)| name == "partNumber" && number == "1")
-            })
-            .count()
-    }
-
     #[tokio::test]
     async fn a_part_whose_answer_stalls_is_cut_at_the_stall_timeout_and_sent_again() {
         use wiremock::matchers::{method, path, query_param};
@@ -1103,7 +1087,7 @@ mod tests {
             (uploaded.size, uploaded.etag.as_deref()),
             (data.len() as u64, Some("\"whole-6\""))
         );
-        assert_eq!(sent_first_part(&server).await, 2);
+        assert_eq!(common::test_wire::first_part_sent(&server).await, 2);
     }
 
     #[tokio::test]
@@ -1152,7 +1136,7 @@ mod tests {
             "the failed upload is aborted"
         );
         assert_eq!(
-            sent_first_part(&server).await,
+            common::test_wire::first_part_sent(&server).await,
             3,
             "two attempts cut at the stall timeout, then one bounded by the request timeout"
         );

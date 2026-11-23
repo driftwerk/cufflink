@@ -1060,6 +1060,25 @@ pub(crate) async fn presign_url<S: object_store::signer::Signer>(
 }
 
 #[cfg(test)]
+pub(crate) mod test_wire {
+    pub(crate) async fn first_part_sent(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PUT"
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(name, number)| name == "partNumber" && number == "1")
+            })
+            .count()
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_env {
     use std::sync::Mutex;
 
