@@ -1,14 +1,20 @@
 use crate::common::{self, Keys};
-use crate::parts::Parted;
+use crate::copied::{self, Refused};
+use crate::parts::{CopyPart, Parted};
 use crate::{
-    is_bucket_name, CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions,
-    Uploaded,
+    is_bucket_name, CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, StoredPart,
+    UploadOptions, Uploaded,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use eyre::{Result, WrapErr};
 use futures_util::stream::BoxStream;
-use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer};
+use object_store::client::{HttpClient, HttpRequestBody};
+use object_store::multipart::PartId;
+use object_store::path::Path;
+use object_store::MultipartId;
+use percent_encoding::{utf8_percent_encode, AsciiSet};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -22,6 +28,14 @@ const ENV_BUCKET: &str = "S3_BUCKET";
 
 const ACL_HEADER: http::HeaderName = http::HeaderName::from_static("x-amz-acl");
 
+const COPY_SOURCE_HEADER: http::HeaderName = http::HeaderName::from_static("x-amz-copy-source");
+
+const STRICT_PATH: AsciiSet = copied::STRICT.remove(b'/');
+
+/// The sizes of the parts S3 copies: every part but the last at least
+/// S3's 5 MiB, and none so large that a copy outlasts the stall timeout.
+const COPIED_PART_SIZES: std::ops::RangeInclusive<u64> = 5 * 1024 * 1024..=64 * 1024 * 1024;
+
 #[derive(Clone)]
 struct Connection {
     endpoint: String,
@@ -29,6 +43,7 @@ struct Connection {
     access_key: String,
     secret_key: Zeroizing<String>,
     allow_http: bool,
+    client: HttpClient,
 }
 
 impl Connection {
@@ -66,12 +81,117 @@ impl Connection {
             stall,
         )))
     }
+
+    fn copier(&self, store: &Arc<AmazonS3>, bucket: &str) -> Arc<dyn CopyPart> {
+        Arc::new(PartCopier {
+            store: Arc::clone(store),
+            client: self.client.clone(),
+            bucket_url: format!("{}/{bucket}", self.endpoint.trim_end_matches('/')),
+            bucket: bucket.to_string(),
+            region: self.region.clone(),
+        })
+    }
+}
+
+/// Copies an object of the bucket into a part of one of its multipart
+/// uploads with UploadPartCopy, signed as the store signs its own requests.
+#[derive(Debug)]
+struct PartCopier {
+    store: Arc<AmazonS3>,
+    client: HttpClient,
+    bucket_url: String,
+    bucket: String,
+    region: String,
+}
+
+#[async_trait]
+impl CopyPart for PartCopier {
+    async fn copy_part(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        part_idx: usize,
+        from: &Path,
+    ) -> object_store::Result<PartId> {
+        let url = format!(
+            "{}/{}?partNumber={}&uploadId={}",
+            self.bucket_url,
+            utf8_percent_encode(path.as_ref(), &STRICT_PATH),
+            part_idx + 1,
+            utf8_percent_encode(id, &copied::STRICT)
+        );
+        let source = format!(
+            "{}/{}",
+            self.bucket,
+            utf8_percent_encode(from.as_ref(), &STRICT_PATH)
+        );
+        let (url, source) = (url.as_str(), source.as_str());
+        let request = || async move {
+            let credential = self.store.credentials().get_credential().await?;
+            let mut request = http::Request::builder()
+                .method(http::Method::PUT)
+                .uri(url)
+                .header(COPY_SOURCE_HEADER, source)
+                .body(HttpRequestBody::empty())
+                .map_err(|e| copied::generic(BACKEND, e))?;
+            AwsAuthorizer::new(&credential, "s3", &self.region)
+                .try_authorize(&mut request, None)?;
+            Ok::<_, object_store::Error>(request)
+        };
+        let location = format!("{from} copied into {path}");
+        copied::sent(&self.client, BACKEND, &location, request, |answer| {
+            copied_part(path, &String::from_utf8_lossy(answer))
+        })
+        .await
+    }
+}
+
+/// The part an UploadPartCopy answer names, by its ETag as the store
+/// quotes it, or why it did not copy: S3 can answer `200` with an
+/// `<Error>`, one of whose codes says to ask again.
+fn copied_part(path: &Path, answer: &str) -> Result<PartId, Refused> {
+    let tagged = |tag: &str| {
+        answer
+            .split_once(&format!("<{tag}>"))
+            .and_then(|(_, rest)| rest.split_once(&format!("</{tag}>")))
+            .map(|(value, _)| value.replace("&quot;", "\"").replace("&#34;", "\""))
+    };
+    let refused = || {
+        copied::generic(
+            BACKEND,
+            format!("the copy of a part of {path} was not stored: {answer}"),
+        )
+    };
+    match (answer.contains("<Error>"), tagged("ETag")) {
+        (false, Some(content_id)) => Ok(PartId { content_id }),
+        (true, _)
+            if matches!(
+                tagged("Code").as_deref(),
+                Some("InternalError" | "SlowDown" | "ServiceUnavailable")
+            ) =>
+        {
+            Err(Refused::Transient(refused()))
+        }
+        _ => Err(Refused::Final(refused())),
+    }
+}
+
+/// Whether S3 can copy `parts`, in order, into the parts of one upload.
+fn copyable(parts: &[StoredPart]) -> bool {
+    parts.split_last().is_some_and(|(last, rest)| {
+        parts.len() <= common::MAX_PARTS
+            && rest
+                .iter()
+                .all(|part| COPIED_PART_SIZES.contains(&part.size))
+            && (1..=*COPIED_PART_SIZES.end()).contains(&last.size)
+    })
 }
 
 #[derive(Clone)]
 pub(crate) struct S3Backend {
     primary: Arc<AmazonS3>,
     writes: Arc<Parted<AmazonS3>>,
+    copier: Arc<dyn CopyPart>,
     connection: Connection,
     bucket: String,
     keys: Keys,
@@ -93,11 +213,14 @@ impl S3Backend {
 
     pub(crate) fn from_vars(vars: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let endpoint = env_required(&vars, ENV_ENDPOINT)?;
+        let allow_http = endpoint.starts_with("http://");
         let connection = Connection {
             region: vars(ENV_REGION).unwrap_or_else(|| "us-east-1".to_string()),
             access_key: env_required(&vars, ENV_ACCESS_KEY)?,
             secret_key: Zeroizing::new(env_required(&vars, ENV_SECRET_KEY)?),
-            allow_http: endpoint.starts_with("http://"),
+            allow_http,
+            client: copied::client(&common::client_options().with_allow_http(allow_http))
+                .wrap_err("Failed to build S3 client")?,
             endpoint,
         };
         let bucket = vars(ENV_BUCKET).unwrap_or_else(|| "cufflink".to_string());
@@ -131,6 +254,7 @@ impl S3Backend {
         let primary = connection.store(&bucket, None)?;
         Ok(Self {
             writes: Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall)),
+            copier: connection.copier(&primary, &bucket),
             primary,
             connection,
             bucket,
@@ -215,6 +339,29 @@ impl ObjectStorage for S3Backend {
             data,
             &options,
             self.stall,
+        )
+        .await
+    }
+
+    async fn assemble(
+        &self,
+        key: &str,
+        parts: Vec<StoredPart>,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        if !copyable(&parts) {
+            return self.upload_stream(key, data, content_type).await;
+        }
+        common::put_copied(
+            self.writes.as_ref(),
+            &self.copier,
+            BACKEND,
+            self.keys,
+            key,
+            parts,
+            data,
+            &UploadOptions::content_type(content_type),
         )
         .await
     }
@@ -354,6 +501,7 @@ impl ObjectStorage for S3Backend {
 mod tests {
     use super::*;
     use crate::common::test_env::with as with_env;
+    use crate::common::test_wire::{bundle_bytes, requests_until, stored_parts};
     use cufflink_settings::process_var as var;
 
     #[test]
@@ -558,6 +706,7 @@ mod tests {
                 size: 8,
                 etag: Some("\"9b2cf535\"".into()),
                 completion: None,
+                parts: crate::PartTimes::default(),
             }
         );
     }
@@ -1184,25 +1333,6 @@ mod tests {
             .expect("uploaded after the retry");
     }
 
-    async fn requests_until(
-        server: &wiremock::MockServer,
-        seen: impl Fn(&wiremock::Request) -> bool,
-    ) -> bool {
-        for _ in 0..200 {
-            if server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .any(&seen)
-            {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        false
-    }
-
     #[tokio::test]
     async fn a_dropped_upload_is_aborted() {
         use wiremock::matchers::{method, path, query_param};
@@ -1302,5 +1432,509 @@ mod tests {
             .expect("presign should succeed");
         assert!(url.contains("/other-bucket/k.jpg"));
         assert!(url.contains("X-Amz-Expires=60"));
+    }
+
+    const ASSEMBLED: &str = "/cufflink/bundles/app.tar.gz";
+
+    const MIB: u64 = 1024 * 1024;
+
+    async fn initiates_assembly(server: &wiremock::MockServer) {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploads", ""))
+            .and(header("content-type", "application/gzip"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn aborts_assembly(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("DELETE"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn never_completes(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_assembly_copies_its_parts_inside_the_store_and_completes_them_in_order() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        for (number, quote) in [(1, "&quot;"), (2, "&#34;"), (3, "&quot;")] {
+            Mock::given(method("PUT"))
+                .and(path(ASSEMBLED))
+                .and(query_param("uploadId", "upload-1"))
+                .and(query_param("partNumber", number.to_string()))
+                .and(header(
+                    "x-amz-copy-source",
+                    format!("cufflink/parts/{}", number - 1),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "<CopyPartResult><ETag>{quote}copied-{number}{quote}</ETag></CopyPartResult>"
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole-3\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let uploaded = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 5 * MIB, 3]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+        assert_eq!(
+            (uploaded.size, uploaded.etag.as_deref()),
+            (13 * MIB + 3, Some("\"whole-3\""))
+        );
+        assert!(uploaded.completion.is_some());
+        assert!((1..=3).contains(&uploaded.parts.in_flight));
+        let requests = server.received_requests().await.unwrap_or_default();
+        let copies = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 3);
+        assert!(copies
+            .iter()
+            .all(|copy| copy.body.is_empty() && signed_by(copy) == "ak"));
+        let completion = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "POST"
+                    && request
+                        .url
+                        .query()
+                        .is_some_and(|query| query.contains("uploadId"))
+            })
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .expect("completed");
+        let tagged = ["\"copied-1\"", "\"copied-2\"", "\"copied-3\""]
+            .map(|etag| completion.find(etag).expect("listed"));
+        assert!(tagged.is_sorted(), "{completion}");
+    }
+
+    #[tokio::test]
+    async fn a_copy_answered_with_an_error_body_aborts_the_assembly() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<Error><Code>AccessDenied</Code><Message>refused</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        aborts_assembly(&server).await;
+        never_completes(&server).await;
+        let failed = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 3]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect_err("failed");
+        assert_eq!(
+            failed.to_string(),
+            "s3 upload failed for bundles/app.tar.gz"
+        );
+        assert!(format!("{failed:?}").contains("AccessDenied"), "{failed:?}");
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the failed assembly is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_whose_bytes_fail_their_check_is_aborted_and_never_completed() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+            ))
+            .mount(&server)
+            .await;
+        aborts_assembly(&server).await;
+        never_completes(&server).await;
+        let failed = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 3]),
+                bundle_bytes(vec![
+                    Ok(Bytes::from_static(b"the parts")),
+                    Err(eyre::eyre!("the bundle is not that hash")),
+                ]),
+                "application/gzip",
+            )
+            .await
+            .expect_err("failed");
+        assert_eq!(failed.to_string(), "the bundle is not that hash");
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the unchecked assembly is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_with_a_part_too_small_to_copy_before_its_last_streams_its_bytes() {
+        use wiremock::matchers::{body_bytes, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(body_bytes(b"small parts".to_vec()))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"whole\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let uploaded = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[5 * MIB - 1, 3]),
+                bundle_bytes(vec![
+                    Ok(Bytes::from_static(b"small ")),
+                    Ok(Bytes::from_static(b"parts")),
+                ]),
+                "application/gzip",
+            )
+            .await
+            .expect("streamed");
+        assert_eq!(uploaded.etag.as_deref(), Some("\"whole\""));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests
+            .iter()
+            .all(|request| !request.headers.contains_key("x-amz-copy-source")));
+    }
+
+    #[test]
+    fn only_parts_of_at_least_five_mib_but_the_last_are_copied() {
+        assert!(copyable(&stored_parts(&[5 * MIB, 8 * MIB, 1])));
+        assert!(copyable(&stored_parts(&[1])));
+        assert!(!copyable(&stored_parts(&[])));
+        assert!(!copyable(&stored_parts(&[5 * MIB - 1, 8 * MIB])));
+        assert!(!copyable(&stored_parts(&[8 * MIB, 0])));
+        assert!(copyable(&stored_parts(&[64 * MIB, 64 * MIB])));
+        assert!(!copyable(&stored_parts(&[64 * MIB + 1, 1])));
+        assert!(!copyable(&stored_parts(&[8 * MIB, 64 * MIB + 1])));
+        assert!(!copyable(&stored_parts(&vec![
+            8 * MIB;
+            common::MAX_PARTS + 1
+        ])));
+    }
+
+    #[test]
+    fn a_copied_part_is_named_by_its_quoted_etag_and_an_error_body_fails() {
+        let path = Path::from("bundles/app.tar.gz");
+        for answer in [
+            "<CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>",
+            "<CopyPartResult><LastModified>x</LastModified><ETag>&#34;abc&#34;</ETag></CopyPartResult>",
+        ] {
+            assert_eq!(
+                copied_part(&path, answer).expect("copied").content_id,
+                "\"abc\""
+            );
+        }
+        for answer in [
+            "<Error><Code>InternalError</Code></Error>",
+            "<Error><Code>SlowDown</Code></Error>",
+            "<Error><Code>ServiceUnavailable</Code></Error>",
+        ] {
+            assert!(
+                matches!(copied_part(&path, answer), Err(Refused::Transient(_))),
+                "{answer}"
+            );
+        }
+        for answer in [
+            "<Error><Code>AccessDenied</Code></Error>",
+            "<CopyPartResult></CopyPartResult>",
+            "",
+        ] {
+            assert!(
+                matches!(copied_part(&path, answer), Err(Refused::Final(_))),
+                "{answer}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_bucket_copies_within_its_own_bucket_with_its_keys_encoded() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const KEY: &str = "/example-documents/bundles/my%20app%2B1.tar.gz";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(KEY))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (number, source) in [(1, "parts/a%20b%2B0"), (2, "parts/1")] {
+            Mock::given(method("PUT"))
+                .and(path(KEY))
+                .and(query_param("partNumber", number.to_string()))
+                .and(header(
+                    "x-amz-copy-source",
+                    format!("example-documents/{source}"),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(KEY))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut parts = stored_parts(&[8 * MIB, 3]);
+        parts[0].key = "parts/a b+0".into();
+        tenant_bucket(&server.uri(), None)
+            .assemble(
+                "bundles/my app+1.tar.gz",
+                parts,
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+    }
+
+    #[tokio::test]
+    async fn a_missing_part_is_answered_as_the_read_answers_it_not_as_the_copy_does() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("<Error><Code>NoSuchKey</Code></Error>"),
+            )
+            .mount(&server)
+            .await;
+        aborts_assembly(&server).await;
+        never_completes(&server).await;
+        let read = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"the parts")),
+            Err(eyre::eyre!("part 1 was not uploaded")),
+        ])
+        .then(|chunk| async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            chunk
+        });
+        let failed = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 3]),
+                Box::pin(read),
+                "application/gzip",
+            )
+            .await
+            .expect_err("failed");
+        assert_eq!(failed.to_string(), "part 1 was not uploaded");
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the failed assembly is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_answered_with_a_server_error_is_sent_again() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("SlowDown"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[3]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the part"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+    }
+
+    #[tokio::test]
+    async fn a_copy_answered_with_an_internal_error_body_is_sent_again() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<Error><Code>InternalError</Code><Message>try again</Message></Error>",
+            ))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[3]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the part"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+    }
+
+    #[tokio::test]
+    async fn a_refused_copy_is_answered_without_waiting_for_the_read_to_end() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .mount(&server)
+            .await;
+        aborts_assembly(&server).await;
+        never_completes(&server).await;
+        let read = futures_util::stream::iter([Ok(Bytes::from_static(b"the parts"))])
+            .chain(futures_util::stream::pending());
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend_at(&server.uri()).assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 3]),
+                Box::pin(read),
+                "application/gzip",
+            ),
+        )
+        .await
+        .expect("answered before the read ends")
+        .expect_err("failed");
+        assert!(
+            matches!(
+                failed.downcast_ref::<object_store::Error>(),
+                Some(object_store::Error::PermissionDenied { .. })
+            ),
+            "{failed:?}"
+        );
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the refused assembly is aborted"
+        );
     }
 }

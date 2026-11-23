@@ -10,6 +10,8 @@ use zeroize::Zeroizing;
 pub use cufflink_types::host::storage::CannedAcl;
 
 mod common;
+mod compose;
+mod copied;
 mod gcs;
 mod gcs_v4;
 mod parts;
@@ -54,6 +56,22 @@ pub trait ObjectStorage: Send + Sync {
         data: BoxStream<'static, Result<Bytes>>,
         content_type: &str,
     ) -> Result<Uploaded>;
+
+    /// Stores at `key` the objects at `parts`, one after another, while
+    /// `data` yields their bytes. A store that can copies the parts inside
+    /// itself and reads `data` only to its end, completing the object once
+    /// `data` ends without an error; any other stores what `data` yields as
+    /// [`ObjectStorage::upload_stream`] does. When `data` yields an error
+    /// nothing is stored, and that error is returned as it was yielded.
+    async fn assemble(
+        &self,
+        key: &str,
+        _parts: Vec<StoredPart>,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        self.upload_stream(key, data, content_type).await
+    }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>>;
 
@@ -195,6 +213,26 @@ pub struct Uploaded {
     /// How long the store took to complete the upload, when it went up in
     /// parts.
     pub completion: Option<std::time::Duration>,
+    /// How its parts were stored, when it went up in parts.
+    pub parts: PartTimes,
+}
+
+/// How an upload's parts were stored, sent or copied inside the store: the
+/// most stored at once, the longest one's time with its resends, and the
+/// time from the first one's start to the last one's end. Zero for an
+/// upload stored whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartTimes {
+    pub in_flight: usize,
+    pub longest: std::time::Duration,
+    pub span: std::time::Duration,
+}
+
+/// A stored object an assembly is made of, in the store's primary bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPart {
+    pub key: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

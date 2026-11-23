@@ -3,6 +3,7 @@ use crate::registry::ServiceIdentity;
 use crate::repo::deployments::{Artifact, Deployment};
 use crate::storage::S3Storage;
 use crate::AppState;
+use cufflink_storage::{PartTimes, StoredPart, Uploaded};
 use cufflink_types::features::{WEB_BUNDLE_PARTS, WEB_RELEASES};
 use cufflink_types::ServiceMode;
 use futures_util::stream::{self, BoxStream};
@@ -324,6 +325,7 @@ struct Spent {
     slot: Duration,
     read_wait: Duration,
     write_wait: Duration,
+    parts: PartTimes,
     complete: Duration,
     stream: Duration,
 }
@@ -524,17 +526,25 @@ async fn streamed(
     bundle: &Artifact,
     parts: Vec<Artifact>,
     waits: Arc<Waits>,
-) -> PlatformResult<(Stored, Option<Duration>)> {
+) -> PlatformResult<(Stored, Option<Uploaded>)> {
+    let stored = parts
+        .iter()
+        .map(|part| StoredPart {
+            key: part.s3_key.clone(),
+            size: u64::try_from(part.size).unwrap_or_default(),
+        })
+        .collect();
     let streamed = storage
-        .upload_stream(
+        .assemble(
             &bundle.s3_key,
+            stored,
             verified(storage, bundle, parts, Arc::clone(&waits)),
             Object::Bundle.content_type(),
         )
         .await;
     let _ = waits.answered.set(Instant::now());
     match streamed {
-        Ok(uploaded) => Ok((Stored::Uploaded, uploaded.completion)),
+        Ok(uploaded) => Ok((Stored::Uploaded, Some(uploaded))),
         Err(e) => match stored_size(storage, &bundle.s3_key).await {
             Ok(Some(stored)) if i64::try_from(stored).ok() == Some(bundle.size) => {
                 Ok((Stored::Present, None))
@@ -661,6 +671,11 @@ pub(crate) async fn assemble(
         millis(spent.stream),
         millis(started.elapsed()),
     );
+    let (parts_in_flight, part_store_max_ms, part_store_ms) = (
+        spent.parts.in_flight,
+        millis(spent.parts.longest),
+        millis(spent.parts.span),
+    );
     match &assembled {
         Ok(answered) => info!(
             %service_id,
@@ -673,6 +688,9 @@ pub(crate) async fn assemble(
             slot_ms,
             read_wait_ms,
             write_wait_ms,
+            parts_in_flight,
+            part_store_max_ms,
+            part_store_ms,
             complete_ms,
             stream_ms,
             elapsed_ms,
@@ -687,6 +705,9 @@ pub(crate) async fn assemble(
             slot_ms,
             read_wait_ms,
             write_wait_ms,
+            parts_in_flight,
+            part_store_max_ms,
+            part_store_ms,
             complete_ms,
             stream_ms,
             elapsed_ms,
@@ -744,11 +765,14 @@ async fn assembling(
         let streamed = streamed(storage, &bundle, parts, Arc::clone(&waits)).await;
         spent.stream = streaming.elapsed();
         spent.read_wait = Waits::of(&waits.read);
-        spent.complete = streamed
+        let uploaded = streamed
             .as_ref()
             .ok()
-            .and_then(|(_, completion)| *completion)
+            .and_then(|(_, uploaded)| uploaded.as_ref());
+        spent.complete = uploaded
+            .and_then(|uploaded| uploaded.completion)
             .unwrap_or_default();
+        spent.parts = uploaded.map(|uploaded| uploaded.parts).unwrap_or_default();
         spent.write_wait = waits.writing(spent.complete);
         streamed?.0
     };

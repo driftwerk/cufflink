@@ -14,6 +14,7 @@ use object_store::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct Parted<S> {
@@ -30,6 +31,39 @@ impl<S> Parted<S> {
             stall,
         }
     }
+}
+
+impl<S: MultipartStore> Parted<S> {
+    pub(crate) async fn begin(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Upload<S>> {
+        let id = self.store.create_multipart_opts(location, opts).await?;
+        Ok(Upload {
+            store: Arc::clone(&self.store),
+            backend: self.backend,
+            stall: self.stall,
+            path: location.clone(),
+            id,
+            next: 0,
+            parts: Arc::default(),
+            sent: Arc::default(),
+        })
+    }
+}
+
+/// A store that copies an object it holds into a part of a multipart
+/// upload, without its bytes leaving the store.
+#[async_trait]
+pub(crate) trait CopyPart: std::fmt::Debug + Send + Sync {
+    async fn copy_part(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        part_idx: usize,
+        from: &Path,
+    ) -> object_store::Result<PartId>;
 }
 
 impl<S: std::fmt::Display> std::fmt::Display for Parted<S> {
@@ -54,17 +88,7 @@ impl<S: ObjectStore + MultipartStore> ObjectStore for Parted<S> {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let id = self.store.create_multipart_opts(location, opts).await?;
-        Ok(Box::new(Upload {
-            store: Arc::clone(&self.store),
-            backend: self.backend,
-            stall: self.stall,
-            path: location.clone(),
-            id,
-            next: 0,
-            parts: Arc::default(),
-            sent: Arc::default(),
-        }))
+        Ok(Box::new(self.begin(location, opts).await?))
     }
 
     async fn get_opts(
@@ -101,7 +125,7 @@ impl<S: ObjectStore + MultipartStore> ObjectStore for Parted<S> {
 }
 
 #[derive(Debug)]
-struct Upload<S> {
+pub(crate) struct Upload<S> {
     store: Arc<S>,
     backend: &'static str,
     stall: Stall,
@@ -113,6 +137,58 @@ struct Upload<S> {
 }
 
 impl<S> Upload<S> {
+    /// Copies the object at `from`, of `size` bytes, into the next part.
+    pub(crate) fn copy_part(
+        &mut self,
+        copier: &Arc<dyn CopyPart>,
+        from: Path,
+        size: u64,
+    ) -> UploadPart {
+        let copier = Arc::clone(copier);
+        self.stored(
+            size,
+            self.stall.timeout(),
+            "copy",
+            move |path, id, index| {
+                let (copier, from) = (Arc::clone(&copier), from.clone());
+                async move { copier.copy_part(&path, &id, index, &from).await }
+            },
+        )
+    }
+
+    fn stored<Fut>(
+        &mut self,
+        size: u64,
+        deadline: Duration,
+        request: &'static str,
+        send: impl Fn(Path, MultipartId, usize) -> Fut + Send + Sync + 'static,
+    ) -> UploadPart
+    where
+        Fut: std::future::Future<Output = object_store::Result<PartId>> + Send + 'static,
+    {
+        let index = self.next;
+        self.next += 1;
+        let (backend, stall) = (self.backend, self.stall);
+        let (path, id) = (self.path.clone(), self.id.clone());
+        let (parts, sent_bytes) = (Arc::clone(&self.parts), Arc::clone(&self.sent));
+        async move {
+            let part = common::attempted(stall, deadline, backend, request, path.as_ref(), || {
+                send(path.clone(), id.clone(), index)
+            })
+            .await?;
+            let mut parts = parts.lock().unwrap_or_else(PoisonError::into_inner);
+            if parts.len() <= index {
+                parts.resize(index + 1, None);
+            }
+            if let Some(slot) = parts.get_mut(index) {
+                *slot = Some(part);
+            }
+            sent_bytes.fetch_add(size, Ordering::Relaxed);
+            Ok(())
+        }
+        .boxed()
+    }
+
     fn sent_parts(&self) -> object_store::Result<Vec<PartId>> {
         let parts = self.parts.lock().unwrap_or_else(PoisonError::into_inner);
         (0..self.next)
@@ -166,34 +242,13 @@ async fn completed_before<S: ObjectStore>(
 #[async_trait]
 impl<S: ObjectStore + MultipartStore> MultipartUpload for Upload<S> {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        let index = self.next;
-        self.next += 1;
-        let (store, backend) = (Arc::clone(&self.store), self.backend);
-        let stall = self.stall.for_write(data.content_length());
-        let (path, id) = (self.path.clone(), self.id.clone());
-        let (parts, sent_bytes) = (Arc::clone(&self.parts), Arc::clone(&self.sent));
-        async move {
-            let size = u64::try_from(data.content_length()).unwrap_or(u64::MAX);
-            let part = common::attempted(
-                stall,
-                stall.timeout(),
-                backend,
-                "part",
-                path.as_ref(),
-                || store.put_part(&path, &id, index, data.clone()),
-            )
-            .await?;
-            let mut parts = parts.lock().unwrap_or_else(PoisonError::into_inner);
-            if parts.len() <= index {
-                parts.resize(index + 1, None);
-            }
-            if let Some(slot) = parts.get_mut(index) {
-                *slot = Some(part);
-            }
-            sent_bytes.fetch_add(size, Ordering::Relaxed);
-            Ok(())
-        }
-        .boxed()
+        let size = u64::try_from(data.content_length()).unwrap_or(u64::MAX);
+        let deadline = self.stall.for_write(data.content_length()).timeout();
+        let store = Arc::clone(&self.store);
+        self.stored(size, deadline, "part", move |path, id, index| {
+            let (store, data) = (Arc::clone(&store), data.clone());
+            async move { store.put_part(&path, &id, index, data).await }
+        })
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
@@ -228,7 +283,7 @@ impl<S: ObjectStore + MultipartStore> MultipartUpload for Upload<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parted, Stall};
+    use super::{CopyPart, Parted, Stall};
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use object_store::memory::InMemory;
@@ -261,6 +316,8 @@ mod tests {
         CompletionAnswerLost,
         CompletionHangsThenGone,
         CompletionGone,
+        CopiesHang(usize),
+        CopiesRefused,
     }
 
     #[derive(Debug, Default)]
@@ -268,6 +325,7 @@ mod tests {
         parts: AtomicUsize,
         completions: AtomicUsize,
         aborts: AtomicUsize,
+        copies: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -425,7 +483,60 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl CopyPart for Faulty {
+        async fn copy_part(
+            &self,
+            path: &Path,
+            id: &MultipartId,
+            part_idx: usize,
+            from: &Path,
+        ) -> object_store::Result<PartId> {
+            let asked = self.counts.copies.fetch_add(1, Ordering::SeqCst);
+            match self.fault {
+                Fault::CopiesHang(hung) if asked < hung => futures_util::future::pending().await,
+                Fault::CopiesRefused => Err(object_store::Error::PermissionDenied {
+                    path: path.to_string(),
+                    source: "the copy was refused".into(),
+                }),
+                _ => {
+                    let copied = self.inner.get(from).await?.bytes().await?;
+                    self.inner
+                        .put_part(path, id, part_idx, PutPayload::from(copied))
+                        .await
+                }
+            }
+        }
+    }
+
     const KEY: &str = "site/bundle";
+
+    const SOURCE: &str = "site/part";
+
+    async fn holding_the_copied_part() -> Arc<InMemory> {
+        let memory = Arc::new(InMemory::new());
+        let [_, copied] = parts();
+        memory
+            .put(&Path::from(SOURCE), PutPayload::from(copied))
+            .await
+            .expect("stored");
+        memory
+    }
+
+    async fn sent_and_copied(store: &Arc<Faulty>) -> object_store::Result<PutResult> {
+        let parted = Parted::new(Arc::clone(store), "faulty", STALL);
+        let copier: Arc<dyn CopyPart> = Arc::<Faulty>::clone(store);
+        let mut upload = parted
+            .begin(&Path::from(KEY), PutMultipartOptions::default())
+            .await?;
+        let [sent, copied] = parts();
+        let stored = [
+            upload.put_part(PutPayload::from(sent)),
+            upload.copy_part(&copier, Path::from(SOURCE), copied.len() as u64),
+        ];
+        futures_util::future::try_join_all(stored).await?;
+        upload.complete().await
+    }
 
     fn parts() -> [Vec<u8>; 2] {
         [vec![7; 300], vec![9; 120]]
@@ -575,5 +686,46 @@ mod tests {
             .expect("started");
         upload.abort().await.expect("aborted");
         assert_eq!(store.count(|c| &c.aborts), 1);
+    }
+
+    #[tokio::test]
+    async fn a_copied_part_takes_its_place_among_the_parts_sent() {
+        let memory = holding_the_copied_part().await;
+        let store = Faulty::over(&memory, Fault::None);
+        sent_and_copied(&store).await.expect("uploaded");
+        assert_eq!(store.count(|c| &c.copies), 1);
+        assert_eq!(stored(&memory).await, Some(parts().concat()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_whose_answer_was_lost_counts_the_copied_parts_as_sent() {
+        let memory = holding_the_copied_part().await;
+        let store = Faulty::over(&memory, Fault::CompletionAnswerLost);
+        sent_and_copied(&store).await.expect("uploaded");
+        assert_eq!(store.count(|c| &c.completions), 2);
+        assert_eq!(stored(&memory).await, Some(parts().concat()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_that_never_answers_is_sent_again_under_its_number_after_the_stall_timeout() {
+        let memory = holding_the_copied_part().await;
+        let store = Faulty::over(&memory, Fault::CopiesHang(1));
+        let started = tokio::time::Instant::now();
+        sent_and_copied(&store).await.expect("uploaded");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(store.count(|c| &c.copies), 2);
+        assert_eq!(stored(&memory).await, Some(parts().concat()));
+    }
+
+    #[tokio::test]
+    async fn a_refused_copy_is_not_sent_again() {
+        let memory = holding_the_copied_part().await;
+        let store = Faulty::over(&memory, Fault::CopiesRefused);
+        let refused = sent_and_copied(&store).await.expect_err("refused");
+        assert!(matches!(
+            refused,
+            object_store::Error::PermissionDenied { .. }
+        ));
+        assert_eq!(store.count(|c| &c.copies), 1);
     }
 }

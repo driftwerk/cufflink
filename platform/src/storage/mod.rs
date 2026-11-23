@@ -1,5 +1,5 @@
 use cufflink_storage::{
-    Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded,
+    Credential, ObjectMeta, ObjectReader, ObjectStorage, StoredPart, UploadOptions, Uploaded,
 };
 use eyre::Result;
 use std::sync::Arc;
@@ -42,13 +42,14 @@ impl S3Storage {
             .await
     }
 
-    pub async fn upload_stream(
+    pub async fn assemble(
         &self,
         key: &str,
+        parts: Vec<StoredPart>,
         data: futures_util::stream::BoxStream<'static, Result<bytes::Bytes>>,
         content_type: &str,
     ) -> Result<Uploaded> {
-        self.inner.upload_stream(key, data, content_type).await
+        self.inner.assemble(key, parts, data, content_type).await
     }
 
     pub async fn head(&self, key: &str) -> Result<u64> {

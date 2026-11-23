@@ -1,12 +1,14 @@
-use crate::{ObjectMeta, ObjectReader, UploadOptions, Uploaded};
+use crate::copied::{self, COPIES_AT_ONCE};
+use crate::parts::{CopyPart, Parted, Upload};
+use crate::{ObjectMeta, ObjectReader, PartTimes, StoredPart, UploadOptions, Uploaded};
 use bytes::{Bytes, BytesMut};
 use eyre::{Result, WrapErr};
 use futures_util::stream::BoxStream;
 use futures_util::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::{
-    path::Path as OsPath, Attribute, AttributeValue, Attributes, ClientOptions, GetOptions,
-    GetRange, GetResult, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    multipart::MultipartStore, path::Path as OsPath, Attribute, AttributeValue, Attributes,
+    ClientOptions, GetOptions, GetRange, GetResult, MultipartUpload, ObjectStore, ObjectStoreExt,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,7 +316,7 @@ struct Multipart {
     concurrency: usize,
 }
 
-const MAX_PARTS: usize = 10_000;
+pub(crate) const MAX_PARTS: usize = 10_000;
 
 enum Put {
     Whole(PutOptions),
@@ -392,24 +394,100 @@ async fn put_in(
     let path = keys.path(key)?;
     let data = data.into();
     let size = data.len() as u64;
-    let (stored, completion) = match multipart.put(data.len(), opts) {
+    let completed = match multipart.put(data.len(), opts) {
         Put::Whole(opts) => {
             let stall = stall.for_upload(data.len(), multipart.min_part_size);
             put_whole(store, backend, key, &path, data, opts, stall)
                 .await
-                .map(|stored| (stored, None))
+                .map(Completed::whole)
         }
-        Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart)
-            .await
-            .map(|(stored, completion)| (stored, Some(completion))),
+        Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart).await,
     }
     .wrap_err_with(|| format!("{backend} upload failed for {key}"))?;
-    tracing::info!(backend, key = %key, size, "Uploaded");
-    Ok(Uploaded {
-        size,
-        etag: stored.e_tag,
-        completion,
-    })
+    Ok(completed.uploaded(backend, key, size))
+}
+
+/// What a store answered an upload with: the object it stored, how long it
+/// took to complete one that went up in parts, and how its parts were
+/// stored.
+pub(crate) struct Completed {
+    pub(crate) stored: PutResult,
+    pub(crate) completion: Option<Duration>,
+    pub(crate) parts: PartTimes,
+}
+
+impl Completed {
+    fn whole(stored: PutResult) -> Self {
+        Self {
+            stored,
+            completion: None,
+            parts: PartTimes::default(),
+        }
+    }
+
+    pub(crate) fn uploaded(self, backend: &'static str, key: &str, size: u64) -> Uploaded {
+        tracing::info!(backend, key = %key, size, "Uploaded");
+        Uploaded {
+            size,
+            etag: self.stored.e_tag,
+            completion: self.completion,
+            parts: self.parts,
+        }
+    }
+}
+
+/// Times the part stores of one upload as they run.
+#[derive(Debug, Default)]
+pub(crate) struct PartClock(std::sync::Mutex<Clock>);
+
+#[derive(Debug, Default)]
+struct Clock {
+    running: usize,
+    peak: usize,
+    longest: Duration,
+    first: Option<tokio::time::Instant>,
+    last: Option<tokio::time::Instant>,
+}
+
+impl PartClock {
+    pub(crate) async fn timed<T>(&self, store: impl std::future::Future<Output = T>) -> T {
+        let started = self.change(|clock| {
+            let now = tokio::time::Instant::now();
+            clock.running += 1;
+            clock.peak = clock.peak.max(clock.running);
+            clock.first.get_or_insert(now);
+            now
+        });
+        let stored = store.await;
+        self.change(|clock| {
+            let now = tokio::time::Instant::now();
+            clock.running = clock.running.saturating_sub(1);
+            clock.longest = clock.longest.max(now.saturating_duration_since(started));
+            clock.last = Some(now);
+        });
+        stored
+    }
+
+    pub(crate) fn times(&self) -> PartTimes {
+        self.change(|clock| PartTimes {
+            in_flight: clock.peak,
+            longest: clock.longest,
+            span: clock
+                .first
+                .zip(clock.last)
+                .map(|(first, last)| last.saturating_duration_since(first))
+                .unwrap_or_default(),
+        })
+    }
+
+    fn change<T>(&self, change: impl FnOnce(&mut Clock) -> T) -> T {
+        change(
+            &mut self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 async fn put_whole(
@@ -522,17 +600,45 @@ async fn put_stream_in(
                 .put_multipart_opts(&keys.path(key)?, opts)
                 .await
                 .map_err(failed)?;
-            let (size, stored, completion) = Pending::new(upload, backend, key)
+            let (size, completed) = Pending::new(upload, backend, key)
                 .finish_stream(head, data, multipart, failed)
                 .await?;
-            tracing::info!(backend, key = %key, size, "Uploaded");
-            Ok(Uploaded {
-                size,
-                etag: stored.e_tag,
-                completion: Some(completion),
-            })
+            Ok(completed.uploaded(backend, key, size))
         }
     }
+}
+
+/// Stores at `key` the objects at `parts` as the parts of one multipart
+/// upload, each copied inside the store, while `data`, their bytes, is read
+/// to its end; the upload completes once both have.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn put_copied<S: ObjectStore + MultipartStore>(
+    store: &Parted<S>,
+    copier: &Arc<dyn CopyPart>,
+    backend: &'static str,
+    keys: Keys,
+    key: &str,
+    parts: Vec<StoredPart>,
+    data: BoxStream<'static, Result<Bytes>>,
+    options: &UploadOptions,
+) -> Result<Uploaded> {
+    let failed = |e: object_store::Error| {
+        eyre::Report::new(e).wrap_err(format!("{backend} upload failed for {key}"))
+    };
+    let size = parts.iter().map(|part| part.size).sum();
+    let sources = parts
+        .into_iter()
+        .map(|part| keys.path(&part.key).map(|path| (path, part.size)))
+        .collect::<Result<Vec<_>>>()?;
+    let opts = PutMultipartOptions {
+        attributes: attributes(options),
+        ..Default::default()
+    };
+    let upload = store.begin(&keys.path(key)?, opts).await.map_err(failed)?;
+    let completed = Pending::new(Box::new(upload), backend, key)
+        .finish_copies(copier, sources, data, failed)
+        .await?;
+    Ok(completed.uploaded(backend, key, size))
 }
 
 fn rechunked(
@@ -569,7 +675,7 @@ async fn put_parts(
     data: Bytes,
     opts: PutMultipartOptions,
     multipart: Multipart,
-) -> object_store::Result<(PutResult, Duration)> {
+) -> object_store::Result<Completed> {
     let upload = store.put_multipart_opts(path, opts).await?;
     Pending::new(upload, backend, key)
         .finish(data, multipart)
@@ -579,15 +685,15 @@ async fn put_parts(
 /// A multipart upload that is aborted, in the background, unless it
 /// completes: when a part or the completion fails, and when the upload is
 /// dropped before it finishes.
-struct Pending {
-    upload: Option<Box<dyn MultipartUpload>>,
+struct Pending<U: MultipartUpload + ?Sized + 'static = dyn MultipartUpload> {
+    upload: Option<Box<U>>,
     backend: &'static str,
     key: String,
     completing: bool,
 }
 
-impl Pending {
-    fn new(upload: Box<dyn MultipartUpload>, backend: &'static str, key: &str) -> Self {
+impl<U: MultipartUpload + ?Sized + 'static> Pending<U> {
+    fn new(upload: Box<U>, backend: &'static str, key: &str) -> Self {
         Self {
             upload: Some(upload),
             backend,
@@ -596,16 +702,35 @@ impl Pending {
         }
     }
 
-    async fn finish(
-        mut self,
-        data: Bytes,
-        multipart: Multipart,
-    ) -> object_store::Result<(PutResult, Duration)> {
-        let completed = self.send(data, multipart).await;
+    fn settled<T, E>(&mut self, completed: std::result::Result<T, E>) -> std::result::Result<T, E> {
         if completed.is_ok() {
             self.upload = None;
         }
         completed
+    }
+
+    async fn completed(&mut self, clock: &PartClock) -> object_store::Result<Completed> {
+        self.completing = true;
+        let asked = tokio::time::Instant::now();
+        unfinished(&mut self.upload, self.backend, &self.key)?
+            .complete()
+            .await
+            .map(|stored| Completed {
+                stored,
+                completion: Some(asked.elapsed()),
+                parts: clock.times(),
+            })
+    }
+}
+
+impl Pending {
+    async fn finish(
+        mut self,
+        data: Bytes,
+        multipart: Multipart,
+    ) -> object_store::Result<Completed> {
+        let completed = self.send(data, multipart).await;
+        self.settled(completed)
     }
 
     async fn finish_stream(
@@ -614,12 +739,9 @@ impl Pending {
         data: BoxStream<'static, Result<Bytes>>,
         multipart: Multipart,
         failed: impl Fn(object_store::Error) -> eyre::Report,
-    ) -> Result<(u64, PutResult, Duration)> {
+    ) -> Result<(u64, Completed)> {
         let completed = self.send_stream(head, data, multipart, failed).await;
-        if completed.is_ok() {
-            self.upload = None;
-        }
-        completed
+        self.settled(completed)
     }
 
     async fn send_stream(
@@ -628,7 +750,8 @@ impl Pending {
         data: BoxStream<'static, Result<Bytes>>,
         multipart: Multipart,
         failed: impl Fn(object_store::Error) -> eyre::Report,
-    ) -> Result<(u64, PutResult, Duration)> {
+    ) -> Result<(u64, Completed)> {
+        let clock = PartClock::default();
         let upload = unfinished(&mut self.upload, self.backend, &self.key).map_err(&failed)?;
         let key = &self.key;
         let size = rechunked(head, data, multipart.min_part_size)
@@ -647,59 +770,81 @@ impl Pending {
             })
             .map_ok(|part| {
                 let size = part.len() as u64;
-                upload
-                    .put_part(PutPayload::from(part))
+                clock
+                    .timed(upload.put_part(PutPayload::from(part)))
                     .map_ok(move |()| size)
                     .map_err(&failed)
             })
             .try_buffer_unordered(multipart.concurrency)
             .try_fold(0, |total, size| future::ready(Ok(total + size)))
             .await?;
-        self.completing = true;
-        let asked = std::time::Instant::now();
-        unfinished(&mut self.upload, self.backend, &self.key)
-            .map_err(&failed)?
-            .complete()
+        self.completed(&clock)
             .await
-            .map(|stored| (size, stored, asked.elapsed()))
+            .map(|completed| (size, completed))
             .map_err(&failed)
     }
 
-    async fn send(
-        &mut self,
-        data: Bytes,
-        multipart: Multipart,
-    ) -> object_store::Result<(PutResult, Duration)> {
+    async fn send(&mut self, data: Bytes, multipart: Multipart) -> object_store::Result<Completed> {
+        let clock = PartClock::default();
         let upload = unfinished(&mut self.upload, self.backend, &self.key)?;
         stream::iter(
             multipart
                 .parts(data)
-                .map(|part| upload.put_part(PutPayload::from(part))),
+                .map(|part| clock.timed(upload.put_part(PutPayload::from(part)))),
         )
         .buffer_unordered(multipart.concurrency)
         .try_collect::<()>()
         .await?;
-        self.completing = true;
-        let asked = std::time::Instant::now();
-        upload
-            .complete()
-            .await
-            .map(|stored| (stored, asked.elapsed()))
+        self.completed(&clock).await
     }
 }
 
-fn unfinished<'a>(
-    upload: &'a mut Option<Box<dyn MultipartUpload>>,
+impl<S: ObjectStore + MultipartStore> Pending<Upload<S>> {
+    async fn finish_copies(
+        mut self,
+        copier: &Arc<dyn CopyPart>,
+        sources: Vec<(OsPath, u64)>,
+        data: BoxStream<'static, Result<Bytes>>,
+        failed: impl Fn(object_store::Error) -> eyre::Report,
+    ) -> Result<Completed> {
+        let completed = self.copy(copier, sources, data, failed).await;
+        self.settled(completed)
+    }
+
+    async fn copy(
+        &mut self,
+        copier: &Arc<dyn CopyPart>,
+        sources: Vec<(OsPath, u64)>,
+        data: BoxStream<'static, Result<Bytes>>,
+        failed: impl Fn(object_store::Error) -> eyre::Report,
+    ) -> Result<Completed> {
+        let clock = PartClock::default();
+        let upload = unfinished(&mut self.upload, self.backend, &self.key).map_err(&failed)?;
+        let copies = stream::iter(
+            sources
+                .into_iter()
+                .map(|(from, size)| clock.timed(upload.copy_part(copier, from, size))),
+        )
+        .buffer_unordered(COPIES_AT_ONCE)
+        .try_collect::<()>()
+        .map_err(&failed);
+        copied::alongside(copies, data).await?;
+        self.completed(&clock).await.map_err(&failed)
+    }
+}
+
+fn unfinished<'a, U: MultipartUpload + ?Sized>(
+    upload: &'a mut Option<Box<U>>,
     backend: &'static str,
     key: &str,
-) -> object_store::Result<&'a mut Box<dyn MultipartUpload>> {
+) -> object_store::Result<&'a mut Box<U>> {
     upload.as_mut().ok_or_else(|| object_store::Error::Generic {
         store: backend,
         source: format!("the multipart upload of {key} has finished").into(),
     })
 }
 
-impl Drop for Pending {
+impl<U: MultipartUpload + ?Sized + 'static> Drop for Pending<U> {
     fn drop(&mut self) {
         let Some(mut upload) = self.upload.take() else {
             return;
@@ -1061,6 +1206,46 @@ pub(crate) async fn presign_url<S: object_store::signer::Signer>(
 
 #[cfg(test)]
 pub(crate) mod test_wire {
+    use crate::StoredPart;
+    use bytes::Bytes;
+    use futures_util::stream::BoxStream;
+
+    pub(crate) fn stored_parts(sizes: &[u64]) -> Vec<StoredPart> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| StoredPart {
+                key: format!("parts/{index}"),
+                size: *size,
+            })
+            .collect()
+    }
+
+    pub(crate) fn bundle_bytes(
+        chunks: Vec<eyre::Result<Bytes>>,
+    ) -> BoxStream<'static, eyre::Result<Bytes>> {
+        Box::pin(futures_util::stream::iter(chunks))
+    }
+
+    pub(crate) async fn requests_until(
+        server: &wiremock::MockServer,
+        seen: impl Fn(&wiremock::Request) -> bool,
+    ) -> bool {
+        for _ in 0..200 {
+            if server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(&seen)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     pub(crate) async fn first_part_sent(server: &wiremock::MockServer) -> usize {
         server
             .received_requests()
@@ -1112,13 +1297,14 @@ mod tests {
     use super::{
         already_aborted, completions_are_never_cut, get_bytes, open_read, put_in, put_stream_in,
         rechunked, request_timeout, retry_timeout, timed_out_requests_cannot_retry, Keys,
-        Multipart, Put, Stall, ENV_COMPLETION_TIMEOUT_SECS, ENV_REQUEST_TIMEOUT_SECS,
+        Multipart, PartClock, Put, Stall, ENV_COMPLETION_TIMEOUT_SECS, ENV_REQUEST_TIMEOUT_SECS,
         ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS, ENV_STALL_TIMEOUT_SECS, MAX_PARTS,
     };
+    use crate::PartTimes;
     use async_trait::async_trait;
     use bytes::{Bytes, BytesMut};
     use futures_util::stream::BoxStream;
-    use futures_util::{FutureExt, StreamExt, TryStreamExt};
+    use futures_util::{future, FutureExt, StreamExt, TryStreamExt};
     use object_store::memory::InMemory;
     use object_store::path::Path as OsPath;
     use object_store::{
@@ -1512,6 +1698,7 @@ mod tests {
             .await
             .expect("uploaded");
             assert_eq!(uploaded.size, size as u64);
+            assert!(uploaded.parts.in_flight > 0 && uploaded.completion.is_some());
             let got = store.get(&OsPath::from(key)).await.expect("stored");
             assert_eq!(
                 got.attributes
@@ -1707,6 +1894,10 @@ mod tests {
             .await
             .expect("uploaded");
             assert_eq!(uploaded.size, size as u64);
+            assert_eq!(
+                (uploaded.completion.is_some(), uploaded.parts.in_flight > 0),
+                (key == "large.tar.gz", key == "large.tar.gz")
+            );
             let got = store.get(&OsPath::from(key)).await.expect("stored");
             assert_eq!(
                 got.attributes
@@ -1740,6 +1931,26 @@ mod tests {
         }
         assert_eq!(store.aborted().await, 1);
         assert_eq!(store.counts.get(), [0, 1, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_part_clock_keeps_the_most_at_once_the_longest_and_the_span() {
+        let clock = PartClock::default();
+        let stored = |after: u64| clock.timed(tokio::time::sleep(Duration::from_secs(after)));
+        future::join3(stored(3), stored(1), async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            stored(4).await
+        })
+        .await;
+        assert_eq!(
+            clock.times(),
+            PartTimes {
+                in_flight: 2,
+                longest: Duration::from_secs(4),
+                span: Duration::from_secs(6),
+            }
+        );
+        assert_eq!(PartClock::default().times(), PartTimes::default());
     }
 
     #[test]

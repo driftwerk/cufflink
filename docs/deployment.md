@@ -962,7 +962,15 @@ steps, and only the last one changes what runs:
      ([web uploads](observability.md#web-uploads)).
    - `POST /api/services/{id}/web/artifacts/{sha256}/parts` with
      `{"size": 41234567, "parts": ["…", …]}`, naming 1 to 1024 parts,
-     streams the parts in order into the bundle's key. A part not
+     stores the parts in order at the bundle's key while it reads them
+     once for the bundle's hash. On S3 the store copies them into the
+     bundle's multipart upload (UploadPartCopy) when every part but the
+     last holds 5 to 64 MiB, as the CLI's do; on GCS it composes them,
+     32 at a time through intermediate objects beside the bundle's key
+     that it then removes. The platform then sends none of the bundle's
+     bytes, and completes the bundle only once its hash is checked. On
+     any other layout, and on the memory and local backends, it streams
+     the parts' bytes into the bundle's key. A part not
      uploaded, or no longer stored, is named in a `409`; parts that do not
      add up to `size` or do not hash to `{sha256}` are refused with a
      `422`, and nothing is stored at the bundle's key. Otherwise the bundle

@@ -105,10 +105,10 @@ any order, is the same as uploading it once.
   answer to a new bundle (section 5), so it is not counted in
   `cufflink_web_uploads_total`. The recorded sizes must add up to `size`
   (`422`).
-- The platform streams the parts in order, opening each only once the one
+- The platform reads the parts in order, opening each only once the one
   before it is read, so no opened part waits out the store's request
-  timeout, into `ObjectStorage::upload_stream` at the bundle's key, and
-  hashes them as they pass. A part whose object is missing, or of another size than
+  timeout, and hashes them as they pass, into `ObjectStorage::assemble`
+  at the bundle's key with the parts' keys and sizes (section 4.3). A part whose object is missing, or of another size than
   recorded, ends the stream with the same `409`. When the parts end, a hash
   that is not `sha256` ends the stream with `web::require_content`'s `422`.
   An error from the stream means the object is never completed, so a
@@ -210,6 +210,46 @@ can never claim a part as a bundle.
   removes its parts.
 - Deleting a service already deletes everything under `web/{service_id}/`,
   parts included, and the foreign key removes their rows.
+
+### 4.3 Copied assemblies
+
+`ObjectStorage::assemble(key, parts, data, content_type)` stores at `key`
+the objects at `parts` while `data` yields their bytes. Memory and local
+stores, and any layout a store cannot copy, store `data` as
+`upload_stream` does. S3 and GCS copy the parts inside the store, so the
+platform sends none of the bundle's bytes, and read `data` to its end
+alongside. An error `data` yields is returned as it was yielded, ahead of
+a copy's missing source, so a part the read finds missing is answered with
+the read's `409`, not as the copy's `404`; any other failed copy is
+answered at once, without reading the rest of `data`:
+
+- S3 copies each part into the bundle's multipart upload with
+  UploadPartCopy, eight at a time, signed with object_store's own
+  credentials and signer and sent through its HTTP client. Every part but
+  the last must hold at least 5 MiB, and none more than 64 MiB, so that a
+  copy is bounded by the stall timeout. A copied part takes its number and
+  its size in the upload as a sent one does, through the same cut-short
+  loop, so a completion whose answer was lost still stands on the size
+  sent. The upload completes only once `data` has ended; an error from
+  it, or a copy that fails (S3 can answer `200` with an `<Error>` body),
+  aborts the upload through the same guard.
+- GCS composes the parts, 32 at a time, into intermediate objects beside
+  the key (`{key}.compose/{nonce}/{tier}-{index}`, the nonce its
+  assembly's own, so two replicas assembling the same bundle never remove
+  each other's) until 32 or fewer remain, a group of one passing through
+  as it is, then
+  composes those into the key once `data` has ended, with the bundle's
+  content type. The intermediate objects are removed once the compose
+  stores the bundle or fails. A compose names its sources, so one sent
+  again stores the same object.
+- A copy or compose is cut short and sent again as a part is; the
+  completion, or GCS's last compose, as a completion is. A copy or
+  compose answered with a `5xx` or `429` (or, on S3, a `200` whose
+  `<Error>` is `InternalError`, `SlowDown` or `ServiceUnavailable`), or
+  whose connection fails, is
+  sent again after a pause, with object_store's backoff and within its
+  retry budget (`OBJECT_STORE_RETRY_TIMEOUT_SECS`), as object_store
+  retries its own requests.
 
 ## 5. The CLI
 

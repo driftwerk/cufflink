@@ -574,6 +574,9 @@ Rolling a platform back from v0.40.3 to v0.40.2:
 | `OBJECT_STORE_COMPLETION_TIMEOUT_SECS` | Nothing: v0.40.2 ignores it, and a multipart upload's completion is bounded by the request timeout alone again |
 | `write_wait_ms` and `complete_ms` in the assembly's log lines | Nothing: v0.40.2 logs neither, so a query on them finds none |
 | `part` and `complete` as a stalled request | Nothing: v0.40.2 logs neither |
+| Web bundles assembled by copying their parts inside the store | Nothing to undo: a bundle copied or composed is stored at its content key and reads back as any other. v0.40.2 streams the parts' bytes into the bundle again. An intermediate object a GCS compose could not remove stays under the service's prefix until the service is deleted; it is never served |
+| `parts_in_flight`, `part_store_max_ms` and `part_store_ms` in the assembly's log lines, `copy` and `compose` as a stalled request | Nothing: v0.40.2 logs none of them |
+| `ObjectStorage::assemble` | Nothing: only assembly calls it |
 | The database | Nothing: v0.40.3 has no migration |
 
 Rolling a platform back from v0.40.2 to v0.40.1:
@@ -1442,8 +1445,9 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 Unreleased.
 
-A multipart upload's part whose answer stalls is sent again, and the
-upload's completion is bounded on its own. No new feature. A service built
+A multipart upload's part whose answer stalls is sent again, the
+upload's completion is bounded on its own, and a web bundle assembled from
+its parts is copied from them inside S3 or GCS. No new feature. A service built
 for v0.40.2 deploys and runs on this platform unchanged. There is no
 migration. New environment variable: `OBJECT_STORE_COMPLETION_TIMEOUT_SECS`
 on the platform, the worker and the web runner ([setup](setup.md)).
@@ -1468,6 +1472,20 @@ on the platform, the worker and the web runner ([setup](setup.md)).
 - A part or completion cut short logs
   `A storage request made no progress in time; trying it again` with
   `request` `part` or `complete`.
+- A web bundle assembled from its parts is stored without the platform
+  sending its bytes: on S3 the store copies each part into the bundle's
+  multipart upload (UploadPartCopy, eight at a time) when every part but
+  the last holds 5 to 64 MiB, and on GCS it composes them, 32 at a time
+  through intermediate objects it then removes. The platform still reads
+  the parts once for the bundle's hash, and completes the bundle only once
+  the hash is checked; a bundle whose bytes are not its hash is never
+  stored. Any other layout, and the memory and local backends, stream the
+  parts as before. A copy or compose cut short logs `request` `copy` or
+  `compose` ([deployment](deployment.md), [setup](setup.md)).
+- The assembly logs `parts_in_flight`, `part_store_max_ms` and
+  `part_store_ms`: the most part stores that ran at once, the longest one,
+  and the time from the first one's start to the last one's end
+  ([observability](observability.md)).
 
 ## Changes in v0.40.2
 
