@@ -1,4 +1,5 @@
 use crate::common::{self, Keys};
+use crate::parts::Parted;
 use crate::{
     is_bucket_name, CannedAcl, Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions,
     Uploaded,
@@ -52,11 +53,25 @@ impl Connection {
             .wrap_err("Failed to build S3 client")?;
         Ok(Arc::new(store))
     }
+
+    fn writer(
+        &self,
+        bucket: &str,
+        acl: Option<CannedAcl>,
+        stall: common::Stall,
+    ) -> Result<Arc<Parted<AmazonS3>>> {
+        Ok(Arc::new(Parted::new(
+            self.store(bucket, acl)?,
+            BACKEND,
+            stall,
+        )))
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct S3Backend {
     primary: Arc<AmazonS3>,
+    writes: Arc<Parted<AmazonS3>>,
     connection: Connection,
     bucket: String,
     keys: Keys,
@@ -113,8 +128,10 @@ impl S3Backend {
         keys: Keys,
         stall: common::Stall,
     ) -> Result<Self> {
+        let primary = connection.store(&bucket, None)?;
         Ok(Self {
-            primary: connection.store(&bucket, None)?,
+            writes: Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall)),
+            primary,
             connection,
             bucket,
             keys,
@@ -127,6 +144,14 @@ impl S3Backend {
         match acl {
             None if bucket == self.bucket => Ok(Arc::clone(&self.primary)),
             acl => self.connection.store(bucket, acl),
+        }
+    }
+
+    fn writer_for(&self, bucket: &str, acl: Option<CannedAcl>) -> Result<Arc<Parted<AmazonS3>>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
+        match acl {
+            None if bucket == self.bucket => Ok(Arc::clone(&self.writes)),
+            acl => self.connection.writer(bucket, acl, self.stall),
         }
     }
 }
@@ -161,7 +186,7 @@ impl ObjectStorage for S3Backend {
         data: Vec<u8>,
         options: &UploadOptions,
     ) -> Result<Uploaded> {
-        let store = self.store_for(bucket, options.acl)?;
+        let store = self.writer_for(bucket, options.acl)?;
         common::put(
             store.as_ref(),
             BACKEND,
@@ -180,7 +205,7 @@ impl ObjectStorage for S3Backend {
         data: BoxStream<'static, Result<Bytes>>,
         content_type: &str,
     ) -> Result<Uploaded> {
-        let store = self.store_for(&self.bucket, None)?;
+        let store = self.writer_for(&self.bucket, None)?;
         let options = UploadOptions::content_type(content_type);
         common::put_stream(
             store.as_ref(),
@@ -472,7 +497,15 @@ mod tests {
     }
 
     fn backend_with(endpoint: &str, timeouts: &[(&str, Option<&str>)]) -> S3Backend {
-        let mut backend = None;
+        built_with(endpoint, timeouts, |backend| backend)
+    }
+
+    fn built_with<T>(
+        endpoint: &str,
+        timeouts: &[(&str, Option<&str>)],
+        build: impl FnOnce(S3Backend) -> T,
+    ) -> T {
+        let mut built = None;
         let vars = [
             (ENV_ENDPOINT, Some(endpoint)),
             (ENV_REGION, Some("us-east-1")),
@@ -481,9 +514,9 @@ mod tests {
             (ENV_BUCKET, Some("cufflink")),
         ];
         with_env(&[&vars[..], timeouts].concat(), || {
-            backend = Some(S3Backend::from_vars(var).expect("should build"))
+            built = Some(build(S3Backend::from_vars(var).expect("should build")))
         });
-        backend.unwrap()
+        built.expect("built")
     }
 
     #[tokio::test]
@@ -523,7 +556,8 @@ mod tests {
             uploaded,
             Uploaded {
                 size: 8,
-                etag: Some("\"9b2cf535\"".into())
+                etag: Some("\"9b2cf535\"".into()),
+                completion: None,
             }
         );
     }
@@ -834,15 +868,22 @@ mod tests {
     const BUNDLE: &str = "/example-documents/bundles/app.tar.gz";
 
     async fn initiates_upload(server: &wiremock::MockServer) {
+        initiates_upload_with(server, Some("public-read")).await;
+    }
+
+    async fn initiates_upload_with(server: &wiremock::MockServer, acl: Option<&'static str>) {
         use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
-        Mock::given(method("POST"))
+        let initiate = Mock::given(method("POST"))
             .and(path(BUNDLE))
             .and(query_param("uploads", ""))
-            .and(header("content-type", "application/gzip"))
-            .and(header("x-amz-acl", "public-read"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
+            .and(header("content-type", "application/gzip"));
+        match acl {
+            Some(acl) => initiate.and(header("x-amz-acl", acl)),
+            None => initiate,
+        }
+        .respond_with(ResponseTemplate::new(200).set_body_string(
                 "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
             ))
             .expect(1)
@@ -897,12 +938,10 @@ mod tests {
             .await
             .expect("uploaded");
         assert_eq!(
-            uploaded,
-            Uploaded {
-                size: data.len() as u64,
-                etag: Some("\"whole-6\"".into())
-            }
+            (uploaded.size, uploaded.etag.as_deref()),
+            (data.len() as u64, Some("\"whole-6\""))
         );
+        assert!(uploaded.completion.is_some());
         let requests = server.received_requests().await.unwrap_or_default();
         let mut parts: Vec<(usize, &[u8])> = requests
             .iter()
@@ -976,6 +1015,130 @@ mod tests {
         assert!(
             requests_until(&server, |request| request.method.as_str() == "DELETE").await,
             "the failed upload is aborted"
+        );
+    }
+
+    fn cut_at_a_second(server: &str, timeouts: &[(&str, Option<&str>)]) -> Arc<dyn ObjectStorage> {
+        built_with(
+            server,
+            &[&[(common::ENV_STALL_TIMEOUT_SECS, Some("1"))][..], timeouts].concat(),
+            |backend| {
+                backend
+                    .tenant_bucket("example-documents", None)
+                    .expect("tenant bucket")
+            },
+        )
+    }
+
+    async fn parts_answered(server: &wiremock::MockServer, stalled: u64) {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .and(query_param("partNumber", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"stalled\"")
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .up_to_n_times(stalled)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"part\""))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_part_whose_answer_stalls_is_cut_at_the_stall_timeout_and_sent_again() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_upload(&server).await;
+        parts_answered(&server, 1).await;
+        Mock::given(method("POST"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole-6\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let data = large_payload();
+        let uploaded = cut_at_a_second(&server.uri(), &[])
+            .upload_to_bucket_with(
+                "example-documents",
+                "bundles/app.tar.gz",
+                data.clone(),
+                &public_bundle(),
+            )
+            .await
+            .expect("uploaded");
+        assert_eq!(
+            (uploaded.size, uploaded.etag.as_deref()),
+            (data.len() as u64, Some("\"whole-6\""))
+        );
+        assert_eq!(common::test_wire::first_part_sent(&server).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_part_that_stalls_on_every_attempt_fails_its_upload_and_aborts_it() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_upload_with(&server, None).await;
+        parts_answered(&server, u64::MAX).await;
+        Mock::given(method("DELETE"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(BUNDLE))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let refused = cut_at_a_second(
+            &server.uri(),
+            &[
+                (common::ENV_REQUEST_TIMEOUT_SECS, Some("2")),
+                (common::ENV_RETRY_TIMEOUT_SECS, Some("1")),
+            ],
+        )
+        .upload_to_bucket_with(
+            "example-documents",
+            "bundles/app.tar.gz",
+            large_payload(),
+            &UploadOptions::content_type("application/gzip"),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(
+            refused.to_string(),
+            "s3 upload failed for bundles/app.tar.gz"
+        );
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the failed upload is aborted"
+        );
+        assert_eq!(
+            common::test_wire::first_part_sent(&server).await,
+            3,
+            "two attempts cut at the stall timeout, then one bounded by the request timeout"
         );
     }
 

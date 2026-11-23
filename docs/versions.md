@@ -566,6 +566,16 @@ Rolling a platform back from v0.40.0 to v0.39.0:
 | `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
 | The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
 
+Rolling a platform back from v0.40.3 to v0.40.2:
+
+| What v0.40.3 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| A part of a multipart upload sent again | Nothing to undo: an object uploaded this way reads back as any other. v0.40.2 sends each part once, bounded by the request timeout alone, so a part whose answer stalls holds its upload up to that timeout again |
+| `OBJECT_STORE_COMPLETION_TIMEOUT_SECS` | Nothing: v0.40.2 ignores it, and a multipart upload's completion is bounded by the request timeout alone again |
+| `write_wait_ms` and `complete_ms` in the assembly's log lines | Nothing: v0.40.2 logs neither, so a query on them finds none |
+| `part` and `complete` as a stalled request | Nothing: v0.40.2 logs neither |
+| The database | Nothing: v0.40.3 has no migration |
+
 Rolling a platform back from v0.40.2 to v0.40.1:
 
 | What v0.40.2 changed | Before rolling the platform back |
@@ -1427,6 +1437,37 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.40.3
+
+Unreleased.
+
+A multipart upload's part whose answer stalls is sent again, and the
+upload's completion is bounded on its own. No new feature. A service built
+for v0.40.2 deploys and runs on this platform unchanged. There is no
+migration. New environment variable: `OBJECT_STORE_COMPLETION_TIMEOUT_SECS`
+on the platform, the worker and the web runner ([setup](setup.md)).
+
+- A part of a multipart upload to S3 or GCS is cut short and sent again
+  as a whole write is: a part that has not finished within
+  `OBJECT_STORE_STALL_TIMEOUT_SECS` (default `20`) for each 8 MiB it holds
+  is sent again under its own part number, so the resend replaces it, at
+  most `OBJECT_STORE_STALL_ATTEMPTS` times, the last bounded only by
+  `OBJECT_STORE_REQUEST_TIMEOUT_SECS`. A slow but healthy part still
+  succeeds on its last attempt.
+- A multipart upload's completion is cut after
+  `OBJECT_STORE_COMPLETION_TIMEOUT_SECS` (default: the stall timeout) and
+  sent again, at most `OBJECT_STORE_STALL_ATTEMPTS` times, the last bounded
+  by the request timeout. A completion that finds the upload no longer
+  open, because one sent before it, by the platform or by the storage
+  library, completed the upload and its answer was lost, stands only when
+  the object stored at the key is the size sent; otherwise it fails.
+- The web bundle's assembly logs `write_wait_ms`, the time it waited on the
+  bundle's writes, and `complete_ms`, the time the store took to complete
+  the bundle, beside `read_wait_ms` ([observability](observability.md)).
+- A part or completion cut short logs
+  `A storage request made no progress in time; trying it again` with
+  `request` `part` or `complete`.
 
 ## Changes in v0.40.2
 

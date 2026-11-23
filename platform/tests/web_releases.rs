@@ -1693,6 +1693,8 @@ async fn each_part_and_assembly_logs_what_it_waited_for() {
                 "turn_ms",
                 "slot_ms",
                 "read_wait_ms",
+                "write_wait_ms",
+                "complete_ms",
                 "stream_ms",
                 "elapsed_ms"
             ]
@@ -1703,6 +1705,14 @@ async fn each_part_and_assembly_logs_what_it_waited_for() {
         answered[1]["read_wait_ms"].as_u64() <= answered[1]["stream_ms"].as_u64()
             && answered[1]["stream_ms"].as_u64() <= answered[1]["elapsed_ms"].as_u64(),
         "the reads are waited on within the stream, and the stream within the assembly: {answered:?}"
+    );
+    let within_the_stream = ["read_wait_ms", "write_wait_ms", "complete_ms"]
+        .iter()
+        .map(|field| answered[1][field].as_u64().unwrap_or(u64::MAX))
+        .try_fold(0_u64, u64::checked_add);
+    assert!(
+        within_the_stream.is_some_and(|spent| spent <= answered[1]["stream_ms"].as_u64().unwrap_or(0) + 1),
+        "the reads, the writes and the completion are waited on in turn within the stream: {answered:?}"
     );
 }
 
@@ -1777,6 +1787,8 @@ async fn a_part_or_assembly_that_fails_logs_how_long_it_took() {
                 "turn_ms",
                 "slot_ms",
                 "read_wait_ms",
+                "write_wait_ms",
+                "complete_ms",
                 "stream_ms",
                 "elapsed_ms"
             ]

@@ -12,6 +12,7 @@ pub use cufflink_types::host::storage::CannedAcl;
 mod common;
 mod gcs;
 mod gcs_v4;
+mod parts;
 mod prefixed;
 mod s3;
 
@@ -191,6 +192,9 @@ impl UploadOptions {
 pub struct Uploaded {
     pub size: u64,
     pub etag: Option<String>,
+    /// How long the store took to complete the upload, when it went up in
+    /// parts.
+    pub completion: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

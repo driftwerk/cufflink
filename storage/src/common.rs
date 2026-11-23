@@ -90,6 +90,8 @@ const DEFAULT_STALL_ATTEMPTS: u64 = 3;
 
 pub(crate) const ENV_STALL_ATTEMPTS: &str = "OBJECT_STORE_STALL_ATTEMPTS";
 
+pub(crate) const ENV_COMPLETION_TIMEOUT_SECS: &str = "OBJECT_STORE_COMPLETION_TIMEOUT_SECS";
+
 fn env_positive(name: &'static str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -120,25 +122,53 @@ pub(crate) fn request_timeout() -> Duration {
 }
 
 /// How a storage request that makes no progress is cut short and tried
-/// again: a write that has not finished within `timeout` for each part's
-/// worth of its bytes, an open with no answer within `timeout`, and a read
-/// that receives nothing for it, which resumes from its next byte. A request
-/// is tried at most `attempts` times in a row, and its last attempt is
-/// bounded only by the request timeout, the `ceiling`.
+/// again: a write, whole or one part of a multipart upload, that has not
+/// finished within `timeout` for each part's worth of its bytes, the
+/// completion of a multipart upload not answered within `completion`, an
+/// open with no answer within `timeout`, and a read that receives nothing for
+/// it, which resumes from its next byte. A request is tried at most `attempts`
+/// times in a row, and its last attempt is bounded only by the request
+/// timeout, the `ceiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stall {
     timeout: Duration,
     attempts: u32,
     ceiling: Duration,
+    completion: Duration,
 }
 
 impl Stall {
     pub(crate) fn configured() -> Self {
+        let timeout = env_secs(ENV_STALL_TIMEOUT_SECS, DEFAULT_STALL_TIMEOUT_SECS);
         Self {
-            timeout: env_secs(ENV_STALL_TIMEOUT_SECS, DEFAULT_STALL_TIMEOUT_SECS),
+            timeout,
             attempts: u32::try_from(env_positive(ENV_STALL_ATTEMPTS, DEFAULT_STALL_ATTEMPTS))
                 .unwrap_or(u32::MAX),
             ceiling: request_timeout(),
+            completion: env_secs(ENV_COMPLETION_TIMEOUT_SECS, timeout.as_secs()),
+        }
+    }
+
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    pub(crate) fn completion(self) -> Duration {
+        self.completion
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn of(
+        timeout: Duration,
+        attempts: u32,
+        ceiling: Duration,
+        completion: Duration,
+    ) -> Self {
+        Self {
+            timeout,
+            attempts,
+            ceiling,
+            completion,
         }
     }
 
@@ -148,6 +178,10 @@ impl Stall {
 
     fn outlasts_ceiling(self) -> bool {
         self.attempts > 1 && self.timeout >= self.ceiling
+    }
+
+    pub(crate) fn for_write(self, size: usize) -> Self {
+        self.for_upload(size, Multipart::DEFAULT.min_part_size)
     }
 
     fn for_upload(self, size: usize, part_size: usize) -> Self {
@@ -163,7 +197,7 @@ impl Stall {
 
 /// Runs `attempt` until it answers: each attempt but the last is abandoned
 /// once `deadline` passes, and the last is left to the ceiling.
-async fn attempted<T, Fut>(
+pub(crate) async fn attempted<T, Fut>(
     stall: Stall,
     deadline: Duration,
     backend: &'static str,
@@ -230,6 +264,21 @@ pub(crate) fn warn_unless_timed_out_requests_retry(backend: &'static str) {
             "{ENV_STALL_TIMEOUT_SECS} is not below {ENV_REQUEST_TIMEOUT_SECS}, so a stalled request is never cut short"
         );
     }
+    if completions_are_never_cut(
+        std::env::var_os(ENV_COMPLETION_TIMEOUT_SECS).is_some(),
+        stall,
+    ) {
+        tracing::warn!(
+            backend,
+            completion_timeout_secs = stall.completion.as_secs(),
+            request_timeout_secs = stall.ceiling.as_secs(),
+            "{ENV_COMPLETION_TIMEOUT_SECS} is not below {ENV_REQUEST_TIMEOUT_SECS}, so a stalled completion is never cut short"
+        );
+    }
+}
+
+fn completions_are_never_cut(configured: bool, stall: Stall) -> bool {
+    configured && stall.attempts > 1 && !stall.cuts(stall.completion)
 }
 
 pub(crate) fn retry_config() -> object_store::RetryConfig {
@@ -343,18 +392,23 @@ async fn put_in(
     let path = keys.path(key)?;
     let data = data.into();
     let size = data.len() as u64;
-    let stored = match multipart.put(data.len(), opts) {
+    let (stored, completion) = match multipart.put(data.len(), opts) {
         Put::Whole(opts) => {
             let stall = stall.for_upload(data.len(), multipart.min_part_size);
-            put_whole(store, backend, key, &path, data, opts, stall).await
+            put_whole(store, backend, key, &path, data, opts, stall)
+                .await
+                .map(|stored| (stored, None))
         }
-        Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart).await,
+        Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart)
+            .await
+            .map(|(stored, completion)| (stored, Some(completion))),
     }
     .wrap_err_with(|| format!("{backend} upload failed for {key}"))?;
     tracing::info!(backend, key = %key, size, "Uploaded");
     Ok(Uploaded {
         size,
         etag: stored.e_tag,
+        completion,
     })
 }
 
@@ -468,13 +522,14 @@ async fn put_stream_in(
                 .put_multipart_opts(&keys.path(key)?, opts)
                 .await
                 .map_err(failed)?;
-            let (size, stored) = Pending::new(upload, backend, key)
+            let (size, stored, completion) = Pending::new(upload, backend, key)
                 .finish_stream(head, data, multipart, failed)
                 .await?;
             tracing::info!(backend, key = %key, size, "Uploaded");
             Ok(Uploaded {
                 size,
                 etag: stored.e_tag,
+                completion: Some(completion),
             })
         }
     }
@@ -514,7 +569,7 @@ async fn put_parts(
     data: Bytes,
     opts: PutMultipartOptions,
     multipart: Multipart,
-) -> object_store::Result<PutResult> {
+) -> object_store::Result<(PutResult, Duration)> {
     let upload = store.put_multipart_opts(path, opts).await?;
     Pending::new(upload, backend, key)
         .finish(data, multipart)
@@ -545,7 +600,7 @@ impl Pending {
         mut self,
         data: Bytes,
         multipart: Multipart,
-    ) -> object_store::Result<PutResult> {
+    ) -> object_store::Result<(PutResult, Duration)> {
         let completed = self.send(data, multipart).await;
         if completed.is_ok() {
             self.upload = None;
@@ -559,7 +614,7 @@ impl Pending {
         data: BoxStream<'static, Result<Bytes>>,
         multipart: Multipart,
         failed: impl Fn(object_store::Error) -> eyre::Report,
-    ) -> Result<(u64, PutResult)> {
+    ) -> Result<(u64, PutResult, Duration)> {
         let completed = self.send_stream(head, data, multipart, failed).await;
         if completed.is_ok() {
             self.upload = None;
@@ -573,7 +628,7 @@ impl Pending {
         data: BoxStream<'static, Result<Bytes>>,
         multipart: Multipart,
         failed: impl Fn(object_store::Error) -> eyre::Report,
-    ) -> Result<(u64, PutResult)> {
+    ) -> Result<(u64, PutResult, Duration)> {
         let upload = unfinished(&mut self.upload, self.backend, &self.key).map_err(&failed)?;
         let key = &self.key;
         let size = rechunked(head, data, multipart.min_part_size)
@@ -601,15 +656,20 @@ impl Pending {
             .try_fold(0, |total, size| future::ready(Ok(total + size)))
             .await?;
         self.completing = true;
+        let asked = std::time::Instant::now();
         unfinished(&mut self.upload, self.backend, &self.key)
             .map_err(&failed)?
             .complete()
             .await
-            .map(|stored| (size, stored))
+            .map(|stored| (size, stored, asked.elapsed()))
             .map_err(&failed)
     }
 
-    async fn send(&mut self, data: Bytes, multipart: Multipart) -> object_store::Result<PutResult> {
+    async fn send(
+        &mut self,
+        data: Bytes,
+        multipart: Multipart,
+    ) -> object_store::Result<(PutResult, Duration)> {
         let upload = unfinished(&mut self.upload, self.backend, &self.key)?;
         stream::iter(
             multipart
@@ -620,7 +680,11 @@ impl Pending {
         .try_collect::<()>()
         .await?;
         self.completing = true;
-        upload.complete().await
+        let asked = std::time::Instant::now();
+        upload
+            .complete()
+            .await
+            .map(|stored| (stored, asked.elapsed()))
     }
 }
 
@@ -996,6 +1060,25 @@ pub(crate) async fn presign_url<S: object_store::signer::Signer>(
 }
 
 #[cfg(test)]
+pub(crate) mod test_wire {
+    pub(crate) async fn first_part_sent(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PUT"
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(name, number)| name == "partNumber" && number == "1")
+            })
+            .count()
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_env {
     use std::sync::Mutex;
 
@@ -1027,10 +1110,10 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::{
-        already_aborted, get_bytes, open_read, put_in, put_stream_in, rechunked, request_timeout,
-        retry_timeout, timed_out_requests_cannot_retry, Keys, Multipart, Put, Stall,
-        ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS,
-        ENV_STALL_TIMEOUT_SECS, MAX_PARTS,
+        already_aborted, completions_are_never_cut, get_bytes, open_read, put_in, put_stream_in,
+        rechunked, request_timeout, retry_timeout, timed_out_requests_cannot_retry, Keys,
+        Multipart, Put, Stall, ENV_COMPLETION_TIMEOUT_SECS, ENV_REQUEST_TIMEOUT_SECS,
+        ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS, ENV_STALL_TIMEOUT_SECS, MAX_PARTS,
     };
     use async_trait::async_trait;
     use bytes::{Bytes, BytesMut};
@@ -1057,6 +1140,7 @@ mod tests {
         timeout: Duration::from_secs(1),
         attempts: 1,
         ceiling: Duration::from_secs(30),
+        completion: Duration::from_secs(2),
     };
 
     fn payload(size: usize) -> Vec<u8> {
@@ -1742,6 +1826,7 @@ mod tests {
         timeout: Duration::from_secs(1),
         attempts: 3,
         ceiling: CEILING,
+        completion: Duration::from_secs(2),
     };
 
     async fn stored(probe: &Probe, key: &str, data: &[u8]) {
@@ -1806,6 +1891,7 @@ mod tests {
                 (ENV_STALL_TIMEOUT_SECS, None),
                 (ENV_STALL_ATTEMPTS, None),
                 (ENV_REQUEST_TIMEOUT_SECS, None),
+                (ENV_COMPLETION_TIMEOUT_SECS, None),
             ],
             || {
                 let stall = Stall::configured();
@@ -1815,9 +1901,11 @@ mod tests {
                         timeout: Duration::from_secs(20),
                         attempts: 3,
                         ceiling: Duration::from_secs(30),
+                        completion: Duration::from_secs(20),
                     }
                 );
                 assert!(stall.cuts(stall.timeout));
+                assert!(stall.cuts(stall.completion));
                 assert!(!stall.outlasts_ceiling());
             },
         );
@@ -1826,12 +1914,44 @@ mod tests {
                 (ENV_STALL_TIMEOUT_SECS, Some("0")),
                 (ENV_STALL_ATTEMPTS, Some("many")),
                 (ENV_REQUEST_TIMEOUT_SECS, None),
+                (ENV_COMPLETION_TIMEOUT_SECS, Some("-1")),
             ],
             || {
                 assert_eq!(Stall::configured().timeout, Duration::from_secs(20));
                 assert_eq!(Stall::configured().attempts, 3);
+                assert_eq!(Stall::configured().completion, Duration::from_secs(20));
             },
         );
+        super::test_env::with(
+            &[
+                (ENV_STALL_TIMEOUT_SECS, Some("7")),
+                (ENV_COMPLETION_TIMEOUT_SECS, None),
+            ],
+            || assert_eq!(Stall::configured().completion, Duration::from_secs(7)),
+        );
+        super::test_env::with(&[(ENV_COMPLETION_TIMEOUT_SECS, Some("25"))], || {
+            assert_eq!(Stall::configured().completion, Duration::from_secs(25));
+        });
+    }
+
+    #[test]
+    fn a_part_is_given_the_stall_timeout_for_each_part_of_its_bytes() {
+        let part = 8 * 1024 * 1024;
+        assert_eq!(STALL.for_write(1).timeout(), Duration::from_secs(1));
+        assert_eq!(STALL.for_write(part).timeout(), Duration::from_secs(1));
+        assert_eq!(STALL.for_write(part + 1).timeout(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_completion_bound_not_below_the_request_timeout_is_warned_of_only_when_set() {
+        let long = Stall {
+            completion: CEILING,
+            ..STALL
+        };
+        assert!(completions_are_never_cut(true, long));
+        assert!(!completions_are_never_cut(false, long));
+        assert!(!completions_are_never_cut(true, STALL));
+        assert!(!completions_are_never_cut(true, UNCUT));
     }
 
     #[test]
