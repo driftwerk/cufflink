@@ -147,9 +147,7 @@ impl CopyPart for PartCopier {
 }
 
 /// The part an UploadPartCopy answer names, by its ETag as the store
-/// quotes it. S3 can answer a copy that failed after it began with `200`
-/// and an `<Error>` body.
-/// The part S3 copied, or why it did not: S3 can answer `200` with an
+/// quotes it, or why it did not copy: S3 can answer `200` with an
 /// `<Error>`, one of whose codes says to ask again.
 fn copied_part(path: &Path, answer: &str) -> Result<PartId, Refused> {
     let tagged = |tag: &str| {
@@ -1565,7 +1563,7 @@ mod tests {
             .and(path(ASSEMBLED))
             .and(query_param("uploadId", "upload-1"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                "<Error><Code>InternalError</Code><Message>try again</Message></Error>",
+                "<Error><Code>AccessDenied</Code><Message>refused</Message></Error>",
             ))
             .mount(&server)
             .await;
@@ -1584,10 +1582,7 @@ mod tests {
             failed.to_string(),
             "s3 upload failed for bundles/app.tar.gz"
         );
-        assert!(
-            format!("{failed:?}").contains("InternalError"),
-            "{failed:?}"
-        );
+        assert!(format!("{failed:?}").contains("AccessDenied"), "{failed:?}");
         assert!(
             requests_until(&server, |request| request.method.as_str() == "DELETE").await,
             "the failed assembly is aborted"
@@ -1693,6 +1688,7 @@ mod tests {
         for answer in [
             "<Error><Code>InternalError</Code></Error>",
             "<Error><Code>SlowDown</Code></Error>",
+            "<Error><Code>ServiceUnavailable</Code></Error>",
         ] {
             assert!(
                 matches!(copied_part(&path, answer), Err(Refused::Transient(_))),
@@ -1935,6 +1931,10 @@ mod tests {
                 Some(object_store::Error::PermissionDenied { .. })
             ),
             "{failed:?}"
+        );
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the refused assembly is aborted"
         );
     }
 }

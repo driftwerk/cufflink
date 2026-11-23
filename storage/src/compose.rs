@@ -194,11 +194,12 @@ impl Composer {
         };
         let location = match sources {
             [source] => format!("{source} composed into {into}"),
-            [first, .., last] => format!(
-                "{} sources, {first} to {last}, composed into {into}",
-                sources.len()
+            _ => format!(
+                "{} sources, {} to {}, composed into {into}",
+                sources.len(),
+                sources.first().map(Path::to_string).unwrap_or_default(),
+                sources.last().map(Path::to_string).unwrap_or_default()
             ),
-            [] => format!("nothing composed into {into}"),
         };
         let composed: Composed =
             copied::sent(&self.api.client, BACKEND, &location, request, |answer| {
