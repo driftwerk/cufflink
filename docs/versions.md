@@ -566,6 +566,15 @@ Rolling a platform back from v0.40.0 to v0.39.0:
 | `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
 | The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
 
+Rolling a platform back from v0.40.2 to v0.40.1:
+
+| What v0.40.2 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| `OBJECT_STORE_STALL_TIMEOUT_SECS` and `OBJECT_STORE_STALL_ATTEMPTS` | Nothing: v0.40.1 ignores them. Its storage requests are again bounded by the request timeout alone, and a download that takes longer than it fails |
+| The two storage warn lines | Nothing: v0.40.1 logs neither, so a query on them finds none |
+| An assembly's read-ahead | Nothing: v0.40.1 reads the parts one at a time, so its `read_wait_ms` rises again |
+| The database | Nothing: v0.40.2 has no migration |
+
 Rolling a platform back from v0.40.1 to v0.40.0:
 
 | What v0.40.1 changed | Before rolling the platform back |
@@ -1421,11 +1430,11 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.40.2
 
-Unreleased.
-
 Object-storage requests that stall are cut short and tried again, and a
-web bundle's assembly reads its parts ahead. It changes no manifest, SDK
-or host function and needs no migration. New environment variables:
+web bundle's assembly reads its parts ahead. No new feature. A service
+built for v0.40.1 deploys and runs on this platform unchanged, and a CLI
+of this release deploys to a v0.40.1 platform as a v0.40.1 CLI does.
+There is no migration. New environment variables:
 `OBJECT_STORE_STALL_TIMEOUT_SECS` and `OBJECT_STORE_STALL_ATTEMPTS` on the
 platform, the worker and the web runner, which all reach object storage
 through `cufflink-storage` ([setup](setup.md)).
@@ -1459,6 +1468,18 @@ through `cufflink-storage` ([setup](setup.md)).
   not yet fetched, so it falls as the read-ahead keeps up.
 - Each cut-short request and each resume logs a warning with the object,
   the attempt and the cause ([observability](observability.md)).
+
+Crates: a patch release of every published crate, none of which changes:
+the change is in `cufflink-storage` and the platform, which ship in the
+images. cufflink-types, cufflink-migrate, cufflink-pgcodec,
+cufflink-sdk-macros and cufflink 0.24.2, cufflink-fn 0.40.2, cufflink-cli
+0.31.2, cufflink-nats 0.9.7, cufflink-native 0.12.2, cufflink-model 0.1.9
+and cufflink-sql-parse 0.4.2 are bumped so the tagged commit publishes
+them. `cufflink init` still scaffolds `cufflink = "0.24"` and
+`cufflink-fn = "0.40"`.
+
+Rolling a platform back from v0.40.2 to v0.40.1 needs nothing undone
+first ([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.40.1
 
