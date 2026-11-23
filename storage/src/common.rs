@@ -1921,9 +1921,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stalled_read_resumes_from_its_next_byte_by_its_etag() {
         let data = payload(1000);
-        let (read, offsets) = read_back(&[Answer::Stalls(100)]).await;
+        let (read, asked) = read_back(&[Answer::Stalls(100)]).await;
         assert_eq!(read.expect("read"), data);
-        assert_eq!(offsets, [None, Some(100)]);
+        assert_eq!(asked, [None, Some(100)]);
 
         let downloaded = reads(&[Answer::Stalls(100)]);
         stored(&downloaded, "site/bundle", &data).await;
@@ -1993,16 +1993,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_last_attempt_of_a_read_waits_for_the_ceiling() {
-        let pause = Answer::Pauses(Duration::from_secs(5));
-        let (read, offsets) = read_back(&[pause, pause, pause]).await;
+        const PAUSE: Answer = Answer::Pauses(Duration::from_secs(5));
+        let (read, offsets) = read_back(&[PAUSE, PAUSE, PAUSE]).await;
         assert_eq!(read.expect("read"), payload(1000));
         assert_eq!(offsets, [None, Some(0), Some(0)]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_read_that_stalls_on_every_attempt_in_a_row_fails_at_the_cap() {
-        let stalls = [Answer::Stalls(100), Answer::Stalls(0), Answer::Stalls(0)];
-        let (read, offsets) = read_back(&stalls).await;
+        let (read, offsets) =
+            read_back(&[Answer::Stalls(100), Answer::Stalls(0), Answer::Stalls(0)]).await;
         failed_with(read, "the request timed out");
         assert_eq!(offsets, [None, Some(100), Some(100)]);
     }
