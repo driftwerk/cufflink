@@ -1,7 +1,11 @@
 use crate::common::{self, Keys};
+use crate::compose::{Composer, DEFAULT_BASE_URL};
+use crate::copied;
 use crate::gcs_v4::{sign_url, BlobSigner, IamSignBlobSigner};
 use crate::parts::Parted;
-use crate::{Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
+use crate::{
+    Credential, ObjectMeta, ObjectReader, ObjectStorage, StoredPart, UploadOptions, Uploaded,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -19,6 +23,7 @@ const ENV_SA_KEY_PATH: &str = "GOOGLE_APPLICATION_CREDENTIALS";
 pub(crate) struct GcsBackend {
     primary: Arc<GoogleCloudStorage>,
     writes: Arc<Parted<GoogleCloudStorage>>,
+    composer: Composer,
     bucket: String,
     sa_key_path: Option<String>,
     iam_signer: Option<Arc<IamSignBlobSigner>>,
@@ -34,6 +39,14 @@ impl GcsBackend {
         let stall = common::Stall::configured();
         let primary = build_store(&bucket, sa_key_path.as_deref())?;
         let writes = Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall));
+        let composer = Composer {
+            store: Arc::clone(&primary),
+            client: copied::client(&common::client_options())
+                .wrap_err("Failed to build GCS client")?,
+            base_url: base_url(sa_key_path.as_deref())?,
+            bucket: bucket.clone(),
+            stall,
+        };
         let iam_signer = match sa_key_path.as_deref() {
             Some(_) => None,
             None => Some(Arc::new(IamSignBlobSigner::new()?)),
@@ -53,6 +66,7 @@ impl GcsBackend {
         Ok(Self {
             primary,
             writes,
+            composer,
             bucket,
             sa_key_path,
             iam_signer,
@@ -79,6 +93,24 @@ impl GcsBackend {
             BACKEND,
             self.stall,
         )))
+    }
+
+    /// This backend for `bucket`, its keys stored exactly as given: its
+    /// reads, writes and composes all reach that bucket.
+    fn for_bucket(&self, bucket: &str) -> Result<Self> {
+        let primary = build_store(bucket, self.sa_key_path.as_deref())?;
+        Ok(Self {
+            writes: Arc::new(Parted::new(Arc::clone(&primary), BACKEND, self.stall)),
+            composer: Composer {
+                store: Arc::clone(&primary),
+                bucket: bucket.to_string(),
+                ..self.composer.clone()
+            },
+            primary,
+            bucket: bucket.to_string(),
+            keys: Keys::Exact,
+            ..self.clone()
+        })
     }
 
     async fn presign(
@@ -109,6 +141,24 @@ impl GcsBackend {
             }
         }
     }
+}
+
+/// Where the store's JSON API is: the service-account key's
+/// `gcs_base_url`, as object_store reads it, or Google's.
+fn base_url(sa_key_path: Option<&str>) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Key {
+        gcs_base_url: Option<String>,
+    }
+    sa_key_path.map_or(Ok(DEFAULT_BASE_URL.to_string()), |path| {
+        let key = std::fs::read(path)
+            .wrap_err_with(|| format!("Failed to read the GCS service account key {path}"))?;
+        let key: Key = serde_json::from_slice(&key)
+            .wrap_err_with(|| format!("Failed to parse the GCS service account key {path}"))?;
+        Ok(key
+            .gcs_base_url
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()))
+    })
 }
 
 fn build_store(bucket: &str, sa_key_path: Option<&str>) -> Result<Arc<GoogleCloudStorage>> {
@@ -182,6 +232,21 @@ impl ObjectStorage for GcsBackend {
             self.stall,
         )
         .await
+    }
+
+    async fn assemble(
+        &self,
+        key: &str,
+        parts: Vec<StoredPart>,
+        data: BoxStream<'static, Result<Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        if parts.is_empty() {
+            return self.upload_stream(key, data, content_type).await;
+        }
+        self.composer
+            .assemble(self.keys, key, parts, data, content_type)
+            .await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
@@ -291,12 +356,7 @@ impl ObjectStorage for GcsBackend {
             crate::is_bucket_name(bucket),
             "{bucket:?} is not a bucket name"
         );
-        Ok(Arc::new(Self {
-            primary: build_store(bucket, self.sa_key_path.as_deref())?,
-            bucket: bucket.to_string(),
-            keys: Keys::Exact,
-            ..self.clone()
-        }))
+        Ok(Arc::new(self.for_bucket(bucket)?))
     }
 }
 
@@ -331,6 +391,14 @@ mod tests {
         );
         GcsBackend {
             writes: Arc::new(Parted::new(Arc::clone(&store), BACKEND, stall)),
+            composer: Composer {
+                store: Arc::clone(&store),
+                client: copied::client(&common::client_options().with_allow_http(true))
+                    .expect("client"),
+                base_url: server.to_string(),
+                bucket: "example-documents".into(),
+                stall,
+            },
             primary: store,
             bucket: "example-documents".into(),
             sa_key_path: None,
@@ -499,5 +567,198 @@ mod tests {
             assert_eq!(backend.backend_kind(), "gcs");
             assert_eq!(backend.primary_bucket(), "b");
         });
+    }
+
+    const COMPOSED: &str = "/storage/v1/b/example%2Ddocuments/o/bundles%2Fapp%2Etar%2Egz/compose";
+
+    fn stored_parts(count: usize) -> Vec<StoredPart> {
+        (0..count)
+            .map(|index| StoredPart {
+                key: format!("parts/{index}"),
+                size: 8,
+            })
+            .collect()
+    }
+
+    fn bundle_bytes(chunks: Vec<Result<Bytes>>) -> BoxStream<'static, Result<Bytes>> {
+        Box::pin(futures_util::stream::iter(chunks))
+    }
+
+    fn composed_from(request: &wiremock::Request) -> Vec<String> {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| {
+                body["sourceObjects"].as_array().map(|sources| {
+                    sources
+                        .iter()
+                        .filter_map(|source| source["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    async fn requests_until(
+        server: &wiremock::MockServer,
+        seen: impl Fn(&[wiremock::Request]) -> bool,
+    ) -> bool {
+        for _ in 0..200 {
+            if seen(&server.received_requests().await.unwrap_or_default()) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn an_assembly_of_up_to_32_parts_is_one_compose_with_its_content_type() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(COMPOSED))
+            .and(body_partial_json(serde_json::json!({
+                "destination": { "contentType": "application/gzip" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "etag": "CJ6k", "generation": "7", "size": "256"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let uploaded = emulated(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(32),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+        assert_eq!(
+            (uploaded.size, uploaded.etag.as_deref()),
+            (256, Some("CJ6k"))
+        );
+        assert!(uploaded.completion.is_some());
+        assert_eq!(uploaded.parts, crate::PartTimes::default());
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            composed_from(&requests[0]),
+            (0..32)
+                .map(|index| format!("parts/{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_of_more_than_32_parts_is_composed_in_tiers_whose_objects_are_removed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/compose$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "etag": "CJ6k" })),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let uploaded = emulated(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(33),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+        assert_eq!(uploaded.size, 33 * 8);
+        assert!((1..=2).contains(&uploaded.parts.in_flight));
+        let requests = server.received_requests().await.unwrap_or_default();
+        let last = requests
+            .iter()
+            .find(|request| request.url.path() == COMPOSED)
+            .expect("composed into its key");
+        assert_eq!(
+            composed_from(last),
+            [
+                "bundles/app.tar.gz.compose/1-0",
+                "bundles/app.tar.gz.compose/1-1"
+            ]
+        );
+        let tiers = requests
+            .iter()
+            .filter(|request| request.url.path() != COMPOSED && request.method.as_str() == "POST")
+            .map(composed_from)
+            .collect::<Vec<_>>();
+        assert!(tiers.contains(&(0..32).map(|index| format!("parts/{index}")).collect()));
+        assert!(tiers.contains(&vec!["parts/32".to_string()]));
+        assert!(
+            requests_until(&server, |requests| requests
+                .iter()
+                .filter(|request| request.method.as_str() == "DELETE")
+                .count()
+                == 2)
+            .await,
+            "the intermediate objects are removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assembly_whose_bytes_fail_their_check_is_never_composed_into_its_key() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(COMPOSED))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/compose$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "etag": "CJ6k" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let failed = emulated(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(33),
+                bundle_bytes(vec![
+                    Ok(Bytes::from_static(b"the parts")),
+                    Err(eyre::eyre!("the bundle is not that hash")),
+                ]),
+                "application/gzip",
+            )
+            .await
+            .expect_err("failed");
+        assert_eq!(failed.to_string(), "the bundle is not that hash");
+    }
+
+    #[test]
+    fn a_tenant_bucket_writes_and_composes_in_its_own_bucket() {
+        let tenant = emulated("http://127.0.0.1:1")
+            .for_bucket("tenant-files")
+            .expect("tenant bucket");
+        assert!(tenant.primary.to_string().contains("tenant-files"));
+        assert!(tenant.writes.to_string().contains("tenant-files"));
+        assert!(tenant.composer.store.to_string().contains("tenant-files"));
+        assert_eq!(tenant.composer.bucket, "tenant-files");
+        assert_eq!(tenant.keys, Keys::Exact);
     }
 }
