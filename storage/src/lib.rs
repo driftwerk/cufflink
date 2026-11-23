@@ -213,6 +213,7 @@ pub struct Uploaded {
     /// How long the store took to complete the upload, when it went up in
     /// parts.
     pub completion: Option<std::time::Duration>,
+    /// How its parts were stored, when it went up in parts.
     pub parts: PartTimes,
 }
 

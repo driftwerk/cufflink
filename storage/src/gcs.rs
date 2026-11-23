@@ -379,6 +379,7 @@ impl ObjectStorage for GcsBackend {
 mod tests {
     use super::*;
     use crate::common::test_env::with as with_env;
+    use crate::common::test_wire::{bundle_bytes, requests_until, stored_parts};
     use cufflink_settings::process_var as var;
 
     const OBJECT: &str = "/example%2Ddocuments/bundles%2Fapp%2Etar%2Egz";
@@ -592,20 +593,7 @@ mod tests {
         });
     }
 
-    const COMPOSED: &str = "/storage/v1/b/example%2Ddocuments/o/bundles%2Fapp%2Etar%2Egz/compose";
-
-    fn stored_parts(count: usize) -> Vec<StoredPart> {
-        (0..count)
-            .map(|index| StoredPart {
-                key: format!("parts/{index}"),
-                size: 8,
-            })
-            .collect()
-    }
-
-    fn bundle_bytes(chunks: Vec<Result<Bytes>>) -> BoxStream<'static, Result<Bytes>> {
-        Box::pin(futures_util::stream::iter(chunks))
-    }
+    const COMPOSED: &str = "/storage/v1/b/example-documents/o/bundles%2Fapp.tar.gz/compose";
 
     fn composed_from(request: &wiremock::Request) -> Vec<String> {
         serde_json::from_slice::<serde_json::Value>(&request.body)
@@ -619,19 +607,6 @@ mod tests {
                 })
             })
             .unwrap_or_default()
-    }
-
-    async fn requests_until(
-        server: &wiremock::MockServer,
-        seen: impl Fn(&[wiremock::Request]) -> bool,
-    ) -> bool {
-        for _ in 0..200 {
-            if seen(&server.received_requests().await.unwrap_or_default()) {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        false
     }
 
     #[tokio::test]
@@ -654,7 +629,7 @@ mod tests {
         let uploaded = emulated(&server.uri())
             .assemble(
                 "bundles/app.tar.gz",
-                stored_parts(32),
+                stored_parts(&[8; 32]),
                 bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
                 "application/gzip",
             )
@@ -686,53 +661,122 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "etag": "CJ6k" })),
             )
-            .expect(3)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
             .respond_with(ResponseTemplate::new(204))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         let uploaded = emulated(&server.uri())
             .assemble(
                 "bundles/app.tar.gz",
-                stored_parts(33),
+                stored_parts(&[8; 33]),
                 bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
                 "application/gzip",
             )
             .await
             .expect("assembled");
         assert_eq!(uploaded.size, 33 * 8);
-        assert!((1..=2).contains(&uploaded.parts.in_flight));
+        assert_eq!(uploaded.parts.in_flight, 1);
         let requests = server.received_requests().await.unwrap_or_default();
+        let tier = requests
+            .iter()
+            .find(|request| request.method.as_str() == "POST" && request.url.path() != COMPOSED)
+            .expect("a tier composed");
+        assert_eq!(
+            composed_from(tier),
+            (0..32)
+                .map(|index| format!("parts/{index}"))
+                .collect::<Vec<_>>()
+        );
         let last = requests
             .iter()
             .find(|request| request.url.path() == COMPOSED)
-            .expect("composed into its key");
-        assert_eq!(
-            composed_from(last),
-            [
-                "bundles/app.tar.gz.compose/1-0",
-                "bundles/app.tar.gz.compose/1-1"
-            ]
-        );
-        let tiers = requests
-            .iter()
-            .filter(|request| request.url.path() != COMPOSED && request.method.as_str() == "POST")
             .map(composed_from)
-            .collect::<Vec<_>>();
-        assert!(tiers.contains(&(0..32).map(|index| format!("parts/{index}")).collect()));
-        assert!(tiers.contains(&vec!["parts/32".to_string()]));
+            .expect("composed into its key");
+        let [intermediate, single] = last.as_slice() else {
+            panic!("composed from {last:?}");
+        };
         assert!(
-            requests_until(&server, |requests| requests
-                .iter()
-                .filter(|request| request.method.as_str() == "DELETE")
-                .count()
-                == 2)
-            .await,
-            "the intermediate objects are removed"
+            intermediate.starts_with("bundles/app.tar.gz.compose/")
+                && intermediate.ends_with("/1-0"),
+            "{intermediate}"
         );
+        assert_eq!(single, "parts/32");
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the intermediate object is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_part_is_answered_as_the_read_answers_it_not_as_the_compose_does() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/compose$"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("No such object"))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let read = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"the parts")),
+            Err(eyre::eyre!("part 32 was not uploaded")),
+        ])
+        .then(|chunk| async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            chunk
+        });
+        let failed = emulated(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8; 33]),
+                Box::pin(read),
+                "application/gzip",
+            )
+            .await
+            .expect_err("failed");
+        assert_eq!(failed.to_string(), "part 32 was not uploaded");
+    }
+
+    #[tokio::test]
+    async fn a_key_that_must_be_encoded_is_encoded_in_the_url_and_named_as_it_is() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/storage/v1/b/example-documents/o/bundles%2Fmy%20app%2B1.tar.gz/compose",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "etag": "CJ6k" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        emulated(&server.uri())
+            .assemble(
+                "bundles/my app+1.tar.gz",
+                vec![StoredPart {
+                    key: "parts/a b+0".into(),
+                    size: 8,
+                }],
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the part"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(composed_from(&requests[0]), ["parts/a b+0"]);
     }
 
     #[tokio::test]
@@ -761,7 +805,7 @@ mod tests {
         let failed = emulated(&server.uri())
             .assemble(
                 "bundles/app.tar.gz",
-                stored_parts(33),
+                stored_parts(&[8; 33]),
                 bundle_bytes(vec![
                     Ok(Bytes::from_static(b"the parts")),
                     Err(eyre::eyre!("the bundle is not that hash")),

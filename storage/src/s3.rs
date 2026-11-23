@@ -14,7 +14,7 @@ use object_store::client::{HttpClient, HttpRequestBody};
 use object_store::multipart::PartId;
 use object_store::path::Path;
 use object_store::MultipartId;
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -30,17 +30,11 @@ const ACL_HEADER: http::HeaderName = http::HeaderName::from_static("x-amz-acl");
 
 const COPY_SOURCE_HEADER: http::HeaderName = http::HeaderName::from_static("x-amz-copy-source");
 
-const STRICT: AsciiSet = NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
+const STRICT_PATH: AsciiSet = copied::STRICT.remove(b'/');
 
-const STRICT_PATH: AsciiSet = STRICT.remove(b'/');
-
-/// The sizes S3 copies a part of: every part but the last at least 5 MiB,
-/// none above 5 GiB.
-const COPIED_PART_SIZES: std::ops::RangeInclusive<u64> = 5 * 1024 * 1024..=5 * 1024 * 1024 * 1024;
+/// The sizes of the parts S3 copies: every part but the last at least
+/// S3's 5 MiB, and none so large that a copy outlasts the stall timeout.
+const COPIED_PART_SIZES: std::ops::RangeInclusive<u64> = 5 * 1024 * 1024..=64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Connection {
@@ -119,32 +113,33 @@ impl CopyPart for PartCopier {
         part_idx: usize,
         from: &Path,
     ) -> object_store::Result<PartId> {
-        let credential = self.store.credentials().get_credential().await?;
-        let invalid = |source: http::Error| object_store::Error::Generic {
-            store: BACKEND,
-            source: Box::new(source),
+        let url = format!(
+            "{}/{}?partNumber={}&uploadId={}",
+            self.bucket_url,
+            utf8_percent_encode(path.as_ref(), &STRICT_PATH),
+            part_idx + 1,
+            utf8_percent_encode(id, &copied::STRICT)
+        );
+        let source = format!(
+            "{}/{}",
+            self.bucket,
+            utf8_percent_encode(from.as_ref(), &STRICT_PATH)
+        );
+        let (url, source) = (url.as_str(), source.as_str());
+        let request = || async move {
+            let credential = self.store.credentials().get_credential().await?;
+            let mut request = http::Request::builder()
+                .method(http::Method::PUT)
+                .uri(url)
+                .header(COPY_SOURCE_HEADER, source)
+                .body(HttpRequestBody::empty())
+                .map_err(|e| copied::generic(BACKEND, e))?;
+            AwsAuthorizer::new(&credential, "s3", &self.region)
+                .try_authorize(&mut request, None)?;
+            Ok::<_, object_store::Error>(request)
         };
-        let mut request = http::Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!(
-                "{}/{}?partNumber={}&uploadId={}",
-                self.bucket_url,
-                utf8_percent_encode(path.as_ref(), &STRICT_PATH),
-                part_idx + 1,
-                utf8_percent_encode(id, &STRICT)
-            ))
-            .header(
-                COPY_SOURCE_HEADER,
-                format!(
-                    "{}/{}",
-                    self.bucket,
-                    utf8_percent_encode(from.as_ref(), &STRICT_PATH)
-                ),
-            )
-            .body(HttpRequestBody::empty())
-            .map_err(invalid)?;
-        AwsAuthorizer::new(&credential, "s3", &self.region).try_authorize(&mut request, None)?;
-        let answer = copied::sent(&self.client, BACKEND, path.as_ref(), request).await?;
+        let location = format!("{from} copied into {path}");
+        let answer = copied::sent(&self.client, BACKEND, &location, request).await?;
         copied_part(path, &String::from_utf8_lossy(&answer))
     }
 }
@@ -161,10 +156,10 @@ fn copied_part(path: &Path, answer: &str) -> object_store::Result<PartId> {
     };
     match (answer.contains("<Error>"), tagged("ETag")) {
         (false, Some(content_id)) => Ok(PartId { content_id }),
-        _ => Err(object_store::Error::Generic {
-            store: BACKEND,
-            source: format!("the copy of a part of {path} was not stored: {answer}").into(),
-        }),
+        _ => Err(copied::generic(
+            BACKEND,
+            format!("the copy of a part of {path} was not stored: {answer}"),
+        )),
     }
 }
 
@@ -493,6 +488,7 @@ impl ObjectStorage for S3Backend {
 mod tests {
     use super::*;
     use crate::common::test_env::with as with_env;
+    use crate::common::test_wire::{bundle_bytes, requests_until, stored_parts};
     use cufflink_settings::process_var as var;
 
     #[test]
@@ -1324,25 +1320,6 @@ mod tests {
             .expect("uploaded after the retry");
     }
 
-    async fn requests_until(
-        server: &wiremock::MockServer,
-        seen: impl Fn(&wiremock::Request) -> bool,
-    ) -> bool {
-        for _ in 0..200 {
-            if server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .any(&seen)
-            {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        false
-    }
-
     #[tokio::test]
     async fn a_dropped_upload_is_aborted() {
         use wiremock::matchers::{method, path, query_param};
@@ -1447,21 +1424,6 @@ mod tests {
     const ASSEMBLED: &str = "/cufflink/bundles/app.tar.gz";
 
     const MIB: u64 = 1024 * 1024;
-
-    fn stored_parts(sizes: &[u64]) -> Vec<StoredPart> {
-        sizes
-            .iter()
-            .enumerate()
-            .map(|(index, size)| StoredPart {
-                key: format!("parts/{index}"),
-                size: *size,
-            })
-            .collect()
-    }
-
-    fn bundle_bytes(chunks: Vec<Result<Bytes>>) -> BoxStream<'static, Result<Bytes>> {
-        Box::pin(futures_util::stream::iter(chunks))
-    }
 
     async fn initiates_assembly(server: &wiremock::MockServer) {
         use wiremock::matchers::{header, method, path, query_param};
@@ -1692,7 +1654,9 @@ mod tests {
         assert!(!copyable(&stored_parts(&[])));
         assert!(!copyable(&stored_parts(&[5 * MIB - 1, 8 * MIB])));
         assert!(!copyable(&stored_parts(&[8 * MIB, 0])));
-        assert!(!copyable(&stored_parts(&[5 * 1024 * MIB + 1])));
+        assert!(copyable(&stored_parts(&[64 * MIB, 64 * MIB])));
+        assert!(!copyable(&stored_parts(&[64 * MIB + 1, 1])));
+        assert!(!copyable(&stored_parts(&[8 * MIB, 64 * MIB + 1])));
         assert!(!copyable(&stored_parts(&vec![
             8 * MIB;
             common::MAX_PARTS + 1
@@ -1718,5 +1682,144 @@ mod tests {
         ] {
             assert!(copied_part(&path, answer).is_err(), "{answer}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_bucket_copies_within_its_own_bucket_with_its_keys_encoded() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const KEY: &str = "/example-documents/bundles/my%20app%2B1.tar.gz";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(KEY))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (number, source) in [(1, "parts/a%20b%2B0"), (2, "parts/1")] {
+            Mock::given(method("PUT"))
+                .and(path(KEY))
+                .and(query_param("partNumber", number.to_string()))
+                .and(header(
+                    "x-amz-copy-source",
+                    format!("example-documents/{source}"),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(KEY))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut parts = stored_parts(&[8 * MIB, 3]);
+        parts[0].key = "parts/a b+0".into();
+        tenant_bucket(&server.uri(), None)
+            .assemble(
+                "bundles/my app+1.tar.gz",
+                parts,
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+    }
+
+    #[tokio::test]
+    async fn a_missing_part_is_answered_as_the_read_answers_it_not_as_the_copy_does() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("<Error><Code>NoSuchKey</Code></Error>"),
+            )
+            .mount(&server)
+            .await;
+        aborts_assembly(&server).await;
+        never_completes(&server).await;
+        let read = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"the parts")),
+            Err(eyre::eyre!("part 1 was not uploaded")),
+        ])
+        .then(|chunk| async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            chunk
+        });
+        let failed = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 3]),
+                Box::pin(read),
+                "application/gzip",
+            )
+            .await
+            .expect_err("failed");
+        assert_eq!(failed.to_string(), "part 1 was not uploaded");
+        assert!(
+            requests_until(&server, |request| request.method.as_str() == "DELETE").await,
+            "the failed assembly is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_answered_with_a_server_error_is_sent_again() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("SlowDown"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[3]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the part"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
     }
 }

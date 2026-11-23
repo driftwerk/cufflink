@@ -14,7 +14,8 @@ use object_store::client::{HttpClient, HttpRequestBody};
 use object_store::gcp::GoogleCloudStorage;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutResult};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::utf8_percent_encode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -70,9 +71,15 @@ impl Composer {
         let clock = PartClock::default();
         let made = Intermediates::new(Arc::clone(&self.store));
         let tiers = self
-            .tiers(&path, sources, content_type, &clock, &made)
+            .tiers(
+                &format!("{path}.compose/{}", nonce()),
+                sources,
+                content_type,
+                &clock,
+                &made,
+            )
             .map_err(&failed);
-        let (last, ()) = future::try_join(tiers, copied::drained(data)).await?;
+        let last = copied::alongside(tiers, data).await?;
         let asked = tokio::time::Instant::now();
         let stored = self
             .compose(
@@ -92,36 +99,40 @@ impl Composer {
         .uploaded(BACKEND, key, size))
     }
 
+    /// Composes `sources` in groups of 32 into intermediate objects under
+    /// `prefix` until 32 or fewer remain; a group of one stays as it is.
     async fn tiers(
         &self,
-        path: &Path,
-        sources: Vec<Path>,
+        prefix: &str,
+        mut sources: Vec<Path>,
         content_type: &str,
         clock: &PartClock,
         made: &Intermediates,
     ) -> object_store::Result<Vec<Path>> {
-        let mut sources = sources;
         let mut tier = 0;
         while sources.len() > MAX_SOURCES {
             tier += 1;
             let groups: Vec<BoxFuture<'_, object_store::Result<Path>>> = sources
                 .chunks(MAX_SOURCES)
                 .enumerate()
-                .map(|(index, group)| {
-                    let into = made.add(Path::from(format!("{path}.compose/{tier}-{index}")));
-                    async move {
-                        clock
-                            .timed(self.compose(
-                                &into,
-                                group,
-                                content_type,
-                                "compose",
-                                self.stall.timeout(),
-                            ))
-                            .await
-                            .map(|_| into)
+                .map(|(index, group)| match group {
+                    [single] => future::ready(Ok(single.clone())).boxed(),
+                    group => {
+                        let into = made.add(Path::from(format!("{prefix}/{tier}-{index}")));
+                        async move {
+                            clock
+                                .timed(self.compose(
+                                    &into,
+                                    group,
+                                    content_type,
+                                    "compose",
+                                    self.stall.timeout(),
+                                ))
+                                .await
+                                .map(|_| into)
+                        }
+                        .boxed()
                     }
-                    .boxed()
                 })
                 .collect();
             let composed = stream::iter(groups)
@@ -158,43 +169,66 @@ impl Composer {
         sources: &[Path],
         content_type: &str,
     ) -> object_store::Result<PutResult> {
-        let generic =
-            |source: Box<dyn std::error::Error + Send + Sync>| object_store::Error::Generic {
-                store: BACKEND,
-                source,
-            };
-        let credential = self.store.credentials().get_credential().await?;
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}/compose",
+            self.api.base_url,
+            utf8_percent_encode(&self.bucket, &copied::STRICT),
+            utf8_percent_encode(into.as_ref(), &copied::STRICT)
+        );
         let body = serde_json::json!({
             "sourceObjects": sources
                 .iter()
                 .map(|source| serde_json::json!({ "name": source.as_ref() }))
                 .collect::<Vec<_>>(),
             "destination": { "contentType": content_type },
-        });
-        let request = http::Request::builder()
-            .method(http::Method::POST)
-            .uri(format!(
-                "{}/storage/v1/b/{}/o/{}/compose",
-                self.api.base_url,
-                utf8_percent_encode(&self.bucket, NON_ALPHANUMERIC),
-                utf8_percent_encode(into.as_ref(), NON_ALPHANUMERIC)
-            ))
-            .header(http::header::CONTENT_TYPE, "application/json");
-        let request = match credential.bearer.as_str() {
-            "" => request,
-            bearer => request.header(http::header::AUTHORIZATION, format!("Bearer {bearer}")),
-        }
-        .body(HttpRequestBody::from(body.to_string()))
-        .map_err(|e| generic(Box::new(e)))?;
-        let answer = copied::sent(&self.api.client, BACKEND, into.as_ref(), request).await?;
+        })
+        .to_string();
+        let (url, body) = (url.as_str(), body.as_str());
+        let request = || async move {
+            let credential = self.store.credentials().get_credential().await?;
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(url)
+                .header(http::header::CONTENT_TYPE, "application/json");
+            match credential.bearer.as_str() {
+                "" => request,
+                bearer => request.header(http::header::AUTHORIZATION, format!("Bearer {bearer}")),
+            }
+            .body(HttpRequestBody::from(body.to_string()))
+            .map_err(|e| copied::generic(BACKEND, e))
+        };
+        let location = format!(
+            "{} composed into {into}",
+            sources
+                .iter()
+                .map(Path::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let answer = copied::sent(&self.api.client, BACKEND, &location, request).await?;
         let composed: Composed =
-            serde_json::from_slice(&answer).map_err(|e| generic(Box::new(e)))?;
+            serde_json::from_slice(&answer).map_err(|e| copied::generic(BACKEND, e))?;
         Ok(PutResult {
             e_tag: composed.etag,
             version: composed.generation,
             extensions: object_store::Extensions::default(),
         })
     }
+}
+
+/// A name no other assembly's intermediate objects share, so two replicas
+/// composing the same bundle at once never remove each other's.
+fn nonce() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{now:x}-{:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The intermediate objects of one compose, removed in the background once

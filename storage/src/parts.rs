@@ -525,7 +525,7 @@ mod tests {
 
     async fn sent_and_copied(store: &Arc<Faulty>) -> object_store::Result<PutResult> {
         let parted = Parted::new(Arc::clone(store), "faulty", STALL);
-        let copier: Arc<dyn CopyPart> = Arc::clone(store);
+        let copier: Arc<dyn CopyPart> = Arc::<Faulty>::clone(store);
         let mut upload = parted
             .begin(&Path::from(KEY), PutMultipartOptions::default())
             .await?;

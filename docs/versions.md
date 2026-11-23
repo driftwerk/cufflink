@@ -1475,7 +1475,7 @@ on the platform, the worker and the web runner ([setup](setup.md)).
 - A web bundle assembled from its parts is stored without the platform
   sending its bytes: on S3 the store copies each part into the bundle's
   multipart upload (UploadPartCopy, eight at a time) when every part but
-  the last holds at least 5 MiB, and on GCS it composes them, 32 at a time
+  the last holds 5 to 64 MiB, and on GCS it composes them, 32 at a time
   through intermediate objects it then removes. The platform still reads
   the parts once for the bundle's hash, and completes the bundle only once
   the hash is checked; a bundle whose bytes are not its hash is never

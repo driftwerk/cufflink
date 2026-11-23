@@ -218,27 +218,35 @@ the objects at `parts` while `data` yields their bytes. Memory and local
 stores, and any layout a store cannot copy, store `data` as
 `upload_stream` does. S3 and GCS copy the parts inside the store, so the
 platform sends none of the bundle's bytes, and read `data` to its end
-alongside, its error returned as it was yielded:
+alongside. An error `data` yields is returned as it was yielded, ahead of
+any error of the copies, so a part the read finds missing is answered with
+the read's `409`, not as the copy's failure:
 
 - S3 copies each part into the bundle's multipart upload with
   UploadPartCopy, eight at a time, signed with object_store's own
   credentials and signer and sent through its HTTP client. Every part but
-  the last must hold at least 5 MiB. A copied part takes its number and
+  the last must hold at least 5 MiB, and none more than 64 MiB, so that a
+  copy is bounded by the stall timeout. A copied part takes its number and
   its size in the upload as a sent one does, through the same cut-short
   loop, so a completion whose answer was lost still stands on the size
   sent. The upload completes only once `data` has ended; an error from
   it, or a copy that fails (S3 can answer `200` with an `<Error>` body),
   aborts the upload through the same guard.
 - GCS composes the parts, 32 at a time, into intermediate objects beside
-  the key (`{key}.compose/{tier}-{index}`) until 32 or fewer remain, then
+  the key (`{key}.compose/{nonce}/{tier}-{index}`, the nonce its
+  assembly's own, so two replicas assembling the same bundle never remove
+  each other's) until 32 or fewer remain, a group of one passing through
+  as it is, then
   composes those into the key once `data` has ended, with the bundle's
   content type. The intermediate objects are removed once the compose
   stores the bundle or fails. A compose names its sources, so one sent
   again stores the same object.
 - A copy or compose is cut short and sent again as a part is; the
-  completion, or GCS's last compose, as a completion is. A `5xx` from the
-  store fails the assembly, which the CLI sends again: object_store's own
-  retries do not reach a request it does not send.
+  completion, or GCS's last compose, as a completion is. A copy or
+  compose answered with a `5xx` or `429`, or whose connection fails, is
+  sent again after a pause, with object_store's backoff and within its
+  retry budget (`OBJECT_STORE_RETRY_TIMEOUT_SECS`), as object_store
+  retries its own requests.
 
 ## 5. The CLI
 

@@ -965,7 +965,7 @@ steps, and only the last one changes what runs:
      stores the parts in order at the bundle's key while it reads them
      once for the bundle's hash. On S3 the store copies them into the
      bundle's multipart upload (UploadPartCopy) when every part but the
-     last holds at least 5 MiB, as the CLI's do; on GCS it composes them,
+     last holds 5 to 64 MiB, as the CLI's do; on GCS it composes them,
      32 at a time through intermediate objects beside the bundle's key
      that it then removes. The platform then sends none of the bundle's
      bytes, and completes the bundle only once its hash is checked. On

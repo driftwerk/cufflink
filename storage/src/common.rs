@@ -828,7 +828,7 @@ impl<S: ObjectStore + MultipartStore> Pending<Upload<S>> {
         .buffer_unordered(COPIES_AT_ONCE)
         .try_collect::<()>()
         .map_err(&failed);
-        future::try_join(copies, copied::drained(data)).await?;
+        copied::alongside(copies, data).await?;
         self.completed(&clock).await.map_err(&failed)
     }
 }
@@ -1206,6 +1206,46 @@ pub(crate) async fn presign_url<S: object_store::signer::Signer>(
 
 #[cfg(test)]
 pub(crate) mod test_wire {
+    use crate::StoredPart;
+    use bytes::Bytes;
+    use futures_util::stream::BoxStream;
+
+    pub(crate) fn stored_parts(sizes: &[u64]) -> Vec<StoredPart> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| StoredPart {
+                key: format!("parts/{index}"),
+                size: *size,
+            })
+            .collect()
+    }
+
+    pub(crate) fn bundle_bytes(
+        chunks: Vec<eyre::Result<Bytes>>,
+    ) -> BoxStream<'static, eyre::Result<Bytes>> {
+        Box::pin(futures_util::stream::iter(chunks))
+    }
+
+    pub(crate) async fn requests_until(
+        server: &wiremock::MockServer,
+        seen: impl Fn(&wiremock::Request) -> bool,
+    ) -> bool {
+        for _ in 0..200 {
+            if server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(&seen)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     pub(crate) async fn first_part_sent(server: &wiremock::MockServer) -> usize {
         server
             .received_requests()
