@@ -1436,18 +1436,19 @@ through `cufflink-storage` ([setup](setup.md)).
   timeout. The last of `OBJECT_STORE_STALL_ATTEMPTS` (default `3`) attempts
   waits up to `OBJECT_STORE_REQUEST_TIMEOUT_SECS`, so a slow but healthy
   request still succeeds where it did before. A request that never answers
-  now fails after two deadlines plus the request timeout (70 s at the
-  defaults); `OBJECT_STORE_STALL_ATTEMPTS=1` keeps the old bound. A conditional upload and a part of a
-  multipart upload are never sent again, since a repeat could fail on, or
-  add to, what the first attempt left.
+  now fails after `OBJECT_STORE_STALL_ATTEMPTS` − 1 deadlines plus the
+  request timeout (70 s at the defaults);
+  `OBJECT_STORE_STALL_ATTEMPTS=1` keeps the old bound. A conditional
+  upload and a part of a multipart upload are never sent again, since a
+  repeat could fail on, or add to, what the first attempt left.
 - A read that receives nothing for the stall timeout, or whose body breaks
   or ends early, resumes from its next byte with a ranged request pinned to
   the ETag of its first answer. An object that changed fails the read, one
   answered without an ETag is never cut short, any byte received resets
   the count of attempts, and the last answer waits up to the request
   timeout. A download longer than the request timeout now finishes,
-  resuming at each cut, where it failed before. Downloads, the web runner's bundle download and
-  every streamed read go through it. A body that ends before the object's
+  resuming at each cut, where it failed before. Downloads, the web
+  runner's bundle download and every streamed read go through it. A body that ends before the object's
   size is now an error, where it was a short read.
 - A web bundle's assembly fetches up to four parts ahead of the one it
   streams, in order, so its reads overlap its writes. An assembly holds at

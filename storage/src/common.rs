@@ -150,10 +150,14 @@ impl Stall {
         self.attempts > 1 && self.timeout >= self.ceiling
     }
 
-    fn for_upload(self, size: usize) -> Duration {
-        let parts = size.div_ceil(Multipart::DEFAULT.min_part_size).max(1);
-        self.timeout
-            .saturating_mul(u32::try_from(parts).unwrap_or(u32::MAX))
+    fn for_upload(self, size: usize, part_size: usize) -> Self {
+        let parts = size.div_ceil(part_size).max(1);
+        Self {
+            timeout: self
+                .timeout
+                .saturating_mul(u32::try_from(parts).unwrap_or(u32::MAX)),
+            ..self
+        }
     }
 }
 
@@ -340,7 +344,10 @@ async fn put_in(
     let data = data.into();
     let size = data.len() as u64;
     let stored = match multipart.put(data.len(), opts) {
-        Put::Whole(opts) => put_whole(store, backend, key, &path, data, opts, stall).await,
+        Put::Whole(opts) => {
+            let stall = stall.for_upload(data.len(), multipart.min_part_size);
+            put_whole(store, backend, key, &path, data, opts, stall).await
+        }
         Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart).await,
     }
     .wrap_err_with(|| format!("{backend} upload failed for {key}"))?;
@@ -360,11 +367,10 @@ async fn put_whole(
     opts: PutOptions,
     stall: Stall,
 ) -> object_store::Result<PutResult> {
-    let deadline = stall.for_upload(data.len());
     let payload = PutPayload::from(data);
     match opts.mode {
         PutMode::Overwrite => {
-            attempted(stall, deadline, backend, "write", key, || {
+            attempted(stall, stall.timeout, backend, "write", key, || {
                 store.put_opts(path, payload.clone(), opts.clone())
             })
             .await
@@ -1092,6 +1098,7 @@ mod tests {
         Empties(usize),
         Hangs,
         Whole,
+        Other(&'static str),
     }
 
     #[derive(Debug, Default)]
@@ -1195,6 +1202,18 @@ mod tests {
             match answer {
                 None => self.inner.get_opts(location, options).await,
                 Some(Answer::Hangs) => futures_util::future::pending().await,
+                Some(Answer::Other(key)) => {
+                    let unpinned = GetOptions {
+                        range: options.range,
+                        ..Default::default()
+                    };
+                    answered(
+                        self.inner.get_opts(&OsPath::from(key), unpinned).await?,
+                        Answer::Whole,
+                        etag,
+                    )
+                    .await
+                }
                 Some(Answer::Whole) => {
                     let whole = GetOptions {
                         range: None,
@@ -1834,7 +1853,8 @@ mod tests {
     #[test]
     fn an_upload_has_the_stall_timeout_for_each_part_of_its_bytes() {
         let part = Multipart::DEFAULT.min_part_size;
-        let deadlines = [0, 100, part, part + 1, 4 * part].map(|size| STALL.for_upload(size));
+        let deadlines =
+            [0, 100, part, part + 1, 4 * part].map(|size| STALL.for_upload(size, part).timeout);
         assert_eq!(deadlines, [1, 1, 1, 2, 4].map(Duration::from_secs));
     }
 
@@ -2006,6 +2026,18 @@ mod tests {
             "the resumed read answered from byte 0 of 1000, not 100 of 1000",
         );
         assert_eq!(offsets, [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_answer_from_an_object_of_another_size_fails_the_read() {
+        let probe = reads(&[Answer::Ends(100), Answer::Other("site/other")]);
+        stored(&probe, "site/bundle", &payload(1000)).await;
+        stored(&probe, "site/other", &payload(900)).await;
+        failed_with(
+            read(&probe, "site/bundle").await,
+            "the resumed read answered from byte 100 of 900, not 100 of 1000",
+        );
+        assert_eq!(offsets(&probe), [None, Some(100)]);
     }
 
     #[tokio::test(start_paused = true)]
