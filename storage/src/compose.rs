@@ -70,14 +70,9 @@ impl Composer {
             .collect::<Result<Vec<_>>>()?;
         let clock = PartClock::default();
         let made = Intermediates::new(Arc::clone(&self.store));
+        let prefix = format!("{path}.compose/{}", nonce());
         let tiers = self
-            .tiers(
-                &format!("{path}.compose/{}", nonce()),
-                sources,
-                content_type,
-                &clock,
-                &made,
-            )
+            .tiers(&prefix, sources, content_type, &clock, &made)
             .map_err(&failed);
         let last = copied::alongside(tiers, data).await?;
         let asked = tokio::time::Instant::now();
