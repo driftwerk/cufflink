@@ -1307,7 +1307,7 @@ mod tests {
                     }),
                 )
                 .boxed(),
-            Answer::Hangs | Answer::Whole => head(usize::MAX).boxed(),
+            Answer::Hangs | Answer::Whole | Answer::Other(_) => head(usize::MAX).boxed(),
         };
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream),
