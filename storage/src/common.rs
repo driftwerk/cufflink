@@ -5,9 +5,10 @@ use futures_util::stream::BoxStream;
 use futures_util::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::{
     path::Path as OsPath, Attribute, AttributeValue, Attributes, ClientOptions, GetOptions,
-    MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult,
+    GetRange, GetResult, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How a key becomes the object's name: as `object_store` encodes it, or
@@ -81,22 +82,33 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) const ENV_REQUEST_TIMEOUT_SECS: &str = "OBJECT_STORE_REQUEST_TIMEOUT_SECS";
 
-fn env_secs(name: &'static str, default: u64) -> Duration {
-    let secs = std::env::var(name)
+const DEFAULT_STALL_TIMEOUT_SECS: u64 = 20;
+
+pub(crate) const ENV_STALL_TIMEOUT_SECS: &str = "OBJECT_STORE_STALL_TIMEOUT_SECS";
+
+const DEFAULT_STALL_ATTEMPTS: u64 = 3;
+
+pub(crate) const ENV_STALL_ATTEMPTS: &str = "OBJECT_STORE_STALL_ATTEMPTS";
+
+fn env_positive(name: &'static str, default: u64) -> u64 {
+    std::env::var(name)
         .ok()
         .map_or(default, |raw| match raw.trim().parse::<u64>() {
-            Ok(secs) if secs > 0 => secs,
+            Ok(value) if value > 0 => value,
             _ => {
                 tracing::warn!(
                     variable = name,
                     value = %raw,
                     default,
-                    "Ignoring a timeout that is not a positive number of seconds"
+                    "Ignoring a setting that is not a positive whole number"
                 );
                 default
             }
-        });
-    Duration::from_secs(secs)
+        })
+}
+
+fn env_secs(name: &'static str, default: u64) -> Duration {
+    Duration::from_secs(env_positive(name, default))
 }
 
 pub(crate) fn retry_timeout() -> Duration {
@@ -105,6 +117,87 @@ pub(crate) fn retry_timeout() -> Duration {
 
 pub(crate) fn request_timeout() -> Duration {
     env_secs(ENV_REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)
+}
+
+/// How a storage request that makes no progress is cut short and tried
+/// again: a write that has not finished within `timeout` for each part's
+/// worth of its bytes, an open with no answer within `timeout`, and a read
+/// that receives nothing for it, which resumes from its next byte. A request
+/// is tried at most `attempts` times in a row, and its last attempt is
+/// bounded only by the request timeout, the `ceiling`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stall {
+    timeout: Duration,
+    attempts: u32,
+    ceiling: Duration,
+}
+
+impl Stall {
+    pub(crate) fn configured() -> Self {
+        Self {
+            timeout: env_secs(ENV_STALL_TIMEOUT_SECS, DEFAULT_STALL_TIMEOUT_SECS),
+            attempts: u32::try_from(env_positive(ENV_STALL_ATTEMPTS, DEFAULT_STALL_ATTEMPTS))
+                .unwrap_or(u32::MAX),
+            ceiling: request_timeout(),
+        }
+    }
+
+    fn cuts(self, deadline: Duration) -> bool {
+        self.attempts > 1 && deadline < self.ceiling
+    }
+
+    fn outlasts_ceiling(self) -> bool {
+        self.attempts > 1 && self.timeout >= self.ceiling
+    }
+
+    fn for_upload(self, size: usize, part_size: usize) -> Self {
+        let parts = size.div_ceil(part_size).max(1);
+        Self {
+            timeout: self
+                .timeout
+                .saturating_mul(u32::try_from(parts).unwrap_or(u32::MAX)),
+            ..self
+        }
+    }
+}
+
+/// Runs `attempt` until it answers: each attempt but the last is abandoned
+/// once `deadline` passes, and the last is left to the ceiling.
+async fn attempted<T, Fut>(
+    stall: Stall,
+    deadline: Duration,
+    backend: &'static str,
+    request: &'static str,
+    location: &str,
+    mut attempt: impl FnMut() -> Fut,
+) -> object_store::Result<T>
+where
+    Fut: std::future::Future<Output = object_store::Result<T>>,
+{
+    let cut = if stall.cuts(deadline) {
+        stall.attempts - 1
+    } else {
+        0
+    };
+    for tried in 1..=cut {
+        match tokio::time::timeout(deadline, attempt()).await {
+            Ok(answered) => return answered,
+            Err(_) => tracing::warn!(
+                backend,
+                request,
+                location,
+                attempt = tried,
+                attempts = stall.attempts,
+                timeout_ms = millis(deadline),
+                "A storage request made no progress in time; trying it again"
+            ),
+        }
+    }
+    attempt().await
+}
+
+fn millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn client_options() -> ClientOptions {
@@ -128,6 +221,15 @@ pub(crate) fn warn_unless_timed_out_requests_retry(backend: &'static str) {
             "{ENV_RETRY_TIMEOUT_SECS} is below {ENV_REQUEST_TIMEOUT_SECS}, so a request that times out is not retried"
         );
     }
+    let stall = Stall::configured();
+    if stall.outlasts_ceiling() {
+        tracing::warn!(
+            backend,
+            stall_timeout_secs = stall.timeout.as_secs(),
+            request_timeout_secs = stall.ceiling.as_secs(),
+            "{ENV_STALL_TIMEOUT_SECS} is not below {ENV_REQUEST_TIMEOUT_SECS}, so a stalled request is never cut short"
+        );
+    }
 }
 
 pub(crate) fn retry_config() -> object_store::RetryConfig {
@@ -144,12 +246,13 @@ pub(crate) async fn put(
     key: &str,
     data: Vec<u8>,
     options: &UploadOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
     let opts = PutOptions {
         attributes: attributes(options),
         ..Default::default()
     };
-    put_with(store, backend, keys, key, data, opts).await
+    put_with(store, backend, keys, key, data, opts, stall).await
 }
 
 /// When an upload goes up in parts: above `threshold` bytes, in parts of at
@@ -211,10 +314,22 @@ pub(crate) async fn put_with(
     key: &str,
     data: Vec<u8>,
     opts: PutOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
-    put_in(store, backend, keys, key, data, opts, Multipart::DEFAULT).await
+    put_in(
+        store,
+        backend,
+        keys,
+        key,
+        data,
+        opts,
+        Multipart::DEFAULT,
+        stall,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn put_in(
     store: &dyn ObjectStore,
     backend: &'static str,
@@ -223,12 +338,16 @@ async fn put_in(
     data: impl Into<Bytes>,
     opts: PutOptions,
     multipart: Multipart,
+    stall: Stall,
 ) -> Result<Uploaded> {
     let path = keys.path(key)?;
     let data = data.into();
     let size = data.len() as u64;
     let stored = match multipart.put(data.len(), opts) {
-        Put::Whole(opts) => store.put_opts(&path, PutPayload::from(data), opts).await,
+        Put::Whole(opts) => {
+            let stall = stall.for_upload(data.len(), multipart.min_part_size);
+            put_whole(store, backend, key, &path, data, opts, stall).await
+        }
         Put::InParts(opts) => put_parts(store, backend, key, &path, data, opts, multipart).await,
     }
     .wrap_err_with(|| format!("{backend} upload failed for {key}"))?;
@@ -239,6 +358,27 @@ async fn put_in(
     })
 }
 
+async fn put_whole(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    key: &str,
+    path: &OsPath,
+    data: Bytes,
+    opts: PutOptions,
+    stall: Stall,
+) -> object_store::Result<PutResult> {
+    let payload = PutPayload::from(data);
+    match opts.mode {
+        PutMode::Overwrite => {
+            attempted(stall, stall.timeout, backend, "write", key, || {
+                store.put_opts(path, payload.clone(), opts.clone())
+            })
+            .await
+        }
+        _ => store.put_opts(path, payload, opts).await,
+    }
+}
+
 pub(crate) async fn put_stream(
     store: &dyn ObjectStore,
     backend: &'static str,
@@ -246,12 +386,13 @@ pub(crate) async fn put_stream(
     key: &str,
     data: BoxStream<'static, Result<Bytes>>,
     options: &UploadOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
     let opts = PutOptions {
         attributes: attributes(options),
         ..Default::default()
     };
-    put_stream_with(store, backend, keys, key, data, opts).await
+    put_stream_with(store, backend, keys, key, data, opts, stall).await
 }
 
 pub(crate) async fn put_stream_with(
@@ -261,8 +402,19 @@ pub(crate) async fn put_stream_with(
     key: &str,
     data: BoxStream<'static, Result<Bytes>>,
     opts: PutOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
-    put_stream_in(store, backend, keys, key, data, opts, Multipart::DEFAULT).await
+    put_stream_in(
+        store,
+        backend,
+        keys,
+        key,
+        data,
+        opts,
+        Multipart::DEFAULT,
+        stall,
+    )
+    .await
 }
 
 async fn gathered(data: &mut BoxStream<'static, Result<Bytes>>, limit: usize) -> Result<BytesMut> {
@@ -276,6 +428,7 @@ async fn gathered(data: &mut BoxStream<'static, Result<Bytes>>, limit: usize) ->
     Ok(head)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn put_stream_in(
     store: &dyn ObjectStore,
     backend: &'static str,
@@ -284,6 +437,7 @@ async fn put_stream_in(
     mut data: BoxStream<'static, Result<Bytes>>,
     opts: PutOptions,
     multipart: Multipart,
+    stall: Stall,
 ) -> Result<Uploaded> {
     let head = gathered(&mut data, multipart.threshold + 1).await?;
     match multipart.put(head.len(), opts) {
@@ -294,7 +448,17 @@ async fn put_stream_in(
                     future::ready(Ok(whole))
                 })
                 .await?;
-            put_in(store, backend, keys, key, whole.freeze(), opts, multipart).await
+            put_in(
+                store,
+                backend,
+                keys,
+                key,
+                whole.freeze(),
+                opts,
+                multipart,
+                stall,
+            )
+            .await
         }
         Put::InParts(opts) => {
             let failed = |e: object_store::Error| {
@@ -542,44 +706,189 @@ pub(crate) async fn head_meta(
 }
 
 pub(crate) async fn get_bytes(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     backend: &'static str,
     keys: Keys,
     bucket: Option<&str>,
     key: &str,
+    stall: Stall,
 ) -> Result<Vec<u8>> {
     let path = keys.path(key)?;
     let location = bucket.map_or_else(|| key.to_string(), |b| format!("{b}/{key}"));
-    let got = store
-        .get(&path)
+    let got = first_read(store.as_ref(), backend, &path, &location, stall)
         .await
         .wrap_err_with(|| format!("{backend} download failed for {location}"))?;
-    let bytes = got
-        .bytes()
+    let capacity = usize::try_from(got.meta.size).unwrap_or_default();
+    Read::resumable(store, backend, path, location, got, stall)
+        .try_fold(Vec::with_capacity(capacity), |mut bytes, chunk| {
+            bytes.extend_from_slice(&chunk);
+            future::ready(Ok(bytes))
+        })
         .await
-        .wrap_err_with(|| format!("{backend} read body failed for {location}"))?;
-    Ok(bytes.to_vec())
 }
 
 pub(crate) async fn open_read(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     backend: &'static str,
     keys: Keys,
     bucket: &str,
     key: &str,
+    stall: Stall,
 ) -> Result<Option<ObjectReader>> {
+    let path = keys.path(key)?;
     let location = format!("{bucket}/{key}");
-    match store.get(&keys.path(key)?).await {
+    let first = first_read(store.as_ref(), backend, &path, &location, stall).await;
+    match first {
         Ok(got) => Ok(Some(ObjectReader {
             size: Some(got.meta.size),
             content_type: content_type(&got.attributes),
-            stream: got
-                .into_stream()
-                .map_err(move |e| eyre::eyre!("{backend} read failed for {location}: {e}"))
-                .boxed(),
+            stream: Read::resumable(store, backend, path, location, got, stall),
         })),
         Err(object_store::Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(e).wrap_err_with(|| format!("{backend} open failed for {bucket}/{key}")),
+        Err(e) => Err(e).wrap_err_with(|| format!("{backend} open failed for {location}")),
+    }
+}
+
+async fn first_read(
+    store: &dyn ObjectStore,
+    backend: &'static str,
+    path: &OsPath,
+    location: &str,
+    stall: Stall,
+) -> object_store::Result<GetResult> {
+    attempted(stall, stall.timeout, backend, "open", location, || {
+        store.get_opts(path, GetOptions::default())
+    })
+    .await
+}
+
+/// A read of one object that resumes from its next byte when its body stalls
+/// or breaks, until it stalls on as many attempts in a row without a byte;
+/// its last attempt waits for the ceiling. Each resume asks for the rest of
+/// the object by the ETag it was first answered with, so an object that
+/// changed fails the read instead of mixing two versions, and one answered
+/// without an ETag is never cut short.
+struct Read {
+    store: Arc<dyn ObjectStore>,
+    backend: &'static str,
+    path: OsPath,
+    location: String,
+    etag: Option<String>,
+    size: u64,
+    next: u64,
+    resumes: u32,
+    stall: Stall,
+    body: BoxStream<'static, object_store::Result<Bytes>>,
+}
+
+impl Read {
+    fn resumable(
+        store: Arc<dyn ObjectStore>,
+        backend: &'static str,
+        path: OsPath,
+        location: String,
+        got: GetResult,
+        stall: Stall,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        let read = Self {
+            store,
+            backend,
+            path,
+            location,
+            etag: got.meta.e_tag.clone(),
+            size: got.meta.size,
+            next: got.range.start,
+            resumes: 0,
+            stall,
+            body: got.into_stream(),
+        };
+        stream::try_unfold(read, Self::chunk).boxed()
+    }
+
+    fn resumes_left(&self) -> bool {
+        self.etag.is_some()
+            && self.stall.cuts(self.stall.timeout)
+            && self.resumes + 1 < self.stall.attempts
+    }
+
+    async fn chunk(mut self) -> Result<Option<(Bytes, Self)>> {
+        let mut deadline = tokio::time::Instant::now() + self.stall.timeout;
+        loop {
+            if self.next >= self.size {
+                return Ok(None);
+            }
+            let waited = if self.resumes_left() {
+                tokio::time::timeout_at(deadline, self.body.next()).await
+            } else {
+                Ok(self.body.next().await)
+            };
+            let cause = match waited {
+                Ok(Some(Ok(chunk))) if chunk.is_empty() => continue,
+                Ok(Some(Ok(chunk))) => {
+                    self.next += chunk.len() as u64;
+                    self.resumes = 0;
+                    return Ok(Some((chunk, self)));
+                }
+                Ok(None) => format!("the body ended at byte {} of {}", self.next, self.size),
+                Ok(Some(Err(e))) => e.to_string(),
+                Err(_) => format!("no data for {} ms", millis(self.stall.timeout)),
+            };
+            self = self.resumed(cause).await?;
+            deadline = tokio::time::Instant::now() + self.stall.timeout;
+        }
+    }
+
+    fn failed(&self, cause: impl std::fmt::Display) -> eyre::Report {
+        eyre::eyre!(
+            "{} read failed for {}: {cause}",
+            self.backend,
+            self.location
+        )
+    }
+
+    async fn resumed(mut self, cause: String) -> Result<Self> {
+        let Some(etag) = self.etag.clone().filter(|_| self.resumes_left()) else {
+            return Err(self.failed(cause));
+        };
+        self.resumes += 1;
+        tracing::warn!(
+            backend = self.backend,
+            location = %self.location,
+            offset = self.next,
+            size = self.size,
+            resume = self.resumes,
+            attempts = self.stall.attempts,
+            cause = %cause,
+            "A storage read stalled; resuming it from its next byte"
+        );
+        let rest = GetOptions {
+            range: Some(GetRange::Offset(self.next)),
+            if_match: Some(etag),
+            ..Default::default()
+        };
+        let got = attempted(
+            self.stall,
+            self.stall.timeout,
+            self.backend,
+            "resume",
+            &self.location,
+            || self.store.get_opts(&self.path, rest.clone()),
+        )
+        .await
+        .map_err(|e| match e {
+            object_store::Error::Precondition { .. } => {
+                self.failed("the object changed while it was read")
+            }
+            e => self.failed(e),
+        })?;
+        if got.range.start != self.next || got.meta.size != self.size {
+            return Err(self.failed(format!(
+                "the resumed read answered from byte {} of {}, not {} of {}",
+                got.range.start, got.meta.size, self.next, self.size
+            )));
+        }
+        self.body = got.into_stream();
+        Ok(self)
     }
 }
 
@@ -718,9 +1027,10 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::{
-        already_aborted, put_in, put_stream_in, rechunked, request_timeout, retry_timeout,
-        timed_out_requests_cannot_retry, Keys, Multipart, Put, ENV_REQUEST_TIMEOUT_SECS,
-        ENV_RETRY_TIMEOUT_SECS, MAX_PARTS,
+        already_aborted, get_bytes, open_read, put_in, put_stream_in, rechunked, request_timeout,
+        retry_timeout, timed_out_requests_cannot_retry, Keys, Multipart, Put, Stall,
+        ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS,
+        ENV_STALL_TIMEOUT_SECS, MAX_PARTS,
     };
     use async_trait::async_trait;
     use bytes::{Bytes, BytesMut};
@@ -729,9 +1039,9 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as OsPath;
     use object_store::{
-        Attribute, Attributes, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
-        ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions,
-        PutPayload, PutResult, UploadPart,
+        Attribute, Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload,
+        ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -741,6 +1051,12 @@ mod tests {
         threshold: 1024,
         min_part_size: 256,
         concurrency: 2,
+    };
+
+    const UNCUT: Stall = Stall {
+        timeout: Duration::from_secs(1),
+        attempts: 1,
+        ceiling: Duration::from_secs(30),
     };
 
     fn payload(size: usize) -> Vec<u8> {
@@ -760,6 +1076,31 @@ mod tests {
         None,
         Completion,
         StalledParts,
+        StalledWrites(usize),
+        SlowWrites(Duration),
+        Reads {
+            answers: &'static [Answer],
+            etag: bool,
+        },
+        Trickle(usize),
+    }
+
+    /// How the probe answers one read, in the order it is asked: `Stalls`
+    /// sends that many bytes and then nothing until the request times out,
+    /// `Ends` sends them and ends, `Pauses` sends the rest after a pause,
+    /// `Empties` sends them and then empty frames, `Hangs` never answers,
+    /// `Whole` answers with the whole object whatever range was asked and
+    /// `Other` answers from another object, with the range asked but no ETag
+    /// pin.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Answer {
+        Stalls(usize),
+        Ends(usize),
+        Pauses(Duration),
+        Empties(usize),
+        Hangs,
+        Whole,
+        Other(&'static str),
     }
 
     #[derive(Debug, Default)]
@@ -767,6 +1108,8 @@ mod tests {
         whole: AtomicUsize,
         in_parts: AtomicUsize,
         aborted: AtomicUsize,
+        gets: AtomicUsize,
+        offsets: std::sync::Mutex<Vec<Option<u64>>>,
     }
 
     impl Counts {
@@ -815,7 +1158,14 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
-            self.counts.whole.fetch_add(1, Ordering::SeqCst);
+            let sent = self.counts.whole.fetch_add(1, Ordering::SeqCst);
+            match self.fault {
+                Fault::StalledWrites(stalled) if sent < stalled => {
+                    return futures_util::future::pending().await
+                }
+                Fault::SlowWrites(delay) => tokio::time::sleep(delay).await,
+                _ => {}
+            }
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -837,7 +1187,51 @@ mod tests {
             location: &OsPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
-            self.inner.get_opts(location, options).await
+            let asked = self.counts.gets.fetch_add(1, Ordering::SeqCst);
+            self.counts
+                .offsets
+                .lock()
+                .expect("offsets")
+                .push(match options.range {
+                    Some(GetRange::Offset(offset)) => Some(offset),
+                    _ => None,
+                });
+            let (answer, etag) = match self.fault {
+                Fault::Reads { answers, etag } => (answers.get(asked).copied(), etag),
+                Fault::Trickle(sent) => (Some(Answer::Stalls(sent)), true),
+                _ => (None, true),
+            };
+            match answer {
+                None => self.inner.get_opts(location, options).await,
+                Some(Answer::Hangs) => futures_util::future::pending().await,
+                Some(Answer::Other(key)) => {
+                    let unpinned = GetOptions {
+                        range: options.range,
+                        ..Default::default()
+                    };
+                    answered(
+                        self.inner.get_opts(&OsPath::from(key), unpinned).await?,
+                        Answer::Whole,
+                        etag,
+                    )
+                    .await
+                }
+                Some(Answer::Whole) => {
+                    let whole = GetOptions {
+                        range: None,
+                        ..options
+                    };
+                    answered(
+                        self.inner.get_opts(location, whole).await?,
+                        Answer::Whole,
+                        etag,
+                    )
+                    .await
+                }
+                Some(answer) => {
+                    answered(self.inner.get_opts(location, options).await?, answer, etag).await
+                }
+            }
         }
 
         fn delete_stream(
@@ -869,6 +1263,61 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    const CEILING: Duration = Duration::from_secs(30);
+
+    async fn answered(
+        got: GetResult,
+        answer: Answer,
+        etag: bool,
+    ) -> object_store::Result<GetResult> {
+        let (mut meta, range, attributes, extensions) = (
+            got.meta.clone(),
+            got.range.clone(),
+            got.attributes.clone(),
+            got.extensions.clone(),
+        );
+        if !etag {
+            meta.e_tag = None;
+        }
+        let body = got.bytes().await?;
+        let head = |sent: usize| {
+            let head = body.slice(..sent.min(body.len()));
+            futures_util::stream::once(async move { Ok::<_, object_store::Error>(head) })
+        };
+        let timed_out = futures_util::stream::once(async {
+            tokio::time::sleep(CEILING).await;
+            Err(object_store::Error::Generic {
+                store: "probe",
+                source: "the request timed out".into(),
+            })
+        });
+        let stream = match answer {
+            Answer::Stalls(sent) => head(sent).chain(timed_out).boxed(),
+            Answer::Ends(sent) => head(sent).boxed(),
+            Answer::Pauses(pause) => futures_util::stream::once(async move {
+                tokio::time::sleep(pause).await;
+                Ok(body)
+            })
+            .boxed(),
+            Answer::Empties(sent) => head(sent)
+                .chain(
+                    futures_util::stream::repeat_with(Bytes::new).then(|empty| async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok(empty)
+                    }),
+                )
+                .boxed(),
+            Answer::Hangs | Answer::Whole | Answer::Other(_) => head(usize::MAX).boxed(),
+        };
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(stream),
+            meta,
+            range,
+            attributes,
+            extensions,
+        })
     }
 
     #[derive(Debug)]
@@ -974,6 +1423,7 @@ mod tests {
                 data.clone(),
                 typed("application/gzip"),
                 SMALL,
+                UNCUT,
             )
             .await
             .expect("uploaded");
@@ -1002,6 +1452,7 @@ mod tests {
             data.clone(),
             typed("application/json"),
             SMALL,
+            UNCUT,
         )
         .await
         .expect("uploaded");
@@ -1034,6 +1485,7 @@ mod tests {
             payload(4096),
             create(),
             SMALL,
+            UNCUT,
         )
         .await
         .expect("created");
@@ -1045,6 +1497,7 @@ mod tests {
             payload(4096),
             create(),
             SMALL,
+            UNCUT,
         )
         .await
         .expect_err("already exists");
@@ -1063,6 +1516,7 @@ mod tests {
             payload(4096),
             PutOptions::default(),
             SMALL,
+            UNCUT,
         )
         .await
         .expect_err("refused");
@@ -1082,6 +1536,7 @@ mod tests {
             payload(4096),
             PutOptions::default(),
             SMALL,
+            UNCUT,
         );
         assert!(tokio::time::timeout(Duration::from_millis(20), upload)
             .await
@@ -1101,6 +1556,7 @@ mod tests {
             payload(4096),
             PutOptions::default(),
             SMALL,
+            UNCUT,
         )
         .await
         .expect("uploaded");
@@ -1162,6 +1618,7 @@ mod tests {
                 streamed(&data, 300, None),
                 typed("application/gzip"),
                 SMALL,
+                UNCUT,
             )
             .await
             .expect("uploaded");
@@ -1190,6 +1647,7 @@ mod tests {
                 streamed(&payload(size), 300, Some("not the content it claims")),
                 PutOptions::default(),
                 SMALL,
+                UNCUT,
             )
             .await
             .expect_err("refused");
@@ -1278,5 +1736,336 @@ mod tests {
         super::test_env::with(&[(ENV_REQUEST_TIMEOUT_SECS, Some("60\n"))], || {
             assert_eq!(request_timeout(), Duration::from_secs(60));
         });
+    }
+
+    const STALL: Stall = Stall {
+        timeout: Duration::from_secs(1),
+        attempts: 3,
+        ceiling: CEILING,
+    };
+
+    async fn stored(probe: &Probe, key: &str, data: &[u8]) {
+        probe
+            .inner
+            .put(&OsPath::from(key), PutPayload::from(data.to_vec()))
+            .await
+            .expect("stored");
+    }
+
+    fn offsets(probe: &Probe) -> Vec<Option<u64>> {
+        probe.counts.offsets.lock().expect("offsets").clone()
+    }
+
+    fn reads(answers: &'static [Answer]) -> Arc<Probe> {
+        Arc::new(Probe::failing(Fault::Reads {
+            answers,
+            etag: true,
+        }))
+    }
+
+    async fn read_with(probe: &Arc<Probe>, key: &str, stall: Stall) -> eyre::Result<Vec<u8>> {
+        let reader = open_read(
+            Arc::clone(probe) as Arc<dyn ObjectStore>,
+            "memory",
+            Keys::Encoded,
+            "bucket",
+            key,
+            stall,
+        )
+        .await?
+        .expect("found");
+        reader
+            .stream
+            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                Ok(bytes)
+            })
+            .await
+    }
+
+    async fn read(probe: &Arc<Probe>, key: &str) -> eyre::Result<Vec<u8>> {
+        read_with(probe, key, STALL).await
+    }
+
+    async fn read_back(answers: &'static [Answer]) -> (eyre::Result<Vec<u8>>, Vec<Option<u64>>) {
+        let probe = reads(answers);
+        stored(&probe, "site/bundle", &payload(1000)).await;
+        let read = read(&probe, "site/bundle").await;
+        (read, offsets(&probe))
+    }
+
+    fn failed_with(read: eyre::Result<Vec<u8>>, cause: &str) {
+        let failed = read.expect_err("failed");
+        assert!(format!("{failed:#}").contains(cause), "{failed:#}");
+    }
+
+    #[test]
+    fn stall_settings_default_and_parse() {
+        super::test_env::with(
+            &[
+                (ENV_STALL_TIMEOUT_SECS, None),
+                (ENV_STALL_ATTEMPTS, None),
+                (ENV_REQUEST_TIMEOUT_SECS, None),
+            ],
+            || {
+                let stall = Stall::configured();
+                assert_eq!(
+                    stall,
+                    Stall {
+                        timeout: Duration::from_secs(20),
+                        attempts: 3,
+                        ceiling: Duration::from_secs(30),
+                    }
+                );
+                assert!(stall.cuts(stall.timeout));
+                assert!(!stall.outlasts_ceiling());
+            },
+        );
+        super::test_env::with(
+            &[
+                (ENV_STALL_TIMEOUT_SECS, Some("0")),
+                (ENV_STALL_ATTEMPTS, Some("many")),
+                (ENV_REQUEST_TIMEOUT_SECS, None),
+            ],
+            || {
+                assert_eq!(Stall::configured().timeout, Duration::from_secs(20));
+                assert_eq!(Stall::configured().attempts, 3);
+            },
+        );
+    }
+
+    #[test]
+    fn a_deadline_not_below_the_request_timeout_or_one_attempt_cuts_nothing_short() {
+        let at_ceiling = Stall {
+            timeout: CEILING,
+            ..STALL
+        };
+        assert!(!at_ceiling.cuts(at_ceiling.timeout));
+        assert!(at_ceiling.outlasts_ceiling());
+        assert!(!STALL.cuts(CEILING));
+
+        let once = Stall {
+            attempts: 1,
+            ..STALL
+        };
+        assert!(!once.cuts(once.timeout));
+        assert!(!once.outlasts_ceiling());
+    }
+
+    #[test]
+    fn an_upload_has_the_stall_timeout_for_each_part_of_its_bytes() {
+        let part = Multipart::DEFAULT.min_part_size;
+        let deadlines =
+            [0, 100, part, part + 1, 4 * part].map(|size| STALL.for_upload(size, part).timeout);
+        assert_eq!(deadlines, [1, 1, 1, 2, 4].map(Duration::from_secs));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_makes_no_progress_is_sent_again_and_stored() {
+        let store = Probe::failing(Fault::StalledWrites(1));
+        let data = payload(100);
+        put_in(
+            &store,
+            "memory",
+            Keys::Encoded,
+            "site/part",
+            data.clone(),
+            PutOptions::default(),
+            SMALL,
+            STALL,
+        )
+        .await
+        .expect("uploaded");
+        assert_eq!(store.counts.whole.load(Ordering::SeqCst), 2);
+        let got = store.get(&OsPath::from("site/part")).await.expect("stored");
+        assert_eq!(got.bytes().await.expect("body").to_vec(), data);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_write_is_cut_short_only_until_its_last_attempt_which_has_the_ceiling() {
+        let store = Probe::failing(Fault::SlowWrites(Duration::from_secs(5)));
+        put_in(
+            &store,
+            "memory",
+            Keys::Encoded,
+            "site/slow",
+            payload(100),
+            PutOptions::default(),
+            SMALL,
+            STALL,
+        )
+        .await
+        .expect("uploaded on its last attempt");
+        assert_eq!(store.counts.whole.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_create_only_write_is_never_sent_again() {
+        let store = Probe::failing(Fault::SlowWrites(Duration::from_secs(5)));
+        put_in(
+            &store,
+            "memory",
+            Keys::Encoded,
+            "site/once",
+            payload(100),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+            SMALL,
+            STALL,
+        )
+        .await
+        .expect("uploaded");
+        assert_eq!(store.counts.whole.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_read_resumes_from_its_next_byte_by_its_etag() {
+        let data = payload(1000);
+        let (read, asked) = read_back(&[Answer::Stalls(100)]).await;
+        assert_eq!(read.expect("read"), data);
+        assert_eq!(asked, [None, Some(100)]);
+
+        let downloaded = reads(&[Answer::Stalls(100)]);
+        stored(&downloaded, "site/bundle", &data).await;
+        let bytes = get_bytes(
+            Arc::clone(&downloaded) as Arc<dyn ObjectStore>,
+            "memory",
+            Keys::Encoded,
+            None,
+            "site/bundle",
+            STALL,
+        )
+        .await
+        .expect("downloaded");
+        assert_eq!(bytes, data);
+        assert_eq!(offsets(&downloaded), [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_whose_body_ends_early_resumes_from_its_next_byte() {
+        let (read, offsets) = read_back(&[Answer::Ends(100)]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_cannot_resume_fails_on_a_body_that_ends_early() {
+        let probe = reads(&[Answer::Ends(100)]);
+        stored(&probe, "site/short", &payload(1000)).await;
+        failed_with(
+            read_with(&probe, "site/short", UNCUT).await,
+            "the body ended at byte 100 of 1000",
+        );
+        assert_eq!(offsets(&probe), [None]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_and_a_resume_that_never_answer_are_sent_again() {
+        let (read, offsets) = read_back(&[Answer::Hangs]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, None]);
+
+        let (read, offsets) = read_back(&[Answer::Stalls(100), Answer::Hangs]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(100), Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_keeps_moving_resumes_as_often_as_it_stalls() {
+        let data = payload(1000);
+        let probe = Arc::new(Probe::failing(Fault::Trickle(100)));
+        stored(&probe, "site/trickle", &data).await;
+        assert_eq!(read(&probe, "site/trickle").await.expect("read"), data);
+        assert_eq!(
+            offsets(&probe),
+            std::iter::once(None)
+                .chain((1..10).map(|part| Some(part * 100)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_frames_are_not_progress() {
+        let (read, offsets) = read_back(&[Answer::Empties(100)]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_last_attempt_of_a_read_waits_for_the_ceiling() {
+        const PAUSE: Answer = Answer::Pauses(Duration::from_secs(5));
+        let (read, offsets) = read_back(&[PAUSE, PAUSE, PAUSE]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(0), Some(0)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_stalls_on_every_attempt_in_a_row_fails_at_the_cap() {
+        let (read, offsets) =
+            read_back(&[Answer::Stalls(100), Answer::Stalls(0), Answer::Stalls(0)]).await;
+        failed_with(read, "the request timed out");
+        assert_eq!(offsets, [None, Some(100), Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_answered_without_an_etag_is_never_cut_short() {
+        let probe = Arc::new(Probe::failing(Fault::Reads {
+            answers: &[Answer::Stalls(100)],
+            etag: false,
+        }));
+        stored(&probe, "site/unpinned", &payload(1000)).await;
+        failed_with(read(&probe, "site/unpinned").await, "the request timed out");
+        assert_eq!(offsets(&probe), [None]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_answer_from_another_byte_fails_the_read() {
+        let (read, offsets) = read_back(&[Answer::Ends(100), Answer::Whole]).await;
+        failed_with(
+            read,
+            "the resumed read answered from byte 0 of 1000, not 100 of 1000",
+        );
+        assert_eq!(offsets, [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_answer_from_an_object_of_another_size_fails_the_read() {
+        let probe = reads(&[Answer::Ends(100), Answer::Other("site/other")]);
+        stored(&probe, "site/bundle", &payload(1000)).await;
+        stored(&probe, "site/other", &payload(900)).await;
+        failed_with(
+            read(&probe, "site/bundle").await,
+            "the resumed read answered from byte 100 of 900, not 100 of 1000",
+        );
+        assert_eq!(offsets(&probe), [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_an_object_that_changed_fails_instead_of_mixing_versions() {
+        let probe = reads(&[Answer::Stalls(100)]);
+        stored(&probe, "site/changed", &payload(1000)).await;
+        let mut reader = open_read(
+            Arc::clone(&probe) as Arc<dyn ObjectStore>,
+            "memory",
+            Keys::Encoded,
+            "bucket",
+            "site/changed",
+            STALL,
+        )
+        .await
+        .expect("opened")
+        .expect("found");
+        let first = reader.stream.try_next().await.expect("first chunk");
+        assert_eq!(first.map(|chunk| chunk.len()), Some(100));
+        stored(&probe, "site/changed", &payload(900)).await;
+        let failed = reader.stream.try_next().await.expect_err("changed");
+        assert!(
+            failed
+                .to_string()
+                .contains("the object changed while it was read"),
+            "{failed}"
+        );
     }
 }

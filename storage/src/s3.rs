@@ -60,6 +60,7 @@ pub(crate) struct S3Backend {
     connection: Connection,
     bucket: String,
     keys: Keys,
+    stall: common::Stall,
 }
 
 impl S3Backend {
@@ -85,7 +86,12 @@ impl S3Backend {
             endpoint,
         };
         let bucket = vars(ENV_BUCKET).unwrap_or_else(|| "cufflink".to_string());
-        let backend = Self::new(connection, bucket, Keys::Encoded)?;
+        let backend = Self::new(
+            connection,
+            bucket,
+            Keys::Encoded,
+            common::Stall::configured(),
+        )?;
 
         tracing::info!(
             backend = BACKEND,
@@ -101,12 +107,18 @@ impl S3Backend {
         Ok(backend)
     }
 
-    fn new(connection: Connection, bucket: String, keys: Keys) -> Result<Self> {
+    fn new(
+        connection: Connection,
+        bucket: String,
+        keys: Keys,
+        stall: common::Stall,
+    ) -> Result<Self> {
         Ok(Self {
             primary: connection.store(&bucket, None)?,
             connection,
             bucket,
             keys,
+            stall,
         })
     }
 
@@ -150,7 +162,16 @@ impl ObjectStorage for S3Backend {
         options: &UploadOptions,
     ) -> Result<Uploaded> {
         let store = self.store_for(bucket, options.acl)?;
-        common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
+        common::put(
+            store.as_ref(),
+            BACKEND,
+            self.keys,
+            key,
+            data,
+            options,
+            self.stall,
+        )
+        .await
     }
 
     async fn upload_stream(
@@ -161,21 +182,38 @@ impl ObjectStorage for S3Backend {
     ) -> Result<Uploaded> {
         let store = self.store_for(&self.bucket, None)?;
         let options = UploadOptions::content_type(content_type);
-        common::put_stream(store.as_ref(), BACKEND, self.keys, key, data, &options).await
+        common::put_stream(
+            store.as_ref(),
+            BACKEND,
+            self.keys,
+            key,
+            data,
+            &options,
+            self.stall,
+        )
+        .await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(self.primary.as_ref(), BACKEND, self.keys, None, key).await
+        common::get_bytes(
+            self.primary.clone(),
+            BACKEND,
+            self.keys,
+            None,
+            key,
+            self.stall,
+        )
+        .await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         let store = self.store_for(bucket, None)?;
-        common::get_bytes(store.as_ref(), BACKEND, self.keys, Some(bucket), key).await
+        common::get_bytes(store, BACKEND, self.keys, Some(bucket), key, self.stall).await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
         let store = self.store_for(bucket, None)?;
-        common::open_read(store.as_ref(), BACKEND, self.keys, bucket, key).await
+        common::open_read(store, BACKEND, self.keys, bucket, key, self.stall).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
@@ -282,6 +320,7 @@ impl ObjectStorage for S3Backend {
             connection,
             bucket.to_string(),
             Keys::Exact,
+            self.stall,
         )?))
     }
 }

@@ -28,5 +28,5 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 cufflink-settings = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"

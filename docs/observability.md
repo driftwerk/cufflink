@@ -374,6 +374,18 @@ A reverse proxy that buffers request bodies before passing them on makes
 `receive_ms` near zero: the time on the network is then in the CLI's
 number alone.
 
+### Stalled storage requests
+
+The platform, the worker and the web runner reach object storage through
+`cufflink-storage`, which cuts short a request that makes no progress
+([setup](setup.md)) and logs each time it does, with `backend` and
+`location` (the object's key, and its bucket for a read):
+
+| Message | Level | Fields | What it tells |
+|---------|-------|--------|---------------|
+| `A storage request made no progress in time; trying it again` | warn | `request` (`write`, `open`, `resume`), `attempt`, `attempts`, `timeout_ms` | A write had not finished within `timeout_ms` (the stall timeout for each 8 MiB it holds), or an open or a resumed read had no answer within the stall timeout; the request is sent again, and its last attempt waits up to the request timeout |
+| `A storage read stalled; resuming it from its next byte` | warn | `offset`, `size`, `resume`, `attempts`, `cause` | A read received no byte for the stall timeout, or its body broke, timed out or ended early, at byte `offset` of `size`; the rest is asked for by the object's ETag. Any byte that arrives resets the count, so `resume` counts stalls in a row. A healthy download longer than the request timeout logs one at each cut |
+
 ## Metrics
 
 The platform serves Prometheus metrics on `/metrics` (`:8080`) and each worker on `:8081/metrics` (`WORKER_HTTP_PORT`). The web runner serves its own on `/_cufflink/metrics` (`:3100`), new in R2, only with `Authorization: Bearer $WEB_STATUS_TOKEN` and not at all without the variable; a scrape of it needs the token. The extension runner does the same on its port (`RUNNER_PORT`, 3200) with `EXT_STATUS_TOKEN`. Prometheus (`infra/monitoring/prometheus.yml`) scrapes `platform:8080` and `wasm-worker:8081` every 15 seconds, and neither runner: add a scrape with its token for the runners' series. The NATS server's own metrics are not collected: its monitoring port serves JSON, which Prometheus reads only through an exporter.

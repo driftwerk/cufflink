@@ -21,6 +21,7 @@ pub(crate) struct GcsBackend {
     sa_key_path: Option<String>,
     iam_signer: Option<Arc<IamSignBlobSigner>>,
     keys: Keys,
+    stall: common::Stall,
 }
 
 impl GcsBackend {
@@ -51,6 +52,7 @@ impl GcsBackend {
             sa_key_path,
             iam_signer,
             keys: Keys::Encoded,
+            stall: common::Stall::configured(),
         })
     }
 
@@ -133,7 +135,16 @@ impl ObjectStorage for GcsBackend {
     ) -> Result<Uploaded> {
         let store = self.store_for(bucket)?;
         common::no_acl(BACKEND, options)?;
-        common::put(store.as_ref(), BACKEND, self.keys, key, data, options).await
+        common::put(
+            store.as_ref(),
+            BACKEND,
+            self.keys,
+            key,
+            data,
+            options,
+            self.stall,
+        )
+        .await
     }
 
     async fn upload_stream(
@@ -144,21 +155,38 @@ impl ObjectStorage for GcsBackend {
     ) -> Result<Uploaded> {
         let store = self.store_for(&self.bucket)?;
         let options = UploadOptions::content_type(content_type);
-        common::put_stream(store.as_ref(), BACKEND, self.keys, key, data, &options).await
+        common::put_stream(
+            store.as_ref(),
+            BACKEND,
+            self.keys,
+            key,
+            data,
+            &options,
+            self.stall,
+        )
+        .await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(self.primary.as_ref(), BACKEND, self.keys, None, key).await
+        common::get_bytes(
+            self.primary.clone(),
+            BACKEND,
+            self.keys,
+            None,
+            key,
+            self.stall,
+        )
+        .await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         let store = self.store_for(bucket)?;
-        common::get_bytes(store.as_ref(), BACKEND, self.keys, Some(bucket), key).await
+        common::get_bytes(store, BACKEND, self.keys, Some(bucket), key, self.stall).await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
         let store = self.store_for(bucket)?;
-        common::open_read(store.as_ref(), BACKEND, self.keys, bucket, key).await
+        common::open_read(store, BACKEND, self.keys, bucket, key, self.stall).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
@@ -282,6 +310,7 @@ mod tests {
             sa_key_path: None,
             iam_signer: None,
             keys: Keys::Encoded,
+            stall: common::Stall::configured(),
         }
     }
 
