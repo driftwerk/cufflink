@@ -1449,7 +1449,8 @@ its parts is copied from them inside S3 or GCS. No new feature. A service built
 for v0.40.2 deploys and runs on this platform unchanged, and a CLI of this
 release deploys to a v0.40.2 platform as a v0.40.2 CLI does. There is no
 migration. New environment variable: `OBJECT_STORE_COMPLETION_TIMEOUT_SECS`
-on the platform, the worker and the web runner ([setup](setup.md)).
+on the platform, the worker and the web runner, which all reach object
+storage through `cufflink-storage` ([setup](setup.md)).
 
 - A part of a multipart upload to S3 or GCS is cut short and sent again
   as a whole write is: a part that has not finished within
