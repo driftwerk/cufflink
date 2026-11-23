@@ -18,6 +18,7 @@ pub(crate) struct PrefixedBackend {
     kind: &'static str,
     attributes: bool,
     keys: Keys,
+    stall: common::Stall,
 }
 
 impl PrefixedBackend {
@@ -28,6 +29,7 @@ impl PrefixedBackend {
             kind: "memory",
             attributes: true,
             keys: Keys::Encoded,
+            stall: common::Stall::configured(),
         }
     }
 
@@ -42,6 +44,7 @@ impl PrefixedBackend {
             kind: "local",
             attributes: false,
             keys: Keys::Encoded,
+            stall: common::Stall::configured(),
         })
     }
 
@@ -110,6 +113,7 @@ impl ObjectStorage for PrefixedBackend {
             key,
             data,
             self.put_options(options),
+            self.stall,
         )
         .await
     }
@@ -127,12 +131,21 @@ impl ObjectStorage for PrefixedBackend {
             key,
             data,
             self.put_options(&UploadOptions::content_type(content_type)),
+            self.stall,
         )
         .await
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(Arc::new(self.primary()), self.kind, self.keys, None, key).await
+        common::get_bytes(
+            Arc::new(self.primary()),
+            self.kind,
+            self.keys,
+            None,
+            key,
+            self.stall,
+        )
+        .await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
@@ -142,6 +155,7 @@ impl ObjectStorage for PrefixedBackend {
             self.keys,
             Some(bucket),
             key,
+            self.stall,
         )
         .await
     }
@@ -153,6 +167,7 @@ impl ObjectStorage for PrefixedBackend {
             self.keys,
             bucket,
             key,
+            self.stall,
         )
         .await
     }

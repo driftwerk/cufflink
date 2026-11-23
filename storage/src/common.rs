@@ -120,10 +120,11 @@ pub(crate) fn request_timeout() -> Duration {
 }
 
 /// How a storage request that makes no progress is cut short and tried
-/// again: a write that has not finished within `timeout`, an open with no
-/// answer within it, and a read that receives nothing for it, which resumes
-/// from its next byte. A request is tried at most `attempts` times, and its
-/// last attempt is bounded only by the request timeout, the `ceiling`.
+/// again: a write that has not finished within `timeout` for each part's
+/// worth of its bytes, an open with no answer within `timeout`, and a read
+/// that receives nothing for it, which resumes from its next byte. A request
+/// is tried at most `attempts` times in a row, and its last attempt is
+/// bounded only by the request timeout, the `ceiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stall {
     timeout: Duration,
@@ -141,27 +142,26 @@ impl Stall {
         }
     }
 
-    fn cuts_short(self) -> bool {
-        self.attempts > 1 && self.timeout < self.ceiling
+    fn cuts(self, deadline: Duration) -> bool {
+        self.attempts > 1 && deadline < self.ceiling
     }
 
     fn outlasts_ceiling(self) -> bool {
         self.attempts > 1 && self.timeout >= self.ceiling
     }
 
-    fn cut_attempts(self) -> u32 {
-        if self.cuts_short() {
-            self.attempts - 1
-        } else {
-            0
-        }
+    fn for_upload(self, size: usize) -> Duration {
+        let parts = size.div_ceil(Multipart::DEFAULT.min_part_size).max(1);
+        self.timeout
+            .saturating_mul(u32::try_from(parts).unwrap_or(u32::MAX))
     }
 }
 
 /// Runs `attempt` until it answers: each attempt but the last is abandoned
-/// once the stall timeout passes, and the last is left to the ceiling.
+/// once `deadline` passes, and the last is left to the ceiling.
 async fn attempted<T, Fut>(
     stall: Stall,
+    deadline: Duration,
     backend: &'static str,
     request: &'static str,
     location: &str,
@@ -170,8 +170,13 @@ async fn attempted<T, Fut>(
 where
     Fut: std::future::Future<Output = object_store::Result<T>>,
 {
-    for tried in 1..=stall.cut_attempts() {
-        match tokio::time::timeout(stall.timeout, attempt()).await {
+    let cut = if stall.cuts(deadline) {
+        stall.attempts - 1
+    } else {
+        0
+    };
+    for tried in 1..=cut {
+        match tokio::time::timeout(deadline, attempt()).await {
             Ok(answered) => return answered,
             Err(_) => tracing::warn!(
                 backend,
@@ -179,7 +184,7 @@ where
                 location,
                 attempt = tried,
                 attempts = stall.attempts,
-                timeout_ms = millis(stall.timeout),
+                timeout_ms = millis(deadline),
                 "A storage request made no progress in time; trying it again"
             ),
         }
@@ -237,12 +242,13 @@ pub(crate) async fn put(
     key: &str,
     data: Vec<u8>,
     options: &UploadOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
     let opts = PutOptions {
         attributes: attributes(options),
         ..Default::default()
     };
-    put_with(store, backend, keys, key, data, opts).await
+    put_with(store, backend, keys, key, data, opts, stall).await
 }
 
 /// When an upload goes up in parts: above `threshold` bytes, in parts of at
@@ -304,6 +310,7 @@ pub(crate) async fn put_with(
     key: &str,
     data: Vec<u8>,
     opts: PutOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
     put_in(
         store,
@@ -313,7 +320,7 @@ pub(crate) async fn put_with(
         data,
         opts,
         Multipart::DEFAULT,
-        Stall::configured(),
+        stall,
     )
     .await
 }
@@ -353,10 +360,11 @@ async fn put_whole(
     opts: PutOptions,
     stall: Stall,
 ) -> object_store::Result<PutResult> {
+    let deadline = stall.for_upload(data.len());
     let payload = PutPayload::from(data);
     match opts.mode {
         PutMode::Overwrite => {
-            attempted(stall, backend, "write", key, || {
+            attempted(stall, deadline, backend, "write", key, || {
                 store.put_opts(path, payload.clone(), opts.clone())
             })
             .await
@@ -372,12 +380,13 @@ pub(crate) async fn put_stream(
     key: &str,
     data: BoxStream<'static, Result<Bytes>>,
     options: &UploadOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
     let opts = PutOptions {
         attributes: attributes(options),
         ..Default::default()
     };
-    put_stream_with(store, backend, keys, key, data, opts).await
+    put_stream_with(store, backend, keys, key, data, opts, stall).await
 }
 
 pub(crate) async fn put_stream_with(
@@ -387,6 +396,7 @@ pub(crate) async fn put_stream_with(
     key: &str,
     data: BoxStream<'static, Result<Bytes>>,
     opts: PutOptions,
+    stall: Stall,
 ) -> Result<Uploaded> {
     put_stream_in(
         store,
@@ -396,7 +406,7 @@ pub(crate) async fn put_stream_with(
         data,
         opts,
         Multipart::DEFAULT,
-        Stall::configured(),
+        stall,
     )
     .await
 }
@@ -695,16 +705,6 @@ pub(crate) async fn get_bytes(
     keys: Keys,
     bucket: Option<&str>,
     key: &str,
-) -> Result<Vec<u8>> {
-    get_bytes_in(store, backend, keys, bucket, key, Stall::configured()).await
-}
-
-async fn get_bytes_in(
-    store: Arc<dyn ObjectStore>,
-    backend: &'static str,
-    keys: Keys,
-    bucket: Option<&str>,
-    key: &str,
     stall: Stall,
 ) -> Result<Vec<u8>> {
     let path = keys.path(key)?;
@@ -713,26 +713,15 @@ async fn get_bytes_in(
         .await
         .wrap_err_with(|| format!("{backend} download failed for {location}"))?;
     let capacity = usize::try_from(got.meta.size).unwrap_or_default();
-    Read::resumable(store, backend, path, location.clone(), got, stall)
+    Read::resumable(store, backend, path, location, got, stall)
         .try_fold(Vec::with_capacity(capacity), |mut bytes, chunk| {
             bytes.extend_from_slice(&chunk);
             future::ready(Ok(bytes))
         })
         .await
-        .wrap_err_with(|| format!("{backend} read body failed for {location}"))
 }
 
 pub(crate) async fn open_read(
-    store: Arc<dyn ObjectStore>,
-    backend: &'static str,
-    keys: Keys,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<ObjectReader>> {
-    open_read_in(store, backend, keys, bucket, key, Stall::configured()).await
-}
-
-async fn open_read_in(
     store: Arc<dyn ObjectStore>,
     backend: &'static str,
     keys: Keys,
@@ -761,17 +750,18 @@ async fn first_read(
     location: &str,
     stall: Stall,
 ) -> object_store::Result<GetResult> {
-    attempted(stall, backend, "open", location, || {
+    attempted(stall, stall.timeout, backend, "open", location, || {
         store.get_opts(path, GetOptions::default())
     })
     .await
 }
 
 /// A read of one object that resumes from its next byte when its body stalls
-/// or breaks, until it stalls on as many attempts in a row without a byte.
-/// Each resume asks for the rest of the object by the ETag it was first
-/// answered with, so an object that changed fails the read instead of mixing
-/// two versions, and one answered without an ETag is never resumed.
+/// or breaks, until it stalls on as many attempts in a row without a byte;
+/// its last attempt waits for the ceiling. Each resume asks for the rest of
+/// the object by the ETag it was first answered with, so an object that
+/// changed fails the read instead of mixing two versions, and one answered
+/// without an ETag is never cut short.
 struct Read {
     store: Arc<dyn ObjectStore>,
     backend: &'static str,
@@ -809,13 +799,20 @@ impl Read {
         stream::try_unfold(read, Self::chunk).boxed()
     }
 
+    fn resumes_left(&self) -> bool {
+        self.etag.is_some()
+            && self.stall.cuts(self.stall.timeout)
+            && self.resumes + 1 < self.stall.attempts
+    }
+
     async fn chunk(mut self) -> Result<Option<(Bytes, Self)>> {
+        let mut deadline = tokio::time::Instant::now() + self.stall.timeout;
         loop {
             if self.next >= self.size {
                 return Ok(None);
             }
-            let waited = if self.stall.cuts_short() {
-                tokio::time::timeout(self.stall.timeout, self.body.next()).await
+            let waited = if self.resumes_left() {
+                tokio::time::timeout_at(deadline, self.body.next()).await
             } else {
                 Ok(self.body.next().await)
             };
@@ -831,6 +828,7 @@ impl Read {
                 Err(_) => format!("no data for {} ms", millis(self.stall.timeout)),
             };
             self = self.resumed(cause).await?;
+            deadline = tokio::time::Instant::now() + self.stall.timeout;
         }
     }
 
@@ -843,11 +841,8 @@ impl Read {
     }
 
     async fn resumed(mut self, cause: String) -> Result<Self> {
-        let etag = match &self.etag {
-            Some(etag) if self.stall.cuts_short() && self.resumes + 1 < self.stall.attempts => {
-                etag.clone()
-            }
-            _ => return Err(self.failed(cause)),
+        let Some(etag) = self.etag.clone().filter(|_| self.resumes_left()) else {
+            return Err(self.failed(cause));
         };
         self.resumes += 1;
         tracing::warn!(
@@ -865,9 +860,14 @@ impl Read {
             if_match: Some(etag),
             ..Default::default()
         };
-        let got = attempted(self.stall, self.backend, "resume", &self.location, || {
-            self.store.get_opts(&self.path, rest.clone())
-        })
+        let got = attempted(
+            self.stall,
+            self.stall.timeout,
+            self.backend,
+            "resume",
+            &self.location,
+            || self.store.get_opts(&self.path, rest.clone()),
+        )
         .await
         .map_err(|e| match e {
             object_store::Error::Precondition { .. } => {
@@ -1021,9 +1021,9 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::{
-        already_aborted, get_bytes_in, open_read_in, put_in, put_stream_in, rechunked,
-        request_timeout, retry_timeout, timed_out_requests_cannot_retry, Keys, Multipart, Put,
-        Stall, ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS,
+        already_aborted, get_bytes, open_read, put_in, put_stream_in, rechunked, request_timeout,
+        retry_timeout, timed_out_requests_cannot_retry, Keys, Multipart, Put, Stall,
+        ENV_REQUEST_TIMEOUT_SECS, ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS,
         ENV_STALL_TIMEOUT_SECS, MAX_PARTS,
     };
     use async_trait::async_trait;
@@ -1072,12 +1072,26 @@ mod tests {
         StalledParts,
         StalledWrites(usize),
         SlowWrites(Duration),
-        StalledReads {
-            first: usize,
-            times: usize,
+        Reads {
+            answers: &'static [Answer],
             etag: bool,
         },
         Trickle(usize),
+    }
+
+    /// How the probe answers one read, in the order it is asked: `Stalls`
+    /// sends that many bytes and then nothing until the request times out,
+    /// `Ends` sends them and ends, `Pauses` sends the rest after a pause,
+    /// `Empties` sends them and then empty frames, `Hangs` never answers and
+    /// `Whole` answers with the whole object whatever range was asked.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Answer {
+        Stalls(usize),
+        Ends(usize),
+        Pauses(Duration),
+        Empties(usize),
+        Hangs,
+        Whole,
     }
 
     #[derive(Debug, Default)]
@@ -1173,13 +1187,29 @@ mod tests {
                     Some(GetRange::Offset(offset)) => Some(offset),
                     _ => None,
                 });
-            let got = self.inner.get_opts(location, options).await?;
-            match self.fault {
-                Fault::StalledReads { first, times, etag } if asked < times => {
-                    stalled(got, if asked == 0 { first } else { 0 }, etag).await
+            let (answer, etag) = match self.fault {
+                Fault::Reads { answers, etag } => (answers.get(asked).copied(), etag),
+                Fault::Trickle(sent) => (Some(Answer::Stalls(sent)), true),
+                _ => (None, true),
+            };
+            match answer {
+                None => self.inner.get_opts(location, options).await,
+                Some(Answer::Hangs) => futures_util::future::pending().await,
+                Some(Answer::Whole) => {
+                    let whole = GetOptions {
+                        range: None,
+                        ..options
+                    };
+                    answered(
+                        self.inner.get_opts(location, whole).await?,
+                        Answer::Whole,
+                        etag,
+                    )
+                    .await
                 }
-                Fault::Trickle(sent) => stalled(got, sent, true).await,
-                _ => Ok(got),
+                Some(answer) => {
+                    answered(self.inner.get_opts(location, options).await?, answer, etag).await
+                }
             }
         }
 
@@ -1214,7 +1244,13 @@ mod tests {
         }
     }
 
-    async fn stalled(got: GetResult, sent: usize, etag: bool) -> object_store::Result<GetResult> {
+    const CEILING: Duration = Duration::from_secs(30);
+
+    async fn answered(
+        got: GetResult,
+        answer: Answer,
+        etag: bool,
+    ) -> object_store::Result<GetResult> {
         let (mut meta, range, attributes, extensions) = (
             got.meta.clone(),
             got.range.clone(),
@@ -1225,13 +1261,37 @@ mod tests {
             meta.e_tag = None;
         }
         let body = got.bytes().await?;
-        let head = body.slice(..sent.min(body.len()));
+        let head = |sent: usize| {
+            let head = body.slice(..sent.min(body.len()));
+            futures_util::stream::once(async move { Ok::<_, object_store::Error>(head) })
+        };
+        let timed_out = futures_util::stream::once(async {
+            tokio::time::sleep(CEILING).await;
+            Err(object_store::Error::Generic {
+                store: "probe",
+                source: "the request timed out".into(),
+            })
+        });
+        let stream = match answer {
+            Answer::Stalls(sent) => head(sent).chain(timed_out).boxed(),
+            Answer::Ends(sent) => head(sent).boxed(),
+            Answer::Pauses(pause) => futures_util::stream::once(async move {
+                tokio::time::sleep(pause).await;
+                Ok(body)
+            })
+            .boxed(),
+            Answer::Empties(sent) => head(sent)
+                .chain(
+                    futures_util::stream::repeat_with(Bytes::new).then(|empty| async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok(empty)
+                    }),
+                )
+                .boxed(),
+            Answer::Hangs | Answer::Whole => head(usize::MAX).boxed(),
+        };
         Ok(GetResult {
-            payload: GetResultPayload::Stream(
-                futures_util::stream::once(async move { Ok::<_, object_store::Error>(head) })
-                    .chain(futures_util::stream::pending())
-                    .boxed(),
-            ),
+            payload: GetResultPayload::Stream(stream),
             meta,
             range,
             attributes,
@@ -1660,7 +1720,7 @@ mod tests {
     const STALL: Stall = Stall {
         timeout: Duration::from_secs(1),
         attempts: 3,
-        ceiling: Duration::from_secs(30),
+        ceiling: CEILING,
     };
 
     async fn stored(probe: &Probe, key: &str, data: &[u8]) {
@@ -1675,14 +1735,21 @@ mod tests {
         probe.counts.offsets.lock().expect("offsets").clone()
     }
 
-    async fn read(probe: &Arc<Probe>, key: &str) -> eyre::Result<Vec<u8>> {
-        let reader = open_read_in(
+    fn reads(answers: &'static [Answer]) -> Arc<Probe> {
+        Arc::new(Probe::failing(Fault::Reads {
+            answers,
+            etag: true,
+        }))
+    }
+
+    async fn read_with(probe: &Arc<Probe>, key: &str, stall: Stall) -> eyre::Result<Vec<u8>> {
+        let reader = open_read(
             Arc::clone(probe) as Arc<dyn ObjectStore>,
             "memory",
             Keys::Encoded,
             "bucket",
             key,
-            STALL,
+            stall,
         )
         .await?
         .expect("found");
@@ -1693,6 +1760,22 @@ mod tests {
                 Ok(bytes)
             })
             .await
+    }
+
+    async fn read(probe: &Arc<Probe>, key: &str) -> eyre::Result<Vec<u8>> {
+        read_with(probe, key, STALL).await
+    }
+
+    async fn read_back(answers: &'static [Answer]) -> (eyre::Result<Vec<u8>>, Vec<Option<u64>>) {
+        let probe = reads(answers);
+        stored(&probe, "site/bundle", &payload(1000)).await;
+        let read = read(&probe, "site/bundle").await;
+        (read, offsets(&probe))
+    }
+
+    fn failed_with(read: eyre::Result<Vec<u8>>, cause: &str) {
+        let failed = read.expect_err("failed");
+        assert!(format!("{failed:#}").contains(cause), "{failed:#}");
     }
 
     #[test]
@@ -1713,9 +1796,8 @@ mod tests {
                         ceiling: Duration::from_secs(30),
                     }
                 );
-                assert!(stall.cuts_short());
+                assert!(stall.cuts(stall.timeout));
                 assert!(!stall.outlasts_ceiling());
-                assert_eq!(stall.cut_attempts(), 2);
             },
         );
         super::test_env::with(
@@ -1732,22 +1814,28 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_timeout_not_below_the_request_timeout_or_one_attempt_cuts_nothing_short() {
+    fn a_deadline_not_below_the_request_timeout_or_one_attempt_cuts_nothing_short() {
         let at_ceiling = Stall {
-            timeout: Duration::from_secs(30),
+            timeout: CEILING,
             ..STALL
         };
-        assert!(!at_ceiling.cuts_short());
+        assert!(!at_ceiling.cuts(at_ceiling.timeout));
         assert!(at_ceiling.outlasts_ceiling());
-        assert_eq!(at_ceiling.cut_attempts(), 0);
+        assert!(!STALL.cuts(CEILING));
 
         let once = Stall {
             attempts: 1,
             ..STALL
         };
-        assert!(!once.cuts_short());
+        assert!(!once.cuts(once.timeout));
         assert!(!once.outlasts_ceiling());
-        assert_eq!(once.cut_attempts(), 0);
+    }
+
+    #[test]
+    fn an_upload_has_the_stall_timeout_for_each_part_of_its_bytes() {
+        let part = Multipart::DEFAULT.min_part_size;
+        let deadlines = [0, 100, part, part + 1, 4 * part].map(|size| STALL.for_upload(size));
+        assert_eq!(deadlines, [1, 1, 1, 2, 4].map(Duration::from_secs));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1813,22 +1901,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stalled_read_resumes_from_its_next_byte_by_its_etag() {
         let data = payload(1000);
-        let probe = Arc::new(Probe::failing(Fault::StalledReads {
-            first: 100,
-            times: 1,
-            etag: true,
-        }));
-        stored(&probe, "site/bundle", &data).await;
-        assert_eq!(read(&probe, "site/bundle").await.expect("read"), data);
-        assert_eq!(offsets(&probe), [None, Some(100)]);
+        let (read, offsets) = read_back(&[Answer::Stalls(100)]).await;
+        assert_eq!(read.expect("read"), data);
+        assert_eq!(offsets, [None, Some(100)]);
 
-        let downloaded = Arc::new(Probe::failing(Fault::StalledReads {
-            first: 100,
-            times: 1,
-            etag: true,
-        }));
+        let downloaded = reads(&[Answer::Stalls(100)]);
         stored(&downloaded, "site/bundle", &data).await;
-        let bytes = get_bytes_in(
+        let bytes = get_bytes(
             Arc::clone(&downloaded) as Arc<dyn ObjectStore>,
             "memory",
             Keys::Encoded,
@@ -1840,6 +1919,35 @@ mod tests {
         .expect("downloaded");
         assert_eq!(bytes, data);
         assert_eq!(offsets(&downloaded), [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_whose_body_ends_early_resumes_from_its_next_byte() {
+        let (read, offsets) = read_back(&[Answer::Ends(100)]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_cannot_resume_fails_on_a_body_that_ends_early() {
+        let probe = reads(&[Answer::Ends(100)]);
+        stored(&probe, "site/short", &payload(1000)).await;
+        failed_with(
+            read_with(&probe, "site/short", UNCUT).await,
+            "the body ended at byte 100 of 1000",
+        );
+        assert_eq!(offsets(&probe), [None]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_and_a_resume_that_never_answer_are_sent_again() {
+        let (read, offsets) = read_back(&[Answer::Hangs]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, None]);
+
+        let (read, offsets) = read_back(&[Answer::Stalls(100), Answer::Hangs]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(100), Some(100)]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1857,46 +1965,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_read_that_stalls_on_every_attempt_in_a_row_fails_at_the_cap() {
-        let probe = Arc::new(Probe::failing(Fault::StalledReads {
-            first: 100,
-            times: usize::MAX,
-            etag: true,
-        }));
-        stored(&probe, "site/dead", &payload(1000)).await;
-        let failed = read(&probe, "site/dead").await.expect_err("stalled");
-        assert!(
-            failed.to_string().contains("no data for 1000 ms"),
-            "{failed}"
-        );
-        assert_eq!(offsets(&probe), [None, Some(100), Some(100)]);
+    async fn empty_frames_are_not_progress() {
+        let (read, offsets) = read_back(&[Answer::Empties(100)]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(100)]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_read_answered_without_an_etag_is_never_resumed() {
-        let probe = Arc::new(Probe::failing(Fault::StalledReads {
-            first: 100,
-            times: 1,
+    async fn the_last_attempt_of_a_read_waits_for_the_ceiling() {
+        let pause = Answer::Pauses(Duration::from_secs(5));
+        let (read, offsets) = read_back(&[pause, pause, pause]).await;
+        assert_eq!(read.expect("read"), payload(1000));
+        assert_eq!(offsets, [None, Some(0), Some(0)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_stalls_on_every_attempt_in_a_row_fails_at_the_cap() {
+        let stalls = [Answer::Stalls(100), Answer::Stalls(0), Answer::Stalls(0)];
+        let (read, offsets) = read_back(&stalls).await;
+        failed_with(read, "the request timed out");
+        assert_eq!(offsets, [None, Some(100), Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_answered_without_an_etag_is_never_cut_short() {
+        let probe = Arc::new(Probe::failing(Fault::Reads {
+            answers: &[Answer::Stalls(100)],
             etag: false,
         }));
         stored(&probe, "site/unpinned", &payload(1000)).await;
-        let failed = read(&probe, "site/unpinned").await.expect_err("stalled");
-        assert!(
-            failed.to_string().contains("no data for 1000 ms"),
-            "{failed}"
-        );
+        failed_with(read(&probe, "site/unpinned").await, "the request timed out");
         assert_eq!(offsets(&probe), [None]);
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_resumed_answer_from_another_byte_fails_the_read() {
+        let (read, offsets) = read_back(&[Answer::Ends(100), Answer::Whole]).await;
+        failed_with(
+            read,
+            "the resumed read answered from byte 0 of 1000, not 100 of 1000",
+        );
+        assert_eq!(offsets, [None, Some(100)]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_read_of_an_object_that_changed_fails_instead_of_mixing_versions() {
-        let probe = Arc::new(Probe::failing(Fault::StalledReads {
-            first: 100,
-            times: 1,
-            etag: true,
-        }));
+        let probe = reads(&[Answer::Stalls(100)]);
         stored(&probe, "site/changed", &payload(1000)).await;
-        let mut reader = open_read_in(
+        let mut reader = open_read(
             Arc::clone(&probe) as Arc<dyn ObjectStore>,
             "memory",
             Keys::Encoded,

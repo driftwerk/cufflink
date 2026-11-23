@@ -383,8 +383,8 @@ The platform, the worker and the web runner reach object storage through
 
 | Message | Level | Fields | What it tells |
 |---------|-------|--------|---------------|
-| `A storage request made no progress in time; trying it again` | warn | `request` (`write`, `open`, `resume`), `attempt`, `attempts`, `timeout_ms` | A write had not finished, or an open or a resumed read had no answer, within `OBJECT_STORE_STALL_TIMEOUT_SECS`; the request is sent again, and its last attempt waits up to the request timeout |
-| `A storage read stalled; resuming it from its next byte` | warn | `offset`, `size`, `resume`, `attempts`, `cause` | A read received nothing for the stall timeout, or its body broke or ended early, at byte `offset` of `size`; the rest is asked for by the object's ETag. Any byte that arrives resets the count, so `resume` counts stalls in a row |
+| `A storage request made no progress in time; trying it again` | warn | `request` (`write`, `open`, `resume`), `attempt`, `attempts`, `timeout_ms` | A write had not finished within `timeout_ms` (the stall timeout for each 8 MiB it holds), or an open or a resumed read had no answer within the stall timeout; the request is sent again, and its last attempt waits up to the request timeout |
+| `A storage read stalled; resuming it from its next byte` | warn | `offset`, `size`, `resume`, `attempts`, `cause` | A read received no byte for the stall timeout, or its body broke, timed out or ended early, at byte `offset` of `size`; the rest is asked for by the object's ETag. Any byte that arrives resets the count, so `resume` counts stalls in a row. A healthy download longer than the request timeout logs one at each cut |
 
 ## Metrics
 
