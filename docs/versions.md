@@ -1448,8 +1448,9 @@ through `cufflink-storage` ([setup](setup.md)).
   the count of attempts, and the last answer waits up to the request
   timeout. A download longer than the request timeout now finishes,
   resuming at each cut, where it failed before. Downloads, the web
-  runner's bundle download and every streamed read go through it. A body that ends before the object's
-  size is now an error, where it was a short read.
+  runner's bundle download and every streamed read go through it. A body
+  that ends before the object's size is now an error, where it was a short
+  read.
 - A web bundle's assembly fetches up to four parts ahead of the one it
   streams, in order, so its reads overlap its writes. An assembly holds at
   most five parts in memory, the one it streams and four ahead, besides

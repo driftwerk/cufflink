@@ -1088,8 +1088,10 @@ mod tests {
     /// How the probe answers one read, in the order it is asked: `Stalls`
     /// sends that many bytes and then nothing until the request times out,
     /// `Ends` sends them and ends, `Pauses` sends the rest after a pause,
-    /// `Empties` sends them and then empty frames, `Hangs` never answers and
-    /// `Whole` answers with the whole object whatever range was asked.
+    /// `Empties` sends them and then empty frames, `Hangs` never answers,
+    /// `Whole` answers with the whole object whatever range was asked and
+    /// `Other` answers from another object, with the range asked but no ETag
+    /// pin.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Answer {
         Stalls(usize),
