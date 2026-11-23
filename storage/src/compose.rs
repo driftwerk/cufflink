@@ -23,11 +23,18 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://storage.googleapis.com";
 
 const MAX_SOURCES: usize = 32;
 
+/// How the store's JSON API is reached: its HTTP client and base URL,
+/// shared by every bucket's composer.
+#[derive(Debug, Clone)]
+pub(crate) struct Api {
+    pub(crate) client: HttpClient,
+    pub(crate) base_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Composer {
     pub(crate) store: Arc<GoogleCloudStorage>,
-    pub(crate) client: HttpClient,
-    pub(crate) base_url: String,
+    pub(crate) api: Api,
     pub(crate) bucket: String,
     pub(crate) stall: Stall,
 }
@@ -163,7 +170,7 @@ impl Composer {
             .method(http::Method::POST)
             .uri(format!(
                 "{}/storage/v1/b/{}/o/{}/compose",
-                self.base_url,
+                self.api.base_url,
                 utf8_percent_encode(&self.bucket, NON_ALPHANUMERIC),
                 utf8_percent_encode(into.as_ref(), NON_ALPHANUMERIC)
             ))
@@ -174,7 +181,7 @@ impl Composer {
         }
         .body(HttpRequestBody::from(body.to_string()))
         .map_err(|e| generic(Box::new(e)))?;
-        let answer = copied::sent(&self.client, BACKEND, into.as_ref(), request).await?;
+        let answer = copied::sent(&self.api.client, BACKEND, into.as_ref(), request).await?;
         let composed: Composed =
             serde_json::from_slice(&answer).map_err(|e| generic(Box::new(e)))?;
         Ok(PutResult {
