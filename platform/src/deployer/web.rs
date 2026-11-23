@@ -323,7 +323,44 @@ struct Spent {
     turn: Duration,
     slot: Duration,
     read_wait: Duration,
+    write_wait: Duration,
+    complete: Duration,
     stream: Duration,
+}
+
+/// What an assembly's stream spent waiting on: `read`, its parts' reads,
+/// while the upload asked for bytes, and `write`, the upload's writes while
+/// it asked for none; `ended` is when its last byte was handed over.
+#[derive(Debug, Default)]
+struct Waits {
+    read: AtomicU64,
+    write: AtomicU64,
+    ended: std::sync::OnceLock<Instant>,
+}
+
+impl Waits {
+    fn add(spent: &AtomicU64, since: Instant) {
+        spent.fetch_add(
+            u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn of(spent: &AtomicU64) -> Duration {
+        Duration::from_micros(spent.load(Ordering::Relaxed))
+    }
+
+    /// The upload's writes: those it waited on while it held bytes, and
+    /// those after its last byte, its last parts, up to its completion.
+    fn writing(&self, complete: Duration) -> Duration {
+        let after_last_byte = self
+            .ended
+            .get()
+            .map(Instant::elapsed)
+            .unwrap_or_default()
+            .saturating_sub(complete);
+        Self::of(&self.write) + after_last_byte
+    }
 }
 
 fn require_assembly(assembly: &Assembly) -> PlatformResult<i64> {
@@ -438,30 +475,42 @@ fn verified(
     storage: &S3Storage,
     bundle: &Artifact,
     parts: Vec<Artifact>,
-    waited: Arc<AtomicU64>,
+    waits: Arc<Waits>,
 ) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
     let (storage, sha256) = (storage.clone(), bundle.hash.clone());
     let read = read_ahead(parts, move |part| {
         fetched(storage.clone(), part, sha256.clone())
     });
     stream::try_unfold(
-        (read, Sha256::new(), bundle.hash.clone(), waited),
-        |(mut read, mut digest, sha256, waited)| async move {
+        (
+            read,
+            Sha256::new(),
+            bundle.hash.clone(),
+            waits,
+            None::<Instant>,
+        ),
+        |(mut read, mut digest, sha256, waits, handed)| async move {
+            if let Some(handed) = handed {
+                Waits::add(&waits.write, handed);
+            }
             let asked = Instant::now();
             let next = read.try_next().await;
-            waited.fetch_add(
-                u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            Waits::add(&waits.read, asked);
             match next? {
                 Some(chunk) => {
                     digest.update(&chunk);
-                    Ok(Some((chunk, (read, digest, sha256, waited))))
+                    Ok(Some((
+                        chunk,
+                        (read, digest, sha256, waits, Some(Instant::now())),
+                    )))
                 }
-                None => Object::Bundle
-                    .require_content(&sha256, &hex::encode(digest.finalize()))
-                    .map(|()| None)
-                    .map_err(eyre::Report::new),
+                None => {
+                    let _ = waits.ended.set(Instant::now());
+                    Object::Bundle
+                        .require_content(&sha256, &hex::encode(digest.finalize()))
+                        .map(|()| None)
+                        .map_err(eyre::Report::new)
+                }
             }
         },
     )
@@ -472,20 +521,20 @@ async fn streamed(
     storage: &S3Storage,
     bundle: &Artifact,
     parts: Vec<Artifact>,
-    waited: Arc<AtomicU64>,
-) -> PlatformResult<Stored> {
+    waits: Arc<Waits>,
+) -> PlatformResult<(Stored, Option<Duration>)> {
     let streamed = storage
         .upload_stream(
             &bundle.s3_key,
-            verified(storage, bundle, parts, waited),
+            verified(storage, bundle, parts, waits),
             Object::Bundle.content_type(),
         )
         .await;
     match streamed {
-        Ok(_) => Ok(Stored::Uploaded),
+        Ok(uploaded) => Ok((Stored::Uploaded, uploaded.completion)),
         Err(e) => match stored_size(storage, &bundle.s3_key).await {
             Ok(Some(stored)) if i64::try_from(stored).ok() == Some(bundle.size) => {
-                Ok(Stored::Present)
+                Ok((Stored::Present, None))
             }
             _ => Err(e.downcast::<PlatformError>().unwrap_or_else(|e| {
                 PlatformError::Internal(format!("Failed to assemble {}: {e}", bundle.s3_key))
@@ -600,10 +649,12 @@ pub(crate) async fn assemble(
     let mut spent = Spent::default();
     let assembled = assembling(state, service_id, sha256, assembly, uploaded_by, &mut spent).await;
     let (bundle, parts, size) = (short(sha256), assembly.parts.len(), assembly.size);
-    let (turn_ms, slot_ms, read_wait_ms, stream_ms, elapsed_ms) = (
+    let (turn_ms, slot_ms, read_wait_ms, write_wait_ms, complete_ms, stream_ms, elapsed_ms) = (
         millis(spent.turn),
         millis(spent.slot),
         millis(spent.read_wait),
+        millis(spent.write_wait),
+        millis(spent.complete),
         millis(spent.stream),
         millis(started.elapsed()),
     );
@@ -618,6 +669,8 @@ pub(crate) async fn assemble(
             turn_ms,
             slot_ms,
             read_wait_ms,
+            write_wait_ms,
+            complete_ms,
             stream_ms,
             elapsed_ms,
             "Web bundle assembly answered"
@@ -630,6 +683,8 @@ pub(crate) async fn assemble(
             turn_ms,
             slot_ms,
             read_wait_ms,
+            write_wait_ms,
+            complete_ms,
             stream_ms,
             elapsed_ms,
             error = %e,
@@ -681,12 +736,18 @@ async fn assembling(
             .await
             .map_err(|e| PlatformError::Internal(format!("No assembly can start: {e}")))?;
         spent.slot = asked.elapsed();
-        let waited = Arc::new(AtomicU64::new(0));
+        let waits = Arc::new(Waits::default());
         let streaming = Instant::now();
-        let streamed = streamed(storage, &bundle, parts, Arc::clone(&waited)).await;
+        let streamed = streamed(storage, &bundle, parts, Arc::clone(&waits)).await;
         spent.stream = streaming.elapsed();
-        spent.read_wait = Duration::from_micros(waited.load(Ordering::Relaxed));
-        streamed?
+        spent.read_wait = Waits::of(&waits.read);
+        spent.complete = streamed
+            .as_ref()
+            .ok()
+            .and_then(|(_, completion)| *completion)
+            .unwrap_or_default();
+        spent.write_wait = waits.writing(spent.complete);
+        streamed?.0
     };
     let stored = record_upload(state, service_id, (bundle, stored), uploaded_by).await?;
     remove_parts(state, service_id, recorded).await;

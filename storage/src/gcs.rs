@@ -1,5 +1,6 @@
 use crate::common::{self, Keys};
 use crate::gcs_v4::{sign_url, BlobSigner, IamSignBlobSigner};
+use crate::parts::Parted;
 use crate::{Credential, ObjectMeta, ObjectReader, ObjectStorage, UploadOptions, Uploaded};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,6 +18,7 @@ const ENV_SA_KEY_PATH: &str = "GOOGLE_APPLICATION_CREDENTIALS";
 #[derive(Clone)]
 pub(crate) struct GcsBackend {
     primary: Arc<GoogleCloudStorage>,
+    writes: Arc<Parted<GoogleCloudStorage>>,
     bucket: String,
     sa_key_path: Option<String>,
     iam_signer: Option<Arc<IamSignBlobSigner>>,
@@ -29,7 +31,9 @@ impl GcsBackend {
         let bucket = vars(ENV_BUCKET)
             .ok_or_else(|| eyre::eyre!("Missing required environment variable: {}", ENV_BUCKET))?;
         let sa_key_path = vars(ENV_SA_KEY_PATH);
+        let stall = common::Stall::configured();
         let primary = build_store(&bucket, sa_key_path.as_deref())?;
+        let writes = build_writer(Arc::clone(&primary), &bucket, sa_key_path.as_deref(), stall)?;
         let iam_signer = match sa_key_path.as_deref() {
             Some(_) => None,
             None => Some(Arc::new(IamSignBlobSigner::new()?)),
@@ -48,11 +52,12 @@ impl GcsBackend {
 
         Ok(Self {
             primary,
+            writes,
             bucket,
             sa_key_path,
             iam_signer,
             keys: Keys::Encoded,
-            stall: common::Stall::configured(),
+            stall,
         })
     }
 
@@ -62,6 +67,20 @@ impl GcsBackend {
             return Ok(Arc::clone(&self.primary));
         }
         build_store(bucket, self.sa_key_path.as_deref())
+    }
+
+    fn writer_for(&self, bucket: &str) -> Result<Arc<Parted<GoogleCloudStorage>>> {
+        common::admit_bucket(&self.bucket, self.keys, bucket)?;
+        if bucket == self.bucket {
+            return Ok(Arc::clone(&self.writes));
+        }
+        let sa_key_path = self.sa_key_path.as_deref();
+        build_writer(
+            build_store(bucket, sa_key_path)?,
+            bucket,
+            sa_key_path,
+            self.stall,
+        )
     }
 
     async fn presign(
@@ -95,10 +114,37 @@ impl GcsBackend {
 }
 
 fn build_store(bucket: &str, sa_key_path: Option<&str>) -> Result<Arc<GoogleCloudStorage>> {
+    built(
+        bucket,
+        sa_key_path,
+        common::client_options(),
+        common::retry_config(),
+    )
+}
+
+fn build_writer(
+    store: Arc<GoogleCloudStorage>,
+    bucket: &str,
+    sa_key_path: Option<&str>,
+    stall: common::Stall,
+) -> Result<Arc<Parted<GoogleCloudStorage>>> {
+    let cut = stall
+        .part_client()
+        .map(|(options, retry)| built(bucket, sa_key_path, options, retry))
+        .transpose()?;
+    Ok(Arc::new(Parted::new(store, cut, BACKEND, stall)))
+}
+
+fn built(
+    bucket: &str,
+    sa_key_path: Option<&str>,
+    options: object_store::ClientOptions,
+    retry: object_store::RetryConfig,
+) -> Result<Arc<GoogleCloudStorage>> {
     let mut builder = GoogleCloudStorageBuilder::new()
         .with_bucket_name(bucket)
-        .with_client_options(common::client_options())
-        .with_retry(common::retry_config());
+        .with_client_options(options)
+        .with_retry(retry);
     if let Some(path) = sa_key_path {
         builder = builder.with_service_account_path(path);
     }
@@ -133,7 +179,7 @@ impl ObjectStorage for GcsBackend {
         data: Vec<u8>,
         options: &UploadOptions,
     ) -> Result<Uploaded> {
-        let store = self.store_for(bucket)?;
+        let store = self.writer_for(bucket)?;
         common::no_acl(BACKEND, options)?;
         common::put(
             store.as_ref(),
@@ -153,7 +199,7 @@ impl ObjectStorage for GcsBackend {
         data: BoxStream<'static, Result<Bytes>>,
         content_type: &str,
     ) -> Result<Uploaded> {
-        let store = self.store_for(&self.bucket)?;
+        let store = self.writer_for(&self.bucket)?;
         let options = UploadOptions::content_type(content_type);
         common::put_stream(
             store.as_ref(),
@@ -297,20 +343,24 @@ mod tests {
             "private_key": "",
             "private_key_id": "",
         });
-        let store = GoogleCloudStorageBuilder::new()
-            .with_bucket_name("example-documents")
-            .with_service_account_key(key.to_string())
-            .with_client_options(common::client_options().with_allow_http(true))
-            .with_retry(common::retry_config())
-            .build()
-            .expect("store");
+        let store = Arc::new(
+            GoogleCloudStorageBuilder::new()
+                .with_bucket_name("example-documents")
+                .with_service_account_key(key.to_string())
+                .with_client_options(common::client_options().with_allow_http(true))
+                .with_retry(common::retry_config())
+                .build()
+                .expect("store"),
+        );
+        let stall = common::Stall::configured();
         GcsBackend {
-            primary: Arc::new(store),
+            writes: Arc::new(Parted::new(Arc::clone(&store), None, BACKEND, stall)),
+            primary: store,
             bucket: "example-documents".into(),
             sa_key_path: None,
             iam_signer: None,
             keys: Keys::Encoded,
-            stall: common::Stall::configured(),
+            stall,
         }
     }
 
@@ -360,12 +410,10 @@ mod tests {
             .await
             .expect("uploaded");
         assert_eq!(
-            uploaded,
-            Uploaded {
-                size: data.len() as u64,
-                etag: Some("\"whole-5\"".into())
-            }
+            (uploaded.size, uploaded.etag.as_deref()),
+            (data.len() as u64, Some("\"whole-5\""))
         );
+        assert!(uploaded.completion.is_some());
     }
 
     #[test]
