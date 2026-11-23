@@ -7,12 +7,13 @@ use crate::copied::{self, COPIES_AT_ONCE};
 use crate::{StoredPart, Uploaded};
 use bytes::Bytes;
 use eyre::Result;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
-use futures_util::{future, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::{future, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use object_store::client::{HttpClient, HttpRequestBody};
 use object_store::gcp::GoogleCloudStorage;
 use object_store::path::Path;
-use object_store::{CredentialProvider, ObjectStoreExt, PutResult};
+use object_store::{ObjectStoreExt, PutResult};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -103,8 +104,10 @@ impl Composer {
         let mut tier = 0;
         while sources.len() > MAX_SOURCES {
             tier += 1;
-            let composed = stream::iter(sources.chunks(MAX_SOURCES).enumerate().map(
-                |(index, group)| {
+            let groups: Vec<BoxFuture<'_, object_store::Result<Path>>> = sources
+                .chunks(MAX_SOURCES)
+                .enumerate()
+                .map(|(index, group)| {
                     let into = made.add(Path::from(format!("{path}.compose/{tier}-{index}")));
                     async move {
                         clock
@@ -118,11 +121,13 @@ impl Composer {
                             .await
                             .map(|_| into)
                     }
-                },
-            ))
-            .buffered(COPIES_AT_ONCE)
-            .try_collect::<Vec<_>>()
-            .await?;
+                    .boxed()
+                })
+                .collect();
+            let composed = stream::iter(groups)
+                .buffered(COPIES_AT_ONCE)
+                .try_collect::<Vec<_>>()
+                .await?;
             sources = composed;
         }
         Ok(sources)

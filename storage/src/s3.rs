@@ -13,7 +13,7 @@ use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer};
 use object_store::client::{HttpClient, HttpRequestBody};
 use object_store::multipart::PartId;
 use object_store::path::Path;
-use object_store::{CredentialProvider, MultipartId};
+use object_store::MultipartId;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use std::sync::Arc;
 use zeroize::Zeroizing;

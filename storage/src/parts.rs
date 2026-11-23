@@ -161,7 +161,7 @@ impl<S> Upload<S> {
         size: u64,
         deadline: Duration,
         request: &'static str,
-        send: impl Fn(Path, MultipartId, usize) -> Fut + Send + 'static,
+        send: impl Fn(Path, MultipartId, usize) -> Fut + Send + Sync + 'static,
     ) -> UploadPart
     where
         Fut: std::future::Future<Output = object_store::Result<PartId>> + Send + 'static,
