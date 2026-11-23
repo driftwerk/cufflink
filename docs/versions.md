@@ -1443,14 +1443,14 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.40.3
 
-Unreleased.
-
 A multipart upload's part whose answer stalls is sent again, the
 upload's completion is bounded on its own, and a web bundle assembled from
 its parts is copied from them inside S3 or GCS. No new feature. A service built
-for v0.40.2 deploys and runs on this platform unchanged. There is no
+for v0.40.2 deploys and runs on this platform unchanged, and a CLI of this
+release deploys to a v0.40.2 platform as a v0.40.2 CLI does. There is no
 migration. New environment variable: `OBJECT_STORE_COMPLETION_TIMEOUT_SECS`
-on the platform, the worker and the web runner ([setup](setup.md)).
+on the platform, the worker and the web runner, which all reach object
+storage through `cufflink-storage` ([setup](setup.md)).
 
 - A part of a multipart upload to S3 or GCS is cut short and sent again
   as a whole write is: a part that has not finished within
@@ -1486,6 +1486,18 @@ on the platform, the worker and the web runner ([setup](setup.md)).
   `part_store_ms`: the most part stores that ran at once, the longest one,
   and the time from the first one's start to the last one's end
   ([observability](observability.md)).
+
+Crates: a patch release of every published crate, none of which changes:
+the change is in `cufflink-storage` and the platform, which ship in the
+images. cufflink-types, cufflink-migrate, cufflink-pgcodec,
+cufflink-sdk-macros and cufflink 0.24.3, cufflink-fn 0.40.3, cufflink-cli
+0.31.3, cufflink-nats 0.9.8, cufflink-native 0.12.3, cufflink-model 0.1.10
+and cufflink-sql-parse 0.4.3 are bumped so the tagged commit publishes
+them. `cufflink init` still scaffolds `cufflink = "0.24"` and
+`cufflink-fn = "0.40"`.
+
+Rolling a platform back from v0.40.3 to v0.40.2 needs nothing undone
+first ([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.40.2
 
