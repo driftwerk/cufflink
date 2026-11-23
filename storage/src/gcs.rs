@@ -33,7 +33,6 @@ impl GcsBackend {
         let sa_key_path = vars(ENV_SA_KEY_PATH);
         let stall = common::Stall::configured();
         let primary = build_store(&bucket, sa_key_path.as_deref())?;
-        let writes = Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall));
         let iam_signer = match sa_key_path.as_deref() {
             Some(_) => None,
             None => Some(Arc::new(IamSignBlobSigner::new()?)),
@@ -50,15 +49,44 @@ impl GcsBackend {
         );
         common::warn_unless_timed_out_requests_retry(BACKEND);
 
-        Ok(Self {
+        Ok(Self::serving(
             primary,
-            writes,
             bucket,
             sa_key_path,
             iam_signer,
-            keys: Keys::Encoded,
+            Keys::Encoded,
             stall,
-        })
+        ))
+    }
+
+    fn serving(
+        primary: Arc<GoogleCloudStorage>,
+        bucket: String,
+        sa_key_path: Option<String>,
+        iam_signer: Option<Arc<IamSignBlobSigner>>,
+        keys: Keys,
+        stall: common::Stall,
+    ) -> Self {
+        Self {
+            writes: Arc::new(Parted::new(Arc::clone(&primary), BACKEND, stall)),
+            primary,
+            bucket,
+            sa_key_path,
+            iam_signer,
+            keys,
+            stall,
+        }
+    }
+
+    fn tenant(&self, bucket: &str) -> Result<Self> {
+        Ok(Self::serving(
+            build_store(bucket, self.sa_key_path.as_deref())?,
+            bucket.to_string(),
+            self.sa_key_path.clone(),
+            self.iam_signer.clone(),
+            Keys::Exact,
+            self.stall,
+        ))
     }
 
     fn store_for(&self, bucket: &str) -> Result<Arc<GoogleCloudStorage>> {
@@ -291,12 +319,7 @@ impl ObjectStorage for GcsBackend {
             crate::is_bucket_name(bucket),
             "{bucket:?} is not a bucket name"
         );
-        Ok(Arc::new(Self {
-            primary: build_store(bucket, self.sa_key_path.as_deref())?,
-            bucket: bucket.to_string(),
-            keys: Keys::Exact,
-            ..self.clone()
-        }))
+        Ok(Arc::new(self.tenant(bucket)?))
     }
 }
 
@@ -329,15 +352,14 @@ mod tests {
                 .build()
                 .expect("store"),
         );
-        GcsBackend {
-            writes: Arc::new(Parted::new(Arc::clone(&store), BACKEND, stall)),
-            primary: store,
-            bucket: "example-documents".into(),
-            sa_key_path: None,
-            iam_signer: None,
-            keys: Keys::Encoded,
+        GcsBackend::serving(
+            store,
+            "example-documents".into(),
+            None,
+            None,
+            Keys::Encoded,
             stall,
-        }
+        )
     }
 
     #[tokio::test]
@@ -450,6 +472,18 @@ mod tests {
             .expect("uploaded");
         assert_eq!(uploaded.etag.as_deref(), Some("\"whole-5\""));
         assert_eq!(common::test_wire::first_part_sent(&server).await, 2);
+    }
+
+    #[test]
+    fn a_tenant_bucket_writes_through_a_store_of_its_own_bucket() {
+        let platform = emulated("http://127.0.0.1:1");
+        let tenant = platform.tenant("acme-documents").expect("tenant");
+        let writer = tenant
+            .writer_for("acme-documents")
+            .expect("writer")
+            .to_string();
+        assert_eq!(writer, format!("Parted({})", tenant.primary));
+        assert_ne!(writer, format!("Parted({})", platform.primary));
     }
 
     #[test]
