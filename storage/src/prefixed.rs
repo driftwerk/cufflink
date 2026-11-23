@@ -132,12 +132,12 @@ impl ObjectStorage for PrefixedBackend {
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(&self.primary(), self.kind, self.keys, None, key).await
+        common::get_bytes(Arc::new(self.primary()), self.kind, self.keys, None, key).await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         common::get_bytes(
-            &self.store_for(bucket)?,
+            Arc::new(self.store_for(bucket)?),
             self.kind,
             self.keys,
             Some(bucket),
@@ -147,7 +147,14 @@ impl ObjectStorage for PrefixedBackend {
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
-        common::open_read(&self.store_for(bucket)?, self.kind, self.keys, bucket, key).await
+        common::open_read(
+            Arc::new(self.store_for(bucket)?),
+            self.kind,
+            self.keys,
+            bucket,
+            key,
+        )
+        .await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {

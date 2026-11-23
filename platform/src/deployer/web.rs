@@ -27,6 +27,8 @@ const ASSEMBLY_MAX_PARTS: usize = 1024;
 
 const PARTS_REMOVED_AT_ONCE: usize = 4;
 
+const PARTS_READ_AHEAD: usize = 4;
+
 const ASSEMBLIES_AT_ONCE: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -403,6 +405,35 @@ async fn opened(
     }
 }
 
+async fn fetched(storage: S3Storage, part: Artifact, bundle: String) -> eyre::Result<bytes::Bytes> {
+    let capacity = usize::try_from(part.size).unwrap_or_default();
+    opened(storage, part, bundle)
+        .await?
+        .try_fold(
+            bytes::BytesMut::with_capacity(capacity),
+            |mut whole, chunk| async move {
+                whole.extend_from_slice(&chunk);
+                Ok(whole)
+            },
+        )
+        .await
+        .map(bytes::BytesMut::freeze)
+}
+
+fn read_ahead<T, Fut>(
+    parts: Vec<T>,
+    fetch: impl FnMut(T) -> Fut + Send + 'static,
+) -> BoxStream<'static, eyre::Result<bytes::Bytes>>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = eyre::Result<bytes::Bytes>> + Send + 'static,
+{
+    stream::iter(parts)
+        .map(fetch)
+        .buffered(PARTS_READ_AHEAD)
+        .boxed()
+}
+
 fn verified(
     storage: &S3Storage,
     bundle: &Artifact,
@@ -410,10 +441,9 @@ fn verified(
     waited: Arc<AtomicU64>,
 ) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
     let (storage, sha256) = (storage.clone(), bundle.hash.clone());
-    let read = stream::iter(parts)
-        .then(move |part| opened(storage.clone(), part, sha256.clone()))
-        .try_flatten()
-        .boxed();
+    let read = read_ahead(parts, move |part| {
+        fetched(storage.clone(), part, sha256.clone())
+    });
     stream::try_unfold(
         (read, Sha256::new(), bundle.hash.clone(), waited),
         |(mut read, mut digest, sha256, waited)| async move {
@@ -1180,5 +1210,32 @@ mod tests {
                 "tenant_slug": "acme",
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parts_are_read_ahead_in_order_at_most_a_few_at_once() {
+        let (open, most) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let (counting, highest) = (Arc::clone(&open), Arc::clone(&most));
+        let parts: Vec<u64> = (0..10).collect();
+        let read: Vec<bytes::Bytes> = read_ahead(parts, move |part| {
+            let (open, most) = (Arc::clone(&counting), Arc::clone(&highest));
+            async move {
+                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100 * (10 - part))).await;
+                open.fetch_sub(1, Ordering::SeqCst);
+                Ok(bytes::Bytes::from(part.to_be_bytes().to_vec()))
+            }
+        })
+        .try_collect()
+        .await
+        .expect("read");
+        assert_eq!(
+            read,
+            (0..10_u64)
+                .map(|part| bytes::Bytes::from(part.to_be_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(most.load(Ordering::SeqCst), PARTS_READ_AHEAD as u64);
     }
 }

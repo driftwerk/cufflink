@@ -1419,6 +1419,39 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.40.2
+
+Unreleased.
+
+Object-storage requests that stall are cut short and tried again, and a
+web bundle's assembly reads its parts ahead. It changes no manifest, SDK
+or host function and needs no migration. New environment variables:
+`OBJECT_STORE_STALL_TIMEOUT_SECS` and `OBJECT_STORE_STALL_ATTEMPTS` on the
+platform, the worker and the web runner, which all reach object storage
+through `cufflink-storage` ([setup](setup.md)).
+
+- A whole upload that has not finished within
+  `OBJECT_STORE_STALL_TIMEOUT_SECS` (default `20`) is sent again, as is an
+  open with no answer in that time. The last of
+  `OBJECT_STORE_STALL_ATTEMPTS` (default `3`) attempts waits up to
+  `OBJECT_STORE_REQUEST_TIMEOUT_SECS`, so a slow but healthy request still
+  succeeds where it did before. A conditional upload and a part of a
+  multipart upload are never sent again, since a repeat could fail on, or
+  add to, what the first attempt left.
+- A read that receives nothing for the stall timeout, or whose body breaks
+  or ends early, resumes from its next byte with a ranged request pinned to
+  the ETag of its first answer. An object that changed fails the read, one
+  answered without an ETag is not resumed, and any byte received resets
+  the count of attempts. Downloads, the web runner's bundle download and
+  every streamed read go through it. A body that ends before the object's
+  size is now an error, where it was a short read.
+- A web bundle's assembly fetches up to four parts ahead of the one it
+  streams, in order, so its reads overlap its writes. An assembly holds at
+  most five parts in memory, the one it streams and four ahead, and two
+  assemblies run at once.
+- Each cut-short request and each resume logs a warning with the object,
+  the attempt and the cause ([observability](observability.md)).
+
 ## Changes in v0.40.1
 
 Timings of a web upload, in the deploy's output and the platform's log

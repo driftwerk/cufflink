@@ -165,17 +165,17 @@ impl ObjectStorage for S3Backend {
     }
 
     async fn download(&self, key: &str) -> Result<Vec<u8>> {
-        common::get_bytes(self.primary.as_ref(), BACKEND, self.keys, None, key).await
+        common::get_bytes(self.primary.clone(), BACKEND, self.keys, None, key).await
     }
 
     async fn download_from_bucket(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
         let store = self.store_for(bucket, None)?;
-        common::get_bytes(store.as_ref(), BACKEND, self.keys, Some(bucket), key).await
+        common::get_bytes(store, BACKEND, self.keys, Some(bucket), key).await
     }
 
     async fn open_read(&self, bucket: &str, key: &str) -> Result<Option<ObjectReader>> {
         let store = self.store_for(bucket, None)?;
-        common::open_read(store.as_ref(), BACKEND, self.keys, bucket, key).await
+        common::open_read(store, BACKEND, self.keys, bucket, key).await
     }
 
     async fn head(&self, key: &str) -> Result<u64> {
