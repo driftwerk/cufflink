@@ -304,8 +304,10 @@ answered at once, without reading the rest of `data`:
   included, is final, and one that gets no answer is followed by the parts.
   A refusal the CLI never reads is no answer: a `413` the platform sends
   before the CLI has written the whole body may reach it as a reset
-  connection, and the bundle then goes in parts, whose sizes the body
-  limit does not bound. The single upload's handler is not spawned, so
+  connection, and the bundle then falls back: one above the platform's
+  250 MiB cap is refused by the first assembly request with a `413`
+  before any part is sent, and one under it, refused only by a proxy's
+  body limit, goes in parts. The single upload's handler is not spawned, so
   when the CLI gives up on it the platform may finish storing the bundle
   or stop; the fallback's assembly then finds it `present`, or stores the
   same bytes at the same content key.
@@ -471,9 +473,10 @@ Uploading bundle 3f9a1c2b4d5e...
   `unanswered` is the time the one request waited before it was given up;
   `parts` is the wall time of sending them, pauses before an attempt
   again included; `assembly` is that of every assembly request; the total
-  runs from the start of the upload, so the three add up to it. A bundle
-  sent whole prints the summary without its phases. When the first
-  assembly request is answered, because the platform already stores the bundle or all its
+  runs from the start of the upload, so the three add up to it but for
+  the slicing and hashing of the parts. A bundle sent whole prints the
+  summary without its phases. When the first assembly request is
+  answered, because the platform already stores the bundle or all its
   parts, no part is sent and no summary prints.
 - `In N parts` counts the bundle's parts, and adds `(K distinct)` when
   some repeat, since each distinct part is sent once.

@@ -354,7 +354,7 @@ a line when a bundle's one request gets no answer and it goes in parts
 instead (`Uploading bundle 3f9a1c2b4d5e: no answer after 120.0 s; sending
 it in parts`), and a summary: `Sent 156.0 MB in 310.3 s (0.5 MB/s):
 unanswered 120.0 s, parts 183.6 s, assembly 6.7 s`, whose phases add up to
-the total. A part's time is its request's: its bytes on the network and
+about the total. A part's time is its request's: its bytes on the network and
 the platform's write of them.
 
 The platform logs these lines, each with `service_id` and the 12-digit

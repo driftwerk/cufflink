@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bundle_whose_one_request_is_refused_is_not_sent_after_a_lost_request() {
+    async fn a_bundle_whose_one_request_is_refused_is_not_sent_in_parts() {
         for (status, refusal) in [
             (
                 413,

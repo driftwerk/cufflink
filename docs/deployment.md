@@ -1033,10 +1033,11 @@ steps, and only the last one changes what runs:
    8388608 bytes in 4.0 s (2.0 MB/s)`), an assembly its time, and a failed
    attempt its reason and wait (`no answer after 120.0 s; trying again (2
    of 3)`). A part is numbered by its place in the bundle. The upload ends
-   with a summary, `Sent 156.0 MB in 76.4 s (2.0 MB/s)`, followed for a
-   bundle in parts by `: unanswered 120.0 s, parts 183.6 s, assembly
-   6.7 s`, the time the one request went unanswered, then spent sending
-   the parts and on the assembly, which add up to the total; an upload
+   with a summary, `Sent 156.0 MB in 76.4 s (2.0 MB/s)` for a bundle sent
+   whole, and for one in parts `Sent 156.0 MB in 310.3 s (0.5 MB/s):
+   unanswered 120.0 s, parts 183.6 s, assembly 6.7 s`: the time the one
+   request went unanswered, then spent sending the parts and on the
+   assembly, which add up to about the total; an upload
    whose first assembly request is answered sends no part and prints none
    ([web uploads](observability.md#web-uploads)).
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
