@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
+pub use copied::StoreAnswer;
 pub use cufflink_types::host::storage::CannedAcl;
 
 mod common;

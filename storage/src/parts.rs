@@ -145,15 +145,10 @@ impl<S> Upload<S> {
         size: u64,
     ) -> UploadPart {
         let copier = Arc::clone(copier);
-        self.stored(
-            size,
-            self.stall.timeout(),
-            "copy",
-            move |path, id, index| {
-                let (copier, from) = (Arc::clone(&copier), from.clone());
-                async move { copier.copy_part(&path, &id, index, &from).await }
-            },
-        )
+        self.stored(size, self.stall.copy(), "copy", move |path, id, index| {
+            let (copier, from) = (Arc::clone(&copier), from.clone());
+            async move { copier.copy_part(&path, &id, index, &from).await }
+        })
     }
 
     fn stored<Fut>(
@@ -299,11 +294,14 @@ mod tests {
 
     const COMPLETION: Duration = Duration::from_secs(2);
 
+    const COPY: Duration = Duration::from_secs(3);
+
     const STALL: Stall = Stall::of(
         Duration::from_secs(1),
         3,
         Duration::from_secs(30),
         COMPLETION,
+        COPY,
     );
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -317,6 +315,7 @@ mod tests {
         CompletionHangsThenGone,
         CompletionGone,
         CopiesHang(usize),
+        CopiesSlow(Duration),
         CopiesRefused,
     }
 
@@ -495,6 +494,13 @@ mod tests {
             let asked = self.counts.copies.fetch_add(1, Ordering::SeqCst);
             match self.fault {
                 Fault::CopiesHang(hung) if asked < hung => futures_util::future::pending().await,
+                Fault::CopiesSlow(slow) => {
+                    tokio::time::sleep(slow).await;
+                    let copied = self.inner.get(from).await?.bytes().await?;
+                    self.inner
+                        .put_part(path, id, part_idx, PutPayload::from(copied))
+                        .await
+                }
                 Fault::CopiesRefused => Err(object_store::Error::PermissionDenied {
                     path: path.to_string(),
                     source: "the copy was refused".into(),
@@ -524,7 +530,14 @@ mod tests {
     }
 
     async fn sent_and_copied(store: &Arc<Faulty>) -> object_store::Result<PutResult> {
-        let parted = Parted::new(Arc::clone(store), "faulty", STALL);
+        sent_and_copied_under(store, STALL).await
+    }
+
+    async fn sent_and_copied_under(
+        store: &Arc<Faulty>,
+        stall: Stall,
+    ) -> object_store::Result<PutResult> {
+        let parted = Parted::new(Arc::clone(store), "faulty", stall);
         let copier: Arc<dyn CopyPart> = Arc::<Faulty>::clone(store);
         let mut upload = parted
             .begin(&Path::from(KEY), PutMultipartOptions::default())
@@ -707,13 +720,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_copy_that_never_answers_is_sent_again_under_its_number_after_the_stall_timeout() {
+    async fn a_copy_that_never_answers_is_sent_again_under_its_number_after_the_copy_timeout() {
         let memory = holding_the_copied_part().await;
         let store = Faulty::over(&memory, Fault::CopiesHang(1));
         let started = tokio::time::Instant::now();
         sent_and_copied(&store).await.expect("uploaded");
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(started.elapsed(), COPY);
         assert_eq!(store.count(|c| &c.copies), 2);
+        assert_eq!(stored(&memory).await, Some(parts().concat()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_slower_than_its_timeout_is_cut_short_first_and_not_last() {
+        let memory = holding_the_copied_part().await;
+        let slow = COPY * 4;
+        let store = Faulty::over(&memory, Fault::CopiesSlow(slow));
+        let started = tokio::time::Instant::now();
+        sent_and_copied(&store).await.expect("uploaded");
+        assert_eq!(started.elapsed(), COPY * 2 + slow);
+        assert_eq!(store.count(|c| &c.copies), 3);
+        assert_eq!(stored(&memory).await, Some(parts().concat()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_whose_timeout_is_not_set_is_sent_once_however_slow() {
+        let memory = holding_the_copied_part().await;
+        let ceiling = Duration::from_secs(30);
+        let uncut = Stall::of(Duration::from_secs(1), 3, ceiling, COMPLETION, ceiling);
+        let slow = Duration::from_secs(25);
+        let store = Faulty::over(&memory, Fault::CopiesSlow(slow));
+        let started = tokio::time::Instant::now();
+        sent_and_copied_under(&store, uncut)
+            .await
+            .expect("uploaded");
+        assert_eq!(started.elapsed(), slow);
+        assert_eq!(store.count(|c| &c.copies), 1);
         assert_eq!(stored(&memory).await, Some(parts().concat()));
     }
 

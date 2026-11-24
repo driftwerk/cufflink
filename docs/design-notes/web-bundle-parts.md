@@ -226,8 +226,23 @@ answered at once, without reading the rest of `data`:
 - S3 copies each part into the bundle's multipart upload with
   UploadPartCopy, eight at a time, signed with object_store's own
   credentials and signer and sent through its HTTP client. Every part but
-  the last must hold at least 5 MiB, and none more than 64 MiB, so that a
-  copy is bounded by the stall timeout. A copied part takes its number and
+  the last must hold at least 5 MiB, and none more than 64 MiB. Each copy
+  names its empty body's length (`Content-Length: 0`): a strict
+  S3-compatible store (Ceph RGW) answers a copy without one `411`. A copy
+  sends no bytes, so it is not cut at the stall timeout's per 8 MiB: it is
+  sent once, bounded by the request timeout, which must exceed the store's
+  slowest copy, raised above its default where a copy can take longer.
+  A copy's time is the store's work, and a slow copy sent again is often
+  no faster, so cutting it gains nothing. `OBJECT_STORE_COPY_TIMEOUT_SECS`, not
+  set by default, cuts and sends a copy again for a store where that
+  helps. A copy cut short is not cancelled on the store, so attempts of
+  one part can overlap; each copies the same source into the same part
+  number, which is safe where the store keeps a part's overwrite atomic
+  with the completion and names a part by its content's MD5, as #115
+  already assumes of a part sent again. An attempt that lands after the
+  completion is refused, as the upload is gone. A refused copy fails the assembly
+  with the store's status and code in the answer and its whole answer in
+  the log. A copied part takes its number and
   its size in the upload as a sent one does, through the same cut-short
   loop, so a completion whose answer was lost still stands on the size
   sent. The upload completes only once `data` has ended; an error from
@@ -242,8 +257,9 @@ answered at once, without reading the rest of `data`:
   content type. The intermediate objects are removed once the compose
   stores the bundle or fails. A compose names its sources, so one sent
   again stores the same object.
-- A copy or compose is cut short and sent again as a part is; the
-  completion, or GCS's last compose, as a completion is. A copy or
+- A compose is cut short and sent again as a part is, and a copy only
+  when `OBJECT_STORE_COPY_TIMEOUT_SECS` is set; the completion, or GCS's
+  last compose, as a completion is. A copy or
   compose answered with a `5xx` or `429` (or, on S3, a `200` whose
   `<Error>` is `InternalError`, `SlowDown` or `ServiceUnavailable`), or
   whose connection fails, is
