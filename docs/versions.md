@@ -1458,8 +1458,9 @@ timeout, and a failed assembly says why. No new feature. A service built
 for v0.40.3 deploys and runs on this platform unchanged, and a CLI of this
 release deploys to a v0.40.3 platform as a v0.40.3 CLI does. There is no
 migration. New environment variable: `OBJECT_STORE_COPY_TIMEOUT_SECS`, not
-set by default, which the platform's copies use; the worker and the web
-runner only warn when it is set not below the request timeout
+set by default, which only the platform's copies use; the platform, the
+worker and the web runner all warn at startup when it is set not below the
+request timeout and `OBJECT_STORE_STALL_ATTEMPTS` is above 1
 ([setup](setup.md)).
 
 - Each UploadPartCopy request names its empty body's length
