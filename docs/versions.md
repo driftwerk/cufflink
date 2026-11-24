@@ -1489,7 +1489,14 @@ unchanged.
   multipart threshold of it (32 MiB), the part being filled and the parts
   in flight, where it held up to about twice the bundle.
 - A bundle already stored at the request's declared size is read through
-  for its hash and not written again (`"stored": "present"`), as before.
+  for its hash and not written again (`"stored": "present"`), as before. A
+  body sent with no declared length (chunked) is written again, its bytes
+  verified, and answered `"uploaded"`; the CLI always declares the length.
+- A refusal that needs no body, a malformed hash (`400`) or a service of
+  another mode (`409`), and a failed write (`500`), are answered without
+  reading the rest of the body; a client still sending may see its
+  connection closed before it reads the answer. Refusals of the body
+  itself keep the plain-text answers of earlier releases.
 - A stalled part is cut short and sent again, and so is a stalled
   completion, as for every multipart write
   ([stalled storage requests](observability.md#stalled-storage-requests)).

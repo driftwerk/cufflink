@@ -309,9 +309,9 @@ async fn written(
         Some(size) => stored_size(storage, &key).await? == Some(size),
         None => false,
     };
-    let data = hashed(body, Object::Bundle, sha256.to_string(), Arc::clone(&waits));
+    let data = hashed(body, sha256.to_string(), Arc::clone(&waits));
     let stored = if present {
-        data.try_for_each(|_| futures_util::future::ready(Ok(())))
+        data.try_for_each(|_| futures_util::future::ok(()))
             .await
             .map(|()| Stored::Present)
     } else {
@@ -581,20 +581,19 @@ fn verified(
     let read = read_ahead(parts, move |part| {
         fetched(storage.clone(), part, sha256.clone())
     });
-    hashed(read, Object::Bundle, bundle.hash.clone(), waits)
+    hashed(read, bundle.hash.clone(), waits)
 }
 
 /// Yields what `data` yields, accounting its waits, and ends only once its
 /// bytes are `sha256` and not empty; otherwise it yields that refusal.
 fn hashed(
     data: BoxStream<'static, eyre::Result<bytes::Bytes>>,
-    object: Object,
     sha256: String,
     waits: Arc<Waits>,
 ) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
     stream::try_unfold(
         (data, Sha256::new(), sha256, waits, None::<Instant>),
-        move |(mut data, mut digest, sha256, waits, handed)| async move {
+        |(mut data, mut digest, sha256, waits, handed)| async move {
             if let Some(handed) = handed {
                 Waits::add(&waits.write, handed);
             }
@@ -614,10 +613,10 @@ fn hashed(
                 }
                 None => {
                     let _ = waits.ended.set(Instant::now());
-                    object
+                    Object::Bundle
                         .require_content(&sha256, &hex::encode(digest.finalize()))
                         .and_then(|()| {
-                            object.require_filled(waits.received.load(Ordering::Relaxed))
+                            Object::Bundle.require_filled(waits.received.load(Ordering::Relaxed))
                         })
                         .map(|()| None)
                         .map_err(eyre::Report::new)
@@ -1497,9 +1496,7 @@ mod tests {
         sha256: String,
     ) -> (Vec<eyre::Result<bytes::Bytes>>, Waited) {
         let waits = Arc::new(Waits::default());
-        let yielded = hashed(data, Object::Bundle, sha256, Arc::clone(&waits))
-            .collect()
-            .await;
+        let yielded = hashed(data, sha256, Arc::clone(&waits)).collect().await;
         (yielded, waits.waited())
     }
 

@@ -4,6 +4,7 @@ use crate::deployer::web;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::repo::deployments::Artifact;
 use crate::repo::services::Status;
+use crate::router::custom::body;
 use crate::wasm_runtime::sha256_hex;
 use crate::AppState;
 use axum::{
@@ -120,17 +121,17 @@ pub async fn upload_web_bundle(
     State(state): State<Arc<AppState>>,
     DeployAuth(user): DeployAuth,
     Path((id, sha256)): Path<(String, String)>,
-    body: Body,
+    request: Body,
 ) -> Result<Json<Value>, Response> {
     let started = Instant::now();
-    let declared = http_body::Body::size_hint(&body).exact();
+    let declared = http_body::Body::size_hint(&request).exact();
     if declared.is_some_and(|size| size > ARTIFACT_BODY_LIMIT as u64) {
-        return Err(crate::router::custom::body::too_large());
+        return Err(body::too_large());
     }
-    let service_id = service_id(&id).map_err(IntoResponse::into_response)?;
+    let service_id = service_id(&id).map_err(body::answer)?;
     let service = super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id)
         .await
-        .map_err(IntoResponse::into_response)?;
+        .map_err(body::answer)?;
     let bundle = web::is_sha256(&sha256).then(|| web::short(&sha256));
     let unanswered = Unanswered::new(started, |elapsed| {
         warn!(
@@ -143,10 +144,16 @@ pub async fn upload_web_bundle(
     let (stored, waited) =
         match require_web_object(&state, &service, web::Object::Bundle, &sha256).await {
             Ok(()) => {
-                let body = crate::router::custom::body::streamed(body, ARTIFACT_BODY_LIMIT);
-                let (stored, waited) =
-                    web::store_streamed(&state, service_id, &sha256, body, declared, &user.subject)
-                        .await;
+                let streamed = body::streamed(request, ARTIFACT_BODY_LIMIT);
+                let (stored, waited) = web::store_streamed(
+                    &state,
+                    service_id,
+                    &sha256,
+                    streamed,
+                    declared,
+                    &user.subject,
+                )
+                .await;
                 (stored, Some(waited))
             }
             Err(e) => (Err(e), None),
@@ -164,7 +171,7 @@ pub async fn upload_web_bundle(
     }
     let answer = uploaded(&state, &user, &service, stored, waited)
         .await
-        .map_err(IntoResponse::into_response);
+        .map_err(body::answer);
     unanswered.answered();
     answer
 }
@@ -234,8 +241,8 @@ pub async fn upload_web_part(
         hint.bundle.as_deref(),
         hint.index,
     );
-    let reserve = crate::router::custom::body::declared(&body);
-    let body = crate::router::custom::body::received(body, web::PART_MAX_BYTES, reserve)
+    let reserve = body::declared(&body);
+    let body = body::received(body, web::PART_MAX_BYTES, reserve)
         .await
         .map_err(|unread| {
             warn!(

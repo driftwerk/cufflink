@@ -886,6 +886,25 @@ async fn a_bundle_above_the_multipart_threshold_whose_bytes_are_not_its_hash_sto
 }
 
 #[tokio::test]
+async fn an_empty_upload_is_refused_after_its_hash_and_stores_nothing() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let sha256 = sha256_hex(b"");
+
+    let (status, refused) = w.put(&service_id, &sha256, b"").await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.to_string().contains("the bundle is empty"),
+        "{refused}"
+    );
+    let (status, refused) = w.put(&service_id, &"ab".repeat(32), b"").await;
+    assert_eq!(status, 422, "the hash is checked first: {refused}");
+    w.left_nothing(&service_id, &sha256).await;
+}
+
+#[tokio::test]
 async fn a_client_that_disconnects_halfway_through_its_bundle_leaves_nothing_stored() {
     let Some(w) = World::start().await else {
         return;
