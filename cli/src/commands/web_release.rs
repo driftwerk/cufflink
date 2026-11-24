@@ -178,6 +178,7 @@ struct Sent {
 
 #[derive(Clone, Copy)]
 struct Phases {
+    unanswered: Duration,
     parts: Duration,
     assembly: Duration,
 }
@@ -185,7 +186,8 @@ struct Phases {
 fn sent_line(sent: Sent, total: Duration) -> String {
     let phases = sent.phases.map_or_else(String::new, |phases| {
         format!(
-            ": parts {}, assembly {}",
+            ": unanswered {}, parts {}, assembly {}",
+            seconds(phases.unanswered),
             seconds(phases.parts),
             seconds(phases.assembly)
         )
@@ -209,21 +211,19 @@ impl Parts {
         platform.offers(WEB_BUNDLE_PARTS).then(Self::default)
     }
 
-    fn of(self, bundle: &Bundle) -> Option<Vec<Bundle>> {
-        (bundle.size() > self.threshold).then(|| {
-            (0..bundle.size())
-                .step_by(self.size)
-                .map(|start| {
-                    let part = bundle
-                        .bytes
-                        .slice(start..(start + self.size).min(bundle.size()));
-                    Bundle {
-                        sha256: crate::digest::sha256_hex(&part),
-                        bytes: part,
-                    }
-                })
-                .collect()
-        })
+    fn split(self, bundle: &Bundle) -> Vec<Bundle> {
+        (0..bundle.size())
+            .step_by(self.size)
+            .map(|start| {
+                let part = bundle
+                    .bytes
+                    .slice(start..(start + self.size).min(bundle.size()));
+                Bundle {
+                    sha256: crate::digest::sha256_hex(&part),
+                    bytes: part,
+                }
+            })
+            .collect()
     }
 }
 
@@ -542,8 +542,9 @@ impl WebApp<'_> {
         reserved: &Reserved,
         bundle: &Bundle,
         parts: Parts,
-        split: &[Bundle],
+        unanswered: Duration,
     ) -> eyre::Result<(Value, Option<Sent>)> {
+        let split = &parts.split(bundle);
         let (doing, label) = (
             format!("Assembling bundle {}", bundle.sha256),
             format!("Assembling bundle {}", short(&bundle.sha256)),
@@ -612,6 +613,7 @@ impl WebApp<'_> {
             Some(Sent {
                 bytes,
                 phases: Some(Phases {
+                    unanswered,
                     parts: parts_took,
                     assembly,
                 }),
@@ -619,46 +621,35 @@ impl WebApp<'_> {
         ))
     }
 
-    async fn whole(&self, reserved: &Reserved, bundle: &Bundle) -> Result<Value, Failed> {
-        self.answered(
-            self.whole_request(reserved, bundle),
-            &format!("Uploading bundle {}", bundle.sha256),
-            reserved,
-        )
-        .await
-    }
-
     async fn upload(&self, reserved: &Reserved, bundle: &Bundle) -> eyre::Result<()> {
         self.say(format!("Uploading bundle {}...", short(&bundle.sha256)));
         let started = Instant::now();
-        let split = self
-            .parts
-            .and_then(|parts| parts.of(bundle).map(|split| (parts, split)));
-        let in_one = Some(Sent {
-            bytes: bundle.size(),
-            phases: None,
-        });
-        let (answer, sent) = match split {
-            Some((parts, split)) => match timed(self.whole(reserved, bundle)).await {
-                (Err(failed), took) if failed.status.is_none() => {
-                    self.say(format!(
-                        "{}; sending it in parts",
-                        failed_line(
-                            &format!("Uploading bundle {}", short(&bundle.sha256)),
-                            &failed.reason(),
-                            took,
-                            None
-                        )
-                    ));
-                    self.assembled(reserved, bundle, parts, &split).await?
-                }
-                (answered, _) => (answered.map_err(|failed| failed.report)?, in_one),
-            },
-            None => (
-                self.whole(reserved, bundle)
-                    .await
-                    .map_err(|failed| failed.report)?,
-                in_one,
+        let parted = self.parts.filter(|parts| bundle.size() > parts.threshold);
+        let whole = timed(self.answered(
+            self.whole_request(reserved, bundle),
+            &format!("Uploading bundle {}", bundle.sha256),
+            reserved,
+        ))
+        .await;
+        let (answer, sent) = match (parted, whole) {
+            (Some(parts), (Err(failed), unanswered)) if failed.status.is_none() => {
+                self.say(format!(
+                    "{}; sending it in parts",
+                    failed_line(
+                        &format!("Uploading bundle {}", short(&bundle.sha256)),
+                        &failed.reason(),
+                        unanswered,
+                        None
+                    )
+                ));
+                self.assembled(reserved, bundle, parts, unanswered).await?
+            }
+            (_, (answered, _)) => (
+                answered.map_err(|failed| failed.report)?,
+                Some(Sent {
+                    bytes: bundle.size(),
+                    phases: None,
+                }),
             ),
         };
         self.say(
@@ -1262,6 +1253,24 @@ mod tests {
             )
         );
         assert_eq!(asked.requests(), [RESERVE, STATUS, &upload()]);
+
+        let (ended, asked, _) = deployed_with(
+            Some(Parts {
+                threshold: BUNDLE.len(),
+                ..IN_PARTS
+            }),
+            answers(vec![vec![None]]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+        assert!(
+            ended
+                .expect_err("no answer")
+                .to_string()
+                .starts_with(&format!("Uploading bundle {} got no answer", sha())),
+            "a bundle at the threshold is not sent in parts"
+        );
+        assert_eq!(asked.requests(), [RESERVE, STATUS, &upload()]);
     }
 
     #[tokio::test]
@@ -1354,7 +1363,7 @@ mod tests {
         requests.iter().map(|request| request.to_string()).collect()
     }
 
-    fn in_parts(groups: Vec<Vec<Option<(u16, Value)>>>) -> Vec<Option<(u16, Value)>> {
+    fn after_a_lost_request(groups: Vec<Vec<Option<(u16, Value)>>>) -> Vec<Option<(u16, Value)>> {
         answers([vec![None]].into_iter().chain(groups).collect())
     }
 
@@ -1397,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bundle_whose_one_request_is_refused_is_not_sent_in_parts() {
+    async fn a_bundle_whose_one_request_is_refused_is_not_sent_after_a_lost_request() {
         for (status, refusal) in [
             (
                 413,
@@ -1427,7 +1436,7 @@ mod tests {
     async fn a_bundle_whose_one_request_gets_no_answer_is_sent_in_parts_and_assembled() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(released(1, false))],
@@ -1465,7 +1474,7 @@ mod tests {
     async fn a_bundle_the_platform_already_stores_sends_no_part() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![vec![
+            after_a_lost_request(vec![vec![
                 Some(stored("present")),
                 Some(released(1, false)),
             ]]),
@@ -1487,7 +1496,7 @@ mod tests {
                 in_flight: 3,
                 ..IN_PARTS
             }),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(released(1, false))],
@@ -1575,7 +1584,7 @@ mod tests {
         ] {
             let (ended, asked, _) = deployed_with(
                 Some(IN_PARTS),
-                in_parts(vec![vec![
+                after_a_lost_request(vec![vec![
                     missing(slices()[0]),
                     Some(refused(status, refusal)),
                 ]]),
@@ -1606,7 +1615,7 @@ mod tests {
     async fn a_part_the_platform_no_longer_stores_at_the_assembly_is_sent_again_once() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![
@@ -1639,7 +1648,7 @@ mod tests {
         let hashes = hashes();
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![
@@ -1706,7 +1715,7 @@ mod tests {
         for (after, starts, sent) in cases {
             let (ended, asked, _) = deployed_with(
                 Some(IN_PARTS),
-                in_parts(vec![vec![missing(slices()[0])], parts_stored(), after]),
+                after_a_lost_request(vec![vec![missing(slices()[0])], parts_stored(), after]),
                 Ok(BUNDLE.to_vec()),
             )
             .await;
@@ -1718,7 +1727,7 @@ mod tests {
 
         let (ended, _, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![vec![None; 3]]),
+            after_a_lost_request(vec![vec![None; 3]]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1735,7 +1744,7 @@ mod tests {
     async fn a_part_or_assembly_lost_or_unavailable_is_sent_again_and_released() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 vec![
                     part_stored(slices()[0]),
@@ -1800,9 +1809,7 @@ mod tests {
 
     #[test]
     fn each_distinct_part_is_sent_once_in_the_order_it_first_appears() {
-        let parts = IN_PARTS
-            .of(&Bundle::of(b"same, 8!tail of same, 8!it".to_vec()))
-            .expect("in parts");
+        let parts = IN_PARTS.split(&Bundle::of(b"same, 8!tail of same, 8!it".to_vec()));
         assert_eq!(parts.len(), 4);
         assert_eq!(
             distinct(&parts)
@@ -1825,7 +1832,7 @@ mod tests {
         );
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(refused(409, &not_stored))],
@@ -1853,27 +1860,24 @@ mod tests {
     #[test]
     fn a_bundle_splits_into_slices_in_order_of_which_only_the_last_is_shorter() {
         let parts = |bytes: &[u8]| {
-            IN_PARTS.of(&Bundle::of(bytes.to_vec())).map(|parts| {
-                parts
-                    .into_iter()
-                    .map(|part| (part.bytes.to_vec(), part.sha256))
-                    .collect::<Vec<_>>()
-            })
+            IN_PARTS
+                .split(&Bundle::of(bytes.to_vec()))
+                .into_iter()
+                .map(|part| (part.bytes.to_vec(), part.sha256))
+                .collect::<Vec<_>>()
         };
         let expected = |slices: &[&[u8]]| {
-            Some(
-                slices
-                    .iter()
-                    .map(|slice| (slice.to_vec(), crate::digest::sha256_hex(slice)))
-                    .collect::<Vec<_>>(),
-            )
+            slices
+                .iter()
+                .map(|slice| (slice.to_vec(), crate::digest::sha256_hex(slice)))
+                .collect::<Vec<_>>()
         };
         assert_eq!(parts(BUNDLE), expected(&slices()));
         assert_eq!(
             parts(&b"sixteen bytes!!!"[..]),
             expected(&[&b"sixteen "[..], &b"bytes!!!"[..]])
         );
-        assert_eq!(parts(&b"8 bytes!"[..]), None, "a bundle at the threshold");
+        assert_eq!(parts(&b"8 bytes!"[..]), expected(&[&b"8 bytes!"[..]]));
     }
 
     #[test]
@@ -1978,7 +1982,7 @@ mod tests {
     async fn each_attempt_of_a_part_or_assembly_says_how_long_it_took_and_the_upload_sums_up() {
         let (ended, _, _, said) = deployed_saying(
             Some(IN_PARTS),
-            in_parts(vec![
+            after_a_lost_request(vec![
                 vec![missing(slices()[0])],
                 vec![
                     part_stored(slices()[0]),
@@ -2009,7 +2013,7 @@ mod tests {
                 format!("{}6 bytes in _ s (_ MB/s)", part(3)),
                 format!("  Assembling bundle {bundle}: answered in _ s"),
                 "  Stored".to_string(),
-                "  Sent _ MB in _ s (_ MB/s): parts _ s, assembly _ s".to_string(),
+                "  Sent _ MB in _ s (_ MB/s): unanswered _ s, parts _ s, assembly _ s".to_string(),
                 "Releasing site...".to_string(),
                 format!("Released site v1 (bundle {bundle})"),
                 "  Deployment ID: d".to_string(),
@@ -2022,7 +2026,7 @@ mod tests {
     async fn a_part_that_fails_for_good_says_how_long_its_last_attempt_took() {
         let (ended, _, _, said) = deployed_saying(
             Some(IN_PARTS),
-            in_parts(vec![vec![missing(slices()[0]), None, None, None]]),
+            after_a_lost_request(vec![vec![missing(slices()[0]), None, None, None]]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -2075,7 +2079,7 @@ mod tests {
 
         let (ended, _, _, said) = deployed_saying(
             Some(IN_PARTS),
-            in_parts(vec![vec![
+            after_a_lost_request(vec![vec![
                 Some(stored("present")),
                 Some(released(1, false)),
             ]]),
@@ -2138,13 +2142,14 @@ mod tests {
                 Sent {
                     bytes: 100 * 1_048_576,
                     phases: Some(Phases {
+                        unanswered: Duration::from_millis(120_700),
                         parts: Duration::from_millis(45_300),
                         assembly: Duration::from_secs(4),
                     }),
                 },
-                Duration::from_secs(50),
+                Duration::from_secs(170),
             ),
-            "  Sent 100.0 MB in 50.0 s (2.0 MB/s): parts 45.3 s, assembly 4.0 s"
+            "  Sent 100.0 MB in 170.0 s (0.6 MB/s): unanswered 120.7 s, parts 45.3 s, assembly 4.0 s"
         );
         assert_eq!(
             sent_line(

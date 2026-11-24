@@ -1010,30 +1010,34 @@ steps, and only the last one changes what runs:
    configs, and tars `.next`, `node_modules`, `package.json` and `public`.
 5. It uploads the bundle by its SHA-256, unless the running version
    already records that bundle. It sends the bundle in one request first,
-   which the platform hashes as it arrives and stores once. On a platform
-   with `web_bundle_parts`, a bundle above 32 MiB whose one request gets no
-   answer (the CLI's 120 s request timeout, or a refused or dropped
-   connection) then goes up as parts of 8 MiB, four at a time, each under
-   that timeout, and is assembled
-   (`Uploading bundle 3f9a1c2b4d5e: no answer after 120.0 s; sending it in
-   parts`). An answer to the one request is final: a refusal, such as a
-   `413` or a `500`, stops the upload in the platform's words and sends no
-   part. The CLI asks for the assembly first and sends its parts only when
-   the platform lacks them, each distinct part once, so a bundle the one
+   which the platform receives whole, hashes and stores once. On a
+   platform with `web_bundle_parts`, a bundle above 32 MiB whose one
+   request gets no answer (the CLI's 120 s request timeout, or a refused
+   or dropped connection) then goes up as parts of 8 MiB, four at a time,
+   each under that timeout, and is assembled (`Uploading bundle
+   3f9a1c2b4d5e: no answer after 120.0 s; sending it in parts`). Any
+   answer to the one request is final and sends no part: a refusal such
+   as a `413` or a `500` stops the upload in the platform's words, and so
+   does an answer from a proxy in front of the platform, such as a body
+   limit's `413` or a gateway's `502` or `504`. A proxy or gateway in front
+   of the platform therefore needs a body limit of at least the bundle's
+   size, and a timeout above the CLI's 120 s, on the artifact route. The
+   CLI asks for the assembly first and sends its parts only when the
+   platform lacks them, each distinct part once, so a bundle the one
    request stored although its answer was lost sends no part. A part or
-   assembly that gets no
-   answer, a `5xx` (except `501` and `505`), `408` or `429` is sent again, up
-   to three times in all, after `Retry-After` when it is longer than the
-   pause; any other refusal stops the upload, and nothing is released.
-   Each attempt prints how long it took: a part its bytes, time and rate
-   (`Uploading part 7 of 20 of bundle 3f9a1c2b4d5e: 8388608 bytes in 4.0 s
-   (2.0 MB/s)`), an assembly its time, and a failed attempt its reason and
-   wait (`no answer after 120.0 s; trying again (2 of 3)`). A part is
-   numbered by its place in the bundle. The upload ends with a summary,
-   `Sent 156.0 MB in 190.3 s (0.8 MB/s)`, followed for a bundle in parts
-   by `: parts 183.6 s, assembly 6.7 s`, the time spent sending the parts
-   and on the assembly; an upload whose first assembly request is answered
-   sends no part and prints none
+   assembly that gets no answer, a `5xx` (except `501` and `505`), `408` or
+   `429` is sent again, up to three times in all, after `Retry-After` when
+   it is longer than the pause; any other refusal stops the upload, and
+   nothing is released. Each attempt prints how long it took: a part its
+   bytes, time and rate (`Uploading part 7 of 20 of bundle 3f9a1c2b4d5e:
+   8388608 bytes in 4.0 s (2.0 MB/s)`), an assembly its time, and a failed
+   attempt its reason and wait (`no answer after 120.0 s; trying again (2
+   of 3)`). A part is numbered by its place in the bundle. The upload ends
+   with a summary, `Sent 156.0 MB in 76.4 s (2.0 MB/s)`, followed for a
+   bundle in parts by `: unanswered 120.0 s, parts 183.6 s, assembly
+   6.7 s`, the time the one request went unanswered, then spent sending
+   the parts and on the assembly, which add up to the total; an upload
+   whose first assembly request is answered sends no part and prints none
    ([web uploads](observability.md#web-uploads)).
 6. It releases it, naming the bundle in `web_artifact`. A `409` (the
    bundle not uploaded, or no longer stored, or another deploy holding the

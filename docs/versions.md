@@ -431,7 +431,7 @@ The web runner is independent of both: a runner of any release reads the
 content keys as it reads the earlier ones, since they are opaque, and
 switches on the events of releases and rollbacks alike.
 
-A web bundle above 32 MiB goes up in parts from v0.40.0 on (`web_bundle_parts`):
+A web bundle above 32 MiB can go up in parts from v0.40.0 on (`web_bundle_parts`):
 
 | CLI | Platform | Outcome |
 |-----|----------|---------|
@@ -1462,7 +1462,7 @@ a platform of v0.40.0 to v0.40.4 as to this one. There is no migration and
 no new setting.
 
 - A bundle above 32 MiB on a platform with `web_bundle_parts` goes up in
-  one request, which the platform hashes as it arrives and stores once.
+  one request, which the platform receives whole, hashes and stores once.
   From v0.40.0 to v0.40.4 such a bundle went in parts at once, and its
   assembly read every part back from the store for the bundle's hash, then
   streamed or copied the parts into the bundle: on a store whose reads and
@@ -1472,12 +1472,17 @@ no new setting.
   a refused or dropped connection), the CLI prints
   `Uploading bundle 3f9a1c2b4d5e: no answer after 120.0 s; sending it in
   parts` and sends the bundle in parts as before. A link too slow for one
-  request costs that one attempt first. A bundle the request stored
-  although its answer was lost is answered `present` by the assembly, and
-  no part is sent.
+  request costs that one attempt first, and the upload's summary names it:
+  `Sent 156.0 MB in 310.3 s (0.5 MB/s): unanswered 120.0 s, parts 183.6 s,
+  assembly 6.7 s`. A bundle the request stored although its answer was
+  lost is answered `present` by the assembly, and no part is sent.
 - An answer to the one request is final: a refusal, such as a `413` above
   the platform's body limit or a `500` from its store, stops the upload in
-  the platform's words, and no part is sent.
+  the platform's words, and no part is sent. So does an answer from a proxy
+  in front of the platform, such as a gateway's `502` or `504`, which the
+  parts of v0.40.0 to v0.40.4 got through: such a proxy needs a body limit
+  of at least the bundle's size, and a timeout above the CLI's 120 s, on
+  the artifact route.
 - The platform holds the bundle in memory while it stores it, as the
   single upload always has, up to the 250 MiB body limit.
 

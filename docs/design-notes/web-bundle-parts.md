@@ -9,26 +9,26 @@ upload, release steps and content-addressed uploads it keeps.
 
 ## Outcome
 
-- A bundle goes from the CLI to the platform in one request first. From
-  v0.40.5, one above 32 MiB whose request gets no answer then goes as parts
-  of 8 MiB, four in flight; v0.40.0 to v0.40.4 sent it in parts at once,
-  and its assembly, which reads every part back from the store, took
-  longer than the one request on a store slow to read and copy. Each part
-  is its own request under the CLI's 120 s
-  request timeout, so no request has to carry the whole bundle across the
-  link. A 250 MiB bundle, the platform's cap, needs about 0.3 MB/s across
-  the four parts in flight instead of 2.2 MB/s for one request.
+- A bundle goes from the CLI to the platform in one request first, which
+  the platform stores with no read-back and no copy. Parts are the
+  fallback: a bundle above 32 MiB whose one request gets no answer goes as
+  parts of 8 MiB, four in flight. Each part is its own request under the
+  CLI's 120 s request timeout, so no part request has to carry the whole
+  bundle across the link. A 250 MiB bundle, the platform's cap, needs
+  about 0.3 MB/s across the four parts in flight instead of 2.2 MB/s for
+  one request.
 - A part or an assembly that gets no answer, or a `5xx`, `408` or `429`, is
   sent again, up to three times in all. Only that request is sent again,
   never the bundle.
-- The platform holds a few parts in memory while it assembles, not the
-  bundle.
+- The platform holds the bundle in memory while it stores the one
+  request, as the single upload always has, and only a few parts while it
+  assembles.
 - No bundle is ever stored at its content key unless its bytes are that
   hash.
 - Every storage backend works, and every platform replica serves every
   request: no upload state lives in a process.
 - A smaller bundle, a platform without the feature, and a CLI without it,
-  all upload in one request as today.
+  all upload in one request only, with no fallback.
 
 ## 1. Why the upload fails today
 
@@ -302,6 +302,13 @@ answered at once, without reading the rest of `data`:
   `404`/`405` of a replica mid-upgrade included, and a `501` or `505`, are
   final. The single request is not sent again: an answer to it, a refusal
   included, is final, and one that gets no answer is followed by the parts.
+  A refusal the CLI never reads is no answer: a `413` the platform sends
+  before the CLI has written the whole body may reach it as a reset
+  connection, and the bundle then goes in parts, whose sizes the body
+  limit does not bound. The single upload's handler is not spawned, so
+  when the CLI gives up on it the platform may finish storing the bundle
+  or stop; the fallback's assembly then finds it `present`, or stores the
+  same bytes at the same content key.
 - One function, `answered`, turns every upload request's outcome into its
   error, ending as every upload error does today:
   `Uploading part 3 of 24 of bundle {sha256} got no answer; nothing was
@@ -442,7 +449,7 @@ Uploading bundle 3f9a1c2b4d5e...
   ...
   Assembling bundle 3f9a1c2b4d5e: answered in 6.5 s
   Stored
-  Sent 156.0 MB in 190.3 s (0.8 MB/s): parts 183.6 s, assembly 6.7 s
+  Sent 156.0 MB in 310.3 s (0.5 MB/s): unanswered 120.0 s, parts 183.6 s, assembly 6.7 s
 ```
 
 - One line a part rather than a roll-up: the slow part is what is looked
@@ -461,11 +468,12 @@ Uploading bundle 3f9a1c2b4d5e...
   tells a wait for an assembly's turn apart from the reads and writes.
 - The summary counts the bytes of the parts stored: each distinct part,
   and each part sent again because the platform no longer stored it.
+  `unanswered` is the time the one request waited before it was given up;
   `parts` is the wall time of sending them, pauses before an attempt
   again included; `assembly` is that of every assembly request; the total
-  runs from the start of the upload. A bundle sent whole prints the
-  summary without its phases. When the first assembly request is
-  answered, because the platform already stores the bundle or all its
+  runs from the start of the upload, so the three add up to it. A bundle
+  sent whole prints the summary without its phases. When the first
+  assembly request is answered, because the platform already stores the bundle or all its
   parts, no part is sent and no summary prints.
 - `In N parts` counts the bundle's parts, and adds `(K distinct)` when
   some repeat, since each distinct part is sent once.
