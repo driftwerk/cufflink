@@ -1502,12 +1502,12 @@ unchanged.
   upload, and a failed one logs `Web bundle not stored`
   ([web uploads](observability.md#web-uploads)).
 
-Crates: a patch release of every published crate, of which none changes:
-the platform does. cufflink-types, cufflink-migrate, cufflink-pgcodec,
-cufflink-sdk-macros and cufflink 0.24.6, cufflink-fn 0.40.6, cufflink-cli
-0.31.6, cufflink-nats 0.9.11, cufflink-native 0.12.6, cufflink-model
-0.1.13 and cufflink-sql-parse 0.4.6 are bumped so the tagged commit
-publishes them. `cufflink init` still scaffolds `cufflink = "0.24"` and
+Crates: a patch release of every published crate, none of which changes;
+only the platform does. cufflink-types, cufflink-migrate,
+cufflink-pgcodec, cufflink-sdk-macros and cufflink 0.24.6, cufflink-fn
+0.40.6, cufflink-cli 0.31.6, cufflink-nats 0.9.11, cufflink-native 0.12.6,
+cufflink-model 0.1.13 and cufflink-sql-parse 0.4.6 are bumped so the
+tagged commit publishes them. `cufflink init` still scaffolds `cufflink = "0.24"` and
 `cufflink-fn = "0.40"`.
 
 Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone
