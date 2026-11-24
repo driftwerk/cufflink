@@ -435,7 +435,7 @@ A web bundle above 32 MiB goes up in parts from v0.40.0 on (`web_bundle_parts`):
 
 | CLI | Platform | Outcome |
 |-----|----------|---------|
-| new | new | the bundle in parts of 8 MiB, four at a time, each under the CLI's 120 s request timeout, then assembled; a bundle of at most 32 MiB in one request |
+| new | new | the bundle in one request; from v0.40.5, a bundle above 32 MiB whose one request gets no answer then goes in parts of 8 MiB, four at a time, each under the CLI's 120 s request timeout, and is assembled (v0.40.0 to v0.40.4 send such a bundle in parts at once) |
 | new | older | the bundle in one request, as before |
 | older | new | the bundle in one request, as before: the single upload is unchanged |
 
@@ -1449,6 +1449,39 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.40.5
+
+Unreleased.
+
+The CLI sends a web bundle in one request first, and in parts only when
+that request gets no answer. No platform change and no new feature: the
+single upload (`PUT /api/services/{id}/web/artifacts/{sha256}`) is the one
+every platform since v0.38.0 answers, and a CLI of this release deploys to
+a platform of v0.40.0 to v0.40.4 as to this one. There is no migration and
+no new setting.
+
+- A bundle above 32 MiB on a platform with `web_bundle_parts` goes up in
+  one request, which the platform hashes as it arrives and stores once.
+  From v0.40.0 to v0.40.4 such a bundle went in parts at once, and its
+  assembly read every part back from the store for the bundle's hash, then
+  streamed or copied the parts into the bundle: on a store whose reads and
+  copies are slow, the assembly took longer than the whole upload in one
+  request.
+- When the one request gets no answer (the CLI's 120 s request timeout, or
+  a refused or dropped connection), the CLI prints
+  `Uploading bundle 3f9a1c2b4d5e: no answer after 120.0 s; sending it in
+  parts` and sends the bundle in parts as before. A link too slow for one
+  request costs that one attempt first. A bundle the request stored
+  although its answer was lost is answered `present` by the assembly, and
+  no part is sent.
+- An answer to the one request is final: a refusal, such as a `413` above
+  the platform's body limit or a `500` from its store, stops the upload in
+  the platform's words, and no part is sent.
+- The platform holds the bundle in memory while it stores it, as the
+  single upload always has, up to the 250 MiB body limit.
+
+Crates: only `cufflink-cli` changes.
 
 ## Changes in v0.40.4
 

@@ -9,8 +9,12 @@ upload, release steps and content-addressed uploads it keeps.
 
 ## Outcome
 
-- A bundle above 32 MiB goes from the CLI to the platform as parts of 8 MiB,
-  four in flight. Each part is its own request under the CLI's 120 s
+- A bundle goes from the CLI to the platform in one request first. From
+  v0.40.5, one above 32 MiB whose request gets no answer then goes as parts
+  of 8 MiB, four in flight; v0.40.0 to v0.40.4 sent it in parts at once,
+  and its assembly, which reads every part back from the store, took
+  longer than the one request on a store slow to read and copy. Each part
+  is its own request under the CLI's 120 s
   request timeout, so no request has to carry the whole bundle across the
   link. A 250 MiB bundle, the platform's cap, needs about 0.3 MB/s across
   the four parts in flight instead of 2.2 MB/s for one request.
@@ -278,8 +282,9 @@ answered at once, without reading the rest of `data`:
 - `WebApp::upload` is the one place that sends a bundle, both for the first
   upload and for the upload again after a release refused as not claimed.
   It sends one request when `parts` is `None` or the bundle is at most
-  `threshold`. Otherwise it slices the `Bytes` into `size` parts and hashes
-  each, then:
+  `threshold`. Otherwise it sends one request first, and only when that
+  request gets no answer (`Failed::status` is `None`) slices the `Bytes`
+  into `size` parts and hashes each, then:
   1. asks the platform to assemble them. A bundle it already stores is
      answered `present`, and no part is sent;
   2. on a `409`, sends each distinct part once, `in_flight` at a time,
@@ -295,8 +300,8 @@ answered at once, without reading the rest of `data`:
   `attempts` in all, and each attempt again is printed with its reason and
   the bundle's short hash. A `4xx` other than `408` and `429`, the
   `404`/`405` of a replica mid-upgrade included, and a `501` or `505`, are
-  final. The single request is not sent again: it is only used for
-  bundles of at most 32 MiB and for older platforms.
+  final. The single request is not sent again: an answer to it, a refusal
+  included, is final, and one that gets no answer is followed by the parts.
 - One function, `answered`, turns every upload request's outcome into its
   error, ending as every upload error does today:
   `Uploading part 3 of 24 of bundle {sha256} got no answer; nothing was
@@ -309,7 +314,7 @@ answered at once, without reading the rest of `data`:
 
 | CLI | Platform | Outcome |
 |-----|----------|---------|
-| new | new | a bundle above 32 MiB in parts, a smaller one in one request |
+| new | new | the bundle in one request; one above 32 MiB whose request gets no answer, in parts |
 | new | older | one request, as today |
 | older | new | one request, as today; the single upload route is unchanged |
 
@@ -427,6 +432,7 @@ ends with one line summing it up:
 
 ```
 Uploading bundle 3f9a1c2b4d5e...
+  Uploading bundle 3f9a1c2b4d5e: no answer after 120.0 s; sending it in parts
   Assembling bundle 3f9a1c2b4d5e: 409 Conflict after 0.2 s
   In 20 parts
   Uploading part 2 of 20 of bundle 3f9a1c2b4d5e: 8388608 bytes in 3.1 s (2.6 MB/s)

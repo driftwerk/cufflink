@@ -619,26 +619,46 @@ impl WebApp<'_> {
         ))
     }
 
+    async fn whole(&self, reserved: &Reserved, bundle: &Bundle) -> Result<Value, Failed> {
+        self.answered(
+            self.whole_request(reserved, bundle),
+            &format!("Uploading bundle {}", bundle.sha256),
+            reserved,
+        )
+        .await
+    }
+
     async fn upload(&self, reserved: &Reserved, bundle: &Bundle) -> eyre::Result<()> {
         self.say(format!("Uploading bundle {}...", short(&bundle.sha256)));
         let started = Instant::now();
         let split = self
             .parts
             .and_then(|parts| parts.of(bundle).map(|split| (parts, split)));
+        let in_one = Some(Sent {
+            bytes: bundle.size(),
+            phases: None,
+        });
         let (answer, sent) = match split {
-            Some((parts, split)) => self.assembled(reserved, bundle, parts, &split).await?,
+            Some((parts, split)) => match timed(self.whole(reserved, bundle)).await {
+                (Err(failed), took) if failed.status.is_none() => {
+                    self.say(format!(
+                        "{}; sending it in parts",
+                        failed_line(
+                            &format!("Uploading bundle {}", short(&bundle.sha256)),
+                            &failed.reason(),
+                            took,
+                            None
+                        )
+                    ));
+                    self.assembled(reserved, bundle, parts, &split).await?
+                }
+                (answered, _) => (answered.map_err(|failed| failed.report)?, in_one),
+            },
             None => (
-                self.answered(
-                    self.whole_request(reserved, bundle),
-                    &format!("Uploading bundle {}", bundle.sha256),
-                    reserved,
-                )
-                .await
-                .map_err(|failed| failed.report)?,
-                Some(Sent {
-                    bytes: bundle.size(),
-                    phases: None,
-                }),
+                self.whole(reserved, bundle)
+                    .await
+                    .map_err(|failed| failed.report)?,
+                in_one,
             ),
         };
         self.say(
@@ -1334,6 +1354,14 @@ mod tests {
         requests.iter().map(|request| request.to_string()).collect()
     }
 
+    fn in_parts(groups: Vec<Vec<Option<(u16, Value)>>>) -> Vec<Option<(u16, Value)>> {
+        answers([vec![None]].into_iter().chain(groups).collect())
+    }
+
+    fn opened() -> Vec<String> {
+        [fixed(&[RESERVE, STATUS]), vec![upload()]].concat()
+    }
+
     fn hashes() -> Vec<String> {
         slices()
             .into_iter()
@@ -1342,10 +1370,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bundle_above_the_threshold_is_asked_for_then_sent_in_parts_and_assembled() {
+    async fn a_bundle_above_the_threshold_goes_in_one_request_first() {
+        let (ended, asked, _, said) = deployed_saying(
+            Some(IN_PARTS),
+            answers(vec![vec![
+                Some(stored("uploaded")),
+                Some(released(1, false)),
+            ]]),
+            Ok(BUNDLE.to_vec()),
+        )
+        .await;
+
+        ended.expect("released");
+        assert_eq!(asked.requests(), [RESERVE, STATUS, &upload(), RELEASE]);
+        assert_eq!(
+            said[1..4]
+                .iter()
+                .map(|line| timeless(line))
+                .collect::<Vec<_>>(),
+            [
+                format!("Uploading bundle {}...", short(&sha())),
+                "  Stored".to_string(),
+                "  Sent _ MB in _ s (_ MB/s)".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bundle_whose_one_request_is_refused_is_not_sent_in_parts() {
+        for (status, refusal) in [
+            (
+                413,
+                "Failed to buffer the request body: length limit exceeded",
+            ),
+            (500, "Failed to store web/7/site.tar.gz"),
+        ] {
+            let (ended, asked, _) = deployed_with(
+                Some(IN_PARTS),
+                answers(vec![vec![Some(refused(status, refusal))]]),
+                Ok(BUNDLE.to_vec()),
+            )
+            .await;
+
+            let failed = ended.expect_err("refused").to_string();
+            assert!(
+                failed.starts_with(&format!("Uploading bundle {} failed ({status} ", sha())),
+                "{failed}"
+            );
+            assert!(failed.contains(refusal), "{failed}");
+            assert!(failed.ends_with("; nothing was released"), "{failed}");
+            assert_eq!(asked.requests(), opened(), "no part and no assembly");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bundle_whose_one_request_gets_no_answer_is_sent_in_parts_and_assembled() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(released(1, false))],
@@ -1358,14 +1440,14 @@ mod tests {
         assert_eq!(
             asked.requests(),
             requests(&[
-                &fixed(&[RESERVE, STATUS]),
+                &opened(),
                 &[assemble()],
                 &parts_put(),
                 &[assemble()],
                 &fixed(&[RELEASE]),
             ])
         );
-        for at in [2, 6] {
+        for at in [3, 7] {
             assert_eq!(
                 asked.bodies()[at],
                 json!({"size": BUNDLE.len(), "parts": hashes()}),
@@ -1373,7 +1455,7 @@ mod tests {
             );
         }
         assert_eq!(
-            asked.bodies()[7]["web_artifact"],
+            asked.bodies()[8]["web_artifact"],
             json!({"sha256": sha(), "size": BUNDLE.len()}),
             "the release names the assembled bundle"
         );
@@ -1383,7 +1465,7 @@ mod tests {
     async fn a_bundle_the_platform_already_stores_sends_no_part() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![vec![
+            in_parts(vec![vec![
                 Some(stored("present")),
                 Some(released(1, false)),
             ]]),
@@ -1394,11 +1476,7 @@ mod tests {
         ended.expect("released");
         assert_eq!(
             asked.requests(),
-            requests(&[
-                &fixed(&[RESERVE, STATUS]),
-                &[assemble()],
-                &fixed(&[RELEASE])
-            ])
+            requests(&[&opened(), &[assemble()], &fixed(&[RELEASE])])
         );
     }
 
@@ -1409,7 +1487,7 @@ mod tests {
                 in_flight: 3,
                 ..IN_PARTS
             }),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(released(1, false))],
@@ -1420,12 +1498,12 @@ mod tests {
 
         ended.expect("released");
         let asked = asked.requests();
-        let mut sent = asked[3..6].to_vec();
+        let mut sent = asked[4..7].to_vec();
         sent.sort();
         let mut expected = parts_put();
         expected.sort();
         assert_eq!(sent, expected);
-        assert_eq!(asked[6..], [assemble(), RELEASE.to_string()]);
+        assert_eq!(asked[7..], [assemble(), RELEASE.to_string()]);
     }
 
     #[tokio::test]
@@ -1460,6 +1538,7 @@ mod tests {
                 vec![
                     Some(reserved()),
                     Some(running(7, Some(&"3f".repeat(32)))),
+                    None,
                     missing(slices()[0]),
                     part_stored(slices()[0]),
                 ],
@@ -1481,7 +1560,7 @@ mod tests {
         assert_eq!(
             asked.requests(),
             requests(&[
-                &fixed(&[RESERVE, STATUS]),
+                &opened(),
                 &[assemble(), parts[0].clone()],
                 &[parts[1].clone(), parts[1].clone(), parts[1].clone()],
             ]),
@@ -1496,7 +1575,7 @@ mod tests {
         ] {
             let (ended, asked, _) = deployed_with(
                 Some(IN_PARTS),
-                answers(vec![vec![
+                in_parts(vec![vec![
                     missing(slices()[0]),
                     Some(refused(status, refusal)),
                 ]]),
@@ -1518,7 +1597,7 @@ mod tests {
             assert!(failed.ends_with("; nothing was released"), "{failed}");
             assert_eq!(
                 asked.requests(),
-                requests(&[&fixed(&[RESERVE, STATUS]), &[assemble()], &parts_put()[..1]])
+                requests(&[&opened(), &[assemble()], &parts_put()[..1]])
             );
         }
     }
@@ -1527,7 +1606,7 @@ mod tests {
     async fn a_part_the_platform_no_longer_stores_at_the_assembly_is_sent_again_once() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![
@@ -1546,7 +1625,7 @@ mod tests {
         assert_eq!(
             asked.requests(),
             requests(&[
-                &fixed(&[RESERVE, STATUS]),
+                &opened(),
                 &[assemble()],
                 &parts,
                 &[assemble(), parts[1].clone(), assemble()],
@@ -1560,7 +1639,7 @@ mod tests {
         let hashes = hashes();
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![
@@ -1589,7 +1668,7 @@ mod tests {
         assert_eq!(
             asked.requests(),
             requests(&[
-                &fixed(&[RESERVE, STATUS]),
+                &opened(),
                 &[assemble()],
                 &parts,
                 &[assemble(), parts[0].clone(), parts[2].clone(), assemble()],
@@ -1627,22 +1706,19 @@ mod tests {
         for (after, starts, sent) in cases {
             let (ended, asked, _) = deployed_with(
                 Some(IN_PARTS),
-                answers(vec![vec![missing(slices()[0])], parts_stored(), after]),
+                in_parts(vec![vec![missing(slices()[0])], parts_stored(), after]),
                 Ok(BUNDLE.to_vec()),
             )
             .await;
             let failed = ended.expect_err("refused").to_string();
             assert!(failed.starts_with(&starts), "{failed}");
             assert!(failed.ends_with("; nothing was released"), "{failed}");
-            assert_eq!(
-                asked.requests(),
-                requests(&[&fixed(&[RESERVE, STATUS]), &sent])
-            );
+            assert_eq!(asked.requests(), requests(&[&opened(), &sent]));
         }
 
         let (ended, _, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![vec![None; 3]]),
+            in_parts(vec![vec![None; 3]]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1659,7 +1735,7 @@ mod tests {
     async fn a_part_or_assembly_lost_or_unavailable_is_sent_again_and_released() {
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 vec![
                     part_stored(slices()[0]),
@@ -1679,7 +1755,7 @@ mod tests {
         assert_eq!(
             asked.requests(),
             requests(&[
-                &fixed(&[RESERVE, STATUS]),
+                &opened(),
                 &[assemble()],
                 &[
                     parts[0].clone(),
@@ -1749,11 +1825,11 @@ mod tests {
         );
         let (ended, asked, _) = deployed_with(
             Some(IN_PARTS),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("uploaded")), Some(refused(409, &not_stored))],
-                vec![missing(slices()[0])],
+                vec![None, missing(slices()[0])],
                 parts_stored(),
                 vec![Some(stored("present")), Some(released(2, false))],
             ]),
@@ -1763,7 +1839,7 @@ mod tests {
 
         ended.expect("released after uploading the parts again");
         let once = requests(&[
-            &[assemble()],
+            &[upload(), assemble()],
             &parts_put(),
             &[assemble()],
             &fixed(&[RELEASE]),
@@ -1902,7 +1978,7 @@ mod tests {
     async fn each_attempt_of_a_part_or_assembly_says_how_long_it_took_and_the_upload_sums_up() {
         let (ended, _, _, said) = deployed_saying(
             Some(IN_PARTS),
-            answers(vec![
+            in_parts(vec![
                 vec![missing(slices()[0])],
                 vec![
                     part_stored(slices()[0]),
@@ -1924,6 +2000,7 @@ mod tests {
             [
                 format!("  Bundle {bundle}: 22 bytes (_ MB)"),
                 format!("Uploading bundle {bundle}..."),
+                format!("  Uploading bundle {bundle}: no answer after _ s; sending it in parts"),
                 format!("  Assembling bundle {bundle}: 409 Conflict after _ s"),
                 "  In 3 parts".to_string(),
                 format!("{}8 bytes in _ s (_ MB/s)", part(1)),
@@ -1945,7 +2022,7 @@ mod tests {
     async fn a_part_that_fails_for_good_says_how_long_its_last_attempt_took() {
         let (ended, _, _, said) = deployed_saying(
             Some(IN_PARTS),
-            answers(vec![vec![missing(slices()[0]), None, None, None]]),
+            in_parts(vec![vec![missing(slices()[0]), None, None, None]]),
             Ok(BUNDLE.to_vec()),
         )
         .await;
@@ -1960,7 +2037,7 @@ mod tests {
         );
         let part = format!("  Uploading part 1 of 3 of bundle {}: ", short(&sha()));
         assert_eq!(
-            said[4..]
+            said[5..]
                 .iter()
                 .map(|line| timeless(line))
                 .collect::<Vec<_>>(),
@@ -1998,7 +2075,7 @@ mod tests {
 
         let (ended, _, _, said) = deployed_saying(
             Some(IN_PARTS),
-            answers(vec![vec![
+            in_parts(vec![vec![
                 Some(stored("present")),
                 Some(released(1, false)),
             ]]),
@@ -2007,16 +2084,20 @@ mod tests {
         .await;
         ended.expect("released");
         assert_eq!(
-            said[2..4]
+            said[2..5]
                 .iter()
                 .map(|line| timeless(line))
                 .collect::<Vec<_>>(),
             [
+                format!(
+                    "  Uploading bundle {}: no answer after _ s; sending it in parts",
+                    short(&sha())
+                ),
                 format!("  Assembling bundle {}: answered in _ s", short(&sha())),
                 "  Already stored".to_string(),
             ]
         );
-        assert_eq!(said[4], "Releasing site...", "nothing was sent to sum up");
+        assert_eq!(said[5], "Releasing site...", "nothing was sent to sum up");
     }
 
     #[test]

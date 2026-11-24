@@ -1009,11 +1009,19 @@ steps, and only the last one changes what runs:
 4. It syncs the project's configs, builds the app with the service's
    configs, and tars `.next`, `node_modules`, `package.json` and `public`.
 5. It uploads the bundle by its SHA-256, unless the running version
-   already records that bundle. On a platform with `web_bundle_parts`, a
-   bundle above 32 MiB goes up as parts of 8 MiB, four at a time, each
-   under the CLI's 120 s request timeout, and is then assembled. The CLI
-   asks for the assembly first and sends its parts only when the platform
-   lacks them, each distinct part once. A part or assembly that gets no
+   already records that bundle. It sends the bundle in one request first,
+   which the platform hashes as it arrives and stores once. On a platform
+   with `web_bundle_parts`, a bundle above 32 MiB whose one request gets no
+   answer (the CLI's 120 s request timeout, or a refused or dropped
+   connection) then goes up as parts of 8 MiB, four at a time, each under
+   that timeout, and is assembled
+   (`Uploading bundle 3f9a1c2b4d5e: no answer after 120.0 s; sending it in
+   parts`). An answer to the one request is final: a refusal, such as a
+   `413` or a `500`, stops the upload in the platform's words and sends no
+   part. The CLI asks for the assembly first and sends its parts only when
+   the platform lacks them, each distinct part once, so a bundle the one
+   request stored although its answer was lost sends no part. A part or
+   assembly that gets no
    answer, a `5xx` (except `501` and `505`), `408` or `429` is sent again, up
    to three times in all, after `Retry-After` when it is longer than the
    pause; any other refusal stops the upload, and nothing is released.
