@@ -947,7 +947,12 @@ steps, and only the last one changes what runs:
    gzip tarball stores it by content and records it as an upload of the
    service. It changes no version and tells no runner. The body must hash
    to the path (`422` otherwise, and nothing is stored); `{sha256}` is 64
-   lowercase hex digits (`400`). An object of that size already stored is
+   lowercase hex digits (`400`). From v0.40.6 the platform streams the body
+   into object storage as it arrives and completes the object only once
+   the body has ended and hashes to the path: a body past the 250 MiB limit
+   (`413`, also before a byte is read when its declared length is above
+   it), a body that breaks off (`400`) or a failed write (`500`) leaves
+   nothing stored. An object of the declared size already stored is
    not written again (`"stored": "present"` rather than `"uploaded"`).
    Audited as `web.upload`.
 

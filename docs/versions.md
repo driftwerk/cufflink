@@ -566,6 +566,11 @@ Rolling a platform back from v0.40.0 to v0.39.0:
 | `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
 | The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
 
+Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone: a
+bundle the single upload streamed into storage reads back as any other,
+and v0.40.5 receives that upload whole again before it writes it, holding
+up to about twice the bundle in memory.
+
 Rolling a platform back from v0.40.5 to v0.40.4 needs nothing undone:
 v0.40.5 changes only the CLI, and a v0.40.5 CLI deploys to a v0.40.4
 platform as to its own. A CLI rolled back to 0.31.4 sends a bundle above
@@ -1454,6 +1459,55 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.40.6
+
+Unreleased.
+
+The platform streams the single web upload into object storage as it
+arrives. No new feature, route, answer or setting, and no migration; the
+CLI is unchanged, and a CLI of v0.40.5 uploads to this platform as to the
+last. A service built for v0.40.5 deploys and runs on this platform
+unchanged.
+
+- `PUT /api/services/{id}/web/artifacts/{sha256}` hands the body to the
+  store as it arrives, through the multipart upload the assembly of parts
+  already uses (the storage trait's `upload_stream`), and hashes it on the way.
+  Until v0.40.5 the platform received the whole body, then hashed it, then
+  wrote it: the receive and the write added up. Now they overlap, so an
+  upload takes about the longer of the two.
+- The bundle is stored only when its bytes are its hash: the hash is
+  checked, and an empty body refused, after the last byte and before the
+  upload completes. A body that is not its hash (`422`), an empty one
+  (`400`), a client that disconnects or a body that breaks off (`400`), a
+  body past the 250 MiB limit (`413`) and a failed write (`500`) abort the
+  multipart upload, and nothing is stored at the bundle's key. The limit
+  holds while the body streams, for a body of no declared length too; a
+  declared length above it is refused before a byte is read, with the
+  `413` the platform answered before.
+- The platform holds a few parts of the bundle, not the bundle: one
+  multipart threshold of it (32 MiB), the part being filled and the parts
+  in flight, where it held up to about twice the bundle.
+- A bundle already stored at the request's declared size is read through
+  for its hash and not written again (`"stored": "present"`), as before. A
+  body sent with no declared length (chunked) is written again, its bytes
+  verified, and answered `"uploaded"`; the CLI always declares the length.
+- A refusal that needs no body, a malformed hash (`400`) or a service of
+  another mode (`409`), and a failed write (`500`), are answered without
+  reading the rest of the body; a client still sending may see its
+  connection closed before it reads the answer. Refusals of the body
+  itself keep the plain-text answers of earlier releases.
+- A stalled part is cut short and sent again, and so is a stalled
+  completion, as for every multipart write
+  ([stalled storage requests](observability.md#stalled-storage-requests)).
+- `Web bundle uploaded` gains `receive_ms` and `store_ms` for the single
+  upload, and a failed one logs `Web bundle not stored`
+  ([web uploads](observability.md#web-uploads)).
+
+Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone
+([rolling a platform back](#rolling-a-platform-back)): a bundle streamed
+into storage reads back as any other, and v0.40.5 receives the single
+upload whole again before it writes it.
 
 ## Changes in v0.40.5
 

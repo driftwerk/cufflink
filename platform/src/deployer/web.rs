@@ -187,6 +187,17 @@ impl Object {
         }
     }
 
+    fn require_filled(self, size: u64) -> PlatformResult<()> {
+        if size == 0 {
+            Err(PlatformError::BadRequest(format!(
+                "the {} is empty",
+                self.name()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn key(self, service_id: Uuid, sha256: &str) -> String {
         match self {
             Object::Bundle => object_key(service_id, sha256),
@@ -209,12 +220,7 @@ async fn put(
     sha256: &str,
     bytes: bytes::Bytes,
 ) -> PlatformResult<(Artifact, Stored)> {
-    if bytes.is_empty() {
-        return Err(PlatformError::BadRequest(format!(
-            "the {} is empty",
-            object.name()
-        )));
-    }
+    object.require_filled(bytes.len() as u64)?;
     let storage = storage(state)?;
     let stored = Artifact {
         s3_key: object.key(service_id, sha256),
@@ -258,6 +264,76 @@ pub(crate) async fn store(
 ) -> PlatformResult<(Artifact, Stored)> {
     let stored = put(state, Object::Bundle, service_id, sha256, bundle).await?;
     record_upload(state, service_id, stored, uploaded_by).await
+}
+
+/// Stores the bundle `body` yields as it arrives, once its bytes are
+/// `sha256`. A bundle already stored at the `declared` size is read through
+/// to check it and not written again.
+pub(crate) async fn store_streamed(
+    state: &AppState,
+    service_id: Uuid,
+    sha256: &str,
+    body: BoxStream<'static, eyre::Result<bytes::Bytes>>,
+    declared: Option<u64>,
+    uploaded_by: &str,
+) -> (PlatformResult<(Artifact, Stored)>, Waited) {
+    let waits = Arc::new(Waits::default());
+    let written = written(
+        state,
+        service_id,
+        sha256,
+        body,
+        declared,
+        Arc::clone(&waits),
+    )
+    .await;
+    let _ = waits.answered.set(Instant::now());
+    let recorded = match written {
+        Ok(stored) => record_upload(state, service_id, stored, uploaded_by).await,
+        Err(e) => Err(e),
+    };
+    (recorded, waits.waited())
+}
+
+async fn written(
+    state: &AppState,
+    service_id: Uuid,
+    sha256: &str,
+    body: BoxStream<'static, eyre::Result<bytes::Bytes>>,
+    declared: Option<u64>,
+    waits: Arc<Waits>,
+) -> PlatformResult<(Artifact, Stored)> {
+    let storage = storage(state)?;
+    let key = Object::Bundle.key(service_id, sha256);
+    let present = match declared {
+        Some(size) => stored_size(storage, &key).await? == Some(size),
+        None => false,
+    };
+    let data = hashed(body, sha256.to_string(), Arc::clone(&waits));
+    let stored = if present {
+        data.try_for_each(|_| futures_util::future::ok(()))
+            .await
+            .map(|()| Stored::Present)
+    } else {
+        storage
+            .upload_stream(&key, data, Object::Bundle.content_type())
+            .await
+            .map(|_| Stored::Uploaded)
+    }
+    .map_err(|e| {
+        e.downcast::<PlatformError>()
+            .unwrap_or_else(|e| PlatformError::Internal(format!("Failed to store {key}: {e:#}")))
+    })?;
+    let size = i64::try_from(waits.received.load(Ordering::Relaxed))
+        .map_err(|_| PlatformError::BadRequest("the bundle is too large".into()))?;
+    Ok((
+        Artifact {
+            s3_key: key,
+            hash: sha256.to_string(),
+            size,
+        },
+        stored,
+    ))
 }
 
 pub(crate) async fn store_part(
@@ -331,21 +407,39 @@ struct Spent {
     failure: Option<String>,
 }
 
-/// What an assembly's stream spent waiting on: `read`, its parts' reads,
-/// while the upload asked for bytes, and `write`, the upload's writes while
-/// it asked for none. From `ended`, when its last byte was handed over, to
-/// `answered`, when the upload answered, it waited on its last parts and
-/// its completion.
+/// What a bundle's stream spent waiting on: `read`, its source (the parts'
+/// reads, or the request body), while the upload asked for bytes, and
+/// `write`, the upload's writes while it asked for none. From `ended`, when
+/// its last byte was handed over, to `answered`, when the upload answered,
+/// it waited on its last parts and its completion.
 #[derive(Debug, Default)]
 struct Waits {
     read: AtomicU64,
     write: AtomicU64,
+    received: AtomicU64,
     ended: std::sync::OnceLock<Instant>,
     answered: std::sync::OnceLock<Instant>,
     failure: std::sync::OnceLock<String>,
 }
 
+/// How a streamed upload spent its time: `receive_ms` waiting for the body,
+/// `store_ms` held back by the store and finishing after its last byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Waited {
+    pub(crate) received: u64,
+    pub(crate) receive_ms: u64,
+    pub(crate) store_ms: u64,
+}
+
 impl Waits {
+    fn waited(&self) -> Waited {
+        Waited {
+            received: self.received.load(Ordering::Relaxed),
+            receive_ms: millis(Self::of(&self.read)),
+            store_ms: millis(self.writing(Duration::ZERO)),
+        }
+    }
+
     fn add(spent: &AtomicU64, since: Instant) {
         spent.fetch_add(
             u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -487,33 +581,43 @@ fn verified(
     let read = read_ahead(parts, move |part| {
         fetched(storage.clone(), part, sha256.clone())
     });
+    hashed(read, bundle.hash.clone(), waits)
+}
+
+/// Yields what `data` yields, accounting its waits, and ends only once its
+/// bytes are `sha256` and not empty; otherwise it yields that refusal.
+fn hashed(
+    data: BoxStream<'static, eyre::Result<bytes::Bytes>>,
+    sha256: String,
+    waits: Arc<Waits>,
+) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
     stream::try_unfold(
-        (
-            read,
-            Sha256::new(),
-            bundle.hash.clone(),
-            waits,
-            None::<Instant>,
-        ),
-        |(mut read, mut digest, sha256, waits, handed)| async move {
+        (data, Sha256::new(), sha256, waits, None::<Instant>),
+        |(mut data, mut digest, sha256, waits, handed)| async move {
             if let Some(handed) = handed {
                 Waits::add(&waits.write, handed);
             }
             let asked = Instant::now();
-            let next = read.try_next().await;
+            let next = data.try_next().await;
             Waits::add(&waits.read, asked);
             match next? {
                 Some(chunk) => {
                     digest.update(&chunk);
+                    waits
+                        .received
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     Ok(Some((
                         chunk,
-                        (read, digest, sha256, waits, Some(Instant::now())),
+                        (data, digest, sha256, waits, Some(Instant::now())),
                     )))
                 }
                 None => {
                     let _ = waits.ended.set(Instant::now());
                     Object::Bundle
                         .require_content(&sha256, &hex::encode(digest.finalize()))
+                        .and_then(|()| {
+                            Object::Bundle.require_filled(waits.received.load(Ordering::Relaxed))
+                        })
                         .map(|()| None)
                         .map_err(eyre::Report::new)
                 }
@@ -1376,5 +1480,91 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(most.load(Ordering::SeqCst), PARTS_READ_AHEAD as u64);
+    }
+
+    fn chunks(data: &[&'static [u8]]) -> BoxStream<'static, eyre::Result<bytes::Bytes>> {
+        stream::iter(
+            data.iter()
+                .map(|chunk| Ok(bytes::Bytes::from_static(chunk)))
+                .collect::<Vec<_>>(),
+        )
+        .boxed()
+    }
+
+    async fn through(
+        data: BoxStream<'static, eyre::Result<bytes::Bytes>>,
+        sha256: String,
+    ) -> (Vec<eyre::Result<bytes::Bytes>>, Waited) {
+        let waits = Arc::new(Waits::default());
+        let yielded = hashed(data, sha256, Arc::clone(&waits)).collect().await;
+        (yielded, waits.waited())
+    }
+
+    fn refusal(yielded: &[eyre::Result<bytes::Bytes>]) -> Option<&PlatformError> {
+        yielded.last()?.as_ref().err()?.downcast_ref()
+    }
+
+    #[tokio::test]
+    async fn a_hashed_stream_passes_its_bytes_through_and_ends_when_they_are_its_hash() {
+        let (yielded, waited) = through(
+            chunks(&[b"loan-", b"service ", b"bundle"]),
+            crate::wasm_runtime::sha256_hex(b"loan-service bundle"),
+        )
+        .await;
+        let passed = yielded
+            .into_iter()
+            .collect::<eyre::Result<Vec<_>>>()
+            .expect("no refusal");
+        assert_eq!(passed.concat(), b"loan-service bundle");
+        assert_eq!(waited.received, 19);
+    }
+
+    #[tokio::test]
+    async fn a_hashed_stream_whose_bytes_are_not_its_hash_ends_with_that_refusal() {
+        let claimed = crate::wasm_runtime::sha256_hex(b"what was built");
+        let (yielded, _) = through(chunks(&[b"something ", b"else"]), claimed.clone()).await;
+        assert_eq!(yielded.iter().filter(|chunk| chunk.is_ok()).count(), 2);
+        assert!(
+            matches!(
+                refusal(&yielded),
+                Some(PlatformError::Validation(message)) if message == &format!(
+                    "the bundle's SHA-256 is {}, not {claimed}",
+                    crate::wasm_runtime::sha256_hex(b"something else")
+                )
+            ),
+            "{yielded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_hashed_stream_is_refused_after_its_hash() {
+        let (empty, _) = through(chunks(&[]), crate::wasm_runtime::sha256_hex(b"")).await;
+        assert!(
+            matches!(refusal(&empty), Some(PlatformError::BadRequest(message)) if message == "the bundle is empty"),
+            "{empty:?}"
+        );
+        let (mismatched, _) = through(chunks(&[]), "ab".repeat(32)).await;
+        assert!(
+            matches!(refusal(&mismatched), Some(PlatformError::Validation(_))),
+            "{mismatched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hashed_stream_yields_its_sources_error_as_it_was_and_checks_nothing() {
+        let failing = stream::iter(vec![
+            Ok(bytes::Bytes::from_static(b"half of a bundle")),
+            Err(eyre::Report::new(PlatformError::BadRequest(
+                "Failed to buffer the request body: connection closed".into(),
+            ))),
+        ])
+        .boxed();
+        let (yielded, waited) = through(failing, "ab".repeat(32)).await;
+        assert_eq!(yielded.len(), 2);
+        assert!(
+            matches!(refusal(&yielded), Some(PlatformError::BadRequest(message)) if message.ends_with("connection closed")),
+            "{yielded:?}"
+        );
+        assert_eq!(waited.received, 16);
     }
 }

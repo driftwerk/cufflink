@@ -42,6 +42,15 @@ impl S3Storage {
             .await
     }
 
+    pub async fn upload_stream(
+        &self,
+        key: &str,
+        data: futures_util::stream::BoxStream<'static, Result<bytes::Bytes>>,
+        content_type: &str,
+    ) -> Result<Uploaded> {
+        self.inner.upload_stream(key, data, content_type).await
+    }
+
     pub async fn assemble(
         &self,
         key: &str,

@@ -3,6 +3,8 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
+use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body::Body as _;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::convert::Infallible;
@@ -50,24 +52,45 @@ pub(super) async fn read(body: Body, limit: usize) -> Result<Bytes, Response> {
     })
 }
 
-fn refusal(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response {
+const UNBUFFERED: &str = "Failed to buffer the request body";
+
+fn unread(e: &(dyn std::error::Error + Send + Sync + 'static)) -> PlatformError {
     if e.downcast_ref::<LengthLimitError>().is_some() {
-        too_large()
+        PlatformError::PayloadTooLarge(format!("{UNBUFFERED}: length limit exceeded"))
     } else {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to buffer the request body: {e}"),
-        )
-            .into_response()
+        PlatformError::BadRequest(format!("{UNBUFFERED}: {e}"))
     }
 }
 
-fn too_large() -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "Failed to buffer the request body: length limit exceeded",
-    )
-        .into_response()
+/// Answers `e` as a refusal of the body in the extractor's plain text, and
+/// any other error as it answers itself.
+pub(crate) fn answer(e: PlatformError) -> Response {
+    match e {
+        PlatformError::PayloadTooLarge(reason) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, reason).into_response()
+        }
+        PlatformError::BadRequest(reason) if reason.starts_with(UNBUFFERED) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        e => e.into_response(),
+    }
+}
+
+fn refusal(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response {
+    answer(unread(e))
+}
+
+pub(crate) fn too_large() -> Response {
+    answer(PlatformError::PayloadTooLarge(format!(
+        "{UNBUFFERED}: length limit exceeded"
+    )))
+}
+
+pub(crate) fn streamed(body: Body, limit: usize) -> BoxStream<'static, eyre::Result<Bytes>> {
+    Limited::new(body, limit)
+        .into_data_stream()
+        .map_err(|e| eyre::Report::new(unread(&*e)))
+        .boxed()
 }
 
 fn rejected(reason: &'static str) {
@@ -156,6 +179,28 @@ mod tests {
         assert_eq!(
             read(Body::from("1234"), 4).await.expect("fits"),
             Bytes::from_static(b"1234")
+        );
+
+        let streamed_refusal = streamed(Body::from("12345"), 4)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("too large")
+            .downcast::<PlatformError>()
+            .map(answer)
+            .expect("a refusal of the body");
+        assert_eq!(streamed_refusal.status(), status);
+        assert_eq!(
+            streamed_refusal.headers()[header::CONTENT_TYPE],
+            content_type
+        );
+        assert_eq!(body(streamed_refusal).await.expect("body"), expected_body);
+        assert_eq!(
+            streamed(Body::from("1234"), 4)
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("fits")
+                .concat(),
+            b"1234"
         );
     }
 
