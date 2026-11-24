@@ -226,8 +226,15 @@ answered at once, without reading the rest of `data`:
 - S3 copies each part into the bundle's multipart upload with
   UploadPartCopy, eight at a time, signed with object_store's own
   credentials and signer and sent through its HTTP client. Every part but
-  the last must hold at least 5 MiB, and none more than 64 MiB, so that a
-  copy is bounded by the stall timeout. A copied part takes its number and
+  the last must hold at least 5 MiB, and none more than 64 MiB. Each copy
+  names its empty body's length (`Content-Length: 0`): a strict
+  S3-compatible store (Ceph RGW) answers a copy without one `411`. A copy
+  sends no bytes, so it is cut short after its own timeout
+  (`OBJECT_STORE_COPY_TIMEOUT_SECS`, 10 s), not the stall timeout's per
+  8 MiB; sent again, it copies the same source into the same part number,
+  so the part's bytes and ETag are the same whichever attempt the store
+  keeps, and an attempt that lands after the completion is refused by the
+  store as the upload is gone. A copied part takes its number and
   its size in the upload as a sent one does, through the same cut-short
   loop, so a completion whose answer was lost still stands on the size
   sent. The upload completes only once `data` has ended; an error from

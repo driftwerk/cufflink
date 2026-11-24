@@ -518,6 +518,7 @@ mod tests {
             3,
             Duration::from_secs(30),
             Duration::from_secs(1),
+            Duration::from_secs(1),
         );
         let uploaded = emulated_with(&server.uri(), stall)
             .upload_to_bucket_with(

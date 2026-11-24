@@ -132,6 +132,9 @@ impl CopyPart for PartCopier {
                 .method(http::Method::PUT)
                 .uri(url)
                 .header(COPY_SOURCE_HEADER, source)
+                // An empty body is sent without a length unless it is named:
+                // a strict S3-compatible store answers 411 to a copy without one.
+                .header(http::header::CONTENT_LENGTH, "0")
                 .body(HttpRequestBody::empty())
                 .map_err(|e| copied::generic(BACKEND, e))?;
             AwsAuthorizer::new(&credential, "s3", &self.region)
@@ -1496,6 +1499,7 @@ mod tests {
                     "x-amz-copy-source",
                     format!("cufflink/parts/{}", number - 1),
                 ))
+                .and(header("content-length", "0"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(format!(
                     "<CopyPartResult><ETag>{quote}copied-{number}{quote}</ETag></CopyPartResult>"
                 )))
@@ -1553,6 +1557,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_that_requires_a_content_length_copies_every_part() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        initiates_assembly(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .and(header("content-length", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&quot;copied&quot;</ETag></CopyPartResult>",
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(ASSEMBLED))
+            .respond_with(ResponseTemplate::new(411).set_body_string(
+                "<Error><Code>MissingContentLength</Code><Message></Message></Error>",
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ASSEMBLED))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let uploaded = backend_at(&server.uri())
+            .assemble(
+                "bundles/app.tar.gz",
+                stored_parts(&[8 * MIB, 8 * MIB, 4 * MIB]),
+                bundle_bytes(vec![Ok(Bytes::from_static(b"the parts"))]),
+                "application/gzip",
+            )
+            .await
+            .expect("assembled");
+        assert_eq!(uploaded.etag.as_deref(), Some("\"whole\""));
+        let copies = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 3);
+        assert!(copies.iter().all(|copy| copy
+            .headers
+            .get("content-length")
+            .is_some_and(|length| length == "0")));
+    }
+
+    #[tokio::test]
     async fn a_copy_answered_with_an_error_body_aborts_the_assembly() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1582,7 +1644,10 @@ mod tests {
             failed.to_string(),
             "s3 upload failed for bundles/app.tar.gz"
         );
-        assert!(format!("{failed:?}").contains("AccessDenied"), "{failed:?}");
+        assert!(
+            format!("{failed:#}").contains("<Code>AccessDenied</Code>"),
+            "the store's answer is in the chain a caller prints: {failed:#}"
+        );
         assert!(
             requests_until(&server, |request| request.method.as_str() == "DELETE").await,
             "the failed assembly is aborted"

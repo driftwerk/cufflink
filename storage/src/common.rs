@@ -94,6 +94,10 @@ pub(crate) const ENV_STALL_ATTEMPTS: &str = "OBJECT_STORE_STALL_ATTEMPTS";
 
 pub(crate) const ENV_COMPLETION_TIMEOUT_SECS: &str = "OBJECT_STORE_COMPLETION_TIMEOUT_SECS";
 
+const DEFAULT_COPY_TIMEOUT_SECS: u64 = 10;
+
+pub(crate) const ENV_COPY_TIMEOUT_SECS: &str = "OBJECT_STORE_COPY_TIMEOUT_SECS";
+
 fn env_positive(name: &'static str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -127,16 +131,18 @@ pub(crate) fn request_timeout() -> Duration {
 /// again: a write, whole or one part of a multipart upload, that has not
 /// finished within `timeout` for each part's worth of its bytes, the
 /// completion of a multipart upload not answered within `completion`, an
-/// open with no answer within `timeout`, and a read that receives nothing for
-/// it, which resumes from its next byte. A request is tried at most `attempts`
-/// times in a row, and its last attempt is bounded only by the request
-/// timeout, the `ceiling`.
+/// open with no answer within `timeout`, a part copied inside the store not
+/// answered within `copy`, which sends no bytes and so is not measured by
+/// them, and a read that receives nothing for `timeout`, which resumes from
+/// its next byte. A request is tried at most `attempts` times in a row, and
+/// its last attempt is bounded only by the request timeout, the `ceiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stall {
     timeout: Duration,
     attempts: u32,
     ceiling: Duration,
     completion: Duration,
+    copy: Duration,
 }
 
 impl Stall {
@@ -148,6 +154,7 @@ impl Stall {
                 .unwrap_or(u32::MAX),
             ceiling: request_timeout(),
             completion: env_secs(ENV_COMPLETION_TIMEOUT_SECS, timeout.as_secs()),
+            copy: env_secs(ENV_COPY_TIMEOUT_SECS, DEFAULT_COPY_TIMEOUT_SECS),
         }
     }
 
@@ -159,18 +166,24 @@ impl Stall {
         self.completion
     }
 
+    pub(crate) fn copy(self) -> Duration {
+        self.copy
+    }
+
     #[cfg(test)]
     pub(crate) const fn of(
         timeout: Duration,
         attempts: u32,
         ceiling: Duration,
         completion: Duration,
+        copy: Duration,
     ) -> Self {
         Self {
             timeout,
             attempts,
             ceiling,
             completion,
+            copy,
         }
     }
 
@@ -277,6 +290,18 @@ pub(crate) fn warn_unless_timed_out_requests_retry(backend: &'static str) {
             "{ENV_COMPLETION_TIMEOUT_SECS} is not below {ENV_REQUEST_TIMEOUT_SECS}, so a stalled completion is never cut short"
         );
     }
+    if copies_are_never_cut(stall) {
+        tracing::warn!(
+            backend,
+            copy_timeout_secs = stall.copy.as_secs(),
+            request_timeout_secs = stall.ceiling.as_secs(),
+            "{ENV_COPY_TIMEOUT_SECS} is not below {ENV_REQUEST_TIMEOUT_SECS}, so a slow copy is never sent again"
+        );
+    }
+}
+
+fn copies_are_never_cut(stall: Stall) -> bool {
+    stall.attempts > 1 && !stall.cuts(stall.copy)
 }
 
 fn completions_are_never_cut(configured: bool, stall: Stall) -> bool {
@@ -1295,9 +1320,10 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::{
-        already_aborted, completions_are_never_cut, get_bytes, open_read, put_in, put_stream_in,
-        rechunked, request_timeout, retry_timeout, timed_out_requests_cannot_retry, Keys,
-        Multipart, PartClock, Put, Stall, ENV_COMPLETION_TIMEOUT_SECS, ENV_REQUEST_TIMEOUT_SECS,
+        already_aborted, completions_are_never_cut, copies_are_never_cut, get_bytes, open_read,
+        put_in, put_stream_in, rechunked, request_timeout, retry_timeout,
+        timed_out_requests_cannot_retry, Keys, Multipart, PartClock, Put, Stall,
+        ENV_COMPLETION_TIMEOUT_SECS, ENV_COPY_TIMEOUT_SECS, ENV_REQUEST_TIMEOUT_SECS,
         ENV_RETRY_TIMEOUT_SECS, ENV_STALL_ATTEMPTS, ENV_STALL_TIMEOUT_SECS, MAX_PARTS,
     };
     use crate::PartTimes;
@@ -1327,6 +1353,7 @@ mod tests {
         attempts: 1,
         ceiling: Duration::from_secs(30),
         completion: Duration::from_secs(2),
+        copy: Duration::from_secs(3),
     };
 
     fn payload(size: usize) -> Vec<u8> {
@@ -2038,6 +2065,7 @@ mod tests {
         attempts: 3,
         ceiling: CEILING,
         completion: Duration::from_secs(2),
+        copy: Duration::from_secs(3),
     };
 
     async fn stored(probe: &Probe, key: &str, data: &[u8]) {
@@ -2103,6 +2131,7 @@ mod tests {
                 (ENV_STALL_ATTEMPTS, None),
                 (ENV_REQUEST_TIMEOUT_SECS, None),
                 (ENV_COMPLETION_TIMEOUT_SECS, None),
+                (ENV_COPY_TIMEOUT_SECS, None),
             ],
             || {
                 let stall = Stall::configured();
@@ -2113,10 +2142,12 @@ mod tests {
                         attempts: 3,
                         ceiling: Duration::from_secs(30),
                         completion: Duration::from_secs(20),
+                        copy: Duration::from_secs(10),
                     }
                 );
                 assert!(stall.cuts(stall.timeout));
                 assert!(stall.cuts(stall.completion));
+                assert!(stall.cuts(stall.copy));
                 assert!(!stall.outlasts_ceiling());
             },
         );
@@ -2126,11 +2157,13 @@ mod tests {
                 (ENV_STALL_ATTEMPTS, Some("many")),
                 (ENV_REQUEST_TIMEOUT_SECS, None),
                 (ENV_COMPLETION_TIMEOUT_SECS, Some("-1")),
+                (ENV_COPY_TIMEOUT_SECS, Some("soon")),
             ],
             || {
                 assert_eq!(Stall::configured().timeout, Duration::from_secs(20));
                 assert_eq!(Stall::configured().attempts, 3);
                 assert_eq!(Stall::configured().completion, Duration::from_secs(20));
+                assert_eq!(Stall::configured().copy, Duration::from_secs(10));
             },
         );
         super::test_env::with(
@@ -2143,6 +2176,24 @@ mod tests {
         super::test_env::with(&[(ENV_COMPLETION_TIMEOUT_SECS, Some("25"))], || {
             assert_eq!(Stall::configured().completion, Duration::from_secs(25));
         });
+        super::test_env::with(
+            &[
+                (ENV_STALL_TIMEOUT_SECS, Some("7")),
+                (ENV_COPY_TIMEOUT_SECS, Some("4")),
+            ],
+            || assert_eq!(Stall::configured().copy, Duration::from_secs(4)),
+        );
+    }
+
+    #[test]
+    fn a_copy_bound_not_below_the_request_timeout_is_warned_of() {
+        let long = Stall {
+            copy: CEILING,
+            ..STALL
+        };
+        assert!(copies_are_never_cut(long));
+        assert!(!copies_are_never_cut(STALL));
+        assert!(!copies_are_never_cut(UNCUT));
     }
 
     #[test]

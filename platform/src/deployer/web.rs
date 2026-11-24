@@ -550,7 +550,7 @@ async fn streamed(
                 Ok((Stored::Present, None))
             }
             _ => Err(e.downcast::<PlatformError>().unwrap_or_else(|e| {
-                PlatformError::Internal(format!("Failed to assemble {}: {e}", bundle.s3_key))
+                PlatformError::Internal(format!("Failed to assemble {}: {e:#}", bundle.s3_key))
             })),
         },
     }

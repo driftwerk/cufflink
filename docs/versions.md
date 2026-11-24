@@ -579,6 +579,15 @@ Rolling a platform back from v0.40.3 to v0.40.2:
 | `ObjectStorage::assemble` | Nothing: only assembly calls it |
 | The database | Nothing: v0.40.3 has no migration |
 
+Rolling a platform back from v0.40.4 to v0.40.3:
+
+| What v0.40.4 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| `Content-Length: 0` on a copy | Nothing to undo: a bundle copied this way reads back as any other. A strict S3-compatible store refuses v0.40.3's copies again, so every copied assembly on it fails; roll back to v0.40.2 instead, which streams |
+| `OBJECT_STORE_COPY_TIMEOUT_SECS` | Nothing: v0.40.3 ignores it and cuts a copy at the stall timeout again |
+| The whole error in a failed assembly's answer and log line | Nothing: v0.40.3 answers with the outermost message only |
+| The database | Nothing: v0.40.4 has no migration |
+
 Rolling a platform back from v0.40.2 to v0.40.1:
 
 | What v0.40.2 changed | Before rolling the platform back |
@@ -1440,6 +1449,37 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.40.4
+
+Unreleased.
+
+A web bundle assembled by copying its parts inside S3 is stored by a strict
+S3-compatible store too, a copy that is slow is sent again sooner, and a
+failed assembly says why. No new feature. A service built for v0.40.3
+deploys and runs on this platform unchanged. There is no migration. New
+environment variable: `OBJECT_STORE_COPY_TIMEOUT_SECS` on the platform, the
+worker and the web runner ([setup](setup.md)).
+
+- Each UploadPartCopy request names its empty body's length
+  (`Content-Length: 0`). v0.40.3 sent none, and a strict S3-compatible
+  store (Ceph RGW) answers such a copy `411 Length Required`
+  (`MissingContentLength`), so every copied assembly on it failed.
+- A part copied inside the store is cut short and sent again after
+  `OBJECT_STORE_COPY_TIMEOUT_SECS` (default `10`), not the stall timeout: a
+  copy sends no bytes, so its time is the store's. It is sent again under
+  its own part number from the same source, so the part's bytes, and the
+  ETag the completion names, are the same whichever attempt the store
+  keeps; at most `OBJECT_STORE_STALL_ATTEMPTS` times, the last bounded only
+  by `OBJECT_STORE_REQUEST_TIMEOUT_SECS`, so a copy slower than the copy
+  timeout still succeeds on its last attempt.
+- A failed assembly's `500` answer and its `Web bundle not assembled` log
+  line carry the whole error, the store's own answer included, not only
+  its outermost message.
+
+Rolling a platform back from v0.40.4 to v0.40.3 needs nothing undone
+first ([rolling a platform back](#rolling-a-platform-back)), but a strict
+S3-compatible store fails every copied assembly on v0.40.3 again.
 
 ## Changes in v0.40.3
 
