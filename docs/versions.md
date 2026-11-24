@@ -1462,8 +1462,6 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.40.6
 
-Unreleased.
-
 The platform streams the single web upload into object storage as it
 arrives. No new feature, route, answer or setting, and no migration; the
 CLI is unchanged, and a CLI of v0.40.5 uploads to this platform as to the
@@ -1503,6 +1501,14 @@ unchanged.
 - `Web bundle uploaded` gains `receive_ms` and `store_ms` for the single
   upload, and a failed one logs `Web bundle not stored`
   ([web uploads](observability.md#web-uploads)).
+
+Crates: a patch release of every published crate, of which none changes:
+the platform does. cufflink-types, cufflink-migrate, cufflink-pgcodec,
+cufflink-sdk-macros and cufflink 0.24.6, cufflink-fn 0.40.6, cufflink-cli
+0.31.6, cufflink-nats 0.9.11, cufflink-native 0.12.6, cufflink-model
+0.1.13 and cufflink-sql-parse 0.4.6 are bumped so the tagged commit
+publishes them. `cufflink init` still scaffolds `cufflink = "0.24"` and
+`cufflink-fn = "0.40"`.
 
 Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone
 ([rolling a platform back](#rolling-a-platform-back)): a bundle streamed
