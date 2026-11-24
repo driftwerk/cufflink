@@ -566,6 +566,20 @@ Rolling a platform back from v0.40.0 to v0.39.0:
 | `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
 | The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
 
+Rolling a platform back from v0.40.5 to v0.40.4 needs nothing undone:
+v0.40.5 changes only the CLI, and a v0.40.5 CLI deploys to a v0.40.4
+platform as to its own. A CLI rolled back to 0.31.4 sends a bundle above
+32 MiB to a platform with `web_bundle_parts` in parts at once again.
+
+Rolling a platform back from v0.40.4 to v0.40.3:
+
+| What v0.40.4 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| `Content-Length: 0` on a copy | Nothing to undo: a bundle copied this way reads back as any other. A strict S3-compatible store refuses v0.40.3's copies again, so every copied assembly on it fails; roll back to v0.40.2 instead, which streams |
+| A copy sent once, and `OBJECT_STORE_COPY_TIMEOUT_SECS` | Nothing: v0.40.3 ignores the setting and cuts a copy at the stall timeout again |
+| The store's status and code in a failed assembly's answer, and `cause` in its log line | Nothing: v0.40.3 answers with the outermost message and the storage key, and logs no `cause` |
+| The database | Nothing: v0.40.4 has no migration |
+
 Rolling a platform back from v0.40.3 to v0.40.2:
 
 | What v0.40.3 changed | Before rolling the platform back |
@@ -578,15 +592,6 @@ Rolling a platform back from v0.40.3 to v0.40.2:
 | `parts_in_flight`, `part_store_max_ms` and `part_store_ms` in the assembly's log lines, `copy` and `compose` as a stalled request | Nothing: v0.40.2 logs none of them |
 | `ObjectStorage::assemble` | Nothing: only assembly calls it |
 | The database | Nothing: v0.40.3 has no migration |
-
-Rolling a platform back from v0.40.4 to v0.40.3:
-
-| What v0.40.4 changed | Before rolling the platform back |
-|----------------------|----------------------------------|
-| `Content-Length: 0` on a copy | Nothing to undo: a bundle copied this way reads back as any other. A strict S3-compatible store refuses v0.40.3's copies again, so every copied assembly on it fails; roll back to v0.40.2 instead, which streams |
-| A copy sent once, and `OBJECT_STORE_COPY_TIMEOUT_SECS` | Nothing: v0.40.3 ignores the setting and cuts a copy at the stall timeout again |
-| The store's status and code in a failed assembly's answer, and `cause` in its log line | Nothing: v0.40.3 answers with the outermost message and the storage key, and logs no `cause` |
-| The database | Nothing: v0.40.4 has no migration |
 
 Rolling a platform back from v0.40.2 to v0.40.1:
 
@@ -1452,14 +1457,13 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.40.5
 
-Unreleased.
-
 The CLI sends a web bundle in one request first, and in parts only when
 that request gets no answer. No platform change and no new feature: the
 single upload (`PUT /api/services/{id}/web/artifacts/{sha256}`) is the one
 every platform since v0.38.0 answers, and a CLI of this release deploys to
-a platform of v0.40.0 to v0.40.4 as to this one. There is no migration and
-no new setting.
+a platform of v0.40.0 to v0.40.4 as to this one. A service built for
+v0.40.4 deploys and runs on this platform unchanged. There is no migration
+and no new setting.
 
 - A bundle above 32 MiB on a platform with `web_bundle_parts` goes up in
   one request, which the platform receives whole, hashes and stores once.
@@ -1486,7 +1490,18 @@ no new setting.
 - The platform holds the bundle in memory while it stores it, as the
   single upload always has, up to the 250 MiB body limit.
 
-Crates: only `cufflink-cli` changes.
+Crates: a patch release of every published crate, of which only
+`cufflink-cli` changes. cufflink-types, cufflink-migrate,
+cufflink-pgcodec, cufflink-sdk-macros and cufflink 0.24.5, cufflink-fn
+0.40.5, cufflink-cli 0.31.5, cufflink-nats 0.9.10, cufflink-native
+0.12.5, cufflink-model 0.1.12 and cufflink-sql-parse 0.4.5 are bumped so
+the tagged commit publishes them. `cufflink init` still scaffolds
+`cufflink = "0.24"` and `cufflink-fn = "0.40"`.
+
+Rolling a platform back from v0.40.5 to v0.40.4 needs nothing undone
+([rolling a platform back](#rolling-a-platform-back)): the platform does
+not change. A CLI rolled back to 0.31.4 sends a bundle above 32 MiB to a
+platform with `web_bundle_parts` in parts at once again.
 
 ## Changes in v0.40.4
 
