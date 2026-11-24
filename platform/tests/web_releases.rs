@@ -19,7 +19,7 @@ struct World {
     tenant: Tenant,
     admin_key: String,
     db: TestDb,
-    _storage_dir: tempfile::TempDir,
+    storage_dir: tempfile::TempDir,
     storage: Arc<dyn ObjectStorage>,
     deploys: async_nats::Subscriber,
 }
@@ -66,7 +66,7 @@ impl World {
             tenant,
             admin_key,
             db,
-            _storage_dir: storage_dir,
+            storage_dir,
             storage,
             deploys,
         })
@@ -456,6 +456,100 @@ impl World {
     fn key(service_id: &str, bundle: &[u8]) -> String {
         format!("web/{service_id}/{}.tar.gz", sha256_hex(bundle))
     }
+
+    async fn sent_raw(
+        &self,
+        service_id: &str,
+        sha256: &str,
+        framing: &str,
+        body: impl IntoIterator<Item = Vec<u8>>,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        use tokio::io::AsyncWriteExt;
+        let mut connection =
+            tokio::net::TcpStream::connect(("127.0.0.1", self.platform.port)).await?;
+        connection
+            .write_all(
+                format!(
+                    "PUT /api/services/{service_id}/web/artifacts/{sha256} HTTP/1.1\r\n\
+                     host: 127.0.0.1\r\nauthorization: {}\r\n{framing}\r\n\r\n",
+                    self.deployer()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        for piece in body {
+            connection.write_all(&piece).await?;
+        }
+        Ok(connection)
+    }
+
+    async fn answered_raw(connection: std::io::Result<tokio::net::TcpStream>) -> Option<u16> {
+        use tokio::io::AsyncReadExt;
+        let (mut connection, mut answer) = (connection.ok()?, vec![0; 64]);
+        let read = tokio::time::timeout(Duration::from_secs(30), connection.read(&mut answer))
+            .await
+            .ok()?
+            .ok()?;
+        String::from_utf8_lossy(&answer[..read])
+            .split(' ')
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    fn files_of(&self, service_id: &str) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path)
+                    } else {
+                        vec![path]
+                    }
+                })
+                .collect()
+        }
+        walk(self.storage_dir.path())
+            .into_iter()
+            .filter(|path| path.to_string_lossy().contains(service_id))
+            .collect()
+    }
+
+    async fn left_nothing(&self, service_id: &str, sha256: &str) {
+        let mut files = self.files_of(service_id);
+        for _ in 0..50 {
+            if files.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            files = self.files_of(service_id);
+        }
+        assert!(files.is_empty(), "nothing is left in storage: {files:?}");
+        assert_eq!(
+            self.stored(&format!("web/{service_id}/{sha256}.tar.gz"))
+                .await,
+            None
+        );
+        assert!(self.uploads(service_id).await.is_empty());
+    }
+
+    async fn logged_soon(&self, messages: &[&str]) -> Vec<Value> {
+        for _ in 0..100 {
+            let lines = messages
+                .iter()
+                .flat_map(|message| self.logged(message))
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Vec::new()
+    }
 }
 
 #[tokio::test]
@@ -729,6 +823,160 @@ async fn an_upload_whose_bytes_are_not_its_hash_is_refused() {
         None
     );
     w.heard_nothing().await;
+}
+
+const MIB: usize = 1024 * 1024;
+const ARTIFACT_BODY_LIMIT: usize = 250 * MIB;
+
+fn large(size: usize, seed: u8) -> Vec<u8> {
+    (0..size).map(|at| (at % 251) as u8 ^ seed).collect()
+}
+
+#[tokio::test]
+async fn a_bundle_above_the_multipart_threshold_streams_into_storage_and_logs_its_split() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = large(48 * MIB, 7);
+
+    let uploaded = w.uploaded(&service_id, &bundle).await;
+    assert_eq!(
+        (&uploaded["stored"], &uploaded["size"]),
+        (&json!("uploaded"), &json!(bundle.len()))
+    );
+    assert_eq!(
+        w.stored(&World::key(&service_id, &bundle)).await,
+        Some(bundle.clone())
+    );
+    assert_eq!(w.uploaded(&service_id, &bundle).await["stored"], "present");
+    let lines = w.logged("Web bundle uploaded");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|line| timed(line, &["receive_ms", "store_ms"])),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bundle_above_the_multipart_threshold_whose_bytes_are_not_its_hash_stores_nothing() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let claimed = sha256_hex(&large(48 * MIB, 1));
+    let sent = large(48 * MIB, 2);
+
+    let (status, refused) = w.put(&service_id, &claimed, &sent).await;
+    assert_eq!(status, 422, "{refused}");
+    assert!(
+        refused.to_string().contains(&format!(
+            "the bundle's SHA-256 is {}, not {claimed}",
+            sha256_hex(&sent)
+        )),
+        "{refused}"
+    );
+    w.left_nothing(&service_id, &claimed).await;
+    let lines = w.logged("Web bundle not stored");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["received"], json!(sent.len()));
+    assert!(timed(&lines[0], &["receive_ms", "store_ms"]), "{lines:?}");
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_halfway_through_its_bundle_leaves_nothing_stored() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let bundle = large(72 * MIB, 3);
+    let sha256 = sha256_hex(&bundle);
+
+    let connection = w
+        .sent_raw(
+            &service_id,
+            &sha256,
+            &format!("content-length: {}", bundle.len()),
+            bundle[..40 * MIB].chunks(MIB).map(<[u8]>::to_vec),
+        )
+        .await
+        .expect("half of the bundle is sent");
+    drop(connection);
+
+    let ended = w
+        .logged_soon(&[
+            "Web bundle not stored",
+            "Web bundle request dropped before its answer",
+        ])
+        .await;
+    assert_eq!(ended.len(), 1, "the platform saw the client go: {ended:?}");
+    w.left_nothing(&service_id, &sha256).await;
+    assert!(w.logged("Web bundle uploaded").is_empty());
+}
+
+#[tokio::test]
+async fn a_bundle_one_byte_over_the_limit_is_refused_while_it_streams_and_stores_nothing() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let sha256 = "ab".repeat(32);
+    let piece = vec![b'x'; MIB];
+    let chunk = |data: &[u8]| {
+        [
+            format!("{:x}\r\n", data.len()).into_bytes(),
+            data.to_vec(),
+            b"\r\n".to_vec(),
+        ]
+        .concat()
+    };
+    let chunks = std::iter::repeat_n(chunk(&piece), ARTIFACT_BODY_LIMIT / MIB)
+        .chain([chunk(b"x"), b"0\r\n\r\n".to_vec()]);
+
+    let answered = World::answered_raw(
+        w.sent_raw(&service_id, &sha256, "transfer-encoding: chunked", chunks)
+            .await,
+    )
+    .await;
+    assert!(
+        matches!(answered, Some(413) | None),
+        "a bundle past the limit is refused with a 413, or its connection closed once it is: {answered:?}"
+    );
+    let lines = w.logged_soon(&["Web bundle not stored"]).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("length limit exceeded")),
+        "{lines:?}"
+    );
+    assert_eq!(lines[0]["received"], json!(ARTIFACT_BODY_LIMIT));
+    w.left_nothing(&service_id, &sha256).await;
+}
+
+#[tokio::test]
+async fn a_bundle_declared_over_the_limit_is_refused_before_a_byte_is_read() {
+    let Some(w) = World::start().await else {
+        return;
+    };
+    let service_id = w.reserved().await;
+    let sha256 = "ab".repeat(32);
+
+    let answered = World::answered_raw(
+        w.sent_raw(
+            &service_id,
+            &sha256,
+            &format!("content-length: {}", ARTIFACT_BODY_LIMIT + 1),
+            [],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(answered, Some(413));
+    assert!(w.logged("Web bundle not stored").is_empty());
+    w.left_nothing(&service_id, &sha256).await;
 }
 
 #[tokio::test]

@@ -3,6 +3,8 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
+use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body::Body as _;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::convert::Infallible;
@@ -62,12 +64,23 @@ fn refusal(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response {
     }
 }
 
-fn too_large() -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "Failed to buffer the request body: length limit exceeded",
-    )
-        .into_response()
+const TOO_LARGE: &str = "Failed to buffer the request body: length limit exceeded";
+
+pub(crate) fn too_large() -> Response {
+    (StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE).into_response()
+}
+
+pub(crate) fn streamed(body: Body, limit: usize) -> BoxStream<'static, eyre::Result<Bytes>> {
+    Limited::new(body, limit)
+        .into_data_stream()
+        .map_err(|e| {
+            eyre::Report::new(if e.downcast_ref::<LengthLimitError>().is_some() {
+                PlatformError::PayloadTooLarge(TOO_LARGE.into())
+            } else {
+                PlatformError::BadRequest(format!("Failed to buffer the request body: {e}"))
+            })
+        })
+        .boxed()
 }
 
 fn rejected(reason: &'static str) {

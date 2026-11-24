@@ -20,9 +20,9 @@ upload, release steps and content-addressed uploads it keeps.
 - A part or an assembly that gets no answer, or a `5xx`, `408` or `429`, is
   sent again, up to three times in all. Only that request is sent again,
   never the bundle.
-- The platform holds the bundle in memory while it stores the one
-  request, as the single upload always has, and only a few parts while it
-  assembles.
+- The platform holds only a few parts of the bundle in memory, while it
+  streams the one request into object storage (from v0.40.6; until then it
+  held the whole body) and while it assembles.
 - No bundle is ever stored at its content key unless its bytes are that
   hash.
 - Every storage backend works, and every platform replica serves every
@@ -527,8 +527,10 @@ platform's other timings are.
   with the same `413`, so its time is measured and the bytes that arrived
   are known when it fails. The "Web part stored" line replaces the line
   the store wrote for each part and bundle, "Web bundle assembly
-  answered" the "Web bundle assembled" line; the single upload's "Web
-  bundle uploaded" line is unchanged.
+  answered" the "Web bundle assembled" line. The single upload's "Web
+  bundle uploaded" line gains `receive_ms` and `store_ms` in v0.40.6, when
+  that upload streams into object storage, from the same accounting of
+  waits as the assembly's stream.
 - A drop guard logs a request that ends before its answer once its body
   has arrived: a client that gives up mid-write would otherwise leave no
   line at all. A client that gives up while its body is still arriving

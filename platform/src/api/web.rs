@@ -1,3 +1,4 @@
+use crate::app::layers::ARTIFACT_BODY_LIMIT;
 use crate::auth::{AuthUser, DeployAuth};
 use crate::deployer::web;
 use crate::errors::{PlatformError, PlatformResult};
@@ -79,6 +80,7 @@ async fn uploaded(
     user: &AuthUser,
     service: &crate::repo::services::Service,
     stored: PlatformResult<(Artifact, web::Stored)>,
+    waited: Option<web::Waited>,
 ) -> PlatformResult<Json<Value>> {
     metrics::counter!("cufflink_web_uploads_total", "result" => web::upload_result(&stored))
         .increment(1);
@@ -102,6 +104,8 @@ async fn uploaded(
         sha256 = %upload.hash,
         size = upload.size,
         stored = stored.as_str(),
+        receive_ms = waited.map(|waited| waited.receive_ms),
+        store_ms = waited.map(|waited| waited.store_ms),
         "Web bundle uploaded"
     );
     Ok(Json(json!({
@@ -116,18 +120,53 @@ pub async fn upload_web_bundle(
     State(state): State<Arc<AppState>>,
     DeployAuth(user): DeployAuth,
     Path((id, sha256)): Path<(String, String)>,
-    body: axum::body::Bytes,
-) -> PlatformResult<Json<Value>> {
-    let service_id = service_id(&id)?;
-    let service =
-        super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id).await?;
-    let stored = async {
-        require_web_object(&state, &service, web::Object::Bundle, &sha256).await?;
-        web::Object::Bundle.require_content(&sha256, &sha256_hex(&body))?;
-        web::store(&state, service_id, &sha256, body, &user.subject).await
+    body: Body,
+) -> Result<Json<Value>, Response> {
+    let started = Instant::now();
+    let declared = http_body::Body::size_hint(&body).exact();
+    if declared.is_some_and(|size| size > ARTIFACT_BODY_LIMIT as u64) {
+        return Err(crate::router::custom::body::too_large());
     }
-    .await;
-    uploaded(&state, &user, &service, stored).await
+    let service_id = service_id(&id).map_err(IntoResponse::into_response)?;
+    let service = super::get_service_for_tenant(&state.platform_db, service_id, user.tenant_id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let bundle = web::is_sha256(&sha256).then(|| web::short(&sha256));
+    let unanswered = Unanswered::new(started, |elapsed| {
+        warn!(
+            %service_id,
+            bundle,
+            elapsed_ms = web::millis(elapsed),
+            "Web bundle request dropped before its answer"
+        );
+    });
+    let (stored, waited) =
+        match require_web_object(&state, &service, web::Object::Bundle, &sha256).await {
+            Ok(()) => {
+                let body = crate::router::custom::body::streamed(body, ARTIFACT_BODY_LIMIT);
+                let (stored, waited) =
+                    web::store_streamed(&state, service_id, &sha256, body, declared, &user.subject)
+                        .await;
+                (stored, Some(waited))
+            }
+            Err(e) => (Err(e), None),
+        };
+    if let Err(e) = &stored {
+        warn!(
+            %service_id,
+            bundle,
+            received = waited.map(|waited| waited.received),
+            receive_ms = waited.map(|waited| waited.receive_ms),
+            store_ms = waited.map(|waited| waited.store_ms),
+            error = %e,
+            "Web bundle not stored"
+        );
+    }
+    let answer = uploaded(&state, &user, &service, stored, waited)
+        .await
+        .map_err(IntoResponse::into_response);
+    unanswered.answered();
+    answer
 }
 
 #[derive(Debug, Default)]
@@ -308,9 +347,9 @@ pub async fn assemble_web_bundle(
         match assembled {
             Ok(web::Assembled::Incomplete(missing)) => Err(missing.into()),
             Ok(web::Assembled::Stored(stored)) => {
-                uploaded(&state, &user, &service, Ok(stored)).await
+                uploaded(&state, &user, &service, Ok(stored), None).await
             }
-            Err(e) => uploaded(&state, &user, &service, Err(e)).await,
+            Err(e) => uploaded(&state, &user, &service, Err(e), None).await,
         }
     })
     .await;
