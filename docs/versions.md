@@ -1452,12 +1452,11 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
 
 ## Changes in v0.40.4
 
-Unreleased.
-
 A web bundle assembled by copying its parts inside S3 is stored by a strict
 S3-compatible store too, a copy is no longer cut short at the stall
 timeout, and a failed assembly says why. No new feature. A service built
-for v0.40.3 deploys and runs on this platform unchanged. There is no
+for v0.40.3 deploys and runs on this platform unchanged, and a CLI of this
+release deploys to a v0.40.3 platform as a v0.40.3 CLI does. There is no
 migration. New environment variable: `OBJECT_STORE_COPY_TIMEOUT_SECS`, not
 set by default, which the platform's copies use; the worker and the web
 runner only warn when it is set not below the request timeout
@@ -1490,6 +1489,15 @@ runner only warn when it is set not below the request timeout
   store answered 411 MissingContentLength`), and no longer the bundle's
   storage key. Its `Web bundle not assembled` log line carries the whole
   error, the store's answer included, as `cause`.
+
+Crates: a patch release of every published crate, none of which changes:
+the change is in `cufflink-storage` and the platform, which ship in the
+images. cufflink-types, cufflink-migrate, cufflink-pgcodec,
+cufflink-sdk-macros and cufflink 0.24.4, cufflink-fn 0.40.4, cufflink-cli
+0.31.4, cufflink-nats 0.9.9, cufflink-native 0.12.4, cufflink-model 0.1.11
+and cufflink-sql-parse 0.4.4 are bumped so the tagged commit publishes
+them. `cufflink init` still scaffolds `cufflink = "0.24"` and
+`cufflink-fn = "0.40"`.
 
 Rolling a platform back from v0.40.4 to v0.40.3 needs nothing undone
 first ([rolling a platform back](#rolling-a-platform-back)), but a strict
