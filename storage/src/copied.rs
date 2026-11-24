@@ -22,6 +22,63 @@ pub(crate) const STRICT: AsciiSet = NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
+/// What the store answered to a request it refused: its HTTP status, the
+/// `<Code>` of its `<Error>` if it named one, and the whole answer. It
+/// displays as the whole answer, for the log; [`StoreAnswer::summary`] is
+/// only the status and code, which name no bucket, key, request or host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreAnswer {
+    status: u16,
+    code: Option<String>,
+    answer: String,
+}
+
+impl StoreAnswer {
+    /// The answer `body` the store gave with `status`.
+    pub fn new(status: u16, body: &str) -> Self {
+        let code = body
+            .split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map(|(code, _)| code.trim())
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .map(str::to_string);
+        Self {
+            status,
+            code,
+            answer: body.to_string(),
+        }
+    }
+
+    /// The first answer of a store in `error`'s chain.
+    pub fn in_chain(error: &eyre::Report) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+
+    /// The status and the store's code, as `store answered 411
+    /// MissingContentLength`.
+    pub fn summary(&self) -> String {
+        match &self.code {
+            Some(code) => format!("store answered {} {code}", self.status),
+            None => format!("store answered {}", self.status),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status = http::StatusCode::from_u16(self.status)
+            .map(|status| status.to_string())
+            .unwrap_or_else(|_| self.status.to_string());
+        write!(f, "the store answered {status}: {}", self.answer)
+    }
+}
+
+impl std::error::Error for StoreAnswer {}
+
 pub(crate) fn generic(
     backend: &'static str,
     source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -135,10 +192,7 @@ async fn answered(
     if status.is_success() {
         return Ok(body);
     }
-    let source = format!(
-        "the store answered {status}: {}",
-        String::from_utf8_lossy(&body)
-    );
+    let source = StoreAnswer::new(status.as_u16(), &String::from_utf8_lossy(&body));
     let path = location.to_string();
     Err(match status {
         http::StatusCode::NOT_FOUND => Refused::Final(object_store::Error::NotFound {
@@ -164,4 +218,57 @@ async fn answered(
         }
         _ => Refused::Final(generic(backend, source)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreAnswer;
+
+    #[test]
+    fn a_stores_answer_is_summarised_by_its_status_and_code_alone() {
+        let answer = StoreAnswer::new(
+            411,
+            "<Error><Code>MissingContentLength</Code><BucketName>acme-bundles</BucketName>\
+             <RequestId>tx0000a1b2c3</RequestId></Error>",
+        );
+        assert_eq!(answer.summary(), "store answered 411 MissingContentLength");
+        assert!(answer
+            .to_string()
+            .starts_with("the store answered 411 Length Required: <Error>"));
+        assert!(answer.to_string().contains("tx0000a1b2c3"));
+    }
+
+    #[test]
+    fn an_answer_without_a_plain_code_is_summarised_by_its_status() {
+        for body in [
+            "",
+            "upstream timed out",
+            "<Error><Code></Code></Error>",
+            "<Error><Code>acme-bundles/web key</Code></Error>",
+            "<Error><Code>MissingContentLength",
+        ] {
+            assert_eq!(
+                StoreAnswer::new(504, body).summary(),
+                "store answered 504",
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stores_answer_is_found_through_the_errors_wrapping_it() {
+        let wrapped = eyre::Report::new(object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(StoreAnswer::new(
+                403,
+                "<Error><Code>AccessDenied</Code></Error>",
+            )),
+        })
+        .wrap_err("s3 upload failed for bundles/app.tar.gz");
+        assert_eq!(
+            StoreAnswer::in_chain(&wrapped).map(StoreAnswer::summary),
+            Some("store answered 403 AccessDenied".to_string())
+        );
+        assert_eq!(StoreAnswer::in_chain(&eyre::eyre!("no store")), None);
+    }
 }

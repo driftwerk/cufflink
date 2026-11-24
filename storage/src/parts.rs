@@ -530,7 +530,14 @@ mod tests {
     }
 
     async fn sent_and_copied(store: &Arc<Faulty>) -> object_store::Result<PutResult> {
-        let parted = Parted::new(Arc::clone(store), "faulty", STALL);
+        sent_and_copied_under(store, STALL).await
+    }
+
+    async fn sent_and_copied_under(
+        store: &Arc<Faulty>,
+        stall: Stall,
+    ) -> object_store::Result<PutResult> {
+        let parted = Parted::new(Arc::clone(store), "faulty", stall);
         let copier: Arc<dyn CopyPart> = Arc::<Faulty>::clone(store);
         let mut upload = parted
             .begin(&Path::from(KEY), PutMultipartOptions::default())
@@ -724,8 +731,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_copy_slower_than_its_timeout_is_cut_short_first_and_given_the_request_timeout_last()
-    {
+    async fn a_copy_slower_than_its_timeout_is_cut_short_first_and_not_last() {
         let memory = holding_the_copied_part().await;
         let slow = COPY * 4;
         let store = Faulty::over(&memory, Fault::CopiesSlow(slow));
@@ -733,6 +739,22 @@ mod tests {
         sent_and_copied(&store).await.expect("uploaded");
         assert_eq!(started.elapsed(), COPY * 2 + slow);
         assert_eq!(store.count(|c| &c.copies), 3);
+        assert_eq!(stored(&memory).await, Some(parts().concat()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_whose_timeout_is_not_set_is_sent_once_however_slow() {
+        let memory = holding_the_copied_part().await;
+        let ceiling = Duration::from_secs(30);
+        let uncut = Stall::of(Duration::from_secs(1), 3, ceiling, COMPLETION, ceiling);
+        let slow = Duration::from_secs(25);
+        let store = Faulty::over(&memory, Fault::CopiesSlow(slow));
+        let started = tokio::time::Instant::now();
+        sent_and_copied_under(&store, uncut)
+            .await
+            .expect("uploaded");
+        assert_eq!(started.elapsed(), slow);
+        assert_eq!(store.count(|c| &c.copies), 1);
         assert_eq!(stored(&memory).await, Some(parts().concat()));
     }
 

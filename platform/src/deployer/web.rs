@@ -319,7 +319,7 @@ impl Assembled {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct Spent {
     turn: Duration,
     slot: Duration,
@@ -328,6 +328,7 @@ struct Spent {
     parts: PartTimes,
     complete: Duration,
     stream: Duration,
+    failure: Option<String>,
 }
 
 /// What an assembly's stream spent waiting on: `read`, its parts' reads,
@@ -341,6 +342,7 @@ struct Waits {
     write: AtomicU64,
     ended: std::sync::OnceLock<Instant>,
     answered: std::sync::OnceLock<Instant>,
+    failure: std::sync::OnceLock<String>,
 }
 
 impl Waits {
@@ -549,11 +551,24 @@ async fn streamed(
             Ok(Some(stored)) if i64::try_from(stored).ok() == Some(bundle.size) => {
                 Ok((Stored::Present, None))
             }
-            _ => Err(e.downcast::<PlatformError>().unwrap_or_else(|e| {
-                PlatformError::Internal(format!("Failed to assemble {}: {e:#}", bundle.s3_key))
-            })),
+            _ => {
+                let _ = waits.failure.set(format!("{e:#}"));
+                Err(e
+                    .downcast::<PlatformError>()
+                    .unwrap_or_else(|e| assembly_failed(&bundle.hash, &e)))
+            }
         },
     }
+}
+
+/// The answer to an assembly the store failed: the store's status and code,
+/// which name the cause, but none of its answer's bucket, key, request or
+/// host, which the `Web bundle not assembled` log line carries.
+fn assembly_failed(hash: &str, error: &eyre::Report) -> PlatformError {
+    let cause = cufflink_storage::StoreAnswer::in_chain(error)
+        .map(|answer| format!(": {}", answer.summary()))
+        .unwrap_or_default();
+    PlatformError::Internal(format!("Failed to assemble web bundle {hash}{cause}"))
 }
 
 async fn remove_parts(state: &AppState, service_id: Uuid, parts: Vec<Artifact>) {
@@ -712,6 +727,7 @@ pub(crate) async fn assemble(
             stream_ms,
             elapsed_ms,
             error = %e,
+            cause = spent.failure.as_deref().unwrap_or_default(),
             "Web bundle not assembled"
         ),
     }
@@ -774,6 +790,7 @@ async fn assembling(
             .unwrap_or_default();
         spent.parts = uploaded.map(|uploaded| uploaded.parts).unwrap_or_default();
         spent.write_wait = waits.writing(spent.complete);
+        spent.failure = waits.failure.get().cloned();
         streamed?.0
     };
     let stored = record_upload(state, service_id, (bundle, stored), uploaded_by).await?;
@@ -1007,6 +1024,40 @@ pub(crate) async fn announce(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn a_failed_assembly_answers_with_the_stores_status_and_code_but_not_its_answer() {
+        let answer = cufflink_storage::StoreAnswer::new(
+            411,
+            "<Error><Code>MissingContentLength</Code><BucketName>acme-bundles</BucketName>\
+             <RequestId>tx0000a1b2c3</RequestId><HostId>host-7</HostId></Error>",
+        );
+        let failed = eyre::Report::new(answer)
+            .wrap_err("s3 upload failed for web/00000000-0000-0000-0000-000000000002/ab.tar.gz");
+        let PlatformError::Internal(message) = assembly_failed(&"ab".repeat(32), &failed) else {
+            panic!("an assembly the store failed is an internal error");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "Failed to assemble web bundle {}: store answered 411 MissingContentLength",
+                "ab".repeat(32)
+            )
+        );
+        for hidden in ["acme-bundles", "tx0000a1b2c3", "host-7", "<Error>", "web/"] {
+            assert!(!message.contains(hidden), "{hidden} in {message}");
+        }
+        assert!(format!("{failed:#}").contains("tx0000a1b2c3"));
+    }
+
+    #[test]
+    fn a_failed_assembly_without_a_stores_answer_names_no_cause() {
+        let failed = eyre::eyre!("the bundle's bytes were not its hash in bucket acme-bundles");
+        let PlatformError::Internal(message) = assembly_failed("ab", &failed) else {
+            panic!("an internal error");
+        };
+        assert_eq!(message, "Failed to assemble web bundle ab");
+    }
 
     fn bundle(version: i32) -> Artifact {
         Artifact {

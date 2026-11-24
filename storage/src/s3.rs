@@ -33,7 +33,8 @@ const COPY_SOURCE_HEADER: http::HeaderName = http::HeaderName::from_static("x-am
 const STRICT_PATH: AsciiSet = copied::STRICT.remove(b'/');
 
 /// The sizes of the parts S3 copies: every part but the last at least
-/// S3's 5 MiB, and none so large that a copy outlasts the stall timeout.
+/// S3's 5 MiB, and none above 64 MiB, so that one copy is a bounded piece
+/// of the store's work.
 const COPIED_PART_SIZES: std::ops::RangeInclusive<u64> = 5 * 1024 * 1024..=64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -162,7 +163,8 @@ fn copied_part(path: &Path, answer: &str) -> Result<PartId, Refused> {
     let refused = || {
         copied::generic(
             BACKEND,
-            format!("the copy of a part of {path} was not stored: {answer}"),
+            eyre::Report::new(copied::StoreAnswer::new(200, answer))
+                .wrap_err(format!("the copy of a part of {path} was not stored")),
         )
     };
     match (answer.contains("<Error>"), tagged("ETag")) {
@@ -1647,6 +1649,10 @@ mod tests {
         assert!(
             format!("{failed:#}").contains("<Code>AccessDenied</Code>"),
             "the store's answer is in the chain a caller prints: {failed:#}"
+        );
+        assert_eq!(
+            crate::StoreAnswer::in_chain(&failed).map(crate::StoreAnswer::summary),
+            Some("store answered 200 AccessDenied".to_string())
         );
         assert!(
             requests_until(&server, |request| request.method.as_str() == "DELETE").await,
