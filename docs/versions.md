@@ -1471,9 +1471,9 @@ runner only warn when it is set not below the request timeout
   timeout, a measure of bytes in flight: a copy sends no bytes, and its
   time is the store's. It is sent once and waits up to
   `OBJECT_STORE_REQUEST_TIMEOUT_SECS`, which must exceed the store's
-  slowest copy (about 60 s on a strict S3-compatible store, so raise it,
-  and `OBJECT_STORE_RETRY_TIMEOUT_SECS` with it, above its default of 30 s
-  there); a copy the
+  slowest copy (about 60 s on a strict S3-compatible store, so raise it
+  above the request timeout's default of 30 s there, and
+  `OBJECT_STORE_RETRY_TIMEOUT_SECS` to at least it); a copy the
   store answers `5xx` is still sent again after a pause. On a strict
   S3-compatible store a copy that is slow stays slow when sent again, so
   cutting it only adds the time cut.
