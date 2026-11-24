@@ -231,9 +231,9 @@ answered at once, without reading the rest of `data`:
   S3-compatible store (Ceph RGW) answers a copy without one `411`. A copy
   sends no bytes, so it is not cut at the stall timeout's per 8 MiB: it is
   sent once, bounded by the request timeout, which must exceed the store's
-  slowest copy. On such a store most copies of an 8 MiB part answer within
-  10 s, but a few take 30 to 60 s, and sent again they are as slow, so
-  cutting them gains nothing. `OBJECT_STORE_COPY_TIMEOUT_SECS`, not
+  slowest copy, raised above its default where a copy can take longer.
+  A copy's time is the store's work, and a slow copy sent again is often
+  no faster, so cutting it gains nothing. `OBJECT_STORE_COPY_TIMEOUT_SECS`, not
   set by default, cuts and sends a copy again for a store where that
   helps. A copy cut short is not cancelled on the store, so attempts of
   one part can overlap; each copies the same source into the same part

@@ -131,8 +131,8 @@ pub(crate) fn request_timeout() -> Duration {
 /// completion of a multipart upload not answered within `completion`, an
 /// open with no answer within `timeout`, a part copied inside the store not
 /// answered within `copy`, which sends no bytes and so is not measured by
-/// them and by default is the `ceiling`, so a copy is not cut, and a read that receives nothing for `timeout`, which resumes from
-/// its next byte. A request is tried at most `attempts` times in a row, and
+/// them and by default is the `ceiling`, so a copy is not cut, and a read
+/// that receives nothing for `timeout`, which resumes from its next byte. A request is tried at most `attempts` times in a row, and
 /// its last attempt is bounded only by the request timeout, the `ceiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stall {

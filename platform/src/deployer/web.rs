@@ -727,7 +727,7 @@ pub(crate) async fn assemble(
             stream_ms,
             elapsed_ms,
             error = %e,
-            cause = spent.failure.as_deref().unwrap_or_default(),
+            cause = spent.failure.as_deref(),
             "Web bundle not assembled"
         ),
     }
