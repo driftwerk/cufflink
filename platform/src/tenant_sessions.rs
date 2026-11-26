@@ -1169,7 +1169,7 @@ mod tests {
         Binding {
             service_id: Uuid::nil(),
             role_name: "svc_acme_loan_service".into(),
-            managed: true,
+            origin: crate::repo::service_db_roles::Origin::Platform,
             login: true,
             password_enc: Some(vec![1]),
             read_only_role: Some("reports_ro".into()),

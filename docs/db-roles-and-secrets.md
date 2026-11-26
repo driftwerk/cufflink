@@ -232,7 +232,10 @@ comes before the roles are verified:
    cufflink services db-role set harbor reports-service --read-only-role reports_ro
    ```
 
-   A binding needs the service to have been deployed once. Every statement
+   A binding needs the service to have been deployed once; a service can
+   instead declare its role and be bound by its first deploy
+   ([declaring a role with the service](#declaring-a-role-with-the-service)),
+   with no step of an administrator's per service. Every statement
    of a service can switch to its read-only role, not only
    `query_read_only`: bind one that reaches no more than that service may
    read in its tenant's database
@@ -295,9 +298,84 @@ cufflink tenants policy set harbor db_roles enforce \
 ```
 
 `cufflink services db-role rotate <tenant> <service>` gives a role the
-platform made a new password; `show` prints the binding and its last
-verification. Deleting a service makes its platform-made role `NOLOGIN` and
-leaves its schema.
+platform made a new password; `show` prints the binding, its origin
+(`platform`, `admin` or `declared`) and its last verification. Deleting a
+service makes its platform-made role `NOLOGIN` and leaves its schema; a role
+the platform did not make keeps its login and what it owns, and loses what
+the platform granted it: `USAGE` on `_cufflink`, `EXECUTE` on the outbox
+functions and its mapping to the service. A binding replaced by another
+role is retired the same way.
+
+### Declaring a role with the service
+
+A service whose schema a role of its own owns (one a migration tool made,
+say) can name that role beside its other deploy settings. Its first deploy
+then binds it with the tenant's deploy key alone, under `enforce` too.
+
+**Once, by whoever creates the role.** The role exists, may log in and
+connect, owns the service's schema and reaches nothing else. `pg_hba.conf`
+admits it from the platform's hosts with password authentication
+(`scram-sha-256`), since the platform proves the password by logging in.
+The platform's role is a member of it:
+
+```sql
+GRANT catalog_service_user TO cufflink WITH INHERIT TRUE, SET TRUE;  -- PostgreSQL 16 and later
+GRANT catalog_service_user TO cufflink;                              -- earlier
+```
+
+**Once per tenant, by an administrator.** `declared_roles` in the tenant's
+`db_roles` config lists the role names its deploys may declare: exact names,
+or a stem of at least three characters followed by `*`. It is empty by
+default, which admits none. No entry may admit the platform's own roles
+(`svc_…`), the server's (`pg_…`) or `postgres…`.
+
+```sh
+cufflink tenants policy set harbor db_roles enforce \
+  --config '{"readers": [], "declared_roles": ["catalog_service_user", "loan_*"]}'
+```
+
+A replica older than v0.41.0 cannot read a config holding `declared_roles`
+and falls back to the default config, losing `readers` and
+`login_pool_max` too. Set `declared_roles` only once every platform,
+worker, web-runner and ext-runner replica runs v0.41.0, and remove it from
+every tenant before rolling any replica back below v0.41.0.
+
+**With each deploy.** The deploy request carries the role and its password
+(`db_role`, see [a declared database role](deployment.md#a-declared-database-role)).
+
+**What the deploy checks.** Before it grants or writes anything, the
+platform checks, in order, that no administrator's binding of another role
+is in place (409), that `declared_roles` admits the role, that it exists,
+may log in and may connect, that the password logs in, and that the
+role is no platform-made role, the platform's own, a superuser or
+`postgres`, holds no `CREATEDB`, `CREATEROLE`, `REPLICATION` or
+`BYPASSRLS`, is a member of no role, is bound to no other service, owns the
+service's schema and reaches nothing outside it (`confined`). Under
+`enforce` it must then pass verification. Until the password is proven,
+every refusal gives the same answer, so a deploy learns nothing about roles
+it cannot log in as; which check failed is the operator's alone, in an
+audit row of no tenant and the platform log. After that, a
+refusal is a 422 that lists each finding with its remedy and names nothing
+outside the tenant's database. A login that could not be tried is a 503,
+retryable; only an allowlisted role that exists can be answered so, for
+example one at its connection limit. Probing an allowlisted role that is
+missing or `NOLOGIN` leaves a `FATAL` authentication line in the server log,
+which external tooling counting authentication failures counts too. A
+plan (`?plan=true`) runs the same checks and writes nothing. Every refusal
+is audited (`db_role.declare_refused`): the tenant's row holds what it was
+told, and the operator's row, of no tenant, the gate and the detail. A
+replaced role whose retirement fails is logged with the statements to run
+by hand (`cufflink_db_role_retire_failures_total`); nothing retries it.
+
+- **An administrator's binding of another role** refuses the declaration
+  (409); one of the same role has its password refreshed and stays the
+  administrator's. `db-role set` makes any binding the administrator's.
+- **Rotation:** change the password in the database, then in the vault,
+  then deploy. A deploy that is skipped still takes it.
+- **Changing the role:** declare the other one. The role it replaces is
+  retired as above.
+- **Removing the declaration** leaves the binding as it is; an
+  administrator changes it with `db-role set`.
 
 ### Rolling back
 

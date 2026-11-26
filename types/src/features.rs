@@ -51,6 +51,7 @@ pub const EXT_CALL: &str = "ext_call";
 pub const NATIVE_SERVICES: &str = "native_services";
 pub const PRIVATE_TABLES: &str = "private_tables";
 pub const INACTIVE_DEPLOY: &str = "inactive_deploy";
+pub const DB_ROLE_DECLARATIONS: &str = "db_role_declarations";
 pub const CONFIG_APPLY: &str = "config_apply";
 pub const COLUMN_PERMISSIONS: &str = "column_permissions";
 pub const GUEST_MEMORY_BUDGET: &str = "guest_memory_budget";

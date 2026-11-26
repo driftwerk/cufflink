@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::fmt;
 use zeroize::Zeroizing;
 
@@ -26,6 +27,12 @@ impl From<&str> for SecretString {
     }
 }
 
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[redacted]")
@@ -49,5 +56,12 @@ mod tests {
         assert_eq!(format!("{secret:?}"), "[redacted]");
         assert_eq!(format!("{:?}", Some(&secret)), "Some([redacted])");
         assert_eq!(secret.expose(), "hunter2");
+    }
+
+    #[test]
+    fn a_secret_is_read_from_a_string() {
+        let secret: SecretString = serde_json::from_str("\"hunter2\"").expect("a string");
+        assert_eq!(secret.expose(), "hunter2");
+        assert!(serde_json::from_str::<SecretString>("7").is_err());
     }
 }

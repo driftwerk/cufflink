@@ -7,6 +7,7 @@ use super::native::NativeBinary;
 use super::schema;
 use super::web::WebArtifactRef;
 use crate::auth::AuthUser;
+use crate::db_roles::declared::{self, Declaration};
 use crate::deployer::manifest::ServiceManifest;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::extensions::Registration;
@@ -64,6 +65,7 @@ pub(crate) struct DeployContext<'a> {
     pub commit_hash: Option<&'a str>,
     pub actor: &'a str,
     pub schema: schema::Options,
+    pub declaration: Option<&'a Declaration>,
 }
 
 impl<'a> DeployContext<'a> {
@@ -176,6 +178,9 @@ pub(crate) async fn run_locked(
     let service = crate::repo::services::get_by_id(&state.platform_db, ctx.identity.service_id)
         .await?
         .ok_or_else(|| PlatformError::NotFound("Service disappeared".into()))?;
+    if let (Some(declaration), false) = (ctx.declaration, ctx.schema.plan_only) {
+        declared::take(state, &service, ctx.actor, manifest, declaration).await?;
+    }
     let new_version = service.current_version + 1;
 
     let deployments =

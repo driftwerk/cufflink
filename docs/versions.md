@@ -362,6 +362,12 @@ Migration `V8__tenant_buckets.sql` adds the `tenant_buckets` table.
 |---------|-------------|----------|
 | `web_bundle_parts` | `cufflink deploy` of a web app whose bundle is above 32 MiB, from a CLI of v0.40.0; never demanded by a manifest | a web bundle uploaded as parts of at most 16 MiB, each its own request, and assembled by the platform, which stores it only when its bytes are its hash ([design](design-notes/web-bundle-parts.md)) |
 
+## Features added in v0.41.0
+
+| Feature | Needed when | Provides |
+|---------|-------------|----------|
+| `db_role_declarations` | a `Cufflink.toml` declares `[environments.<env>.db_role]`; never demanded by a manifest | a deploy that carries the service's own database role and its password, and binds it under the deploy lock once the tenant's `declared_roles` admits it and the role passes the declaration checks ([declaring a role](db-roles-and-secrets.md#declaring-a-role-with-the-service), [design](design-notes/declared-db-role-bindings.md)) |
+
 ## Changes in v0.33.0
 
 No new module-declared feature. Spec and client changes:
@@ -1459,6 +1465,57 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   and `scoped` postures, CRUD v2 (`?filter_mode=v2`, `?count=`, the
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
+
+## Changes in v0.41.0
+
+A service can declare its database role, and its first deploy binds it
+with the deploy key alone ([declaring a role](db-roles-and-secrets.md#declaring-a-role-with-the-service)).
+Migration `V11` adds `service_db_roles.declared` and a unique index on
+`service_db_roles.role_name`. Roll out platforms first, then CLIs, then set
+`declared_roles`.
+
+- **Before upgrading**, check that no role is bound twice; the migration
+  fails naming the roles, and the platform does not start, while one is:
+
+  ```sql
+  SELECT role_name FROM service_db_roles GROUP BY 1 HAVING count(*) > 1
+  ```
+
+- **The first-version gate (a change of behaviour).** Under
+  `db_roles: enforce`, the first deploy of a service with no verified role
+  is refused (422) with what it lacks, where it used to be activated and
+  answer 503 to every request. A redeploy of a running service is never
+  refused this way, and a service recorded by a refused first deploy no
+  longer stops its tenant from moving to `enforce`. Such a service, active
+  and never run, may be deployed `--inactive`.
+- **The ordering rule for `declared_roles`.** A replica older than v0.41.0
+  reads a `db_roles` config holding it as the default config, losing
+  `readers` and `login_pool_max`. Set it only once every platform, worker,
+  web-runner and ext-runner replica runs v0.41.0, and remove it from every
+  tenant before rolling any replica back below v0.41.0. An entry is a role
+  name or a stem of at least three characters followed by `*`, and admits
+  no `svc_`, `pg_` or `postgres` name.
+- **During a rolling upgrade**, a `db-role set` served by a replica older
+  than v0.41.0 over a declared binding writes the administrator's role but
+  leaves `declared` true, so the binding still reads as declared. Run
+  `db-role set` again once every replica runs v0.41.0.
+- **A declared role must log in with a password.** `pg_hba.conf` admits it
+  from the platform's hosts with password authentication, since the
+  platform proves the password by logging in as the role.
+- **Retiring a role the platform did not make.** Deleting a service bound
+  by an administrator, or replacing that binding with another role, now
+  revokes what the platform granted the role: `USAGE` on `_cufflink` and
+  `EXECUTE` on the outbox functions, with its mapping to the service. The
+  `REVOKE` also takes away such grants that a superuser made to the role by
+  hand. A platform-made role that a binding of another role replaces is
+  made `NOLOGIN`, as on deletion.
+- **Outbox mappings.** Granting a role the outbox no longer removes the
+  mapping of the role bound before; that is removed once the new role is
+  written as the binding, so a binding refused on the way keeps the
+  service enqueueing as it did.
+- **A login probe** that authenticates and is then refused
+  (`insufficient_privilege`) proves the password, and the verification
+  judges `database_connect` on its own.
 
 ## Changes in v0.40.6
 

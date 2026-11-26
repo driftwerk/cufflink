@@ -4,11 +4,41 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Platform,
+    Admin,
+    Declared,
+}
+
+impl Origin {
+    fn of(managed: bool, declared: bool) -> Self {
+        match (managed, declared) {
+            (true, _) => Origin::Platform,
+            (false, true) => Origin::Declared,
+            (false, false) => Origin::Admin,
+        }
+    }
+
+    pub fn managed(self) -> bool {
+        self == Origin::Platform
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Platform => "platform",
+            Origin::Admin => "admin",
+            Origin::Declared => "declared",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Binding {
     pub service_id: Uuid,
     pub role_name: String,
-    pub managed: bool,
+    pub origin: Origin,
     pub login: bool,
     #[serde(skip)]
     pub password_enc: Option<Vec<u8>>,
@@ -19,8 +49,8 @@ pub struct Binding {
     pub updated_at: DateTime<Utc>,
 }
 
-const COLUMNS: &str = "service_id, role_name, managed, login, password_enc, read_only_role,
-                       verified_at, verify_report, updated_by, updated_at";
+const COLUMNS: &str = "service_id, role_name, managed, declared, login, password_enc,
+                       read_only_role, verified_at, verify_report, updated_by, updated_at";
 
 fn qualified(alias: &str) -> String {
     COLUMNS
@@ -34,7 +64,7 @@ fn row_to_binding(row: &tokio_postgres::Row) -> Binding {
     Binding {
         service_id: row.get("service_id"),
         role_name: row.get("role_name"),
-        managed: row.get("managed"),
+        origin: Origin::of(row.get("managed"), row.get("declared")),
         login: row.get("login"),
         password_enc: row.get("password_enc"),
         read_only_role: row.get("read_only_role"),
@@ -62,10 +92,16 @@ impl Verification {
     }
 }
 
+impl Binding {
+    pub fn managed(&self) -> bool {
+        self.origin.managed()
+    }
+}
+
 pub struct NewBinding<'a> {
     pub service_id: Uuid,
     pub role_name: &'a str,
-    pub managed: bool,
+    pub origin: Origin,
     pub password_enc: Option<&'a [u8]>,
     pub read_only_role: Option<&'a str>,
     pub updated_by: &'a str,
@@ -86,6 +122,15 @@ pub async fn get(
         .map(|row| row.as_ref().map(row_to_binding))
 }
 
+const ROLE_NAME_KEY: &str = "service_db_roles_role_name_key";
+
+pub fn role_taken(error: &tokio_postgres::Error) -> bool {
+    error.as_db_error().is_some_and(|db| {
+        db.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+            && db.constraint() == Some(ROLE_NAME_KEY)
+    })
+}
+
 pub async fn write(
     client: &impl GenericClient,
     new: &NewBinding<'_>,
@@ -94,12 +139,13 @@ pub async fn write(
         .query_one(
             &format!(
                 "INSERT INTO service_db_roles
-                     (service_id, role_name, managed, login, password_enc, read_only_role,
-                      updated_by, verify_report, verified_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                     (service_id, role_name, managed, declared, login, password_enc,
+                      read_only_role, updated_by, verify_report, verified_at)
+                 VALUES ($1, $2, $3, $10, $4, $5, $6, $7, $8,
                          CASE WHEN $9 = 'verified' THEN now() END)
                  ON CONFLICT (service_id) DO UPDATE SET
                      role_name = EXCLUDED.role_name, managed = EXCLUDED.managed,
+                     declared = EXCLUDED.declared,
                      login = EXCLUDED.login, password_enc = EXCLUDED.password_enc,
                      read_only_role = EXCLUDED.read_only_role, updated_by = EXCLUDED.updated_by,
                      verify_report = EXCLUDED.verify_report,
@@ -111,13 +157,14 @@ pub async fn write(
             &[
                 &new.service_id,
                 &new.role_name,
-                &new.managed,
+                &new.origin.managed(),
                 &new.password_enc.is_some(),
                 &new.password_enc,
                 &new.read_only_role,
                 &new.updated_by,
                 &new.verify_report,
                 &new.verification.as_str(),
+                &(new.origin == Origin::Declared),
             ],
         )
         .await

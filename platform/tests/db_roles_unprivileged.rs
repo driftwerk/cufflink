@@ -336,6 +336,88 @@ async fn tier(admin_url: &str, nats_url: Option<&str>) {
     test.round_trip("after a rotation").await;
 }
 
+async fn declared(admin_url: &str, nats_url: Option<&str>) {
+    let test = Unprivileged::start(admin_url, nats_url).await;
+    let role = test.db.role("stock_service_user");
+    test.operator(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'pw-unprivileged-1';
+         DO $$ BEGIN
+             EXECUTE format('GRANT CONNECT ON DATABASE %I TO {role}', current_database());
+         END $$;
+         CREATE SCHEMA stock_service AUTHORIZATION {role};"
+    ))
+    .await;
+    test.policy("enforce", json!({ "declared_roles": [role] }))
+        .await;
+    let deploy = || async {
+        let body = json!({
+            "manifest": manifest(SERVICE, &["items"]),
+            "api_version": 1,
+            "db_role": {"role": role, "password": "pw-unprivileged-1"},
+        });
+        test.platform
+            .send(
+                Method::POST,
+                "/api/services/deploy",
+                &format!("ApiKey {}", test.tenant.api_key),
+                Some(&body),
+            )
+            .await
+    };
+
+    let (status, body) = deploy().await;
+    assert_eq!(
+        status, 422,
+        "the platform may not act as the role yet: {body}"
+    );
+    let grant = cufflink_platform::db_roles::verify::membership_grant(
+        test.server_version_num,
+        &role,
+        &test.platform_role,
+        true,
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&grant)),
+        "the remedy is this server's GRANT, {grant}: {body}"
+    );
+    test.operator(&format!("{grant};")).await;
+    let (status, body) = deploy().await;
+    assert_eq!(
+        status, 200,
+        "a declared first deploy by a platform that is no superuser: {body}"
+    );
+    let binding = test.binding().await;
+    assert_eq!(binding["role"], role.as_str(), "{binding}");
+    assert_eq!(binding["origin"], "declared", "{binding}");
+    assert!(binding["verified_at"].is_string(), "{binding}");
+    assert_eq!(test.owner_of("stock_service.items").await, role);
+    test.round_trip("as the declared role").await;
+    let managed = test.db.managed_role(&test.tenant, SERVICE).await;
+    assert!(
+        !test
+            .one::<bool>(&format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{managed}')"
+            ))
+            .await,
+        "no role is made for the service, by the refused deploy or the one that binds"
+    );
+    assert!(
+        test.logged_in_as(&role).await >= 1,
+        "the service's statements run on a login as the declared role"
+    );
+}
+
+#[tokio::test]
+async fn a_declared_role_binds_on_the_test_server() {
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let _one = ONE_AT_A_TIME.lock().await;
+    declared(&infra.database_url, infra.nats_url()).await;
+}
+
 #[tokio::test]
 async fn db_roles_unprivileged_on_the_test_server() {
     let Some(infra) = common::infra().await else {

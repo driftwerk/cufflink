@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const ROLE_NAME_MAX: usize = 63;
-const MANAGED_PREFIX: &str = "svc_";
+pub const MANAGED_PREFIX: &str = "svc_";
 const DIGEST_HEX: usize = 16;
 const READABLE_MAX: usize = ROLE_NAME_MAX - MANAGED_PREFIX.len() - 1 - DIGEST_HEX;
 
@@ -31,6 +31,10 @@ pub fn managed_role(tenant_slug: &str, schema: &str, tenant_id: Uuid, service_id
         &readable[..readable.len().min(READABLE_MAX)],
         &digest[..DIGEST_HEX]
     )
+}
+
+pub fn is_managed_name(name: &str) -> bool {
+    name.starts_with(MANAGED_PREFIX)
 }
 
 pub fn marker(tenant_id: Uuid, service_id: Uuid) -> String {
