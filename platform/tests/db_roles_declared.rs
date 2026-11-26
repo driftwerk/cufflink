@@ -310,6 +310,52 @@ async fn a_declared_role_is_bound_by_the_first_deploy_under_enforce() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_async_deploy_takes_the_declaration_and_keeps_its_password_out_of_the_job() {
+    let Some(test) = Declared::start().await else {
+        return;
+    };
+    test.allow().await;
+
+    let (status, accepted) = test
+        .deploy("?async=true", Some((&test.role, PASSWORD)))
+        .await;
+    assert_eq!(status, 202, "{accepted}");
+    let id = accepted["deploy_id"]
+        .as_str()
+        .expect("deploy_id")
+        .to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let job = loop {
+        let (status, job) = test
+            .platform
+            .send(
+                Method::GET,
+                &format!("/api/deploys/{id}"),
+                &format!("ApiKey {}", test.tenant.api_key),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{job}");
+        if !matches!(job["status"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(std::time::Instant::now() < deadline, "the job ends: {job}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(
+        job["request"]["db_role"],
+        json!({"role": test.role}),
+        "the job records the role alone: {job}"
+    );
+    assert!(!job.to_string().contains(PASSWORD), "{job}");
+    let shown = test.show().await;
+    assert_eq!(shown["binding"]["origin"], "declared", "{shown}");
+    assert!(shown["binding"]["verified_at"].is_string(), "{shown}");
+    test.nothing_holds_the_password().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_changed_password_is_taken_by_a_deploy_that_changes_nothing_else() {
     let Some(test) = Declared::start().await else {
         return;
