@@ -68,6 +68,15 @@ fn verified(report: &Value) -> eyre::Result<()> {
     }
 }
 
+pub(crate) fn origin(binding: &Value) -> std::borrow::Cow<'static, str> {
+    match (binding["origin"].as_str(), binding["managed"].as_bool()) {
+        (Some("declared"), _) => "declared by the service".into(),
+        (Some("platform"), _) | (None, Some(true)) => "managed by the platform".into(),
+        (Some("admin"), _) | (None, Some(false)) => "bound by an admin".into(),
+        _ => format!("origin {}", binding["origin"]).into(),
+    }
+}
+
 fn print_binding(body: &Value) {
     let binding = &body["binding"];
     if binding.is_null() {
@@ -83,11 +92,7 @@ fn print_binding(body: &Value) {
         body["tenant"].as_str().unwrap_or_default(),
         body["service"].as_str().unwrap_or_default(),
         binding["role"].as_str().unwrap_or_default(),
-        if binding["managed"].as_bool().unwrap_or(false) {
-            "managed by the platform"
-        } else {
-            "bound by an admin"
-        },
+        origin(binding),
         if binding["login"].as_bool().unwrap_or(false) {
             "password stored"
         } else {
@@ -284,6 +289,24 @@ mod tests {
             set_body(Some("loan_service_user"), None, Some("reports_ro")),
             json!({"role": "loan_service_user", "password": null, "read_only_role": "reports_ro"})
         );
+    }
+
+    #[test]
+    fn a_binding_is_told_by_its_origin_and_an_unknown_one_as_it_is() {
+        let told = |binding: Value| origin(&binding).into_owned();
+        assert_eq!(
+            told(json!({"origin": "declared"})),
+            "declared by the service"
+        );
+        assert_eq!(
+            told(json!({"origin": "platform"})),
+            "managed by the platform"
+        );
+        assert_eq!(told(json!({"origin": "admin"})), "bound by an admin");
+        assert_eq!(told(json!({"managed": true})), "managed by the platform");
+        assert_eq!(told(json!({"managed": false})), "bound by an admin");
+        assert_eq!(told(json!({"origin": "imported"})), "origin \"imported\"");
+        assert_eq!(told(json!({})), "origin null");
     }
 
     #[test]

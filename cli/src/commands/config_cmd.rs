@@ -581,8 +581,16 @@ pub(crate) fn unreferenced_vault_secrets(
     let Some(stored) = super::secrets_cmd::vault_secret_names(project, env_name) else {
         return Vec::new();
     };
-    let referenced: std::collections::HashSet<&str> =
-        secret_refs.values().map(String::as_str).collect();
+    let declared = project
+        .environments
+        .get(env_name)
+        .and_then(|environment| environment.db_role.as_ref())
+        .map(|declared| declared.password_secret.as_str());
+    let referenced: std::collections::HashSet<&str> = secret_refs
+        .values()
+        .map(String::as_str)
+        .chain(declared)
+        .collect();
     let mut unused: Vec<String> = stored
         .into_iter()
         .filter(|name| !referenced.contains(name.as_str()))
@@ -674,6 +682,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            db_role: None,
         }
     }
 
@@ -712,6 +721,21 @@ mod tests {
             ("B".to_string(), "mail:api_key".to_string()),
         ]);
         assert!(unreferenced_vault_secrets(&project, "prod", &refs).is_empty());
+    }
+
+    #[test]
+    fn the_declared_role_password_is_referenced() {
+        let (_tmp, mut project) = make_project_with_vault("prod");
+        let mut environment = env_with(&[], &[]);
+        environment.db_role = Some(crate::project_config::DeclaredRole {
+            role: "loan_app".to_string(),
+            password_secret: "mail:api_key".to_string(),
+        });
+        project.environments.insert("prod".to_string(), environment);
+        assert_eq!(
+            unreferenced_vault_secrets(&project, "prod", &HashMap::new()),
+            vec!["google_maps:api_key".to_string()]
+        );
     }
 
     #[test]
