@@ -692,10 +692,6 @@ pub async fn take(
     let entry = entry(state, service.tenant_id).await?;
     let tenant = &entry.tenant;
     let policy = entry.mode(PolicyKey::DbRoles);
-    let previous = {
-        let platform = state.platform_db.get().await?;
-        service_db_roles::get(&platform, service.id).await?
-    };
     let outcome = provision::declare(
         state,
         &Provisioning {
@@ -737,8 +733,8 @@ pub async fn take(
             "db_role.declare",
             json!({
                 "role": declaration.role,
-                "previous_role": previous.as_ref().map(|binding| &binding.role_name),
-                "previous_origin": previous.as_ref().map(|binding| binding.origin),
+                "previous_role": provisioned.previous.as_ref().map(|binding| &binding.role_name),
+                "previous_origin": provisioned.previous.as_ref().map(|binding| binding.origin),
                 "taking": taking,
                 "verified": provisioned.binding.verified_at.is_some(),
                 "failed": provisioned.report.failed(),

@@ -1312,6 +1312,21 @@ async fn a_declaration_replaces_a_platform_made_binding_and_leaves_its_role_nolo
         !test.logs_in(&made).await,
         "the role the platform made logs in no more"
     );
+    let audited: Value = test
+        .db
+        .pool()
+        .get()
+        .await
+        .expect("checkout")
+        .query_one(
+            "SELECT details FROM audit_log WHERE action = 'db_role.declare' AND tenant_id = $1",
+            &[&test.tenant.id],
+        )
+        .await
+        .expect("audited")
+        .get(0);
+    assert_eq!(audited["previous_role"], made.as_str(), "{audited}");
+    assert_eq!(audited["previous_origin"], "platform", "{audited}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
