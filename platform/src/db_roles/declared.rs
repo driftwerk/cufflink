@@ -132,8 +132,24 @@ impl Refusal {
         }
     }
 
-    fn refused(gate: Gate, reason: String) -> Self {
+    pub(crate) fn refused(gate: Gate, reason: String) -> Self {
         Self::of(gate, Answer::Refused, reason)
+    }
+
+    /// Gates 2 and 3 answer alike until the password is proven, so a
+    /// refusal tells the tenant nothing about roles it cannot log in as.
+    fn unproven(gate: Gate, role: &str, detail: Vec<String>) -> Self {
+        Refusal {
+            detail,
+            ..Self::refused(
+                gate,
+                format!(
+                    "role {role} does not log in to the tenant's database with the password given: \
+                     check that the role exists, may log in and has CONNECT on the database, \
+                     that its password matches the vault entry, and that pg_hba.conf admits it"
+                ),
+            )
+        }
     }
 
     pub fn unsettled(report: &VerifyReport) -> Self {
@@ -230,15 +246,13 @@ fn memberships_refusal(facts: &Facts, role: &str) -> Option<(String, String)> {
             .filter(|held| told_membership(held, &facts.tenant_roles))
             .collect();
         let unnamed = held.len() - named.len();
-        let quoted = quote_ident(role);
-        let remedies = named
-            .iter()
-            .map(|held| format!("REVOKE {} FROM {quoted}", quote_ident(held)))
-            .collect::<Vec<_>>();
         let told = std::iter::once(format!("the role is a member of {} roles", held.len()))
             .chain((!named.is_empty()).then(|| format!("among them {}", named.join(", "))))
             .chain((unnamed > 0).then(|| format!("{unnamed} more that are not this tenant's")))
-            .chain((!remedies.is_empty()).then(|| format!("run {}", remedies.join("; "))))
+            .chain(
+                (!named.is_empty())
+                    .then(|| format!("run {}", verify::revoke_memberships(role, &named))),
+            )
             .collect::<Vec<_>>()
             .join(", ");
         (told, format!("memberships: {}", held.join(", ")))
@@ -250,7 +264,7 @@ fn confined_refusal(reach: &Reach) -> Option<(String, String)> {
         let elsewhere = reach
             .objects
             .iter()
-            .filter(|object| !object.here)
+            .filter(|object| !object.here && object.held())
             .map(|object| object.place.as_str())
             .collect::<Vec<_>>();
         (
@@ -261,23 +275,19 @@ fn confined_refusal(reach: &Reach) -> Option<(String, String)> {
 }
 
 /// Gate 4: each finding of the declaration checks, judged from `facts`.
-/// The administrator's role a refresh keeps is vouched for: what it reaches
-/// beyond the schema is reported by verification, not refused here.
+/// A refresh keeps a binding as it is, an administrator's included, so it is
+/// judged only on what no binding may hold: the platform's marker, the
+/// platform's or the administrator's role, and the attributes. What else the
+/// role reaches is reported by verification.
 pub fn refusals(facts: &Facts, expected: &Expected<'_>) -> Option<Refusal> {
     let role = quote_ident(expected.role);
-    let vouched = expected.taking == Taking::Refresh;
+    let binds = expected.taking != Taking::Refresh;
     let attributes = (!facts.role.attributes.is_empty()).then(|| {
         (
             format!(
-                "the role is {}; run ALTER ROLE {role} {}",
+                "the role is {}; run {}",
                 facts.role.attributes.join(", "),
-                facts
-                    .role
-                    .attributes
-                    .iter()
-                    .map(|attribute| format!("NO{attribute}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                verify::alter_to_none_of(expected.role, &facts.role.attributes)
             ),
             String::new(),
         )
@@ -289,12 +299,7 @@ pub fn refusals(facts: &Facts, expected: &Expected<'_>) -> Option<Refusal> {
             String::new(),
         )
     });
-    let platform = match (facts.role.is_platform, expected.role == ADMINISTRATOR) {
-        (true, _) => Some("the role is the one the platform connects as"),
-        (false, true) => Some("the role is the server's administrator, which no schema confines"),
-        (false, false) => None,
-    }
-    .map(|why| {
+    let platform = verify::unbindable(expected.role, &facts.role).map(|why| {
         (
             format!("{why}; declare a role of the service's own"),
             String::new(),
@@ -324,15 +329,17 @@ pub fn refusals(facts: &Facts, expected: &Expected<'_>) -> Option<Refusal> {
             String::new(),
         )),
     };
-    let reach = [
+    let binding = [
+        elsewhere,
+        owner,
         memberships_refusal(facts, expected.role),
         confined_refusal(&facts.reach),
     ]
     .into_iter()
-    .filter(|_| !vouched);
-    let findings: Vec<(String, String)> = [marked, platform, attributes, elsewhere, owner]
+    .filter(|_| binds);
+    let findings: Vec<(String, String)> = [marked, platform, attributes]
         .into_iter()
-        .chain(reach)
+        .chain(binding)
         .flatten()
         .collect();
     (!findings.is_empty()).then(|| Refusal {
@@ -346,8 +353,6 @@ pub fn refusals(facts: &Facts, expected: &Expected<'_>) -> Option<Refusal> {
         reasons: findings.into_iter().map(|(told, _)| told).collect(),
     })
 }
-
-const ADMINISTRATOR: &str = "postgres";
 
 pub async fn facts(
     platform: &impl GenericClient,
@@ -478,11 +483,12 @@ pub async fn gates(
     let facts = {
         let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
         let Some(role_facts) = verify::role_facts(&tenant_db, role).await? else {
-            return Ok(Err(Refusal::refused(
+            return Ok(Err(Refusal::unproven(
                 Gate::Existence,
-                format!(
+                role,
+                vec![format!(
                     "role {role} does not exist; whoever manages the service's schema creates it"
-                ),
+                )],
             )));
         };
         let connect = tenant_db
@@ -503,28 +509,30 @@ pub async fn gates(
             )),
             (true, true) => None,
         };
-        if let Some(reason) = existence {
-            return Ok(Err(Refusal::refused(Gate::Existence, reason)));
+        if let Some(why) = existence {
+            return Ok(Err(Refusal::unproven(Gate::Existence, role, vec![why])));
         }
-        match verify::login(&state.tenant_sessions, tenant.id, role, &declaration.password).await {
+        match verify::login(
+            &state.tenant_sessions,
+            tenant.id,
+            role,
+            &declaration.password,
+        )
+        .await
+        {
             Probe::Accepted => {}
             Probe::Refused(error) => {
-                return Ok(Err(Refusal {
-                    detail: vec![error],
-                    ..Refusal::refused(
-                        Gate::Login,
-                        format!(
-                            "the password given for role {role} does not log in from the platform: check the password in the database and in the vault entry, and that pg_hba.conf admits the role"
-                        ),
-                    )
-                }))
+                return Ok(Err(Refusal::unproven(Gate::Login, role, vec![error])))
             }
             Probe::Unanswered(error) => {
-                return Ok(Err(Refusal::of(
-                    Gate::Login,
-                    Answer::Unavailable,
-                    format!("a login as role {role} could not be tried ({error}); deploy again"),
-                )))
+                return Ok(Err(Refusal {
+                    detail: vec![error],
+                    ..Refusal::of(
+                        Gate::Login,
+                        Answer::Unavailable,
+                        format!("a login as role {role} could not be tried; deploy again"),
+                    )
+                }))
             }
         }
         facts(
@@ -796,23 +804,34 @@ pub fn admits(entries: &[String], role: &str) -> bool {
     })
 }
 
+/// The shortest stem a `declared_roles` entry may have.
+pub const MIN_STEM: usize = 3;
+
+/// Names no declared role takes: the platform's own roles, the server's
+/// predefined roles and its administrator.
+const RESERVED_ROLE_PREFIXES: [&str; 3] = [MANAGED_PREFIX, "pg_", verify::ADMINISTRATOR];
+
 pub fn refusal_of_entry(entry: &str) -> Option<String> {
     let stemmed = stem(entry);
     let name = stemmed.unwrap_or(entry);
-    let platforms =
-        names::is_managed_name(name) || (stemmed.is_some() && MANAGED_PREFIX.starts_with(name));
-    match (stemmed, is_lowercase_identifier(name)) {
-        (Some(""), _) => Some(format!(
+    let reserved = RESERVED_ROLE_PREFIXES
+        .into_iter()
+        .find(|prefix| name.starts_with(prefix) || (stemmed.is_some() && prefix.starts_with(name)));
+    match (stemmed, is_lowercase_identifier(name), reserved) {
+        (Some(""), _, _) => Some(format!(
             "declared_roles entry '{entry}' would admit every role; name the roles or a stem of them"
         )),
-        (_, false) => Some(format!(
+        (_, false, _) => Some(format!(
             "declared_roles entry '{entry}' must be a role name of lowercase letters, digits and '_', \
              not starting with a digit, or such a name followed by '*'"
         )),
-        (_, true) if platforms => Some(format!(
-            "declared_roles entry '{entry}' would admit the platform's own roles, whose names begin with '{MANAGED_PREFIX}'"
+        (_, true, Some(prefix)) => Some(format!(
+            "declared_roles entry '{entry}' would admit roles whose names begin with '{prefix}', which are the platform's own or the server's"
         )),
-        (_, true) => None,
+        (Some(stem), true, None) if stem.len() < MIN_STEM => Some(format!(
+            "declared_roles entry '{entry}' is too wide a stem; a stem has at least {MIN_STEM} characters"
+        )),
+        (_, true, None) => None,
     }
 }
 
@@ -841,11 +860,12 @@ mod tests {
         for good in [
             "catalog_service_user",
             "loan_*",
-            "l*",
-            "_x*",
+            "loa*",
+            "_xy*",
             "s",
             "svc",
             "sales_*",
+            "pgx_*",
         ] {
             assert_eq!(refusal_of_entry(good), None, "{good}");
         }
@@ -856,6 +876,15 @@ mod tests {
             ("svc_*", "platform's own"),
             ("svc_loans*", "platform's own"),
             ("svc_loans", "platform's own"),
+            ("pg_*", "'pg_'"),
+            ("pg_read_all_data", "'pg_'"),
+            ("p*", "'pg_'"),
+            ("pos*", "'postgres'"),
+            ("postgres*", "'postgres'"),
+            ("postgres", "'postgres'"),
+            ("postgres_app", "'postgres'"),
+            ("l*", "at least 3"),
+            ("lo*", "at least 3"),
             ("Loan_*", "lowercase"),
             ("loan-*", "lowercase"),
             ("loan_**", "lowercase"),
@@ -1029,6 +1058,7 @@ mod tests {
             place: place.into(),
             kind: here.then(|| "table".to_string()),
             identity: here.then(|| "public.ledger".to_string()),
+            received: false,
         };
         for (facts, told) in [
             (
@@ -1127,6 +1157,7 @@ mod tests {
                     place: "tenant_orchard".into(),
                     kind: None,
                     identity: None,
+                    received: false,
                 }],
             },
             ..sound()
@@ -1159,6 +1190,44 @@ mod tests {
         };
         assert_eq!(judged(&reaching, Taking::Refresh), None);
         assert!(judged(&reaching, BIND).is_some());
+
+        let administered = Facts {
+            schema_owner: Some("harbor_owner".into()),
+            bound_elsewhere: Some(("orchard".into(), "ledger-service".into())),
+            ..sound()
+        };
+        assert_eq!(
+            judged(&administered, Taking::Refresh),
+            None,
+            "an administrator's binding keeps its schema's owner, as it was set"
+        );
+        assert!(judged(&administered, BIND).is_some());
+
+        for barred in [
+            Facts {
+                marked: true,
+                ..sound()
+            },
+            Facts {
+                role: RoleFacts {
+                    attributes: vec!["CREATEROLE".into()],
+                    ..sound().role
+                },
+                ..sound()
+            },
+            Facts {
+                role: RoleFacts {
+                    is_platform: true,
+                    ..sound().role
+                },
+                ..sound()
+            },
+        ] {
+            assert!(
+                judged(&barred, Taking::Refresh).is_some(),
+                "no refresh binds what no binding may hold: {barred:?}"
+            );
+        }
     }
 
     #[test]

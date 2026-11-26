@@ -1475,7 +1475,7 @@ Migration `V11` adds `service_db_roles.declared` and a unique index on
 `declared_roles`.
 
 - **Before upgrading**, check that no role is bound twice; the migration
-  fails, and the platform does not start, while one is:
+  fails naming the roles, and the platform does not start, while one is:
 
   ```sql
   SELECT role_name FROM service_db_roles GROUP BY 1 HAVING count(*) > 1
@@ -1492,7 +1492,16 @@ Migration `V11` adds `service_db_roles.declared` and a unique index on
   reads a `db_roles` config holding it as the default config, losing
   `readers` and `login_pool_max`. Set it only once every platform, worker,
   web-runner and ext-runner replica runs v0.41.0, and remove it from every
-  tenant before rolling any replica back below v0.41.0.
+  tenant before rolling any replica back below v0.41.0. An entry is a role
+  name or a stem of at least three characters followed by `*`, and admits
+  no `svc_`, `pg_` or `postgres` name.
+- **During a rolling upgrade**, a `db-role set` served by a replica older
+  than v0.41.0 over a declared binding writes the administrator's role but
+  leaves `declared` true, so the binding still reads as declared. Run
+  `db-role set` again once every replica runs v0.41.0.
+- **A declared role must log in with a password.** `pg_hba.conf` admits it
+  from the platform's hosts with password authentication, since the
+  platform proves the password by logging in as the role.
 - **Retiring a role the platform did not make.** Deleting a service bound
   by an administrator, or replacing that binding with another role, now
   revokes what the platform granted the role: `USAGE` on `_cufflink` and

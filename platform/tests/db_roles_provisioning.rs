@@ -247,6 +247,7 @@ async fn db_roles_provisioning_pg16() {
             "outbox_enqueue",
             "outbox_confined",
             "outbox_service",
+            "outbox_mapped_elsewhere",
         ],
         "and the verification checked it: {binding}"
     );

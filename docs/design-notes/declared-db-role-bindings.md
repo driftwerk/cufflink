@@ -90,8 +90,10 @@ in the tenant database". §5 answers that objection with:
 
    The default is `[]`, which admits no declaration.
 2. **Whoever creates the role meets one precondition once.** The role
-   exists and owns the service's schema. The platform's role is a member
-   of it:
+   exists and owns the service's schema. `pg_hba.conf` admits it from the
+   platform's hosts with password authentication (`scram-sha-256`),
+   because the platform proves the password by logging in as the role
+   (gate 3). The platform's role is a member of it:
 
    ```sql
    GRANT <role> TO <platform role> WITH INHERIT TRUE, SET TRUE;  -- PostgreSQL 16 and later
@@ -200,6 +202,14 @@ password_secret = "CATALOG_DB_ROLE_PASSWORD"
     `Zeroizing<Vec<u8>>` body. The password never enters a
     `serde_json::Value`. The copy that the HTTP client makes of the body is
     outside the CLI's reach, and the doc for the CLI says so.
+  - **The platform's request buffers are not cleared.** The body arrives
+    as hyper's `Bytes`, which are shared and immutable and freed by hyper,
+    and `serde_json` unescapes a string with escapes in a scratch buffer
+    of its own. Neither is the platform's to clear, and a copy made to
+    clear would be one more. What the platform keeps is the
+    `SecretString`, cleared on drop; the buffers live only for the
+    request, in the platform's own memory, as the tenant key in its
+    header does.
 - **Admission refuses** an empty password and one holding a NUL byte,
   which PostgreSQL cannot store.
 - **What keeps the role name only.** `Admitted` holds the declaration.
@@ -295,6 +305,8 @@ stops the request: it is counted and audited as `db_role.declare_refused`
 1. **Allowlist and name.** These checks are pure: `declared_allowed`
    (`declared_roles` admits the name, for `Refresh` too) and
    `declared_not_platforms` (no `svc_` prefix). They refuse with 422.
+   `declared_roles` admits no name the platform or the server reserves
+   (below), so neither does this gate.
 2. **Existence, from the catalog** (`role_facts`, plus `CONNECT` on this
    database):
    - `role_exists`;
@@ -303,8 +315,11 @@ stops the request: it is counted and audited as `db_role.declare_refused`
    - `database_connect`: the remedy is `GRANT CONNECT ON DATABASE … TO …`,
      and the role is never probed into a 42501.
 
-   Each refuses with 422. Only allowlisted names are looked up, so this
-   gate tells a tenant nothing about other roles.
+   Each refuses with 422, and with the answer a refused login gives (gate
+   3): until the password is proven, a deploy learns nothing of a role but
+   that it does not log in with the password given. Which check failed,
+   with its remedy, goes to the refusal's detail: the audit row and the
+   `warn` log. Only allowlisted names are looked up.
 3. **Proof of possession.** `login_pools::probe` logs in with the declared
    password.
    - `probe` classifies 42501 (`insufficient_privilege`) after
@@ -312,15 +327,18 @@ stops the request: it is counted and audited as `db_role.declare_refused`
      has already judged `CONNECT`.
    - Class 28 (`invalid_authorization`) is `Refused`, and the request gets
      a 422. This covers 28P01 (wrong password) and 28000 (for example, a
-     `pg_hba.conf` reject). Both carry the same wording and remedy: `the
-     password given for role X does not log in from the platform: check
-     the password in the database and in the vault entry, and that
-     pg_hba.conf admits the role`.
+     `pg_hba.conf` reject). Both, and every refusal of gate 2, carry one
+     wording: `role X does not log in to the tenant's database with the
+     password given: check that the role exists, may log in and has
+     CONNECT on the database, that its password matches the vault entry,
+     and that pg_hba.conf admits it`. The server's message goes to the
+     detail.
    - Everything else is `Unanswered` and gets a retryable 503. That
      includes a server that cannot be reached, 53300
      (`too_many_connections`), 57P03 (`cannot_connect_now`) and 3D000
      (`invalid_catalog_name`). None of these proves or disproves the
-     password.
+     password. The tenant is told only that a login could not be tried;
+     the error goes to the detail.
    - This holds under every mode.
 4. **The declaration checks of §5.2**, run only once the password is
    proven. `declared::facts` reads the catalog once, and
@@ -402,11 +420,22 @@ stops the request: it is counted and audited as `db_role.declare_refused`
       binding as read under the lock, before the overwrite.
    2. `service_db_roles::write` runs with origin `Declared`.
    3. `forget_role(service.id)` runs.
-   4. Now that the role is the binding, `unmap_others` runs.
-   5. The captured `Retiring` runs as `retire_in(&tenant_db)`. This runs
+   4. The captured `Retiring` runs as `retire_in(&tenant_db)`. This runs
       under the turn and advisory lock that `apply_locked` already holds
       (§7, retiring a binding).
-   6. `db_role.declare` and `db_role.verify` are audited.
+   5. Now that the role is the binding, `unmap_others` runs.
+   6. `db_role.declare` and `db_role.verify` are audited, the first from
+      the binding read under the lock.
+
+   Steps 4 and 5 follow a binding that is written, so neither fails the
+   request. A failure is logged, with what to run by hand, and counted
+   (`cufflink_db_role_retire_failures_total`,
+   `cufflink_db_role_unmap_failures_total`). A mapping left behind is
+   reported by the next verification (`outbox_mapped_elsewhere`, §5.2).
+
+   A write that loses to another tenant's (the unique index, §6), or a
+   role that changes between the gates and the write, is a refusal of the
+   `declaration` gate like any other: audited, counted, and answered 422.
 
 #### Origin through later provisioning
 
@@ -463,7 +492,7 @@ writes nothing, grants nothing and runs no outbox bootstrap.
 - **The plan gains:**
 
   ```json
-  "db_role": { "role": "catalog_service_user", "taking": "bind", "refusals": [], "failed": [] }
+  "db_role": { "role": "catalog_service_user", "taking": "bind", "failed": [] }
   ```
 
 - **A refusal makes the plan a 422** (CLI exit 3).
@@ -578,7 +607,21 @@ A row is **allowed** when one of these holds:
 For a shared object (`dbid = 0`), the one allowed row is the role's ACL
 entry on this database (`CONNECT`, `TEMP`).
 
-Every other row is reported, and so is every row of another database.
+Every other row is reported, and so is every row of another database that
+the role holds itself: what it owns (`deptype = 'o'`) and the policies
+naming it (`'r'`). A privilege granted to it in another database
+(`deptype = 'a'`) is that database's owner's doing, not the role's: any
+tenant whose role may grant can grant to any role it can name, and so could
+otherwise make another tenant's binding fail at its next verification. Such
+grants are counted in `granted_elsewhere`, an `EXCESS` check that fails
+nothing.
+
+A privilege on an object outside the schema counts as harmless only
+without grant option: `USAGE` on `public`, and the platform's own grants
+(rules 4 and 5), are allowed only where they are not `is_grantable`, and
+so are `CONNECT` and `TEMP` on the database. A row that
+`pg_identify_object` cannot name is counted, never dropped.
+
 Privileges that come only through `PUBLIC` are every role's, managed
 roles' included, so `confined` does not judge them.
 
@@ -595,6 +638,16 @@ every binding:
   `REVOKE` statements that can be computed are printed with them.
 - **`declared_memberships` never counts the binding's own
   `read_only_role`.**
+- **Its remedy is the operator's.** It names the roles the role is a member
+  of, which can be other tenants'. The 422 a first version gets under
+  `enforce` (`unverified`) carries every other remedy but this one, for
+  which it points to `db-role verify`.
+
+`outbox_mapped_elsewhere` is an `EXCESS` check of every binding of a
+service that enqueues: another role mapped to the service in
+`_cufflink.service_roles` enqueues as it. It is reported, never refused,
+since the role bound before keeps its mapping until the new one is written
+(§4.3 step 9).
 
 ### 5.3 Threat model
 
@@ -654,13 +707,19 @@ run before upgrading:
 SELECT role_name FROM service_db_roles GROUP BY 1 HAVING count(*) > 1
 ```
 
-`write` maps a violation of the index to the `bound_elsewhere` 422.
+`write` maps a violation of the index to the `bound_elsewhere` 422. V11
+checks first, in a `DO` block, and fails naming the roles bound more than
+once, with what to run, rather than with a bare unique violation.
 
 **`DbRolesConfig` gains `declared_roles: Vec<String>`**, with
 `#[serde(default)]`. `validate` refuses:
 
 - an entry that is neither a role name nor a stem followed by `*`;
-- `*`, and any stem that `svc_` begins with or that begins with `svc_`.
+- `*`, and a stem shorter than three characters;
+- a name or stem that admits a name the platform or the server reserves:
+  one that begins with `svc_` (the platform's), `pg_` (the server's
+  predefined roles) or `postgres` (its administrator). A stem is refused
+  when it begins with one of them, or one of them begins with it.
 
 One function decides a match: `declared::admits`.
 
@@ -984,8 +1043,8 @@ express, and the deploy path stays read-only on claims.
   - `confined` and `declared_memberships` fail for `Declared`;
   - they are `EXCESS` for `Admin`;
   - a binding's own `read_only_role` is not counted.
-- **The probe.** `probe` classifies 42501 as `Accepted`, `28P01` and
-  `28000` as `Refused`, and a server it cannot reach as `Unanswered`.
+- **The probe** is tested against a real server, since a
+  `tokio_postgres::Error` with a code cannot be built by hand (below).
 - **The grants.** `cufflink_grants` holds no `DELETE`, and `unmap_others`
   holds nothing else.
 - **The request.** `SecretString` deserializes. `Debug` of `DeployRequest`
@@ -1011,8 +1070,16 @@ express, and the deploy path stays read-only on claims.
 
 These run against real Postgres with the platform's harness
 (`cufflink_testkit::PlatformProcess`, `TestDb`), in
-`platform/tests/db_roles_bindings.rs`. Roles are made as the operator, and
-the tenant runs `enforce` with `declared_roles` set.
+`platform/tests/db_roles_declared.rs`, and as a platform that is no
+superuser in `platform/tests/db_roles_unprivileged.rs`. Roles are made as
+the operator, and the tenant runs `enforce` with `declared_roles` set.
+
+- **The probe.** `probe` classifies 42501 (no `CONNECT`) as `Accepted`;
+  28P01 (a wrong password) and 28000 (a `NOLOGIN` role, the code a
+  `pg_hba.conf` reject also gives) as `Refused`; 53300 (`CONNECTION LIMIT
+  0`), 3D000 and a server it cannot reach as `Unanswered`. 57P03 cannot be
+  provoked on a running server; it takes the arm of every code outside
+  class 28 and 42501.
 
 - **One-pass first deploy.**
   - The first deploy succeeds.
@@ -1037,13 +1104,13 @@ the tenant runs `enforce` with `declared_roles` set.
   - a member of `pg_read_all_data`;
   - a role bound to another tenant's service;
   - a schema that another role owns;
-  - a `NOLOGIN` role, refused by `can_login` and not reported as a wrong
-    password;
-  - a role without `CONNECT`, refused with the `GRANT CONNECT` and no 503;
-  - a `pg_hba.conf` reject (28000), refused with the same wording as a
-    wrong password.
-- **Errors that leave the password open.** A server answering 53300,
-  57P03 or 3D000 makes the request a 503, and nothing is written.
+  - a `NOLOGIN` role, refused by `can_login` before any probe, and a role
+    without `CONNECT`, refused with no 503; both answer as a wrong
+    password does, the check that failed in the audit row;
+  - a `CREATEROLE` role.
+- **Errors that leave the password open.** A role at its connection limit
+  (53300) makes the request a 503 that does not quote the server, and
+  nothing is written.
 - **No disclosure.**
   - A refusal for a role bound in another tenant names neither that tenant
     nor its service.
@@ -1059,6 +1126,9 @@ the tenant runs `enforce` with `declared_roles` set.
     - a role that holds `SELECT` on a sibling service's table;
     - a role that owns a function in `public`.
   - These are accepted:
+    - a role granted a privilege in another database, which is reported
+      as `granted_elsewhere`, including one another tenant's role grants
+      it;
     - a role whose policy or collation sits in its own schema, with the
       policy's namespace taken from `polrelid`;
     - a role whose default privileges are global
@@ -1086,8 +1156,11 @@ the tenant runs `enforce` with `declared_roles` set.
   enqueues are untouched.
 - **Readiness.**
   - Without platform membership, `enforce` refuses with the `GRANT`, both
-    for the deploy and for `?plan=true`.
-  - Under `warn`, the binding is written unverified.
+    for the deploy and for `?plan=true`, on a platform that is no
+    superuser (`db_roles_unprivileged`), and once the operator runs it
+    the deploy binds the role.
+  - Under `warn`, a binding that fails a readiness check (`CREATE` on
+    `public` through `PUBLIC`) is written unverified.
 - **Precedence.**
   - An admin binding of another role refuses the declaration with 409.
   - An admin binding of the same role is refreshed, and keeps
@@ -1111,8 +1184,17 @@ the tenant runs `enforce` with `declared_roles` set.
     admin's.
   - It is never a declared binding written over an admin binding of
     another role.
-- **Two tenants declare one role at once.** One succeeds, and the other
-  gets 422.
+- **Two tenants declare one role at once.** A role cannot pass the gates
+  in two tenants, since what it owns in one database is reach in the
+  other; the race is therefore between a declaration and another
+  tenant's binding of the role. The test holds that binding uncommitted
+  until the declaration waits on the unique index, then commits it. The
+  declaration gets the `bound_elsewhere` 422, audited, and what it was
+  granted is taken back.
+- **A mapping left behind.** Another role mapped to the service is
+  reported as `outbox_mapped_elsewhere` by `db-role verify`.
+- **V11** names the roles bound more than once, and applies once each
+  carries one service.
 - **The first-version gate.** Without a declaration, under `enforce`, the
   first deploy of a schema owned by another role is a 422 that names the
   declaration. No version is activated. The recorded service does not

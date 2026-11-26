@@ -34,6 +34,8 @@ pub enum Enqueue {
         execute: bool,
         shared: bool,
         mapped: bool,
+        /// Another role is mapped to the service, and enqueues as it.
+        others: bool,
     },
 }
 
@@ -58,8 +60,9 @@ pub async fn facts(
             let mapping = client
                 .query_one(
                     &format!(
-                        "SELECT EXISTS (SELECT 1 FROM {SERVICE_ROLES}
-                                        WHERE service = $2 AND role = $1::name)"
+                        "SELECT COALESCE(bool_or(role = $1::name), false),
+                                COALESCE(bool_or(role <> $1::name), false)
+                         FROM {SERVICE_ROLES} WHERE service = $2"
                     ),
                     &[&role, &service],
                 )
@@ -68,6 +71,7 @@ pub async fn facts(
                 execute: own,
                 shared,
                 mapped: mapping.get(0),
+                others: mapping.get(1),
             }
         }
         (false, true) => Enqueue::Shared { execute: shared },
@@ -261,6 +265,22 @@ pub fn checks(role: &str, service: &str, enqueue: Enqueue) -> Vec<Check> {
 /// What a role of a service the platform never enqueues for holds of the
 /// outbox beyond its need, with what takes each back. It narrows nothing
 /// itself: the operator decides.
+/// Another role mapped to the service enqueues as it. It is left until the
+/// role is bound ([`unmap_others`]), so it is reported, never refused.
+pub fn others_mapped(role: &str, service: &str, enqueue: Enqueue) -> Option<Check> {
+    match enqueue {
+        Enqueue::Own { others, .. } => {
+            Some(Check::excess("outbox_mapped_elsewhere", others, || {
+                (
+                    format!("another role is mapped to service {service} and may enqueue as it"),
+                    format!("{};", unmapping_others(role, service)),
+                )
+            }))
+        }
+        Enqueue::Absent | Enqueue::Shared { .. } => None,
+    }
+}
+
 pub fn excess(role: &str, usage: bool, enqueue: Enqueue) -> Vec<Check> {
     let quoted = quote_ident(role);
     let revoke = |function: &str| format!("REVOKE EXECUTE ON FUNCTION {function} FROM {quoted};");
@@ -319,6 +339,27 @@ pub fn excess(role: &str, usage: bool, enqueue: Enqueue) -> Vec<Check> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn another_role_mapped_to_the_service_is_reported_as_excess() {
+        let own = |others| Enqueue::Own {
+            execute: true,
+            shared: false,
+            mapped: true,
+            others,
+        };
+        let stale = others_mapped(ROLE, "loan-service", own(true));
+        assert!(
+            stale.as_ref().is_some_and(|check| check.ok
+                && check.excess
+                && check.check == "outbox_mapped_elsewhere"
+                && check.remedy.as_deref()
+                    == Some(format!("DELETE FROM {SERVICE_ROLES} WHERE service = 'loan-service' AND role <> '{ROLE}';").as_str())),
+            "{stale:?}"
+        );
+        assert!(others_mapped(ROLE, "loan-service", own(false)).is_some_and(|check| !check.excess));
+        assert!(others_mapped(ROLE, "loan-service", Enqueue::Shared { execute: true }).is_none());
+    }
+
     const ROLE: &str = "svc_default_notes_0011223344556677";
 
     #[test]
@@ -337,6 +378,7 @@ mod tests {
             execute: false,
             shared: true,
             mapped: false,
+            others: false,
         };
         assert_eq!(
             statements(ROLE, "note's-service", fresh),
@@ -359,6 +401,7 @@ mod tests {
             execute: true,
             shared: false,
             mapped: true,
+            others: false,
         };
         assert!(statements(ROLE, "loan-service", settled).is_empty());
         assert!(checks(ROLE, "loan-service", settled).iter().all(|c| c.ok));
@@ -373,6 +416,7 @@ mod tests {
                 execute: false,
                 shared: true,
                 mapped: false,
+                others: false,
             },
         );
         assert_eq!(
@@ -422,6 +466,7 @@ mod tests {
             execute: false,
             shared: false,
             mapped: false,
+            others: false,
         };
         let checks = excess(ROLE, false, bare);
         assert_eq!(
@@ -450,6 +495,7 @@ mod tests {
             execute: true,
             shared: false,
             mapped: true,
+            others: false,
         };
         let checks = excess(ROLE, true, granted);
         assert!(checks.iter().all(|c| c.ok));
@@ -480,6 +526,7 @@ mod tests {
                 execute: false,
                 shared: true,
                 mapped: false,
+                others: false,
             },
         );
         assert!(
@@ -494,6 +541,7 @@ mod tests {
             execute: true,
             shared: true,
             mapped: false,
+            others: false,
         };
         assert_eq!(
             narrowing(ROLE, held),
@@ -505,6 +553,7 @@ mod tests {
             execute: true,
             shared: false,
             mapped: true,
+            others: false,
         };
         assert!(
             narrowing(ROLE, own).is_empty(),

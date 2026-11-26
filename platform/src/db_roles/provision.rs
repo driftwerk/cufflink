@@ -619,6 +619,8 @@ pub struct Provisioned {
     pub binding: Binding,
     pub report: VerifyReport,
     pub taking: Option<Taking>,
+    /// The binding this one replaced or refreshed, read under the lock.
+    pub previous: Option<Binding>,
 }
 
 pub async fn apply(
@@ -707,13 +709,34 @@ fn stored_report(binding: &Binding) -> PlatformResult<VerifyReport> {
         })
 }
 
+/// What a tenant is told of a report: every remedy, but the memberships',
+/// which can name roles outside its database (§5.4); those an
+/// administrator's `db-role verify` shows.
+fn told_remediation(report: &VerifyReport) -> Vec<String> {
+    let withheld = |check: &verify::Check| check.check == verify::DECLARED_MEMBERSHIPS;
+    report
+        .checks
+        .iter()
+        .filter(|check| !check.excess)
+        .flat_map(|check| match (withheld(check), check.ok) {
+            (false, _) => check.remedy.clone(),
+            (true, false) => Some(
+                "the role is a member of roles a service's role may not be; an administrator's `cufflink services db-role verify` names them"
+                    .to_string(),
+            ),
+            (true, true) => None,
+        })
+        .collect()
+}
+
 fn unverified(service: &Service, report: &VerifyReport, verdict: Verdict) -> PlatformError {
+    let remediation = told_remediation(report);
     let told = format!(
         "service {} has no verified database role, which its tenant's db_roles policy (enforce) needs before its first version runs: {}",
         service.name,
-        match report.remediation.is_empty() {
+        match remediation.is_empty() {
             true => report.failed().join(", "),
-            false => report.remediation.join(" "),
+            false => remediation.join(" "),
         }
     );
     match verdict {
@@ -906,6 +929,7 @@ async fn apply_locked(
                 report: stored_report(binding)?,
                 binding: binding.clone(),
                 taking: Some(Taking::Unchanged),
+                previous: Some(binding.clone()),
             }));
         }
     }
@@ -921,13 +945,13 @@ async fn apply_locked(
     if let Some((other_tenant, other_service)) =
         service_db_roles::bound_elsewhere(platform, &target.role, service.id).await?
     {
-        return Err(PlatformError::Validation(match gated {
-            Some(_) => bound_elsewhere(&target.role),
-            None => format!(
+        return match gated {
+            Some(_) => Ok(Err(taken_elsewhere(&target.role))),
+            None => Err(PlatformError::Validation(format!(
                 "role '{}' is bound to the service '{other_service}' of tenant '{other_tenant}'; a role carries one service",
                 target.role
-            ),
-        }));
+            ))),
+        };
     }
     crate::outbox::bootstrap::ensure(&state.tenant_sessions, tenant.id).await?;
     let mut tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
@@ -938,7 +962,10 @@ async fn apply_locked(
             .as_ref()
             .and_then(|facts| unbindable(&target.role, facts)),
     ) {
-        return Err(PlatformError::Validation(refusal));
+        return match gated {
+            Some(_) => Ok(Err(Refusal::refused(Gate::Declaration, refusal))),
+            None => Err(PlatformError::Validation(refusal)),
+        };
     }
     let role_exists = role_facts.is_some();
     let password = match &target.password {
@@ -1059,22 +1086,31 @@ async fn apply_locked(
     let binding = match written {
         Ok(binding) => binding,
         Err(e) if service_db_roles::role_taken(&e) => {
-            if gated.is_some() && newly(&target.role) {
-                relinquish(state, tenant, &target.role, &service.name).await?;
-            }
-            return Err(PlatformError::Validation(bound_elsewhere(&target.role)));
+            return match gated {
+                Some(_) => {
+                    if newly(&target.role) {
+                        relinquish(state, tenant, &target.role, &service.name).await?;
+                    }
+                    Ok(Err(taken_elsewhere(&target.role)))
+                }
+                None => Err(PlatformError::Validation(bound_elsewhere(&target.role))),
+            };
         }
         Err(e) => return Err(e.into()),
     };
     state.tenant_sessions.forget_role(service.id);
-    let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
-    enqueue::unmap_others(&tenant_db, &target.role, &service.name).await?;
-    if let Some(replaced) = existing
+    let replaced = existing
+        .as_ref()
         .filter(|previous| previous.role_name != target.role)
-        .map(|previous| Retiring::of(service, previous, Why::Replaced))
-    {
-        replaced.retired(replaced.retire_in(&tenant_db).await);
-    }
+        .map(|previous| Retiring::of(service, previous.clone(), Why::Replaced));
+    settle(
+        state,
+        tenant,
+        &service.name,
+        &target.role,
+        replaced.as_ref(),
+    )
+    .await;
     crate::repo::audit::log_action(crate::repo::audit::AuditEntry {
         client: platform,
         tenant_id: Some(tenant.id),
@@ -1094,25 +1130,55 @@ async fn apply_locked(
         binding,
         report,
         taking: gated.map(|gated| gated.taking),
+        previous: existing,
     }))
 }
 
-const ADMINISTRATOR: &str = "postgres";
+fn taken_elsewhere(role: &str) -> Refusal {
+    Refusal::refused(Gate::Declaration, bound_elsewhere(role))
+}
+
+/// What follows a written binding: other roles' mappings to the service go,
+/// and the role it replaced is retired. The binding stands either way, so a
+/// failure is logged and counted, and `db-role verify` reports a mapping
+/// left behind.
+async fn settle(
+    state: &AppState,
+    tenant: &Tenant,
+    service: &str,
+    role: &str,
+    replaced: Option<&Retiring>,
+) {
+    let settled = match state
+        .tenant_sessions
+        .platform(tenant.id, None)
+        .await
+        .map_err(PlatformError::from)
+    {
+        Ok(tenant_db) => {
+            if let Some(replaced) = replaced {
+                replaced.retired(replaced.retire_in(&tenant_db).await);
+            }
+            enqueue::unmap_others(&tenant_db, role, service)
+                .await
+                .map_err(PlatformError::from)
+        }
+        Err(e) => {
+            if let Some(replaced) = replaced {
+                retire_failed(replaced.why, service, &e);
+            }
+            Err(e)
+        }
+    };
+    if let Err(e) = settled {
+        metrics::counter!("cufflink_db_role_unmap_failures_total").increment(1);
+        warn!(tenant = %tenant.slug, service = %service, role = %role, error = %e, "Other roles' mappings to the service could not be removed; `cufflink services db-role verify` reports any left");
+    }
+}
 
 fn unbindable(name: &str, role: &verify::RoleFacts) -> Option<String> {
-    let why = match (
-        role.is_platform,
-        role.attributes.iter().any(|a| a == "SUPERUSER"),
-        name == ADMINISTRATOR,
-    ) {
-        (true, _, _) => "the one the platform connects as",
-        (false, true, _) => "a superuser, which no schema confines",
-        (false, false, true) => "the server's administrator, which no schema confines",
-        (false, false, false) => return None,
-    };
-    Some(format!(
-        "the role is {why}; a service is bound to a role of its own"
-    ))
+    verify::unbindable(name, role)
+        .map(|why| format!("{why}; a service is bound to a role of its own"))
 }
 
 async fn entry(state: &AppState, tenant_id: Uuid) -> Option<Arc<TenantEntry>> {
@@ -1266,6 +1332,51 @@ pub async fn after_deploy(state: &AppState, tenant_id: Uuid, service_id: Uuid) {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn a_tenant_is_told_every_remedy_but_the_memberships() {
+        let check = |name: &str, ok: bool, remedy: &str| verify::Check {
+            check: name.into(),
+            ok,
+            inconclusive: false,
+            excess: false,
+            detail: None,
+            remedy: Some(remedy.into()),
+        };
+        let report = VerifyReport {
+            role: "loan_service_user".into(),
+            verified: false,
+            checked_at: Utc::now(),
+            server_version_num: 160004,
+            checks: vec![
+                check(
+                    "schema",
+                    false,
+                    "GRANT USAGE ON SCHEMA \"loan_service\" TO \"loan_service_user\";",
+                ),
+                check(
+                    verify::DECLARED_MEMBERSHIPS,
+                    false,
+                    "REVOKE \"svc_globex_catalog\" FROM \"loan_service_user\";",
+                ),
+            ],
+            remediation: vec![],
+        };
+        let told = told_remediation(&report);
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told[0].starts_with("GRANT USAGE"), "{told:?}");
+        assert!(
+            told.iter().all(|line| !line.contains("svc_globex")),
+            "{told:?}"
+        );
+        assert!(told[1].contains("db-role verify"), "{told:?}");
+
+        let member_of_none = VerifyReport {
+            checks: vec![check(verify::DECLARED_MEMBERSHIPS, true, "")],
+            ..report
+        };
+        assert!(told_remediation(&member_of_none).is_empty());
+    }
 
     fn catalog() -> Catalog {
         Catalog {

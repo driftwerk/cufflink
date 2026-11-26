@@ -313,8 +313,10 @@ say) can name that role beside its other deploy settings. Its first deploy
 then binds it with the tenant's deploy key alone, under `enforce` too.
 
 **Once, by whoever creates the role.** The role exists, may log in and
-connect, owns the service's schema and reaches nothing else, and the
-platform's role is a member of it:
+connect, owns the service's schema and reaches nothing else. `pg_hba.conf`
+admits it from the platform's hosts with password authentication
+(`scram-sha-256`), since the platform proves the password by logging in.
+The platform's role is a member of it:
 
 ```sql
 GRANT catalog_service_user TO cufflink WITH INHERIT TRUE, SET TRUE;  -- PostgreSQL 16 and later
@@ -323,7 +325,9 @@ GRANT catalog_service_user TO cufflink;                              -- earlier
 
 **Once per tenant, by an administrator.** `declared_roles` in the tenant's
 `db_roles` config lists the role names its deploys may declare: exact names,
-or a stem followed by `*`. It is empty by default, which admits none.
+or a stem of at least three characters followed by `*`. It is empty by
+default, which admits none. No entry may admit the platform's own roles
+(`svc_…`), the server's (`pg_…`) or `postgres…`.
 
 ```sh
 cufflink tenants policy set harbor db_roles enforce \
@@ -336,34 +340,24 @@ and falls back to the default config, losing `readers` and
 worker, web-runner and ext-runner replica runs v0.41.0, and remove it from
 every tenant before rolling any replica back below v0.41.0.
 
-**In the project.** `Cufflink.toml` names the role per environment, and its
-password by an entry of that environment's vault:
-
-```toml
-[service]
-name = "catalog-service"
-
-[environments.staging.db_role]
-role = "catalog_service_user"
-password_secret = "CATALOG_DB_ROLE_PASSWORD"
-```
-
-`[service].name` is required and must be the manifest's name. The entry is
-the binding's alone: `[secrets]` may not map it, since the guest reads its
-config. A CLI of v0.41.0 or later is needed; an older one ignores the table.
+**With each deploy.** The deploy request carries the role and its password
+(`db_role`, see [a declared database role](deployment.md#a-declared-database-role)).
 
 **What the deploy checks.** Before it grants or writes anything, the
-platform checks, in order, that `declared_roles` admits the role, that it
-exists, may log in and may connect, that the password logs in, and that the
+platform checks, in order, that no administrator's binding of another role
+is in place (409), that `declared_roles` admits the role, that it exists,
+may log in and may connect, that the password logs in, and that the
 role is no platform-made role, the platform's own, a superuser or
 `postgres`, holds no `CREATEDB`, `CREATEROLE`, `REPLICATION` or
 `BYPASSRLS`, is a member of no role, is bound to no other service, owns the
 service's schema and reaches nothing outside it (`confined`). Under
-`enforce` it must then pass verification. A refusal is a 422 that lists
-each finding with its remedy and names nothing outside the tenant's
-database; a login that could not be tried is a 503. `cufflink deploy
---plan` runs the same checks and writes nothing. Every refusal is audited
-(`db_role.declare_refused`).
+`enforce` it must then pass verification. Until the password is proven,
+every refusal gives the same answer, so a deploy learns nothing about roles
+it cannot log in as; the audit row says which check failed. After that, a
+refusal is a 422 that lists each finding with its remedy and names nothing
+outside the tenant's database. A login that could not be tried is a 503. A
+plan (`?plan=true`) runs the same checks and writes nothing. Every refusal
+is audited (`db_role.declare_refused`), with its detail.
 
 - **An administrator's binding of another role** refuses the declaration
   (409); one of the same role has its password refreshed and stays the

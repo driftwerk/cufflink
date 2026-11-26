@@ -665,9 +665,8 @@ deploy-time migrations.
 
 ### A declared database role
 
-A deploy request may carry the service's own database role
-(`[environments.<env>.db_role]` in `Cufflink.toml`; the CLI sends it only to
-a platform that advertises `db_role_declarations`):
+A deploy request may carry the service's own database role, to a platform
+that advertises `db_role_declarations`:
 
 ```json
 { "manifest": { … }, "db_role": { "role": "catalog_service_user", "password": "…" } }
@@ -678,7 +677,7 @@ role and before the skip check, so a deploy with nothing else to do still
 takes a new password ([declaring a role](db-roles-and-secrets.md#declaring-a-role-with-the-service)).
 The password is kept only sealed: a job's `request`, `result` and `error`,
 the plan, the answer, logs and audit rows carry the role alone. The plan
-gains `"db_role": {"role", "taking", "refusals", "failed"}`, where `taking`
+gains `"db_role": {"role", "taking", "failed"}`, where `taking`
 is `bind`, `refresh` or `unchanged` and `failed` the checks that would not
 pass under `warn`; a refusal makes the plan a 422. Every deploy answer of a
 bound service carries `"db_role": {"role", "origin", "verified"}`.

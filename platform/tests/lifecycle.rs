@@ -529,6 +529,69 @@ async fn v4_applies_where_two_services_already_share_a_schema() {
 }
 
 #[tokio::test]
+async fn v11_names_the_roles_bound_to_more_than_one_service() {
+    let Some(infra) = common::infra().await else {
+        return;
+    };
+    let db = infra.create_database().await;
+    let client = db.pool().get().await.expect("checkout");
+    client
+        .batch_execute(concat!(
+            include_str!("../migrations/V1__baseline.sql"),
+            include_str!("../migrations/V2__r1a_policy_and_isolation.sql"),
+            include_str!("../migrations/V3__r2.sql"),
+            include_str!("../migrations/V4__r3.sql"),
+            include_str!("../migrations/V5__extensions.sql"),
+            include_str!("../migrations/V6__runner_keys.sql"),
+            include_str!("../migrations/V7__capacity_deferrals.sql"),
+            include_str!("../migrations/V8__tenant_buckets.sql"),
+            include_str!("../migrations/V9__web_uploads.sql"),
+            include_str!("../migrations/V10__web_upload_parts.sql"),
+        ))
+        .await
+        .expect("V10 schema");
+    client
+        .batch_execute(
+            "INSERT INTO tenants (id, keycloak_user_id, name, slug) VALUES
+               ('00000000-0000-0000-0000-00000000000a', 'kc-a', 'acme', 'acme'),
+               ('00000000-0000-0000-0000-00000000000b', 'kc-b', 'globex', 'globex');
+             INSERT INTO services (id, tenant_id, name) VALUES
+               ('00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-00000000000a', 'loan-service'),
+               ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-00000000000b', 'loan-service'),
+               ('00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-00000000000b', 'catalog-service');
+             INSERT INTO service_db_roles (service_id, role_name, managed, updated_by) VALUES
+               ('00000000-0000-0000-0000-0000000000a1', 'loan_service_user', false, 'admin'),
+               ('00000000-0000-0000-0000-0000000000b1', 'loan_service_user', false, 'admin'),
+               ('00000000-0000-0000-0000-0000000000b2', 'catalog_service_user', false, 'admin');",
+        )
+        .await
+        .expect("a role bound twice");
+    let error = client
+        .batch_execute(include_str!("../migrations/V11__declared_db_roles.sql"))
+        .await
+        .expect_err("V11 refuses a role bound twice");
+    let refused = error.as_db_error().expect("a database error");
+    assert_eq!(
+        refused.message(),
+        "roles bound to more than one service: loan_service_user"
+    );
+    assert!(refused
+        .hint()
+        .is_some_and(|hint| hint.contains("cufflink services db-role set")));
+
+    client
+        .batch_execute(
+            "DELETE FROM service_db_roles WHERE service_id = '00000000-0000-0000-0000-0000000000b1'",
+        )
+        .await
+        .expect("rebound");
+    client
+        .batch_execute(include_str!("../migrations/V11__declared_db_roles.sql"))
+        .await
+        .expect("V11 applies once every role carries one service");
+}
+
+#[tokio::test]
 async fn a_permanent_startup_failure_exits_with_an_error() {
     let Some(infra) = common::infra().await else {
         return;

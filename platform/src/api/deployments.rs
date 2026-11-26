@@ -586,7 +586,6 @@ async fn previewed(
     Ok(Some(json!({
         "role": declaration.role,
         "taking": previewed.taking,
-        "refusals": [],
         "failed": previewed.unready,
     })))
 }
