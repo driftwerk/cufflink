@@ -313,55 +313,85 @@ impl From<WantsError> for PlatformError {
     }
 }
 
-pub async fn namespace_of(
+async fn claimed(
     state: &AppState,
-    identity: &ServiceIdentity,
+    tenant_id: Uuid,
+    tenant_slug: &str,
 ) -> Result<Namespace, WantsError> {
     state
         .tenants
-        .get_or_load(identity.tenant_id)
+        .get_or_load(tenant_id)
         .await
         .map(|entry| {
             entry.map_or_else(
-                || Namespace::own(&identity.tenant_slug),
+                || Namespace::own(tenant_slug),
                 |entry| entry.namespace.clone(),
             )
         })
         .map_err(|e| WantsError::ClaimsUnread {
-            tenant: identity.tenant_slug.clone(),
+            tenant: tenant_slug.to_string(),
             reason: e.to_string(),
         })
 }
 
-async fn placements_of_service(
+/// The namespace the deployed versions of the tenant's services run in.
+pub async fn namespace_of(
+    state: &AppState,
+    identity: &ServiceIdentity,
+) -> Result<Namespace, WantsError> {
+    claimed(state, identity.tenant_id, &identity.tenant_slug)
+        .await
+        .map(Namespace::admitted)
+}
+
+/// The namespace `manifest` is deployed in, the streams the tenant's
+/// services declare read from the platform database.
+pub async fn deploying(
+    state: &AppState,
+    tenant_id: Uuid,
+    tenant_slug: &str,
+    manifest: &ServiceManifest,
+) -> Result<Namespace, WantsError> {
+    let claimed = claimed(state, tenant_id, tenant_slug).await?;
+    crate::repo::deployments::declaring(&state.platform_db, tenant_id, claimed, manifest)
+        .await
+        .map_err(|e| WantsError::ClaimsUnread {
+            tenant: tenant_slug.to_string(),
+            reason: e.to_string(),
+        })
+}
+
+fn placements_of_service(
     state: &AppState,
     identity: &ServiceIdentity,
     manifest: &ServiceManifest,
+    namespace: &Namespace,
     streams: &StreamSnapshot,
-) -> Result<Vec<Result<DesiredConsumer, PlacementError>>, WantsError> {
-    let namespace = namespace_of(state, identity).await?;
-    Ok(placements(
+) -> Vec<Result<DesiredConsumer, PlacementError>> {
+    placements(
         identity,
         manifest,
-        in_scope(manifest, &namespace),
+        in_scope(manifest, namespace),
         &with_planned(streams, deployed_streams(manifest, &identity.tenant_slug)),
         defaults(state),
     )
     .into_iter()
     .map(|placed| placed.map(|wanted| wanted.consumer))
-    .collect())
+    .collect()
 }
 
-pub async fn of_service(
+pub fn of_service(
     state: &AppState,
     identity: &ServiceIdentity,
     manifest: &ServiceManifest,
+    namespace: &Namespace,
     streams: &StreamSnapshot,
 ) -> Result<Vec<DesiredConsumer>, WantsError> {
-    Ok(placements_of_service(state, identity, manifest, streams)
-        .await?
-        .into_iter()
-        .collect::<Result<_, _>>()?)
+    Ok(
+        placements_of_service(state, identity, manifest, namespace, streams)
+            .into_iter()
+            .collect::<Result<_, _>>()?,
+    )
 }
 
 pub async fn placeable_of_service(
@@ -370,11 +400,13 @@ pub async fn placeable_of_service(
     manifest: &ServiceManifest,
     streams: &StreamSnapshot,
 ) -> Result<Vec<DesiredConsumer>, WantsError> {
-    Ok(placements_of_service(state, identity, manifest, streams)
-        .await?
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect())
+    let namespace = namespace_of(state, identity).await?;
+    Ok(
+        placements_of_service(state, identity, manifest, &namespace, streams)
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect(),
+    )
 }
 
 pub async fn wanted_by_active(

@@ -332,7 +332,13 @@ pub struct Namespace {
     own_stream: String,
     subjects: Vec<String>,
     stream_claims: Vec<Claim>,
-    declared: BTreeSet<String>,
+    declared: Declared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Declared {
+    Streams(BTreeSet<String>),
+    Admitted,
 }
 
 impl Namespace {
@@ -347,14 +353,27 @@ impl Namespace {
                 .chain(subjects.into_iter().map(|claim| claim.pattern))
                 .collect(),
             stream_claims: streams,
-            declared: BTreeSet::new(),
+            declared: Declared::Streams(BTreeSet::new()),
         }
     }
 
     /// The namespace with the streams the tenant's services declare, which
     /// a prefix claim admits.
     pub fn declaring(self, declared: BTreeSet<String>) -> Self {
-        Self { declared, ..self }
+        Self {
+            declared: Declared::Streams(declared),
+            ..self
+        }
+    }
+
+    /// The namespace a deployed version runs in: its deploy checked the
+    /// declarations, so a prefix holds every stream under it until the
+    /// version is replaced.
+    pub fn admitted(self) -> Self {
+        Self {
+            declared: Declared::Admitted,
+            ..self
+        }
     }
 
     pub fn claims_by_prefix(&self) -> bool {
@@ -392,21 +411,29 @@ impl Namespace {
     /// a prefix under which one of the tenant's services declares it.
     pub fn admits_stream(&self, name: &str) -> bool {
         self.stream_claims.iter().any(|claim| {
-            claim.matches_stream(name) && (claim.stem().is_none() || self.declared.contains(name))
+            claim.matches_stream(name)
+                && (claim.stem().is_none()
+                    || match &self.declared {
+                        Declared::Streams(declared) => declared.contains(name),
+                        Declared::Admitted => true,
+                    })
         })
+    }
+
+    /// Whether a subscription may bind the stream: the tenant's own, or one
+    /// its claims admit.
+    pub fn binds_stream(&self, name: &str) -> bool {
+        name == self.own_stream || self.admits_stream(name)
     }
 
     /// The prefix that claims a stream the namespace does not admit because
     /// no service of the tenant declares it.
     pub fn undeclared_under(&self, name: &str) -> Option<&str> {
-        (!self.admits_stream(name))
-            .then(|| {
-                self.stream_claims
-                    .iter()
-                    .find(|claim| claim.matches_stream(name))
-                    .map(|claim| claim.pattern.as_str())
-            })
-            .flatten()
+        self.stream_claims
+            .iter()
+            .find(|claim| claim.matches_stream(name))
+            .filter(|_| !self.admits_stream(name))
+            .map(|claim| claim.pattern.as_str())
     }
 
     pub fn own_stream(&self) -> &str {
@@ -848,6 +875,19 @@ mod tests {
             "what a service declares is admitted only under a claim"
         );
         assert_eq!(declaring.claims().count(), 2);
+    }
+
+    #[test]
+    fn an_admitted_namespace_holds_every_stream_under_its_prefixes_and_binds_its_own() {
+        let admitted = Namespace::new("harbor", [Claim::stream("CATALOG_*")]).admitted();
+        assert!(admitted.admits_stream("CATALOG_EVENTS"));
+        assert_eq!(admitted.undeclared_under("CATALOG_EVENTS"), None);
+        assert!(!admitted.admits_stream("RECEIPTS"));
+        assert!(admitted.binds_stream("DW_HARBOR") && admitted.binds_stream("CATALOG_EVENTS"));
+        assert!(!admitted.binds_stream("DW_ACME"));
+        assert!(
+            !Namespace::new("harbor", [Claim::stream("CATALOG_*")]).binds_stream("CATALOG_EVENTS")
+        );
     }
 
     #[test]

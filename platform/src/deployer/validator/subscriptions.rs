@@ -93,9 +93,7 @@ pub fn subscription_scope_violation(
     sub.stream
         .as_deref()
         .filter(|stream| {
-            *stream != namespace.own_stream()
-                && !namespace.admits_stream(stream)
-                && !SHARED_STREAMS.contains(stream)
+!namespace.binds_stream(stream) && !SHARED_STREAMS.contains(stream)
         })
         .map(|stream| {
             undeclared(namespace, stream).map_or_else(

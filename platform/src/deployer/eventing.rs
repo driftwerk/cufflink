@@ -8,7 +8,7 @@ use crate::nats_manager::consumers::plan::{
 };
 use crate::nats_manager::reconciler::SETTLE_WITHIN;
 use crate::nats_manager::streams::{self, StreamOp, StreamPlan};
-use crate::nats_manager::subjects::{tenant_stream_name, Namespace};
+use crate::nats_manager::subjects::tenant_stream_name;
 use crate::registry::ServiceIdentity;
 use crate::repo::deploy_lock::DeployLock;
 use crate::AppState;
@@ -95,13 +95,7 @@ pub(crate) async fn admit(
     tenant_id: Uuid,
     tenant_slug: &str,
 ) -> PlatformResult<()> {
-    let claimed = state.tenants.get_or_load(tenant_id).await?.map_or_else(
-        || Namespace::own(tenant_slug),
-        |entry| entry.namespace.clone(),
-    );
-    let namespace =
-        crate::repo::deployments::declaring(&state.platform_db, tenant_id, claimed, Some(manifest))
-            .await?;
+    let namespace = desired::deploying(state, tenant_id, tenant_slug, manifest).await?;
     validate_tenant_scope(
         manifest,
         &namespace,
@@ -263,7 +257,9 @@ pub(crate) async fn prepare_version(
         &desired::with_changed(&server, &changed),
         [desired::tenant_stream(&identity.tenant_slug)],
     );
-    let wanted = desired::of_service(state, identity, manifest, &streams).await?;
+    let namespace =
+        desired::deploying(state, identity.tenant_id, &identity.tenant_slug, manifest).await?;
+    let wanted = desired::of_service(state, identity, manifest, &namespace, &streams)?;
     let prior = match &active {
         Some(active) => desired::placeable_of_service(state, identity, active, &streams).await?,
         None => Vec::new(),

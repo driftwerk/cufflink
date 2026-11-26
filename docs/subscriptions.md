@@ -217,6 +217,10 @@ cufflink tenants nats-claims set harbor --subject 'catalog.>' --stream 'CATALOG_
   running subscribers keep their consumers. Once no current version
   declares it, a subscriber holding it through a prefix alone is refused at
   its next deploy. A subscriber holding it by name is not.
+- **Deleting the declaring service** leaves the stream undeclared in the
+  same way. A later put that keeps the prefix is then refused with 409,
+  naming the stream, until it is adopted by name in that put, declared
+  again by a deploy, or removed.
 
 The rules for a prefix:
 

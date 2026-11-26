@@ -1,10 +1,15 @@
 use cufflink_testkit as common;
 
-use async_nats::jetstream::{self, stream};
-use common::{PlatformProcess, Tenant, TestDb};
+use async_nats::jetstream::{self, consumer, stream};
+use common::{until, until_loops, PlatformProcess, Tenant, TestDb};
+use futures_util::TryStreamExt;
 use reqwest::Method;
 use serde_json::{json, Value};
+use std::time::Duration;
 use uuid::Uuid;
+
+const FAST: &[(&str, &str)] = &[("CONSUMER_RECONCILE_INTERVAL_SECS", "1")];
+const WITHIN: Duration = Duration::from_secs(30);
 
 struct Claimed {
     platform: PlatformProcess,
@@ -21,7 +26,7 @@ impl Claimed {
         let infra = common::infra().await?;
         let nats_url = infra.require_nats()?;
         let mut db = infra.create_database().await;
-        let platform = PlatformProcess::start(&db.url, Some(nats_url), &[]).await;
+        let platform = PlatformProcess::start(&db.url, Some(nats_url), FAST).await;
         platform.wait_ready().await;
         let harbor = db.mint_tenant().await;
         let admin = format!("ApiKey {}", db.mint_admin_key().await);
@@ -145,6 +150,70 @@ impl Claimed {
     async fn exists(&self, name: &str) -> bool {
         self.js.get_stream(name).await.is_ok()
     }
+
+    async fn durables(&self, name: &str) -> Vec<consumer::Info> {
+        match self.js.get_stream(name).await {
+            Ok(stream) => stream
+                .consumers()
+                .try_collect()
+                .await
+                .expect("the stream's consumers"),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Publishes a deletion on the stream and waits for a durable on it to
+    /// acknowledge it.
+    async fn delivered(&self, name: &str, topic: &str) {
+        let sequence = self
+            .js
+            .publish(
+                self.subject(&format!("{topic}.deleted")),
+                r#"{"data":{}}"#.into(),
+            )
+            .await
+            .expect("publish")
+            .await
+            .expect("stored")
+            .sequence;
+        let mut durables = Vec::new();
+        until(
+            &format!("a durable on '{name}' acknowledges what was published"),
+            WITHIN,
+            async || {
+                durables = self.durables(name).await;
+                durables
+                    .iter()
+                    .any(|durable| durable.ack_floor.stream_sequence >= sequence)
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}: {durables:?}"));
+    }
+
+    async fn reconciled(&self) {
+        let runs = async || {
+            self.platform
+                .metric(
+                    "cufflink_consumer_reconcile_runs_total",
+                    &[("result", "ok")],
+                )
+                .await
+                .unwrap_or_default()
+        };
+        let before = runs().await;
+        until("two reconcile passes", WITHIN, async || {
+            runs().await >= before + 2.0
+        })
+        .await
+        .expect("the reconciler runs");
+    }
+}
+
+fn versioned(manifest: &Value, version: &str) -> Value {
+    let mut manifest = manifest.clone();
+    manifest["version"] = json!(version);
+    manifest
 }
 
 impl Drop for Claimed {
@@ -229,17 +298,23 @@ async fn a_prefix_is_refused_over_streams_that_are_not_the_tenants() {
     let events = test.stream("EVENTS");
     let (status, body) = test.put(&orchard, std::slice::from_ref(&events)).await;
     assert_eq!(status, 200, "{body}");
+    test.live(&events, "items").await;
     let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
     assert_eq!(
         status, 409,
-        "another tenant's stream under the prefix: {body}"
+        "another tenant's live stream under the prefix: {body}"
     );
     assert!(
-        body.to_string().contains(&orchard.slug) && body.to_string().contains(&events),
+        body.to_string().contains(&format!(
+            "'{}' overlaps '{events}', which tenant '{}' claims",
+            test.prefix(),
+            orchard.slug
+        )),
         "an administrator is told whose stream: {body}"
     );
     let (status, body) = test.put(&orchard, &[]).await;
     assert_eq!(status, 200, "{body}");
+    let _ = test.js.delete_stream(&events).await;
 
     let old = test.stream("OLD");
     test.live(&old, "old").await;
@@ -314,4 +389,223 @@ async fn a_put_that_swaps_names_for_a_prefix_strands_what_no_manifest_declares()
         .put(&test.harbor, &[test.prefix(), legacy.clone()])
         .await;
     assert_eq!(status, 200, "keeping the name strands nothing: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_held_through_a_prefix_gets_its_durable_and_its_messages() {
+    let Some(test) = Claimed::start().await else {
+        return;
+    };
+    let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
+    assert_eq!(status, 200, "{body}");
+    let events = test.stream("EVENTS");
+    let (status, body) = test
+        .deploy(&test.declaring("catalog-service", &events, "items"), false)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = test
+        .deploy(&test.subscriber("loan-service", &events, "items"), false)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["plan"]["consumers"][0]["op"], "create",
+        "the deploy plans the durable: {body}"
+    );
+    assert_eq!(test.durables(&events).await.len(), 1);
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("the subscriber's loop starts");
+    test.delivered(&events, "items").await;
+    test.reconciled().await;
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("a reconcile keeps the loop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscriber_keeps_its_durable_and_loop_when_its_stream_moves_from_a_name_to_a_prefix() {
+    let Some(test) = Claimed::start().await else {
+        return;
+    };
+    let events = test.stream("EVENTS");
+    let (status, body) = test.put(&test.harbor, std::slice::from_ref(&events)).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = test
+        .deploy(&test.declaring("catalog-service", &events, "items"), false)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let subscriber = test.subscriber("loan-service", &events, "items");
+    let (status, body) = test.deploy(&subscriber, false).await;
+    assert_eq!(status, 200, "{body}");
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("the subscriber's loop starts");
+    let created = test.durables(&events).await[0].created;
+
+    let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
+    assert_eq!(status, 200, "the declared stream strands nothing: {body}");
+    test.reconciled().await;
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("a reconcile keeps the loop");
+    test.delivered(&events, "items").await;
+
+    let (status, body) = test.deploy(&versioned(&subscriber, "0.1.1"), false).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["plan"]["consumers"][0]["op"], "keep",
+        "a redeploy keeps the durable: {body}"
+    );
+    let durables = test.durables(&events).await;
+    assert_eq!(
+        durables
+            .iter()
+            .map(|durable| durable.created)
+            .collect::<Vec<_>>(),
+        [created]
+    );
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("the redeployed loop runs");
+    test.delivered(&events, "items").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_made_under_a_prefix_is_bound_only_once_a_declarer_takes_it_over() {
+    let Some(test) = Claimed::start().await else {
+        return;
+    };
+    let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
+    assert_eq!(status, 200, "{body}");
+    let old = test.stream("OLD");
+    test.live(&old, "old").await;
+    let made = test
+        .js
+        .get_stream(&old)
+        .await
+        .expect("stream")
+        .cached_info()
+        .created;
+
+    let subscriber = test.subscriber("loan-service", &old, "old");
+    let (status, body) = test.deploy(&subscriber, false).await;
+    assert_eq!(
+        status, 422,
+        "an out-of-band stream no service declares: {body}"
+    );
+    assert!(test.durables(&old).await.is_empty());
+
+    let (status, body) = test
+        .deploy(&test.declaring("catalog-service", &old, "old"), false)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let op = &body["plan"]["streams"][0];
+    assert_eq!(op["stream"], json!(old), "{body}");
+    assert_ne!(
+        op["op"], "create",
+        "the live stream is planned over: {body}"
+    );
+    assert_eq!(
+        test.js
+            .get_stream(&old)
+            .await
+            .expect("stream")
+            .cached_info()
+            .created,
+        made,
+        "the declarer takes the stream over as it is"
+    );
+
+    let (status, body) = test.deploy(&subscriber, false).await;
+    assert_eq!(status, 200, "{body}");
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("the subscriber's loop starts");
+    test.delivered(&old, "old").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_that_stops_declaring_leaves_its_prefix_subscriber_running_until_it_redeploys() {
+    let Some(test) = Claimed::start().await else {
+        return;
+    };
+    let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
+    assert_eq!(status, 200, "{body}");
+    let events = test.stream("EVENTS");
+    let declarer = test.declaring("catalog-service", &events, "items");
+    let (status, body) = test.deploy(&declarer, false).await;
+    assert_eq!(status, 200, "{body}");
+    let subscriber = test.subscriber("loan-service", &events, "items");
+    let (status, body) = test.deploy(&subscriber, false).await;
+    assert_eq!(status, 200, "{body}");
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("the subscriber's loop starts");
+
+    let mut undeclaring = versioned(&declarer, "0.1.1");
+    undeclaring["streams"] = json!([]);
+    let (status, body) = test.deploy(&undeclaring, false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(test.exists(&events).await, "the stream stays on the server");
+    test.reconciled().await;
+    until_loops(&[&test.platform], 1.0)
+        .await
+        .expect("the running subscriber keeps its loop");
+    assert_eq!(test.durables(&events).await.len(), 1);
+    test.delivered(&events, "items").await;
+
+    let (status, body) = test.deploy(&versioned(&subscriber, "0.1.1"), false).await;
+    assert_eq!(status, 422, "its next deploy: {body}");
+    assert!(
+        body.to_string().contains(&format!(
+            "stream '{events}' is claimed only through '{}' and no service of this tenant declares it yet",
+            test.prefix()
+        )),
+        "{body}"
+    );
+    assert_eq!(
+        test.durables(&events).await.len(),
+        1,
+        "a refused deploy changes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_the_declarer_leaves_its_stream_to_be_adopted() {
+    let Some(test) = Claimed::start().await else {
+        return;
+    };
+    let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
+    assert_eq!(status, 200, "{body}");
+    let events = test.stream("EVENTS");
+    let (status, deployed) = test
+        .deploy(&test.declaring("catalog-service", &events, "items"), false)
+        .await;
+    assert_eq!(status, 200, "{deployed}");
+    let (status, body) = test
+        .platform
+        .send(
+            Method::DELETE,
+            &format!(
+                "/api/services/{}",
+                deployed["service_id"].as_str().expect("service id")
+            ),
+            &format!("ApiKey {}", test.harbor.api_key),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(test.exists(&events).await);
+
+    let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body.to_string()
+            .contains(&format!("'{events}' already exists")),
+        "{body}"
+    );
+    let (status, body) = test
+        .put(&test.harbor, &[test.prefix(), events.clone()])
+        .await;
+    assert_eq!(status, 200, "adopted by name: {body}");
 }
