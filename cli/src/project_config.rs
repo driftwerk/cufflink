@@ -32,6 +32,34 @@ pub struct EnvironmentConfig {
     pub config: HashMap<String, String>,
     #[serde(default)]
     pub secrets: HashMap<String, String>,
+    pub db_role: Option<DeclaredRole>,
+}
+
+/// The service's own database role in an environment, its password named by
+/// an entry of that environment's vault.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredRole {
+    pub role: String,
+    pub password_secret: String,
+}
+
+impl EnvironmentConfig {
+    fn handed_to_guest(&self) -> Option<String> {
+        self.db_role
+            .as_ref()
+            .filter(|declared| {
+                self.secrets
+                    .values()
+                    .any(|entry| *entry == declared.password_secret)
+            })
+            .map(|declared| {
+                format!(
+                    "{} is the db_role's password; [secrets] would hand it to the service's code",
+                    declared.password_secret
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +87,15 @@ impl ProjectConfig {
             .map(|own| Foreign { own, service })
     }
 
-    pub(crate) fn parsed(content: &str, dir: &std::path::Path) -> Result<Self, toml::de::Error> {
+    pub(crate) fn parsed(content: &str, dir: &std::path::Path) -> eyre::Result<Self> {
         let mut config: ProjectConfig = toml::from_str(content)?;
+        if let Some(refusal) = config
+            .environments
+            .values()
+            .find_map(EnvironmentConfig::handed_to_guest)
+        {
+            eyre::bail!(refusal);
+        }
         config.project_dir = dir.to_path_buf();
         config
             .environments
@@ -96,6 +131,30 @@ impl ProjectConfig {
                 available
             )
         })
+    }
+
+    /// The role `env` declares for the service named `manifest`: one the
+    /// `[service].name` of this file claims, so a `Cufflink.toml` above the
+    /// project never binds another service's role.
+    pub(crate) fn declared_role(
+        &self,
+        env: Option<&str>,
+        manifest: &str,
+    ) -> eyre::Result<Option<(String, &DeclaredRole)>> {
+        let Some(name) = self.env_name(env) else {
+            return Ok(None);
+        };
+        let Some(declared) = self
+            .environments
+            .get(&name)
+            .and_then(|environment| environment.db_role.as_ref())
+        else {
+            return Ok(None);
+        };
+        match self.service.name.as_deref() {
+            Some(own) if own == manifest => Ok(Some((name, declared))),
+            _ => eyre::bail!("[environments.{name}.db_role] needs [service].name = \"{manifest}\""),
+        }
     }
 
     pub fn env_name(&self, env: Option<&str>) -> Option<String> {
@@ -172,6 +231,68 @@ mod tests {
                  Run it where Cufflink.toml is of billing, or names no service"
                     .to_string()
             )
+        );
+    }
+
+    const DECLARING: &str = "[service]\nname = \"loan-service\"\n\n\
+        [environments.staging]\napi_url = \"https://api.example.com\"\ntenant = \"acme\"\n\n\
+        [environments.staging.db_role]\nrole = \"loan_app\"\npassword_secret = \"db:loan_app\"\n";
+
+    #[test]
+    fn an_environment_declares_its_role_for_the_service_the_file_names() {
+        let project = ProjectConfig::parsed(DECLARING, Path::new("/")).expect("a project");
+        let expected = DeclaredRole {
+            role: "loan_app".to_string(),
+            password_secret: "db:loan_app".to_string(),
+        };
+        assert_eq!(
+            project
+                .declared_role(Some("staging"), "loan-service")
+                .expect("ours"),
+            Some(("staging".to_string(), &expected))
+        );
+        assert_eq!(
+            project
+                .declared_role(Some("dev"), "loan-service")
+                .expect("none"),
+            None
+        );
+        assert_eq!(
+            project
+                .declared_role(Some("staging"), "catalog-service")
+                .expect_err("another service's")
+                .to_string(),
+            "[environments.staging.db_role] needs [service].name = \"catalog-service\""
+        );
+        let unnamed = ProjectConfig::parsed(
+            DECLARING.replace("name = \"loan-service\"\n", "").as_str(),
+            Path::new("/"),
+        )
+        .expect("a project");
+        assert!(unnamed
+            .declared_role(Some("staging"), "loan-service")
+            .is_err());
+    }
+
+    #[test]
+    fn a_declared_role_refuses_unknown_keys_and_a_password_handed_to_the_guest() {
+        assert!(ProjectConfig::parsed(
+            &format!("{DECLARING}password = \"hunter2\"\n"),
+            Path::new("/")
+        )
+        .is_err());
+        assert_eq!(
+            ProjectConfig::parsed(
+                &DECLARING.replace(
+                    "[environments.staging.db_role]",
+                    "[environments.staging.secrets]\nDB_PASSWORD = \"db:loan_app\"\n\n\
+                     [environments.staging.db_role]"
+                ),
+                Path::new("/")
+            )
+            .expect_err("handed to the guest")
+            .to_string(),
+            "db:loan_app is the db_role's password; [secrets] would hand it to the service's code"
         );
     }
 }

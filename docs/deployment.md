@@ -666,7 +666,9 @@ deploy-time migrations.
 ### A declared database role
 
 A deploy request may carry the service's own database role, to a platform
-that advertises `db_role_declarations`:
+that advertises `db_role_declarations`. The CLI sends the one
+`[environments.<env>.db_role]` in `Cufflink.toml` names, and only to such a
+platform:
 
 ```json
 { "manifest": { … }, "db_role": { "role": "catalog_service_user", "password": "…" } }

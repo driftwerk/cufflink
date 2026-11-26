@@ -1198,10 +1198,12 @@ dependencies = [
  "shellexpand",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "toml 0.8.23",
  "urlencoding",
  "uuid",
  "wat",
+ "zeroize",
 ]
 
 [[package]]

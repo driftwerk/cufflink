@@ -68,6 +68,14 @@ fn verified(report: &Value) -> eyre::Result<()> {
     }
 }
 
+pub(crate) fn origin(binding: &Value) -> &'static str {
+    match (binding["origin"].as_str(), binding["managed"].as_bool()) {
+        (Some("declared"), _) => "declared by the service",
+        (Some("platform"), _) | (None, Some(true)) => "managed by the platform",
+        _ => "bound by an admin",
+    }
+}
+
 fn print_binding(body: &Value) {
     let binding = &body["binding"];
     if binding.is_null() {
@@ -83,11 +91,7 @@ fn print_binding(body: &Value) {
         body["tenant"].as_str().unwrap_or_default(),
         body["service"].as_str().unwrap_or_default(),
         binding["role"].as_str().unwrap_or_default(),
-        if binding["managed"].as_bool().unwrap_or(false) {
-            "managed by the platform"
-        } else {
-            "bound by an admin"
-        },
+        origin(binding),
         if binding["login"].as_bool().unwrap_or(false) {
             "password stored"
         } else {

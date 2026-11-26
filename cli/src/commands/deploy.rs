@@ -5,10 +5,12 @@ use crate::config::CliConfig;
 use crate::project_config::ProjectConfig;
 use cufflink_types::manifest::validate::{active_refusal, inactive_refusal};
 use cufflink_types::ServiceMode;
+use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 const CLI_DEPLOY_API_VERSION: u32 = 1;
 
@@ -520,12 +522,19 @@ pub async fn run_bundle(
     let to = Destination::reached(&config, flags, project.as_ref(), target).await?;
     let quiet = quiet(&config, &to.client, &flags, &package.manifest.name).await?;
     let asking = version::Asking::Bundle { cli: &cli_version };
+    let declared = declared(
+        project.as_ref(),
+        target.env,
+        &package.manifest,
+        &to.platform,
+    )?;
     sent(
         &to,
         &package,
         &asking,
         bundle_commit(given, built_at),
         quiet,
+        declared,
     )
     .await
 }
@@ -801,6 +810,7 @@ async fn deploy_rust(
     }
     verdict?;
     verify_sources(&emitted)?;
+    let declared = declared(project, target.env, &emitted.manifest, &to.platform)?;
 
     println!(
         "Deploying {} (mode: {})...",
@@ -808,7 +818,7 @@ async fn deploy_rust(
         emitted.manifest.mode.as_str()
     );
     let package = built(emitted)?;
-    sent(&to, &package, &asking, commit_hash, quiet).await
+    sent(&to, &package, &asking, commit_hash, quiet, declared).await
 }
 
 async fn sent(
@@ -817,6 +827,7 @@ async fn sent(
     asking: &version::Asking<'_>,
     commit_hash: Option<&str>,
     quiet: Option<NotRunning>,
+    declared: Option<Declared>,
 ) -> eyre::Result<()> {
     let Destination {
         config,
@@ -858,15 +869,20 @@ async fn sent(
         target,
         following: FOLLOWING,
     };
-    let body = settled(config, client, &deploy, &deploy_req).await?;
+    let request = request_body(&deploy_req, declared.as_ref())?;
+    let body = settled(config, client, &deploy, &request).await?;
     if flags.plan {
         plan_report(&body)
             .iter()
+            .chain(&planned_role(&body))
             .for_each(|line| println!("{line}"));
         return Ok(());
     }
     let service_id = service_id(&body)?.to_string();
 
+    role_lines(&body, declared.as_ref())
+        .iter()
+        .for_each(|line| println!("{line}"));
     if body["skipped"].as_bool() == Some(true) {
         println!("{}", summary(&body, &target));
         verify_echoed(
@@ -934,11 +950,12 @@ async fn answered(
     config: &CliConfig,
     client: &reqwest::Client,
     deploy: &Deploy<'_>,
-    request: &serde_json::Value,
+    request: &[u8],
 ) -> eyre::Result<serde_json::Value> {
     let resp = config
         .auth_request(client, reqwest::Method::POST, &deploy.url)
-        .json(request)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request.to_vec())
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -981,7 +998,7 @@ async fn settled(
     config: &CliConfig,
     client: &reqwest::Client,
     deploy: &Deploy<'_>,
-    request: &serde_json::Value,
+    request: &[u8],
 ) -> eyre::Result<serde_json::Value> {
     let name = deploy.name;
     let disable = || deploy.target.services("disable", name);
@@ -1113,6 +1130,150 @@ fn plan_report(body: &serde_json::Value) -> Vec<String> {
         .chain(plan_lines(&body["plan"]))
         .map(|line| format!("  {line}"));
     std::iter::once(heading).chain(would).collect()
+}
+
+/// The service's declared role with its password, read from the vault and
+/// held where it is wiped once dropped.
+pub(crate) struct Declared {
+    role: String,
+    password: Zeroizing<String>,
+}
+
+#[derive(Serialize)]
+struct WithRole<'a> {
+    #[serde(flatten)]
+    request: &'a serde_json::Value,
+    db_role: DeclaredBody<'a>,
+}
+
+#[derive(Serialize)]
+struct DeclaredBody<'a> {
+    role: &'a str,
+    password: &'a str,
+}
+
+/// The deploy request's body. The password goes from the vault into these
+/// bytes alone, never into a `serde_json::Value`; the copy the HTTP client
+/// makes of them is beyond the CLI's reach.
+fn request_body(
+    request: &serde_json::Value,
+    declared: Option<&Declared>,
+) -> eyre::Result<Zeroizing<Vec<u8>>> {
+    Ok(Zeroizing::new(match declared {
+        Some(declared) => serde_json::to_vec(&WithRole {
+            request,
+            db_role: DeclaredBody {
+                role: &declared.role,
+                password: &declared.password,
+            },
+        }),
+        None => serde_json::to_vec(request),
+    }?))
+}
+
+fn declaration_refusal(env: &str, platform: &version::PlatformVersion) -> Option<String> {
+    (!platform.offers(cufflink_types::features::DB_ROLE_DECLARATIONS)).then(|| {
+        format!(
+            "[environments.{env}.db_role] needs a platform that advertises {} (v0.41.0 or later); platform {} does not",
+            cufflink_types::features::DB_ROLE_DECLARATIONS,
+            platform.label()
+        )
+    })
+}
+
+fn keeps_no_role(env: &str, mode: &ServiceMode) -> String {
+    format!(
+        "[environments.{env}.db_role] is for a service whose code runs on the platform; mode {} keeps no database role",
+        mode.as_str()
+    )
+}
+
+fn declared(
+    project: Option<&ProjectConfig>,
+    env: Option<&str>,
+    manifest: &cufflink_types::ServiceManifest,
+    platform: &version::PlatformVersion,
+) -> eyre::Result<Option<Declared>> {
+    let Some((project, (env, declared))) = project
+        .map(|project| {
+            project
+                .declared_role(env, &manifest.name)
+                .map(|found| found.map(|found| (project, found)))
+        })
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    if !manifest.mode.runs_on_platform() {
+        eyre::bail!(keeps_no_role(&env, &manifest.mode));
+    }
+    if let Some(refusal) = declaration_refusal(&env, platform) {
+        eyre::bail!(refusal);
+    }
+    let password = super::secrets_cmd::load_store(project, &env)?
+        .get(&declared.password_secret)
+        .map(Zeroizing::new)
+        .map_err(|e| {
+            eyre::eyre!(
+                "[environments.{env}.db_role] names {} as its password, and the '{env}' vault holds no such entry: {e}",
+                declared.password_secret
+            )
+        })?;
+    Ok(Some(Declared {
+        role: declared.role.clone(),
+        password,
+    }))
+}
+
+fn planned_role(body: &serde_json::Value) -> Vec<String> {
+    let planned = &body["db_role"];
+    let Some(role) = planned["role"].as_str() else {
+        return vec![];
+    };
+    let failed: Vec<&str> = planned["failed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let taking = match planned["taking"].as_str() {
+        Some("bind") => "would be bound",
+        Some("refresh") => "would have its password replaced",
+        _ => "unchanged",
+    };
+    std::iter::once(format!("  Database role:  {role}, {taking}"))
+        .chain((!failed.is_empty()).then(|| {
+            format!(
+                "  Database role checks that would fail: {}",
+                failed.join(", ")
+            )
+        }))
+        .collect()
+}
+
+fn role_lines(body: &serde_json::Value, declared: Option<&Declared>) -> Vec<String> {
+    let bound = &body["db_role"];
+    let Some(role) = bound["role"].as_str() else {
+        return vec![];
+    };
+    let verified = match bound["verified"].as_bool() {
+        Some(true) => "verified",
+        _ => "not verified",
+    };
+    std::iter::once(format!(
+        "  Database role:  {role} ({}, {verified})",
+        super::db_role::origin(bound)
+    ))
+    .chain(
+        (declared.is_none() && bound["origin"].as_str() == Some("declared")).then(|| {
+                format!(
+                    "  note: {} stays bound to the declared role {role}; an administrator changes it with db-role set",
+                    body["name"].as_str().unwrap_or_default()
+                )
+            }),
+        )
+        .collect()
 }
 
 fn deploy_request(
@@ -1538,6 +1699,13 @@ async fn deploy_web(
     env: Option<&str>,
     skipped: SkippedScripts,
 ) -> eyre::Result<()> {
+    if let Some((env, _)) = project
+        .map(|project| project.declared_role(env, service_name))
+        .transpose()?
+        .flatten()
+    {
+        eyre::bail!(keeps_no_role(&env, &ServiceMode::Web));
+    }
     println!("Deploying web app: {}", service_name);
     let client = config.http_client();
     let platform = verify_platform_version(config, &client).await?;
@@ -2383,6 +2551,7 @@ mod tests {
             &asking,
             Some("4f2a9c1"),
             None,
+            None,
         )
         .await
         .expect("deployed");
@@ -2409,6 +2578,7 @@ mod tests {
             &destination(&config, &["db_v2"]),
             &package,
             &asking,
+            None,
             None,
             None,
         )
@@ -2454,6 +2624,7 @@ mod tests {
             &version::Asking::Bundle { cli: "0.21.0" },
             None,
             Some(NotRunning(())),
+            None,
         )
         .await;
         (ended, asked.requests(), asked.bodies())
@@ -3133,7 +3304,7 @@ mod tests {
             &config,
             &reqwest::Client::new(),
             &deploy,
-            &serde_json::json!({"manifest": {"name": "loans"}}),
+            br#"{"manifest": {"name": "loans"}}"#,
         )
         .await;
         (settled, asked.requests())
@@ -3296,7 +3467,7 @@ mod tests {
                 target: Target::default(),
                 following: QUICKLY,
             };
-            let failed = settled(&config, &client, &deploy, &serde_json::json!({}))
+            let failed = settled(&config, &client, &deploy, b"{}")
                 .await
                 .expect_err("started by a replica that read no flag");
             assert_eq!(
@@ -3517,6 +3688,142 @@ mod tests {
             target(Some("other"), false),
             staging,
             "a deploy that no platform key lets act for a tenant acted on the configuration's own"
+        );
+    }
+
+    fn loan_app() -> Declared {
+        Declared {
+            role: "loan_app".to_string(),
+            password: Zeroizing::new("s3cret\"pass".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_declared_role_is_written_beside_the_request_and_only_when_declared() {
+        let request =
+            serde_json::json!({"manifest": {"name": "loan-service"}, "status": "inactive"});
+        let plain = request_body(&request, None).expect("a body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&plain).expect("json"),
+            request
+        );
+        let declaring = request_body(&request, Some(&loan_app())).expect("a body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&declaring).expect("json"),
+            serde_json::json!({
+                "manifest": {"name": "loan-service"},
+                "status": "inactive",
+                "db_role": {"role": "loan_app", "password": "s3cret\"pass"},
+            })
+        );
+    }
+
+    #[test]
+    fn a_declared_role_needs_a_platform_that_takes_declarations() {
+        assert_eq!(
+            declaration_refusal("staging", &platform_at("0.40.2", &["bundled_wasm"])),
+            Some(
+                "[environments.staging.db_role] needs a platform that advertises db_role_declarations \
+                 (v0.41.0 or later); platform v0.40.2 does not"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            declaration_refusal(
+                "staging",
+                &platform_at("0.41.0", &[cufflink_types::features::DB_ROLE_DECLARATIONS])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_declaration_is_refused_for_a_mode_that_keeps_no_role_then_for_a_platform_without_it() {
+        let project = ProjectConfig::parsed(
+            "[service]\nname = \"loan-service\"\n\n\
+             [environments.staging]\napi_url = \"https://api.example.com\"\ntenant = \"acme\"\n\n\
+             [environments.staging.db_role]\nrole = \"loan_app\"\npassword_secret = \"db:loan_app\"\n",
+            Path::new("/nowhere"),
+        )
+        .expect("a project");
+        let manifest = |mode: &str| {
+            serde_json::from_value::<cufflink_types::ServiceManifest>(
+                serde_json::json!({"name": "loan-service", "mode": mode, "tables": []}),
+            )
+            .expect("a manifest")
+        };
+        let refusal = |mode: &str, platform: &version::PlatformVersion| {
+            declared(Some(&project), Some("staging"), &manifest(mode), platform)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let older = platform_at("0.40.2", &[]);
+        assert_eq!(
+            refusal("native", &older),
+            Some(
+                "[environments.staging.db_role] is for a service whose code runs on the platform; \
+                 mode native keeps no database role"
+                    .to_string()
+            )
+        );
+        assert!(
+            refusal("crud", &older).is_some_and(|refusal| refusal.contains("db_role_declarations"))
+        );
+        let current = platform_at("0.41.0", &[cufflink_types::features::DB_ROLE_DECLARATIONS]);
+        assert!(
+            refusal("crud", &current)
+                .is_some_and(|refusal| refusal.contains("Secrets vault not found")),
+            "the vault is read only once the platform takes the declaration"
+        );
+        assert!(declared(None, Some("staging"), &manifest("crud"), &current)
+            .expect("no project")
+            .is_none());
+    }
+
+    #[test]
+    fn a_plan_names_what_it_would_do_to_the_declared_role() {
+        assert!(planned_role(&serde_json::json!({"db_role": null})).is_empty());
+        assert_eq!(
+            planned_role(&serde_json::json!({
+                "db_role": {"role": "loan_app", "taking": "bind", "failed": []},
+            })),
+            ["  Database role:  loan_app, would be bound"]
+        );
+        assert_eq!(
+            planned_role(&serde_json::json!({
+                "db_role": {"role": "loan_app", "taking": "refresh", "failed": ["outbox_owned", "confined"]},
+            })),
+            [
+                "  Database role:  loan_app, would have its password replaced",
+                "  Database role checks that would fail: outbox_owned, confined",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deploy_names_its_role_and_a_declaration_it_no_longer_makes() {
+        let bound = |origin: &str, verified: bool| {
+            serde_json::json!({
+                "name": "loan-service",
+                "db_role": {"role": "loan_app", "origin": origin, "verified": verified},
+            })
+        };
+        assert!(role_lines(&serde_json::json!({"db_role": null}), None).is_empty());
+        assert_eq!(
+            role_lines(&bound("declared", true), Some(&loan_app())),
+            ["  Database role:  loan_app (declared by the service, verified)"]
+        );
+        assert_eq!(
+            role_lines(&bound("admin", false), None),
+            ["  Database role:  loan_app (bound by an admin, not verified)"]
+        );
+        assert_eq!(
+            role_lines(&bound("declared", true), None),
+            [
+                "  Database role:  loan_app (declared by the service, verified)",
+                "  note: loan-service stays bound to the declared role loan_app; \
+                 an administrator changes it with db-role set",
+            ]
         );
     }
 
