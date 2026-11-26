@@ -57,6 +57,11 @@ fn refused(error: ClaimError) -> PlatformError {
     }
 }
 
+/// The claims checked as a request, before any other tenant's are read.
+pub fn well_formed(claims: &[Claim]) -> PlatformResult<()> {
+    validate_claims(claims, &[]).map_err(refused)
+}
+
 pub async fn replace(
     pool: &deadpool_postgres::Pool,
     tenant_id: Uuid,

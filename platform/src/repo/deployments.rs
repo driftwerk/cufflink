@@ -1,10 +1,12 @@
 use crate::errors::{PlatformError, PlatformResult};
+use crate::nats_manager::subjects::Namespace;
 use crate::registry::ServiceIdentity;
 use crate::schema_manager::adopt::AdoptedSchema;
 use chrono::{DateTime, Utc};
 use cufflink_types::{ServiceManifest, ServiceMode, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +313,59 @@ pub async fn current(
         )
         .await?;
     Ok(row.as_ref().map(row_to_deployment))
+}
+
+/// The streams the current version of each of the tenant's services
+/// declares, whatever its status, but those of `except`.
+pub async fn declared_streams(
+    client: &impl deadpool_postgres::GenericClient,
+    tenant_id: Uuid,
+    except: Option<&str>,
+) -> PlatformResult<BTreeSet<String>> {
+    Ok(client
+        .query(
+            "SELECT DISTINCT stream->>'name' AS name
+             FROM services s
+             JOIN deployments d ON d.service_id = s.id AND d.version = s.current_version
+             CROSS JOIN LATERAL jsonb_array_elements(
+                 CASE jsonb_typeof(d.manifest->'streams')
+                     WHEN 'array' THEN d.manifest->'streams'
+                     ELSE '[]'::jsonb
+                 END
+             ) AS stream
+             WHERE s.tenant_id = $1
+               AND s.name IS DISTINCT FROM $2::text
+               AND stream->>'name' IS NOT NULL",
+            &[&tenant_id, &except],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get("name"))
+        .collect())
+}
+
+/// The namespace with the streams the tenant's services declare, read only
+/// when a claim by prefix needs them. A deploy's own manifest stands in for
+/// the version it replaces.
+pub async fn declaring(
+    pool: &deadpool_postgres::Pool,
+    tenant_id: Uuid,
+    namespace: Namespace,
+    deploying: Option<&ServiceManifest>,
+) -> PlatformResult<Namespace> {
+    if !namespace.claims_by_prefix() {
+        return Ok(namespace);
+    }
+    let stored = declared_streams(
+        &pool.get().await?,
+        tenant_id,
+        deploying.map(|manifest| manifest.name.as_str()),
+    )
+    .await?;
+    let deployed = deploying
+        .into_iter()
+        .flat_map(|manifest| manifest.streams.iter().map(|stream| stream.name.clone()));
+    Ok(namespace.declaring(stored.into_iter().chain(deployed).collect()))
 }
 
 pub async fn current_mode(

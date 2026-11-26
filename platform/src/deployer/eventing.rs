@@ -95,10 +95,13 @@ pub(crate) async fn admit(
     tenant_id: Uuid,
     tenant_slug: &str,
 ) -> PlatformResult<()> {
-    let namespace = state.tenants.get_or_load(tenant_id).await?.map_or_else(
+    let claimed = state.tenants.get_or_load(tenant_id).await?.map_or_else(
         || Namespace::own(tenant_slug),
         |entry| entry.namespace.clone(),
     );
+    let namespace =
+        crate::repo::deployments::declaring(&state.platform_db, tenant_id, claimed, Some(manifest))
+            .await?;
     validate_tenant_scope(
         manifest,
         &namespace,
