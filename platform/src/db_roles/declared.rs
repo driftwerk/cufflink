@@ -571,6 +571,9 @@ pub async fn gates(
             creates: subject.creates,
             read_only_role,
             password: Some(&declaration.password),
+            replacing: existing
+                .map(|binding| binding.role_name.as_str())
+                .filter(|previous| *previous != role),
         },
     )
     .await?;

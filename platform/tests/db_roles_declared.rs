@@ -683,7 +683,12 @@ async fn a_replaced_declared_role_loses_what_the_platform_granted_it() {
     .await
     .expect("the replaced role is retired under the lock already held");
     assert_eq!(status, 200, "{body}");
-    assert_eq!(test.show().await["binding"]["role"], next.as_str());
+    let binding = test.show().await["binding"].clone();
+    assert_eq!(binding["role"], next.as_str());
+    assert!(
+        !excess(&binding["verify_report"]).contains(&"outbox_mapped_elsewhere".to_string()),
+        "the replaced role's mapping is no stale one: {binding}"
+    );
     assert!(test.holds_cufflink(&next).await, "the new role enqueues");
     assert!(
         !test.holds_cufflink(&test.role).await,
@@ -853,7 +858,7 @@ async fn a_login_probe_answers_by_what_the_server_says() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_declaration_is_refused_for_what_no_services_role_may_be() {
-    let Some(test) = Declared::start().await else {
+    let Some(mut test) = Declared::start().await else {
         return;
     };
     test.allow().await;
@@ -883,6 +888,22 @@ async fn a_declaration_is_refused_for_what_no_services_role_may_be() {
             format!("ALTER ROLE {role} NOCREATEROLE"),
             Some("NOCREATEROLE"),
         ),
+        (
+            format!("GRANT USAGE ON SCHEMA public TO {role} WITH GRANT OPTION"),
+            format!("REVOKE GRANT OPTION FOR USAGE ON SCHEMA public FROM {role}"),
+            Some("schema public"),
+        ),
+        (
+            format!(
+                "GRANT CONNECT ON DATABASE {} TO {role} WITH GRANT OPTION",
+                test.database()
+            ),
+            format!(
+                "REVOKE GRANT OPTION FOR CONNECT ON DATABASE {} FROM {role}",
+                test.database()
+            ),
+            Some("the role reaches"),
+        ),
     ] {
         test.sql(&break_it).await;
         let (status, body) = test.declare().await;
@@ -909,9 +930,35 @@ async fn a_declaration_is_refused_for_what_no_services_role_may_be() {
     test.sql(&format!("ALTER ROLE {role} CONNECTION LIMIT -1"))
         .await;
 
+    let orchard = test.db.mint_tenant().await;
+    let orchard_db = test.tenant_client(&orchard).await;
+    orchard_db
+        .batch_execute(&format!(
+            "CREATE TABLE public.rates (id int); ALTER TABLE public.rates OWNER TO {role}"
+        ))
+        .await
+        .expect("an object the role owns in another database");
+    let (status, body) = test.declare().await;
+    assert_eq!(
+        status, 422,
+        "what the role owns elsewhere is its reach: {body}"
+    );
+    assert!(
+        reasons(&body).contains("1 objects outside this database"),
+        "{body}"
+    );
+    assert!(
+        !reasons(&body).contains(&TenantPoolManager::managed_db_name(&orchard.slug)),
+        "{body}"
+    );
+    orchard_db
+        .batch_execute("DROP TABLE public.rates")
+        .await
+        .expect("dropped");
+
     assert_eq!(test.bindings().await, 0, "nothing was bound");
     assert!(!test.holds_cufflink(role).await, "nothing was granted");
-    assert_eq!(test.audited("db_role.declare_refused").await, 6);
+    assert_eq!(test.audited("db_role.declare_refused").await, 9);
     let (status, body) = test.declare().await;
     assert_eq!(status, 200, "once mended it is taken: {body}");
 
@@ -1352,4 +1399,40 @@ async fn a_service_that_never_ran_blocks_no_enforce_and_may_first_run_inactive()
         .expect("services")
         .expect("the service");
     assert_eq!(service.status, Status::Inactive);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_stands_when_what_follows_its_write_fails() {
+    let Some(mut test) = Declared::start().await else {
+        return;
+    };
+    let next = test.db.role("catalog_next_user");
+    test.make_role(&next, None).await;
+    let (status, body) = test.policy("warn", &[&test.role, &next]).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = test.declare().await;
+    assert_eq!(status, 200, "{body}");
+    let stray = test.db.role("catalog_stray_user");
+    test.sql(&format!(
+        "REASSIGN OWNED BY {} TO {next};
+         CREATE ROLE {stray} NOLOGIN;
+         INSERT INTO _cufflink.service_roles (role, service) VALUES ('{stray}', '{SERVICE}');",
+        test.role
+    ))
+    .await;
+
+    test.platform = platform(&test.db, &[("CUFFLINK_TEST_FAIL_UNMAP_AFTER_WRITE", "1")]).await;
+    let (status, body) = test.deploy("", Some((&next, PASSWORD))).await;
+    assert_eq!(status, 200, "the binding is written: {body}");
+    assert_eq!(test.show().await["binding"]["role"], next.as_str());
+    assert!(
+        !test.holds_cufflink(&test.role).await,
+        "the replaced role is retired all the same"
+    );
+    assert!(mapped(&test, &stray).await, "the mapping left behind");
+    let report = test.verify().await["report"].clone();
+    assert!(
+        excess(&report).contains(&"outbox_mapped_elsewhere".to_string()),
+        "is reported by the next verification: {report}"
+    );
 }

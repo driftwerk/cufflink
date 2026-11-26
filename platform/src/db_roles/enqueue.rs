@@ -39,10 +39,13 @@ pub enum Enqueue {
     },
 }
 
+/// `replacing` is the role whose binding the caller is replacing: its
+/// mapping stays until the new one is written, so it is not another's.
 pub async fn facts(
     client: &impl GenericClient,
     role: Option<&str>,
     service: &str,
+    replacing: Option<&str>,
 ) -> Result<Enqueue, tokio_postgres::Error> {
     let row = client
         .query_one(
@@ -61,10 +64,10 @@ pub async fn facts(
                 .query_one(
                     &format!(
                         "SELECT COALESCE(bool_or(role = $1::name), false),
-                                COALESCE(bool_or(role <> $1::name), false)
+                                COALESCE(bool_or(role <> $1::name AND role::text IS DISTINCT FROM $3), false)
                          FROM {SERVICE_ROLES} WHERE service = $2"
                     ),
-                    &[&role, &service],
+                    &[&role, &service, &replacing],
                 )
                 .await?;
             Enqueue::Own {

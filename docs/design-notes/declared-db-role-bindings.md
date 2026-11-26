@@ -1191,8 +1191,12 @@ the operator, and the tenant runs `enforce` with `declared_roles` set.
   until the declaration waits on the unique index, then commits it. The
   declaration gets the `bound_elsewhere` 422, audited, and what it was
   granted is taken back.
-- **A mapping left behind.** Another role mapped to the service is
-  reported as `outbox_mapped_elsewhere` by `db-role verify`.
+- **What follows the write fails.** The failpoint
+  `CUFFLINK_TEST_FAIL_UNMAP_AFTER_WRITE` fails `unmap_others` once the
+  binding is written. The request is a 200, the replaced role is retired,
+  and another role's mapping left behind is reported as
+  `outbox_mapped_elsewhere` by `db-role verify`. A replacement's own
+  report never counts the role it replaces (`Candidate::replacing`).
 - **V11** names the roles bound more than once, and applies once each
   carries one service.
 - **The first-version gate.** Without a declaration, under `enforce`, the

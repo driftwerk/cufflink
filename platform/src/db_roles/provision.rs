@@ -379,7 +379,8 @@ pub async fn catalog(
         .collect();
     let server_version_num = head.get(0);
     let role_exists: bool = head.get(3);
-    let enqueue = enqueue::facts(client, role_exists.then_some(spec.role), spec.service).await?;
+    let enqueue =
+        enqueue::facts(client, role_exists.then_some(spec.role), spec.service, None).await?;
     let read_only = match spec.read_only_role {
         Some(named) => read_only(client, spec.role, named, server_version_num).await?,
         None => None,
@@ -687,6 +688,18 @@ async fn after_declared_grants(tenant_db: &impl GenericClient, role: &str) -> Pl
                 quote_ident(role)
             ))
             .await?),
+        _ => Ok(()),
+    }
+}
+
+const FAIL_UNMAP_AFTER_WRITE: &str = "CUFFLINK_TEST_FAIL_UNMAP_AFTER_WRITE";
+
+/// A test's stand-in for a session lost once the binding is written.
+fn unmap_failpoint() -> PlatformResult<()> {
+    match std::env::var_os(FAIL_UNMAP_AFTER_WRITE) {
+        Some(flag) if flag == "1" => Err(PlatformError::Internal(format!(
+            "unmapping failed by {FAIL_UNMAP_AFTER_WRITE}"
+        ))),
         _ => Ok(()),
     }
 }
@@ -1043,6 +1056,10 @@ async fn apply_locked(
             creates,
             read_only_role: target.read_only_role.as_deref(),
             password: opened.as_ref(),
+            replacing: existing
+                .as_ref()
+                .map(|binding| binding.role_name.as_str())
+                .filter(|previous| *previous != target.role),
         },
     )
     .await?;
@@ -1159,9 +1176,12 @@ async fn settle(
             if let Some(replaced) = replaced {
                 replaced.retired(replaced.retire_in(&tenant_db).await);
             }
-            enqueue::unmap_others(&tenant_db, role, service)
-                .await
-                .map_err(PlatformError::from)
+            match unmap_failpoint() {
+                Ok(()) => enqueue::unmap_others(&tenant_db, role, service)
+                    .await
+                    .map_err(PlatformError::from),
+                Err(e) => Err(e),
+            }
         }
         Err(e) => {
             if let Some(replaced) = replaced {

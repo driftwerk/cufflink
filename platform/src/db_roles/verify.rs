@@ -788,6 +788,7 @@ pub async fn facts(
     tenant_id: Uuid,
     expected: &Expected<'_>,
     password: Option<&SecretString>,
+    replacing: Option<&str>,
 ) -> Result<Facts, tokio_postgres::Error> {
     let Expected {
         role,
@@ -909,7 +910,7 @@ pub async fn facts(
         cufflink: match cufflink_exists {
             true => Some((
                 granted(8),
-                enqueue::facts(client, Some(role), expected.service).await?,
+                enqueue::facts(client, Some(role), expected.service, replacing).await?,
             )),
             false => None,
         },
@@ -1053,6 +1054,7 @@ pub async fn inspect(
             tenant.id,
             &expected,
             binding.password,
+            binding.replacing,
         )
         .await
         .map_err(|e| crate::db_error::from_pg(&e).message.clone())
@@ -1071,6 +1073,9 @@ pub struct Candidate<'a> {
     pub creates: bool,
     pub read_only_role: Option<&'a str>,
     pub password: Option<&'a SecretString>,
+    /// The role of the binding this one replaces, still mapped until the
+    /// write.
+    pub replacing: Option<&'a str>,
 }
 
 #[cfg(test)]
