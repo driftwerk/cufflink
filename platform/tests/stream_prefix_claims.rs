@@ -49,13 +49,19 @@ impl Claimed {
         format!("{}.{rest}", self.subjects)
     }
 
+    /// Harbor claims the suite's subjects; another tenant claims none, so
+    /// what it is refused is its streams alone.
     async fn put(&self, tenant: &Tenant, streams: &[String]) -> (u16, Value) {
+        let subjects: Vec<String> = (tenant.slug == self.harbor.slug)
+            .then(|| self.subject(">"))
+            .into_iter()
+            .collect();
         self.platform
             .send(
                 Method::PUT,
                 &format!("/api/tenants/{}/nats-claims", tenant.slug),
                 &self.admin,
-                Some(&json!({"subjects": [self.subject(">")], "streams": streams})),
+                Some(&json!({"subjects": subjects, "streams": streams})),
             )
             .await
     }
@@ -229,8 +235,8 @@ async fn a_prefix_is_refused_over_streams_that_are_not_the_tenants() {
         "another tenant's stream under the prefix: {body}"
     );
     assert!(
-        body.to_string().contains(&orchard.slug),
-        "an administrator is told whose: {body}"
+        body.to_string().contains(&orchard.slug) && body.to_string().contains(&events),
+        "an administrator is told whose stream: {body}"
     );
     let (status, body) = test.put(&orchard, &[]).await;
     assert_eq!(status, 200, "{body}");
