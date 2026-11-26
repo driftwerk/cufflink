@@ -310,16 +310,17 @@ stops the request: it is counted and audited as `db_role.declare_refused`
 2. **Existence, from the catalog** (`role_facts`, plus `CONNECT` on this
    database):
    - `role_exists`;
-   - `can_login`: a `NOLOGIN` role is refused here, never sent to a login
-     probe that would read it as a wrong password;
-   - `database_connect`: the remedy is `GRANT CONNECT ON DATABASE … TO …`,
-     and the role is never probed into a 42501.
+   - `can_login`;
+   - `database_connect`, whose remedy is `GRANT CONNECT ON DATABASE … TO …`.
 
-   Each refuses with 422, and with the answer a refused login gives (gate
-   3): until the password is proven, a deploy learns nothing of a role but
-   that it does not log in with the password given. Which check failed,
-   with its remedy, goes to the refusal's detail: the audit row and the
-   `warn` log. Only allowlisted names are looked up.
+   The same two catalog queries run whether the role exists or not, and the
+   login probe of gate 3 runs either way, so a refusal here takes as long
+   as one there. Each refuses with 422, and with the answer a refused login
+   gives: until the password is proven, a deploy learns nothing of a role
+   but that it does not log in with the password given. Which check failed,
+   with its remedy, goes to the refusal's detail, read by the operator
+   alone (§5.4). A probe that is unanswered is a 503 whatever the catalog
+   says. Only allowlisted names are looked up.
 3. **Proof of possession.** `login_pools::probe` logs in with the declared
    password.
    - `probe` classifies 42501 (`insufficient_privilege`) after
@@ -428,10 +429,16 @@ stops the request: it is counted and audited as `db_role.declare_refused`
       the binding read under the lock.
 
    Steps 4 and 5 follow a binding that is written, so neither fails the
-   request. A failure is logged, with what to run by hand, and counted
+   request. A failure is logged, with the exact statements to run in the
+   tenant's database (`Retiring::remedy`), and counted
    (`cufflink_db_role_retire_failures_total`,
    `cufflink_db_role_unmap_failures_total`). A mapping left behind is
    reported by the next verification (`outbox_mapped_elsewhere`, §5.2).
+   A retirement that fails is not retried: the role it would retire is no
+   longer the binding, so nothing later reads it again. Recording it
+   durably would take a table of pending retirements for a failure that
+   needs the tenant's session, just used for steps 7 and 8, to be lost in
+   between; the logged remedy is the operator's instead.
 
    A write that loses to another tenant's (the unique index, §6), or a
    role that changes between the gates and the write, is a refusal of the
@@ -608,12 +615,12 @@ For a shared object (`dbid = 0`), the one allowed row is the role's ACL
 entry on this database (`CONNECT`, `TEMP`).
 
 Every other row is reported, and so is every row of another database that
-the role holds itself: what it owns (`deptype = 'o'`) and the policies
-naming it (`'r'`). A privilege granted to it in another database
-(`deptype = 'a'`) is that database's owner's doing, not the role's: any
-tenant whose role may grant can grant to any role it can name, and so could
-otherwise make another tenant's binding fail at its next verification. Such
-grants are counted in `granted_elsewhere`, an `EXCESS` check that fails
+the role holds itself: what it owns (`deptype = 'o'`). A privilege granted
+to it in another database (`deptype = 'a'`), and a policy there naming it
+(`'r'`), are that database's owners' doing, not the role's: any tenant
+whose role may grant or make policies can name any role, and so could
+otherwise make another tenant's binding fail at its next verification.
+Such rows are counted in `granted_elsewhere`, an `EXCESS` check that fails
 nothing.
 
 A privilege on an object outside the schema counts as harmless only
@@ -674,9 +681,12 @@ since the role bound before keeps its mapping until the new one is written
   - `schema_owner` names the owning role only, which is in the tenant's
     own database.
 - **To the operator**, the full detail (the other tenant and service, the
-  database names) goes to the platform log, at `warn`
-  (`db_role_declare_refused`), and to the audit row's details. The tenant
-  can read neither.
+  database names, the server's login error) and the gate go to the
+  platform log, at `warn` (`db_role_declare_refused`), and to an audit row
+  of no tenant, which `/api/audit` never lists for a deploy key. The
+  tenant's own `db_role.declare_refused` row holds the role, `plan` and
+  the reasons it was told, nothing more. Every other `db_role.*` row names
+  only the tenant's own bindings and the checks that failed.
 
 ## 6. Data
 
@@ -1104,9 +1114,11 @@ the operator, and the tenant runs `enforce` with `declared_roles` set.
   - a member of `pg_read_all_data`;
   - a role bound to another tenant's service;
   - a schema that another role owns;
-  - a `NOLOGIN` role, refused by `can_login` before any probe, and a role
-    without `CONNECT`, refused with no 503; both answer as a wrong
-    password does, the check that failed in the audit row;
+  - a `NOLOGIN` role, and a role without `CONNECT`, refused with no 503;
+    both answer as a wrong password does, the check that failed in the
+    operator's audit row;
+  - none of the nine refusals' gates, details or server errors, nor another
+    tenant's database, is in `/api/audit` as the tenant reads it;
   - a `CREATEROLE` role.
 - **Errors that leave the password open.** A role at its connection limit
   (53300) makes the request a 503 that does not quote the server, and
@@ -1191,6 +1203,9 @@ the operator, and the tenant runs `enforce` with `declared_roles` set.
   until the declaration waits on the unique index, then commits it. The
   declaration gets the `bound_elsewhere` 422, audited, and what it was
   granted is taken back.
+- **A refusal naming another tenant** is told to the operator alone: its
+  row of no tenant names that tenant and the gate, and the refused
+  tenant's `/api/audit` names neither.
 - **What follows the write fails.** The failpoint
   `CUFFLINK_TEST_FAIL_UNMAP_AFTER_WRITE` fails `unmap_others` once the
   binding is written. The request is a 200, the replaced role is retired,

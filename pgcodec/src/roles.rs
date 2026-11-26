@@ -38,7 +38,8 @@ pub const OWNED_BY_THE_USER: &str = "\
 /// identity, received)`: `here` is whether the object is in the session's
 /// database, where `kind` and `identity` name it; `place` is the database it
 /// is in, or for a shared object the object itself; `received` is whether
-/// the role only holds a privilege on it, which the object's owner granted.
+/// the role only holds a privilege on it, or in another database is named
+/// by a policy, either of which the object's owner made.
 /// Read across every database from `pg_shdepend`. Left out: the schema `$2`
 /// and what it holds, default privileges the role sets for every schema,
 /// `USAGE` alone on schema `public` and on schema `$5`, `EXECUTE` alone on
@@ -92,7 +93,7 @@ pub const REACH_OF_THE_ROLE: &str = "\
                         WHERE db.oid = d.objid AND a.grantee = t.oid \
                           AND (a.privilege_type NOT IN ('CONNECT', 'TEMPORARY') OR a.is_grantable))) \
     UNION ALL \
-    SELECT false, db.datname::text, NULL, NULL, d.deptype = 'a' \
+    SELECT false, db.datname::text, NULL, NULL, d.deptype IN ('a', 'r') \
     FROM dependent d JOIN pg_database db ON db.oid = d.dbid \
     WHERE d.dbid NOT IN (0, (SELECT oid FROM here)) \
     ORDER BY 1 DESC, 2, 3, 4";

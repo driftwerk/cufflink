@@ -119,13 +119,14 @@ Once the policy leaves `off`, each service has a role of its own:
 - A role the platform did not make is also checked for what it reaches
   beyond the service's schema: `declared_memberships`, every role it is a
   member of (its own `read_only_role` aside), and `confined`, every object
-  outside the schema it owns or is named by in a policy, in any database,
-  and every privilege it holds outside the schema in its own database,
+  outside the schema it owns in any database, and every privilege it holds
+  or policy naming it outside the schema in its own database,
   `USAGE` alone on `public`, what the platform grants it of `_cufflink` and
   `CONNECT` or `TEMPORARY` on its own database aside, each without grant
   option. They fail a declared role, and are reported `EXCESS` for one an
-  administrator bound. Privileges granted to the role in other databases
-  are their owners' doing, and are reported `EXCESS` alone
+  administrator bound. Privileges granted to the role in other databases,
+  and policies there naming it, are their owners' doing, and are reported
+  `EXCESS` alone
   (`granted_elsewhere`), as is another role still mapped to the service
   (`outbox_mapped_elsewhere`).
 - Deleting a service makes the role the platform made for it `NOLOGIN`;

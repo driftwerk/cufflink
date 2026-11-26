@@ -296,6 +296,39 @@ impl Declared {
         client
     }
 
+    async fn audit_listing(&self, tenant: &Tenant) -> String {
+        let (status, body) = self
+            .platform
+            .send(
+                Method::GET,
+                "/api/audit?per_page=200",
+                &format!("ApiKey {}", tenant.api_key),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body.to_string()
+    }
+
+    async fn operators(&self, tenant: &Tenant) -> Vec<Value> {
+        self.db
+            .pool()
+            .get()
+            .await
+            .expect("checkout")
+            .query(
+                "SELECT details FROM audit_log
+                 WHERE tenant_id IS NULL AND action = 'db_role.declare_refused'
+                   AND details->>'tenant' = $1 ORDER BY created_at",
+                &[&tenant.slug],
+            )
+            .await
+            .expect("operator rows")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
     async fn nothing_holds_the_password(&self) {
         let found: i64 = self
             .db
@@ -568,24 +601,27 @@ async fn a_role_bound_in_another_tenant_is_refused_without_naming_it() {
     ] {
         assert!(!told.contains(&hidden), "{hidden} in {told}");
     }
-    let detail: String = test
-        .db
-        .pool()
-        .get()
-        .await
-        .expect("checkout")
-        .query_one(
-            "SELECT details::text FROM audit_log
-             WHERE action = 'db_role.declare_refused' AND tenant_id = $1",
-            &[&orchard.id],
-        )
-        .await
-        .expect("audited")
-        .get(0);
+    let listed = test.audit_listing(&orchard).await;
+    assert!(listed.contains("db_role.declare_refused"), "{listed}");
+    for hidden in [
+        test.tenant.slug.clone(),
+        TenantPoolManager::managed_db_name(&test.tenant.slug),
+        SERVICE.to_string() + "' of tenant",
+        "\"gate\"".to_string(),
+        "\"detail\"".to_string(),
+    ] {
+        assert!(
+            !listed.contains(&hidden),
+            "{hidden} in the tenant's audit: {listed}"
+        );
+    }
+    let operators = test.operators(&orchard).await;
+    assert_eq!(operators.len(), 1, "{operators:?}");
     assert!(
-        detail.contains(&test.tenant.slug),
-        "the operator is told: {detail}"
+        operators[0].to_string().contains(&test.tenant.slug),
+        "the operator is told: {operators:?}"
     );
+    assert_eq!(operators[0]["gate"], "declaration", "{operators:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -959,6 +995,32 @@ async fn a_declaration_is_refused_for_what_no_services_role_may_be() {
     assert_eq!(test.bindings().await, 0, "nothing was bound");
     assert!(!test.holds_cufflink(role).await, "nothing was granted");
     assert_eq!(test.audited("db_role.declare_refused").await, 9);
+    let listed = test.audit_listing(&test.tenant).await;
+    for hidden in [
+        "\"gate\"",
+        "\"detail\"",
+        "too many connections",
+        "password authentication failed",
+        "may not log in",
+        "may not connect",
+        &TenantPoolManager::managed_db_name(&orchard.slug),
+    ] {
+        assert!(
+            !listed.contains(hidden),
+            "{hidden} in the tenant's audit: {listed}"
+        );
+    }
+    let operators = test.operators(&test.tenant).await;
+    assert_eq!(operators.len(), 9, "{operators:?}");
+    let told = Value::Array(operators).to_string();
+    for shown in [
+        "\"existence\"",
+        "\"login\"",
+        "may not connect",
+        "1 objects outside this database",
+    ] {
+        assert!(told.contains(shown), "{shown} for the operator: {told}");
+    }
     let (status, body) = test.declare().await;
     assert_eq!(status, 200, "once mended it is taken: {body}");
 
@@ -1023,17 +1085,18 @@ async fn another_tenants_grant_to_a_declared_role_neither_refuses_nor_unverifies
              CREATE SCHEMA ledger_service AUTHORIZATION {orchards};
              SET ROLE {orchards};
              CREATE TABLE ledger_service.entries (id int);
-             GRANT SELECT ON ledger_service.entries TO {};
+             GRANT SELECT ON ledger_service.entries TO {0};
+             CREATE POLICY acme_reads ON ledger_service.entries FOR SELECT TO {0} USING (true);
              RESET ROLE;",
             test.role
         ))
         .await
-        .expect("orchard's role grants to the role acme declares");
+        .expect("orchard's role grants to, and names in a policy, the role acme declares");
     test.allow().await;
     let (status, body) = test.declare().await;
     assert_eq!(
         status, 200,
-        "a grant received is not the role's reach: {body}"
+        "a grant or a policy another's owner made is not the role's reach: {body}"
     );
     let report = test.verify().await["report"].clone();
     assert_eq!(report["verified"], true, "{report}");

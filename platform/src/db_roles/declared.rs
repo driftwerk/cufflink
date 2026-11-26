@@ -482,49 +482,40 @@ pub async fn gates(
     let read_only_role = existing.and_then(|binding| binding.read_only_role.as_deref());
     let facts = {
         let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
-        let Some(role_facts) = verify::role_facts(&tenant_db, role).await? else {
-            return Ok(Err(Refusal::unproven(
-                Gate::Existence,
-                role,
-                vec![format!(
-                    "role {role} does not exist; whoever manages the service's schema creates it"
-                )],
-            )));
-        };
+        let role_facts = verify::role_facts(&tenant_db, role).await?;
         let connect = tenant_db
             .query_one(
-                "SELECT has_database_privilege($1, current_database(), 'CONNECT'), current_database()::text",
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)
+                             THEN has_database_privilege($1, current_database(), 'CONNECT')
+                             ELSE false END,
+                        current_database()::text",
                 &[&role],
             )
             .await?;
-        let existence = match (role_facts.can_login, connect.get::<_, bool>(0)) {
-            (false, _) => Some(format!(
+        let existing_role = match role_facts {
+            None => Err(format!(
+                "role {role} does not exist; whoever manages the service's schema creates it"
+            )),
+            Some(facts) if !facts.can_login => Err(format!(
                 "role {role} may not log in; run ALTER ROLE {} LOGIN",
                 quote_ident(role)
             )),
-            (true, false) => Some(format!(
+            Some(_) if !connect.get::<_, bool>(0) => Err(format!(
                 "role {role} may not connect to the tenant's database; run GRANT CONNECT ON DATABASE {} TO {}",
                 quote_ident(connect.get::<_, &str>(1)),
                 quote_ident(role)
             )),
-            (true, true) => None,
+            Some(facts) => Ok(facts),
         };
-        if let Some(why) = existence {
-            return Ok(Err(Refusal::unproven(Gate::Existence, role, vec![why])));
-        }
-        match verify::login(
+        let probed = verify::login(
             &state.tenant_sessions,
             tenant.id,
             role,
             &declaration.password,
         )
-        .await
-        {
-            Probe::Accepted => {}
-            Probe::Refused(error) => {
-                return Ok(Err(Refusal::unproven(Gate::Login, role, vec![error])))
-            }
-            Probe::Unanswered(error) => {
+        .await;
+        let role_facts = match (probed, existing_role) {
+            (Probe::Unanswered(error), _) => {
                 return Ok(Err(Refusal {
                     detail: vec![error],
                     ..Refusal::of(
@@ -534,7 +525,12 @@ pub async fn gates(
                     )
                 }))
             }
-        }
+            (_, Err(why)) => return Ok(Err(Refusal::unproven(Gate::Existence, role, vec![why]))),
+            (Probe::Refused(error), Ok(_)) => {
+                return Ok(Err(Refusal::unproven(Gate::Login, role, vec![error])))
+            }
+            (Probe::Accepted, Ok(facts)) => facts,
+        };
         facts(
             platform,
             &tenant_db,
@@ -609,9 +605,11 @@ async fn entry(state: &AppState, tenant_id: Uuid) -> PlatformResult<Arc<TenantEn
         .ok_or_else(|| PlatformError::NotFound("Tenant not found".into()))
 }
 
+/// A row for `tenant` is the tenant's to read (`/api/audit`); one for no
+/// tenant is the operator's alone, and may name what lies outside it.
 async fn audit(
     state: &AppState,
-    tenant: &Tenant,
+    tenant: Option<&Tenant>,
     service: &str,
     actor: &str,
     action: &str,
@@ -619,7 +617,7 @@ async fn audit(
 ) -> PlatformResult<()> {
     crate::repo::audit::log_action(crate::repo::audit::AuditEntry {
         client: &state.platform_db.get().await?,
-        tenant_id: Some(tenant.id),
+        tenant_id: tenant.map(|tenant| tenant.id),
         actor,
         action,
         resource_type: "service",
@@ -662,22 +660,38 @@ async fn refused(
         detail = ?refusal.detail,
         "A declared database role was not taken"
     );
-    let audited = audit(
-        state,
-        tenant,
-        service,
-        actor,
-        "db_role.declare_refused",
-        json!({
-            "role": declaration.role,
-            "gate": refusal.gate.as_str(),
-            "plan": plan,
-            "reasons": refusal.reasons,
-            "detail": refusal.detail,
-        }),
-    )
-    .await;
-    match audited {
+    let audited = async {
+        audit(
+            state,
+            Some(tenant),
+            service,
+            actor,
+            "db_role.declare_refused",
+            json!({
+                "role": declaration.role,
+                "plan": plan,
+                "reasons": refusal.reasons,
+            }),
+        )
+        .await?;
+        audit(
+            state,
+            None,
+            service,
+            actor,
+            "db_role.declare_refused",
+            json!({
+                "tenant": tenant.slug,
+                "role": declaration.role,
+                "gate": refusal.gate.as_str(),
+                "plan": plan,
+                "reasons": refusal.reasons,
+                "detail": refusal.detail,
+            }),
+        )
+        .await
+    };
+    match audited.await {
         Ok(()) => refusal.into_error(&declaration.role),
         Err(e) => e,
     }
@@ -730,7 +744,7 @@ pub async fn take(
     if taking != Taking::Unchanged {
         audit(
             state,
-            tenant,
+            Some(tenant),
             &service.name,
             actor,
             "db_role.declare",

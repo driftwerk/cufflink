@@ -824,6 +824,40 @@ fn retire_failed(why: Why, service: &str, error: &PlatformError) {
 }
 
 impl Retiring {
+    /// What an operator runs in the tenant's database when the platform
+    /// could not retire the role; nothing retries it.
+    pub fn remedy(&self) -> String {
+        match self.origin {
+            Origin::Platform => format!(
+                "ALTER ROLE {} NOLOGIN; DELETE FROM {CUFFLINK_SCHEMA}.service_roles WHERE role = {};",
+                quote_ident(&self.role),
+                quote_literal(&self.role)
+            ),
+            Origin::Admin | Origin::Declared => format!(
+                "{};",
+                enqueue::relinquishing(
+                    &self.role,
+                    &self.service,
+                    enqueue::Held {
+                        role: true,
+                        schema: true,
+                        own: true,
+                        shared: true,
+                        mappings: true,
+                    },
+                )
+                .join("; ")
+            ),
+        }
+    }
+
+    fn failed(&self, error: &PlatformError) {
+        metrics::counter!("cufflink_db_role_retire_failures_total").increment(1);
+        warn!(service = %self.service, role = %self.role, error = %error, remedy = %self.remedy(), "{} database role could not be retired, and nothing retries it; run the remedy in the tenant's database", self.why.whose());
+    }
+}
+
+impl Retiring {
     fn of(service: &Service, binding: Binding, why: Why) -> Self {
         Retiring {
             tenant_id: service.tenant_id,
@@ -871,7 +905,7 @@ impl Retiring {
                 info!(service = %self.service, role = %self.role, "{whose} database role holds no more of what the platform granted it")
             }
             (Ok(false), _) => {}
-            (Err(e), _) => retire_failed(self.why, &self.service, &e),
+            (Err(e), _) => self.failed(&e),
         }
     }
 
@@ -1185,7 +1219,7 @@ async fn settle(
         }
         Err(e) => {
             if let Some(replaced) = replaced {
-                retire_failed(replaced.why, service, &e);
+                replaced.failed(&e);
             }
             Err(e)
         }
@@ -1352,6 +1386,33 @@ pub async fn after_deploy(state: &AppState, tenant_id: Uuid, service_id: Uuid) {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn a_retirement_that_failed_logs_what_to_run_by_hand() {
+        let retiring = |origin| Retiring {
+            tenant_id: Uuid::nil(),
+            service_id: Uuid::nil(),
+            service: "loan-service".into(),
+            role: "loan_service_user".into(),
+            origin,
+            why: Why::Replaced,
+        };
+        assert_eq!(
+            retiring(Origin::Platform).remedy(),
+            "ALTER ROLE \"loan_service_user\" NOLOGIN; DELETE FROM _cufflink.service_roles WHERE role = 'loan_service_user';"
+        );
+        for origin in [Origin::Admin, Origin::Declared] {
+            let remedy = retiring(origin).remedy();
+            for statement in [
+                "REVOKE USAGE ON SCHEMA _cufflink FROM \"loan_service_user\"",
+                "REVOKE EXECUTE ON FUNCTION",
+                "DELETE FROM _cufflink.service_roles WHERE role = 'loan_service_user' AND service = 'loan-service'",
+            ] {
+                assert!(remedy.contains(statement), "{statement} in {remedy}");
+            }
+            assert!(!remedy.contains("NOLOGIN"), "{remedy}");
+        }
+    }
 
     #[test]
     fn a_tenant_is_told_every_remedy_but_the_memberships() {

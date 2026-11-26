@@ -353,11 +353,15 @@ role is no platform-made role, the platform's own, a superuser or
 service's schema and reaches nothing outside it (`confined`). Under
 `enforce` it must then pass verification. Until the password is proven,
 every refusal gives the same answer, so a deploy learns nothing about roles
-it cannot log in as; the audit row says which check failed. After that, a
+it cannot log in as; which check failed is the operator's alone, in an
+audit row of no tenant and the platform log. After that, a
 refusal is a 422 that lists each finding with its remedy and names nothing
 outside the tenant's database. A login that could not be tried is a 503. A
 plan (`?plan=true`) runs the same checks and writes nothing. Every refusal
-is audited (`db_role.declare_refused`), with its detail.
+is audited (`db_role.declare_refused`): the tenant's row holds what it was
+told, and the operator's row, of no tenant, the gate and the detail. A
+replaced role whose retirement fails is logged with the statements to run
+by hand (`cufflink_db_role_retire_failures_total`); nothing retries it.
 
 - **An administrator's binding of another role** refuses the declaration
   (409); one of the same role has its password refreshed and stays the

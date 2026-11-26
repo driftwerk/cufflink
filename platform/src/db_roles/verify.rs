@@ -335,7 +335,7 @@ pub fn reach_checks(expected: &Expected<'_>, reach: &Reach) -> [Check; 3] {
             granted => Check {
                 excess: true,
                 detail: Some(format!(
-                    "the role holds {granted} privileges that owners in other databases granted it"
+                    "the role holds {granted} privileges or policies that owners in other databases gave it"
                 )),
                 ..Check::passed("granted_elsewhere")
             },
@@ -1782,7 +1782,7 @@ mod tests {
         assert!(excess.ok && excess.excess, "{excess:?}");
         assert_eq!(
             excess.detail.as_deref(),
-            Some("the role holds 2 privileges that owners in other databases granted it")
+            Some("the role holds 2 privileges or policies that owners in other databases gave it")
         );
         assert_eq!(granted.described(), None);
         let owned = Reach {
