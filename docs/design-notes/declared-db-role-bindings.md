@@ -1258,3 +1258,36 @@ Roll out platforms first and CLIs second, then set `declared_roles`.
    administrator, or replacing that binding, now takes back the platform's
    own `_cufflink` grants (default, §7). The alternative is to do this
    only for declared bindings.
+
+## 14. As implemented
+
+Where the implementation of Part 1 settles what the design left open:
+
+- **`preview`** is called by `api::deployments::plan` for both a recorded
+  and an unrecorded service, under the deploy lock for a recorded one,
+  rather than from `run_locked`. The plan's `skipped` branch reports the
+  declaration too.
+- **Taking back the grants** is one function, `enqueue::relinquish`, shared
+  by retiring a binding and by a refused declaration. It revokes `USAGE` on
+  `_cufflink` and `EXECUTE` on `OWN` and `SHARED`, and deletes the role's
+  mapping to the service: a superset of `cufflink_ungrants`, harmless for
+  the reasons given in §4.3 step 8. It runs on a refusal at gate 5, at
+  step 8, and when the write loses the unique index to another tenant,
+  each only when the role was not already the service's binding. A gate 4
+  refusal never runs it, since the role may then be the platform's own or a
+  superuser.
+- **`confined` and `declared_memberships`** are checked for declared and
+  admin bindings only; a role the platform made is not read for them.
+- **`REACH_OF_THE_ROLE`** lives in `cufflink_pgcodec::roles`, as designed.
+  A row of another database, and any shared object but the role's
+  `CONNECT` or `TEMPORARY` on its own database, is counted as "outside this
+  database" and never named to the tenant.
+- **The failpoint** is `CUFFLINK_TEST_REVOKE_AFTER_DECLARED_GRANTS=1`, which
+  revokes `USAGE` on `_cufflink` from the declared role between steps 7 and
+  8, standing in for a concurrent change of the catalog. No failpoint fails
+  a request between the grants and the write: the step-8 refusal covers
+  the same state, and a crash there leaves only the bounded, additive
+  grants described in §4.3.
+- **The deploy answer's `db_role`** is read after activation and is best
+  effort: a failed read logs and answers `null`, never failing a deploy
+  that succeeded.

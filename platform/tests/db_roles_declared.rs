@@ -35,21 +35,26 @@ struct Declared {
     role: String,
 }
 
+async fn platform(db: &TestDb, extra: &[(&str, &str)]) -> PlatformProcess {
+    let kek = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let env: Vec<(&str, &str)> = [
+        ("CUFFLINK_SECRETS_KEK", kek.as_str()),
+        ("CUFFLINK_SECRETS_KEK_ID", "test"),
+    ]
+    .into_iter()
+    .chain(extra.iter().copied())
+    .collect();
+    let infra = common::infra().await.expect("infra");
+    let platform = PlatformProcess::start(&db.url, infra.nats_url(), &env).await;
+    platform.wait_ready().await;
+    platform
+}
+
 impl Declared {
     async fn start() -> Option<Self> {
         let infra = common::infra().await?;
         let mut db = infra.create_database().await;
-        let kek = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        let platform = PlatformProcess::start(
-            &db.url,
-            infra.nats_url(),
-            &[
-                ("CUFFLINK_SECRETS_KEK", &kek),
-                ("CUFFLINK_SECRETS_KEK_ID", "test"),
-            ],
-        )
-        .await;
-        platform.wait_ready().await;
+        let platform = platform(&db, &[]).await;
         let tenant = db.mint_tenant().await;
         let admin = format!("ApiKey {}", db.mint_admin_key().await);
         let url =
@@ -547,4 +552,76 @@ async fn a_replaced_declared_role_loses_what_the_platform_granted_it() {
         .expect("role")
         .get(0);
     assert!(logs_in, "a role the platform did not make keeps its login");
+}
+
+async fn mapped(test: &Declared, role: &str) -> bool {
+    test.tenant_db
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM _cufflink.service_roles WHERE role = $1 AND service = $2)",
+            &[&role, &SERVICE],
+        )
+        .await
+        .expect("mappings")
+        .get(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declaration_refused_after_its_grants_takes_them_back_and_the_bound_role_keeps_its_own() {
+    let Some(mut test) = Declared::start().await else {
+        return;
+    };
+    let next = test.db.role("catalog_next_user");
+    test.make_role(&next, None).await;
+    let (status, body) = test.policy("warn", &[&test.role, &next]).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = test.declare().await;
+    assert_eq!(status, 200, "{body}");
+    assert!(mapped(&test, &test.role).await);
+    test.sql(&format!(
+        "REASSIGN OWNED BY {0} TO {next};
+         GRANT USAGE ON SCHEMA {SCHEMA} TO {0};
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {SCHEMA} TO {0};",
+        test.role
+    ))
+    .await;
+    let (status, body) = test.policy("enforce", &[&test.role, &next]).await;
+    assert_eq!(status, 200, "{body}");
+
+    test.platform = platform(
+        &test.db,
+        &[("CUFFLINK_TEST_REVOKE_AFTER_DECLARED_GRANTS", "1")],
+    )
+    .await;
+    let (status, body) = test.deploy("", Some((&next, "pw-wrong"))).await;
+    assert_eq!(status, 422, "a wrong password: {body}");
+    assert!(!test.holds_cufflink(&next).await);
+    assert!(
+        mapped(&test, &test.role).await,
+        "the bound role keeps its mapping"
+    );
+
+    let (status, body) = test.deploy("", Some((&next, PASSWORD))).await;
+    assert_eq!(status, 503, "the role changed while it was bound: {body}");
+    assert!(
+        !test.holds_cufflink(&next).await,
+        "what was granted to the refused role is taken back"
+    );
+    assert!(
+        mapped(&test, &test.role).await,
+        "the bound role keeps its mapping"
+    );
+    assert_eq!(test.show().await["binding"]["role"], test.role.as_str());
+    let (status, body) = test
+        .platform
+        .send(
+            Method::POST,
+            &format!("/svc/{}/{SERVICE}/items", test.tenant.slug),
+            &format!("ApiKey {}", test.tenant.api_key),
+            Some(&json!({"body": "still served"})),
+        )
+        .await;
+    assert!(
+        status < 300,
+        "the bound role still serves and enqueues: {status} {body}"
+    );
 }

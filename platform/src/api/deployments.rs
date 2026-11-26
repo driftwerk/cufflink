@@ -395,19 +395,24 @@ fn admit_declaration(
     }
 }
 
-async fn with_db_role(
-    state: &AppState,
-    service_id: Uuid,
-    mut answer: Value,
-) -> PlatformResult<Value> {
-    let binding =
-        crate::repo::service_db_roles::get(&state.platform_db.get().await?, service_id).await?;
-    answer["db_role"] = json!(binding.map(|binding| json!({
-        "role": binding.role_name,
-        "origin": binding.origin,
-        "verified": binding.verified_at.is_some(),
-    })));
-    Ok(answer)
+async fn with_db_role(state: &AppState, service_id: Uuid, mut answer: Value) -> Value {
+    let read = async {
+        crate::repo::service_db_roles::get(&state.platform_db.get().await?, service_id)
+            .await
+            .map_err(PlatformError::from)
+    };
+    answer["db_role"] = match read.await {
+        Ok(binding) => json!(binding.map(|binding| json!({
+            "role": binding.role_name,
+            "origin": binding.origin,
+            "verified": binding.verified_at.is_some(),
+        }))),
+        Err(e) => {
+            tracing::warn!(service_id = %service_id, error = %e, "The deployed service's database role could not be read for the answer");
+            Value::Null
+        }
+    };
+    answer
 }
 
 fn admit_web_artifact(
@@ -721,7 +726,7 @@ async fn perform(
                 "message": "No changes detected, deploy skipped",
                 "api_version": DEPLOY_API_VERSION,
             });
-            let answer = with_db_role(&state, service.id, answer).await?;
+            let answer = with_db_role(&state, service.id, answer).await;
             return Ok(with_web_release(answer, &admitted, &latest, runners_told));
         }
         Ok(DeployOutcome::Deployed {
@@ -798,7 +803,7 @@ async fn perform(
         "plan": pipeline::deploy_plan(&schema, &eventing)?,
     });
     Ok(with_web_release(
-        with_db_role(&state, service.id, answer).await?,
+        with_db_role(&state, service.id, answer).await,
         &admitted,
         &deployment,
         runners_told,

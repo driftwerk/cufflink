@@ -673,14 +673,13 @@ async fn relinquish(
     Ok(())
 }
 
-const DECLARED_GRANTS_FAILPOINT: &str = "CUFFLINK_TEST_FAIL_AFTER_DECLARED_GRANTS";
+const REVOKE_AFTER_DECLARED_GRANTS: &str = "CUFFLINK_TEST_REVOKE_AFTER_DECLARED_GRANTS";
 
+/// A test's stand-in for a change of the catalog made while a declared
+/// role is granted the outbox and before it is verified.
 async fn after_declared_grants(tenant_db: &impl GenericClient, role: &str) -> PlatformResult<()> {
-    match std::env::var(DECLARED_GRANTS_FAILPOINT).as_deref() {
-        Ok("1") => Err(PlatformError::Internal(format!(
-            "deploy failed by {DECLARED_GRANTS_FAILPOINT}"
-        ))),
-        Ok("revoke") => Ok(tenant_db
+    match std::env::var_os(REVOKE_AFTER_DECLARED_GRANTS) {
+        Some(flag) if flag == "1" => Ok(tenant_db
             .batch_execute(&format!(
                 "REVOKE USAGE ON SCHEMA {CUFFLINK_SCHEMA} FROM {}",
                 quote_ident(role)
@@ -688,6 +687,10 @@ async fn after_declared_grants(tenant_db: &impl GenericClient, role: &str) -> Pl
             .await?),
         _ => Ok(()),
     }
+}
+
+fn bound_elsewhere(role: &str) -> String {
+    format!("role '{role}' is bound to another service; a role carries one service")
 }
 
 fn stored_report(binding: &Binding) -> PlatformResult<VerifyReport> {
@@ -918,10 +921,13 @@ async fn apply_locked(
     if let Some((other_tenant, other_service)) =
         service_db_roles::bound_elsewhere(platform, &target.role, service.id).await?
     {
-        return Err(PlatformError::Validation(format!(
-            "role '{}' is bound to the service '{other_service}' of tenant '{other_tenant}'; a role carries one service",
-            target.role
-        )));
+        return Err(PlatformError::Validation(match gated {
+            Some(_) => bound_elsewhere(&target.role),
+            None => format!(
+                "role '{}' is bound to the service '{other_service}' of tenant '{other_tenant}'; a role carries one service",
+                target.role
+            ),
+        }));
     }
     crate::outbox::bootstrap::ensure(&state.tenant_sessions, tenant.id).await?;
     let mut tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
@@ -1036,7 +1042,7 @@ async fn apply_locked(
             "The database role could not be verified; what was known of it stands"
         );
     }
-    let binding = service_db_roles::write(
+    let written = service_db_roles::write(
         platform,
         &NewBinding {
             service_id: service.id,
@@ -1049,14 +1055,17 @@ async fn apply_locked(
             verify_report: &serde_json::to_value(&report)?,
         },
     )
-    .await
-    .map_err(|e| match service_db_roles::role_taken(&e) {
-        true => PlatformError::Validation(format!(
-            "role '{}' is bound to another service; a role carries one service",
-            target.role
-        )),
-        false => PlatformError::from(e),
-    })?;
+    .await;
+    let binding = match written {
+        Ok(binding) => binding,
+        Err(e) if service_db_roles::role_taken(&e) => {
+            if gated.is_some() && newly(&target.role) {
+                relinquish(state, tenant, &target.role, &service.name).await?;
+            }
+            return Err(PlatformError::Validation(bound_elsewhere(&target.role)));
+        }
+        Err(e) => return Err(e.into()),
+    };
     state.tenant_sessions.forget_role(service.id);
     let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
     enqueue::unmap_others(&tenant_db, &target.role, &service.name).await?;
