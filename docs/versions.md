@@ -1516,6 +1516,9 @@ Migration `V11` adds `service_db_roles.declared` and a unique index on
 - **A login probe** that authenticates and is then refused
   (`insufficient_privilege`) proves the password, and the verification
   judges `database_connect` on its own.
+- **CLI.** Declarations need a CLI of v0.41.0 or later; an older one ignores
+  `[environments.<env>.db_role]` and sends nothing, a rotated password
+  included. Pin the CLI in CI wherever a declaration is used.
 
 ## Changes in v0.40.6
 
