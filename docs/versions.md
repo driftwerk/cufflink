@@ -579,7 +579,7 @@ Rolling a platform back from v0.41.0 to v0.40.6:
 | `declared_roles` | Remove it from every tenant's `db_roles` config first: a replica older than v0.41.0 reads a config holding it as the default config, losing `readers` and `login_pool_max` |
 | Declared bindings (`db_role_declarations`) | Nothing to undo: v0.40.6 reads a declared binding as an administrator's and keeps serving with its stored password. v0.40.6 does not offer `db_role_declarations`, so a CLI of v0.41.0 refuses a declaration before building and sends nothing; change a role or its password with `db-role set` until the platform is on v0.41.0 again |
 | The first-version gate | Nothing: v0.40.6 activates a first version with no verified role again, which answers `503` until one is bound |
-| The database | Nothing to undo: `V11__declared_db_roles` adds a column v0.40.6 never reads and a unique index on `service_db_roles.role_name`, under which a `db-role set` of a role another service already holds fails instead of binding it twice |
+| The database | Nothing to undo: `V11__declared_db_roles` adds a column v0.40.6 never reads and a unique index on `service_db_roles.role_name`, under which a `db-role set` of a role another service already holds is answered with an error, its write refused by the index, instead of binding the role twice |
 
 Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone: a
 bundle the single upload streamed into storage reads back as any other,
