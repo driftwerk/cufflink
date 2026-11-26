@@ -356,7 +356,11 @@ every refusal gives the same answer, so a deploy learns nothing about roles
 it cannot log in as; which check failed is the operator's alone, in an
 audit row of no tenant and the platform log. After that, a
 refusal is a 422 that lists each finding with its remedy and names nothing
-outside the tenant's database. A login that could not be tried is a 503. A
+outside the tenant's database. A login that could not be tried is a 503,
+retryable; only an allowlisted role that exists can be answered so, for
+example one at its connection limit. Probing an allowlisted role that is
+missing or `NOLOGIN` leaves a `FATAL` authentication line in the server log,
+which external tooling counting authentication failures counts too. A
 plan (`?plan=true`) runs the same checks and writes nothing. Every refusal
 is audited (`db_role.declare_refused`): the tenant's row holds what it was
 told, and the operator's row, of no tenant, the gate and the detail. A
