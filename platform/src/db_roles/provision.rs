@@ -258,7 +258,7 @@ fn reader_statements<'a>(spec: &'a Spec<'_>) -> impl Iterator<Item = String> + u
     })
 }
 
-fn cufflink_statements(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
+fn cufflink_grants(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
     match (
         catalog.cufflink_schema && (spec.managed || catalog.role_exists),
         spec.enqueues,
@@ -274,14 +274,12 @@ fn cufflink_statements(spec: &Spec<'_>, catalog: &Catalog) -> Vec<String> {
             catalog.enqueue,
         ))
         .collect(),
-        (true, false) => enqueue::narrowing(spec.role, spec.service, catalog.enqueue),
+        (true, false) => enqueue::narrowing(spec.role, catalog.enqueue),
     }
 }
 
 pub fn statements(spec: &Spec<'_>, catalog: &Catalog) -> Result<Vec<Step>, ProvisionError> {
-    let cufflink = cufflink_statements(spec, catalog)
-        .into_iter()
-        .map(Step::from);
+    let cufflink = cufflink_grants(spec, catalog).into_iter().map(Step::from);
     if !spec.managed {
         return Ok(cufflink.collect());
     }
@@ -644,11 +642,28 @@ async fn in_turn<T>(
     done
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    Deleted,
+    Replaced,
+}
+
+impl Why {
+    fn whose(self) -> &'static str {
+        match self {
+            Why::Deleted => "The deleted service's",
+            Why::Replaced => "The replaced binding's",
+        }
+    }
+}
+
 pub struct Retiring {
     tenant_id: Uuid,
     service_id: Uuid,
     service: String,
     role: String,
+    origin: Origin,
+    why: Why,
 }
 
 pub async fn retiring(state: &AppState, service: &Service) -> Option<Retiring> {
@@ -658,34 +673,34 @@ pub async fn retiring(state: &AppState, service: &Service) -> Option<Retiring> {
             .map_err(PlatformError::from)
     };
     match binding.await {
-        Ok(binding) => binding
-            .filter(|binding| binding.managed())
-            .map(|binding| Retiring {
-                tenant_id: service.tenant_id,
-                service_id: service.id,
-                service: service.name.clone(),
-                role: binding.role_name,
-            }),
+        Ok(binding) => binding.map(|binding| Retiring::of(service, binding, Why::Deleted)),
         Err(e) => {
-            retire_failed(&service.name, &e);
+            retire_failed(Why::Deleted, &service.name, &e);
             None
         }
     }
 }
 
-fn retire_failed(service: &str, error: &PlatformError) {
+fn retire_failed(why: Why, service: &str, error: &PlatformError) {
     metrics::counter!("cufflink_db_role_retire_failures_total").increment(1);
-    warn!(service = %service, error = %error, "The deleted service's database role could not be retired; `ALTER ROLE … NOLOGIN` it by hand");
+    warn!(service = %service, error = %error, "{} database role could not be retired; `ALTER ROLE … NOLOGIN` a role the platform made, or revoke what the platform granted on schema {CUFFLINK_SCHEMA} from another, by hand", why.whose());
 }
 
 impl Retiring {
-    pub async fn retire(self, state: &AppState) {
-        let retired = async {
-            let Some(entry) = state.tenants.get_or_load(self.tenant_id).await? else {
-                return Ok(false);
-            };
-            in_turn(state, &entry.tenant, async |_| {
-                let tenant_db = state.tenant_sessions.platform(self.tenant_id, None).await?;
+    fn of(service: &Service, binding: Binding, why: Why) -> Self {
+        Retiring {
+            tenant_id: service.tenant_id,
+            service_id: service.id,
+            service: service.name.clone(),
+            role: binding.role_name,
+            origin: binding.origin,
+            why,
+        }
+    }
+
+    async fn retire_in(&self, tenant_db: &impl GenericClient) -> PlatformResult<bool> {
+        match self.origin {
+            Origin::Platform => {
                 let ours: bool = tenant_db
                     .query_one(
                         "SELECT COALESCE((SELECT shobj_description(oid, 'pg_authid') = $2
@@ -698,19 +713,43 @@ impl Retiring {
                     tenant_db
                         .batch_execute(&format!("ALTER ROLE {} NOLOGIN", quote_ident(&self.role)))
                         .await?;
-                    enqueue::unmap(&tenant_db, &self.role).await?;
+                    enqueue::unmap(tenant_db, &self.role).await?;
                 }
                 Ok(ours)
+            }
+            Origin::Admin | Origin::Declared => {
+                enqueue::relinquish(tenant_db, &self.role, &self.service).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn retired(&self, outcome: PlatformResult<bool>) {
+        let whose = self.why.whose();
+        match (outcome, self.origin) {
+            (Ok(true), Origin::Platform) => {
+                info!(service = %self.service, role = %self.role, "{whose} database role may log in no more")
+            }
+            (Ok(true), Origin::Admin | Origin::Declared) => {
+                info!(service = %self.service, role = %self.role, "{whose} database role holds no more of what the platform granted it")
+            }
+            (Ok(false), _) => {}
+            (Err(e), _) => retire_failed(self.why, &self.service, &e),
+        }
+    }
+
+    pub async fn retire(self, state: &AppState) {
+        let retired = async {
+            let Some(entry) = state.tenants.get_or_load(self.tenant_id).await? else {
+                return Ok(false);
+            };
+            in_turn(state, &entry.tenant, async |_| {
+                let tenant_db = state.tenant_sessions.platform(self.tenant_id, None).await?;
+                self.retire_in(&tenant_db).await
             })
             .await
         };
-        match retired.await {
-            Ok(true) => {
-                info!(service = %self.service, role = %self.role, "The deleted service's database role may log in no more")
-            }
-            Ok(false) => {}
-            Err(e) => retire_failed(&self.service, &e),
-        }
+        self.retired(retired.await);
     }
 }
 
@@ -859,6 +898,14 @@ async fn apply_locked(
     )
     .await?;
     state.tenant_sessions.forget_role(service.id);
+    let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
+    enqueue::unmap_others(&tenant_db, &target.role, &service.name).await?;
+    if let Some(replaced) = existing
+        .filter(|previous| previous.role_name != target.role)
+        .map(|previous| Retiring::of(service, previous, Why::Replaced))
+    {
+        replaced.retired(replaced.retire_in(&tenant_db).await);
+    }
     crate::repo::audit::log_action(crate::repo::audit::AuditEntry {
         client: platform,
         tenant_id: Some(tenant.id),

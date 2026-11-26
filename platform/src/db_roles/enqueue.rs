@@ -34,8 +34,6 @@ pub enum Enqueue {
         execute: bool,
         shared: bool,
         mapped: bool,
-        /// Another role is mapped to the service.
-        stale: bool,
     },
 }
 
@@ -60,9 +58,8 @@ pub async fn facts(
             let mapping = client
                 .query_one(
                     &format!(
-                        "SELECT COALESCE(bool_and(role = $1::name), false),
-                                COALESCE(bool_or(role <> $1::name), false)
-                         FROM {SERVICE_ROLES} WHERE service = $2"
+                        "SELECT EXISTS (SELECT 1 FROM {SERVICE_ROLES}
+                                        WHERE service = $2 AND role = $1::name)"
                     ),
                     &[&role, &service],
                 )
@@ -71,7 +68,6 @@ pub async fn facts(
                 execute: own,
                 shared,
                 mapped: mapping.get(0),
-                stale: mapping.get(1),
             }
         }
         (false, true) => Enqueue::Shared { execute: shared },
@@ -94,31 +90,24 @@ pub fn statements(role: &str, service: &str, enqueue: Enqueue) -> Vec<String> {
             .then(|| grant(OWN))
             .into_iter()
             .chain(shared.then(|| format!("REVOKE EXECUTE ON FUNCTION {SHARED} FROM {quoted}")))
-            .chain((!mapped).then(|| map(role, service)).into_iter().flatten())
+            .chain((!mapped).then(|| map(role, service)))
             .collect(),
     }
 }
 
 /// What a role the platform never enqueues as is made to hold no more of:
-/// the shared function, which enqueues for any service, and the service's
-/// mapping to any role but its own. It grants nothing.
-pub fn narrowing(role: &str, service: &str, enqueue: Enqueue) -> Vec<String> {
+/// the shared function, which enqueues for any service. It grants nothing.
+pub fn narrowing(role: &str, enqueue: Enqueue) -> Vec<String> {
     match enqueue {
-        Enqueue::Absent | Enqueue::Shared { .. } => vec![],
-        Enqueue::Own { shared, stale, .. } => shared
-            .then(|| {
-                format!(
-                    "REVOKE EXECUTE ON FUNCTION {SHARED} FROM {}",
-                    quote_ident(role)
-                )
-            })
-            .into_iter()
-            .chain(stale.then(|| unmap_others(role, service)))
-            .collect(),
+        Enqueue::Own { shared: true, .. } => vec![format!(
+            "REVOKE EXECUTE ON FUNCTION {SHARED} FROM {}",
+            quote_ident(role)
+        )],
+        Enqueue::Absent | Enqueue::Shared { .. } | Enqueue::Own { .. } => vec![],
     }
 }
 
-fn unmap_others(role: &str, service: &str) -> String {
+fn unmapping_others(role: &str, service: &str) -> String {
     format!(
         "DELETE FROM {SERVICE_ROLES} WHERE service = {} AND role <> {}",
         quote_literal(service),
@@ -126,24 +115,96 @@ fn unmap_others(role: &str, service: &str) -> String {
     )
 }
 
-fn map(role: &str, service: &str) -> [String; 2] {
+fn map(role: &str, service: &str) -> String {
+    format!(
+        "INSERT INTO {SERVICE_ROLES} (role, service) VALUES ({}, {})
+         ON CONFLICT (role) DO UPDATE SET service = EXCLUDED.service",
+        quote_literal(role),
+        quote_literal(service)
+    )
+}
+
+async fn mappings(client: &impl GenericClient) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&SERVICE_ROLES])
+        .await?
+        .get(0))
+}
+
+/// Run once `role` is the service's binding, never before: until then the
+/// role bound before keeps its mapping, and its enqueues go on working.
+pub async fn unmap_others(
+    client: &impl GenericClient,
+    role: &str,
+    service: &str,
+) -> Result<(), tokio_postgres::Error> {
+    match mappings(client).await? {
+        true => client.batch_execute(&unmapping_others(role, service)).await,
+        false => Ok(()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    pub role: bool,
+    pub schema: bool,
+    pub own: bool,
+    pub shared: bool,
+    pub mappings: bool,
+}
+
+/// What takes back from `role` all the platform grants it of the outbox,
+/// and its mapping to `service`. The role itself is left as it is.
+pub fn relinquishing(role: &str, service: &str, held: Held) -> Vec<String> {
+    let quoted = quote_ident(role);
+    let revoke = |function: &str| format!("REVOKE EXECUTE ON FUNCTION {function} FROM {quoted}");
     [
-        format!(
-            "INSERT INTO {SERVICE_ROLES} (role, service) VALUES ({}, {})
-             ON CONFLICT (role) DO UPDATE SET service = EXCLUDED.service",
-            quote_literal(role),
-            quote_literal(service)
-        ),
-        unmap_others(role, service),
+        (held.role && held.schema)
+            .then(|| format!("REVOKE USAGE ON SCHEMA {CUFFLINK_SCHEMA} FROM {quoted}")),
+        (held.role && held.own).then(|| revoke(OWN)),
+        (held.role && held.shared).then(|| revoke(SHARED)),
+        held.mappings.then(|| {
+            format!(
+                "DELETE FROM {SERVICE_ROLES} WHERE role = {} AND service = {}",
+                quote_literal(role),
+                quote_literal(service)
+            )
+        }),
     ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+pub async fn relinquish(
+    client: &impl GenericClient,
+    role: &str,
+    service: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),
+                    to_regnamespace($2) IS NOT NULL,
+                    to_regprocedure($3) IS NOT NULL,
+                    to_regprocedure($4) IS NOT NULL,
+                    to_regclass($5) IS NOT NULL",
+            &[&role, &CUFFLINK_SCHEMA, &OWN, &SHARED, &SERVICE_ROLES],
+        )
+        .await?;
+    let held = Held {
+        role: row.get(0),
+        schema: row.get(1),
+        own: row.get(2),
+        shared: row.get(3),
+        mappings: row.get(4),
+    };
+    client
+        .batch_execute(&relinquishing(role, service, held).join(";\n"))
+        .await
 }
 
 pub async fn unmap(client: &impl GenericClient, role: &str) -> Result<(), tokio_postgres::Error> {
-    let mapped: bool = client
-        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&SERVICE_ROLES])
-        .await?
-        .get(0);
-    match mapped {
+    match mappings(client).await? {
         true => client
             .execute(
                 &format!("DELETE FROM {SERVICE_ROLES} WHERE role = $1::name"),
@@ -186,7 +247,11 @@ pub fn checks(role: &str, service: &str, enqueue: Enqueue) -> Vec<Check> {
             Check::of("outbox_service", mapped, || {
                 (
                     format!("the role is not the one mapped to service {service}"),
-                    Some(format!("{};", map(role, service).join("; "))),
+                    Some(format!(
+                        "{}; {};",
+                        map(role, service),
+                        unmapping_others(role, service)
+                    )),
                 )
             }),
         ],
@@ -272,7 +337,6 @@ mod tests {
             execute: false,
             shared: true,
             mapped: false,
-            stale: false,
         };
         assert_eq!(
             statements(ROLE, "note's-service", fresh),
@@ -281,18 +345,20 @@ mod tests {
                 format!("REVOKE EXECUTE ON FUNCTION {SHARED} FROM \"{ROLE}\""),
                 format!(
                     "INSERT INTO _cufflink.service_roles (role, service) VALUES ('{ROLE}', 'note''s-service')
-             ON CONFLICT (role) DO UPDATE SET service = EXCLUDED.service"
-                ),
-                format!(
-                    "DELETE FROM _cufflink.service_roles WHERE service = 'note''s-service' AND role <> '{ROLE}'"
+         ON CONFLICT (role) DO UPDATE SET service = EXCLUDED.service"
                 ),
             ]
+        );
+        assert!(
+            statements(ROLE, "loan-service", fresh)
+                .iter()
+                .all(|statement| !statement.contains("DELETE")),
+            "no mapping of another role is taken before the role is bound"
         );
         let settled = Enqueue::Own {
             execute: true,
             shared: false,
             mapped: true,
-            stale: false,
         };
         assert!(statements(ROLE, "loan-service", settled).is_empty());
         assert!(checks(ROLE, "loan-service", settled).iter().all(|c| c.ok));
@@ -307,7 +373,6 @@ mod tests {
                 execute: false,
                 shared: true,
                 mapped: false,
-                stale: false,
             },
         );
         assert_eq!(
@@ -318,6 +383,16 @@ mod tests {
         assert_eq!(
             checks[1].remedy.as_deref(),
             Some(format!("REVOKE EXECUTE ON FUNCTION {SHARED} FROM \"{ROLE}\";").as_str())
+        );
+        assert!(
+            checks[2]
+                .remedy
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains(&format!(
+                "DELETE FROM {SERVICE_ROLES} WHERE service = 'loan-service' AND role <> '{ROLE}'"
+            ))),
+            "the remedy maps the service to the role alone: {:?}",
+            checks[2].remedy
         );
     }
 
@@ -347,7 +422,6 @@ mod tests {
             execute: false,
             shared: false,
             mapped: false,
-            stale: false,
         };
         let checks = excess(ROLE, false, bare);
         assert_eq!(
@@ -376,7 +450,6 @@ mod tests {
             execute: true,
             shared: false,
             mapped: true,
-            stale: false,
         };
         let checks = excess(ROLE, true, granted);
         assert!(checks.iter().all(|c| c.ok));
@@ -407,7 +480,6 @@ mod tests {
                 execute: false,
                 shared: true,
                 mapped: false,
-                stale: false,
             },
         );
         assert!(
@@ -422,28 +494,74 @@ mod tests {
             execute: true,
             shared: true,
             mapped: false,
-            stale: true,
         };
         assert_eq!(
-            narrowing(ROLE, "note's-service", held),
-            [
-                format!("REVOKE EXECUTE ON FUNCTION {SHARED} FROM \"{ROLE}\""),
-                format!(
-                    "DELETE FROM _cufflink.service_roles WHERE service = 'note''s-service' AND role <> '{ROLE}'"
-                ),
-            ]
+            narrowing(ROLE, held),
+            [format!(
+                "REVOKE EXECUTE ON FUNCTION {SHARED} FROM \"{ROLE}\""
+            )]
         );
         let own = Enqueue::Own {
             execute: true,
             shared: false,
             mapped: true,
-            stale: false,
         };
         assert!(
-            narrowing(ROLE, "loan-service", own).is_empty(),
+            narrowing(ROLE, own).is_empty(),
             "what the role holds of its own is reported, not taken back"
         );
-        assert!(narrowing(ROLE, "loan-service", Enqueue::Shared { execute: true }).is_empty());
-        assert!(narrowing(ROLE, "loan-service", Enqueue::Absent).is_empty());
+        assert!(narrowing(ROLE, Enqueue::Shared { execute: true }).is_empty());
+        assert!(narrowing(ROLE, Enqueue::Absent).is_empty());
+    }
+
+    #[test]
+    fn another_roles_mapping_is_all_unmapping_others_takes() {
+        assert_eq!(
+            unmapping_others(ROLE, "note's-service"),
+            format!(
+                "DELETE FROM _cufflink.service_roles WHERE service = 'note''s-service' AND role <> '{ROLE}'"
+            )
+        );
+    }
+
+    #[test]
+    fn relinquishing_takes_back_what_the_platform_grants_and_the_mapping_alone() {
+        let all = Held {
+            role: true,
+            schema: true,
+            own: true,
+            shared: true,
+            mappings: true,
+        };
+        assert_eq!(
+            relinquishing(ROLE, "note's-service", all),
+            [
+                format!("REVOKE USAGE ON SCHEMA _cufflink FROM \"{ROLE}\""),
+                format!("REVOKE EXECUTE ON FUNCTION {OWN} FROM \"{ROLE}\""),
+                format!("REVOKE EXECUTE ON FUNCTION {SHARED} FROM \"{ROLE}\""),
+                format!(
+                    "DELETE FROM _cufflink.service_roles WHERE role = '{ROLE}' AND service = 'note''s-service'"
+                ),
+            ]
+        );
+        assert_eq!(
+            relinquishing(ROLE, "loan-service", Held { role: false, ..all }),
+            [format!(
+                "DELETE FROM _cufflink.service_roles WHERE role = '{ROLE}' AND service = 'loan-service'"
+            )],
+            "a role that is gone holds no grant"
+        );
+        assert!(relinquishing(
+            ROLE,
+            "loan-service",
+            Held {
+                role: true,
+                schema: false,
+                own: false,
+                shared: false,
+                mappings: false,
+            }
+        )
+        .is_empty());
     }
 }
