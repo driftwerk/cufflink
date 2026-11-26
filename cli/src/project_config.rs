@@ -61,7 +61,6 @@ impl EnvironmentConfig {
     }
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct Declaring<'a> {
     pub(crate) project: &'a ProjectConfig,
     pub(crate) env: String,
@@ -275,7 +274,8 @@ mod tests {
         assert_eq!(
             unnamed
                 .declaring(Some("staging"))
-                .expect_err("no [service].name")
+                .err()
+                .expect("no [service].name")
                 .to_string(),
             "[environments.staging.db_role] needs [service].name, the name of the service it is \
              declared for"

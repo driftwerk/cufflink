@@ -101,7 +101,7 @@ governor = "0.8"
 ipnet = "2.11"
 object_store = { version = "0.14", features = ["aws", "gcp"] }
 async-trait = "0.1"
-bytes = "1"
+bytes = "1.10.1"
 cufflink-storage = { path = "storage" }
 cufflink-telemetry = { path = "telemetry" }
 cufflink-settings = { path = "settings" }

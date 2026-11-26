@@ -256,13 +256,22 @@ impl Project {
         std::fs::write(
             &cargo,
             format!(
-                "#!/bin/sh\ncase \"$*\" in\n  \"run -- --emit-manifest\") cat \"{}\" ;;\n  \
+                "#!/bin/sh\ntouch \"{}\"\ncase \"$*\" in\n  \"run -- --emit-manifest\") cat \"{}\" ;;\n  \
                  metadata*) echo '{{\"packages\":[]}}' ;;\n  *) exit 1 ;;\nesac\n",
+                self.marker().display(),
                 manifest.display()
             ),
         )
         .expect("cargo");
         std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.root.path().join("built")
+    }
+
+    fn built(&self) -> bool {
+        self.marker().exists()
     }
 
     fn bundle(&self) -> String {
@@ -508,18 +517,20 @@ async fn a_platform_that_takes_no_declarations_is_told_so_before_anything_is_bui
 
     let deployed = project.run(&["deploy"]).failed("a deploy");
     assert!(deployed.contains(refusal), "{deployed}");
-    assert!(!deployed.contains("Deploying"), "{deployed}");
+    assert!(!project.built(), "nothing is built");
 
     project.write_project(false);
     let bundle = project.bundle();
     project
         .run(&["build", "--bundle", &bundle])
         .ok("build --bundle");
+    std::fs::remove_file(project.marker()).expect("the build ran cargo");
     project.write_project(true);
     let bundled = project
         .run(&["deploy", "--bundle", &bundle])
         .failed("a bundle's deploy");
     assert!(bundled.contains(refusal), "{bundled}");
+    assert!(!project.built(), "a bundle's deploy builds nothing");
 
     assert_eq!(
         *asked

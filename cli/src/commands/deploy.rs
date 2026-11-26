@@ -1189,9 +1189,9 @@ fn request_body(
                 role: &declared.role,
                 password: &declared.password,
             },
-        }),
-        None => written(request),
-    }?;
+        })?,
+        None => Zeroizing::new(serde_json::to_vec(request)?),
+    };
     Ok(bytes::Bytes::from_owner(body))
 }
 
@@ -3825,7 +3825,8 @@ mod tests {
         let older = platform_at("0.40.2", &[]);
         let current = platform_at("0.41.0", &[cufflink_types::features::DB_ROLE_DECLARATIONS]);
         assert!(declaring(Some(&project), Some("staging"), &older)
-            .expect_err("an older platform")
+            .err()
+            .expect("an older platform")
             .to_string()
             .contains("db_role_declarations"));
         let refusal = |mode: &str| {
@@ -3854,7 +3855,8 @@ mod tests {
                 declaring(Some(&project), Some("staging"), &current).expect("taken"),
                 &other
             )
-            .expect_err("another service's manifest")
+            .err()
+            .expect("another service's manifest")
             .to_string(),
             "[environments.staging.db_role] needs [service].name = \"catalog-service\""
         );
