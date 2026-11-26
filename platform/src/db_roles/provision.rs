@@ -9,7 +9,7 @@ use crate::errors::{PlatformError, PlatformResult};
 use crate::policy::config::DbRolesConfig;
 use crate::policy::{PolicyKey, PolicyMode};
 use crate::repo::advisory_lock::AdvisoryLock;
-use crate::repo::service_db_roles::{self, Binding, NewBinding, Verification};
+use crate::repo::service_db_roles::{self, Binding, NewBinding, Origin, Verification};
 use crate::repo::services::Service;
 use crate::repo::tenants::Tenant;
 use crate::secrets::{random_bytes, SecretString, DB_ROLE_PASSWORD};
@@ -486,6 +486,7 @@ pub struct Change<'a> {
     pub password: Option<&'a str>,
     pub read_only_role: Option<&'a str>,
     pub rotate: bool,
+    pub origin: Option<Origin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,7 +502,7 @@ enum Password {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     role: String,
-    managed: bool,
+    origin: Origin,
     password: Password,
     read_only_role: Option<String>,
 }
@@ -522,13 +523,21 @@ fn target(
             .and_then(|b| b.password_enc.clone())
     };
     let adopted = |role: &str| {
+        let origin = change
+            .origin
+            .filter(|origin| !origin.managed())
+            .unwrap_or_else(|| {
+                existing
+                    .filter(|b| b.role_name == role && !b.managed())
+                    .map_or(Origin::Admin, |b| b.origin)
+            });
         match change.rotate {
         true => Err(format!(
             "role '{role}' was bound by an admin, who changes its password in the database and gives it with `db-role set --password-stdin`"
         )),
         false => Ok(Target {
             role: role.to_string(),
-            managed: false,
+            origin,
             password: change
                 .password
                 .map_or_else(|| Password::Kept(stored(role)), |given| {
@@ -549,14 +558,14 @@ fn target(
                 again: change.rotate,
             },
             role,
-            managed: true,
+            origin: Origin::Platform,
             read_only_role: read_only_role.clone(),
         }),
     }
     };
     match (change.role, existing) {
         (Some(role), _) => adopted(role),
-        (None, Some(binding)) if binding.managed => managed(binding.role_name.clone()),
+        (None, Some(binding)) if binding.managed() => managed(binding.role_name.clone()),
         (None, Some(binding)) => adopted(&binding.role_name),
         (None, None) if policy != PolicyMode::Off => managed(managed_role()),
         (None, None) => Err(
@@ -572,8 +581,8 @@ fn mints(stored: bool, again: bool, role_exists: bool) -> bool {
 fn verification(verdict: Verdict, previous: Option<&Binding>, target: &Target) -> Verification {
     let unchanged = |previous: &Binding| {
         previous.role_name == target.role
-            && previous.managed == target.managed
-            && (target.managed
+            && previous.origin == target.origin
+            && (target.origin.managed()
                 || (matches!(&target.password, Password::Kept(_))
                     && previous.read_only_role == target.read_only_role))
     };
@@ -650,7 +659,7 @@ pub async fn retiring(state: &AppState, service: &Service) -> Option<Retiring> {
     };
     match binding.await {
         Ok(binding) => binding
-            .filter(|binding| binding.managed)
+            .filter(|binding| binding.managed())
             .map(|binding| Retiring {
                 tenant_id: service.tenant_id,
                 service_id: service.id,
@@ -772,12 +781,12 @@ async fn apply_locked(
     };
     let verifier = password
         .as_ref()
-        .filter(|_| target.managed)
+        .filter(|_| target.origin.managed())
         .map(scram_verifier);
     let marker = names::marker(tenant.id, service.id);
     let spec = Spec {
         role: &target.role,
-        managed: target.managed,
+        managed: target.origin.managed(),
         enqueues,
         marker: &marker,
         service: &service.name,
@@ -794,7 +803,7 @@ async fn apply_locked(
         tenant = %tenant.slug,
         service = %service.name,
         role = %target.role,
-        managed = target.managed,
+        origin = target.origin.as_str(),
         statements = steps,
         "Database role provisioned"
     );
@@ -815,7 +824,7 @@ async fn apply_locked(
         service,
         &Candidate {
             role: &target.role,
-            managed: target.managed,
+            managed: target.origin.managed(),
             enqueues,
             creates,
             read_only_role: target.read_only_role.as_deref(),
@@ -840,7 +849,7 @@ async fn apply_locked(
         &NewBinding {
             service_id: service.id,
             role_name: &target.role,
-            managed: target.managed,
+            origin: target.origin,
             password_enc: password_enc.as_deref(),
             read_only_role: target.read_only_role.as_deref(),
             updated_by: actor,
@@ -1456,7 +1465,10 @@ mod tests {
         Binding {
             service_id: Uuid::nil(),
             role_name: "loan_service_user".into(),
-            managed,
+            origin: match managed {
+                true => Origin::Platform,
+                false => Origin::Admin,
+            },
             login: true,
             password_enc: Some(vec![1]),
             read_only_role: Some("reports_ro".into()),
@@ -1479,7 +1491,7 @@ mod tests {
             made,
             Target {
                 role: "svc_default_loan_service".into(),
-                managed: true,
+                origin: Origin::Platform,
                 password: Password::Minted {
                     stored: None,
                     again: false
@@ -1508,7 +1520,7 @@ mod tests {
         .expect("the same role");
         assert_eq!(same.password, Password::Kept(Some(vec![1])));
         assert_eq!(same.read_only_role.as_deref(), Some("reports_ro"));
-        assert!(!same.managed);
+        assert_eq!(same.origin, Origin::Admin);
         let other = target(
             Some(&existing),
             &named("other_user"),
@@ -1596,7 +1608,10 @@ mod tests {
     fn a_verification_that_could_not_be_made_leaves_what_was_known() {
         let kept = |managed| Target {
             role: "loan_service_user".into(),
-            managed,
+            origin: match managed {
+                true => Origin::Platform,
+                false => Origin::Admin,
+            },
             password: match managed {
                 true => Password::Minted {
                     stored: Some(vec![1]),

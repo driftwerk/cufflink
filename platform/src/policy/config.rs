@@ -169,6 +169,8 @@ impl PolicyConfig for OutboxConfig {
 pub struct DbRolesConfig {
     pub readers: Vec<String>,
     pub login_pool_max: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub declared_roles: Vec<String>,
 }
 
 impl DbRolesConfig {
@@ -190,6 +192,13 @@ impl PolicyConfig for DbRolesConfig {
                 "readers entry '{bad}' must be a role name of lowercase letters, digits and '_', \
                  not starting with a digit"
             ));
+        }
+        if let Some(refusal) = self
+            .declared_roles
+            .iter()
+            .find_map(|entry| crate::db_roles::declared::refusal_of_entry(entry))
+        {
+            return Err(refusal);
         }
         match self.login_pool_max {
             Some(0) => Err("login_pool_max must be greater than 0".into()),

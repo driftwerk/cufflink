@@ -1,4 +1,5 @@
 pub mod bindings;
+pub mod declared;
 pub mod enqueue;
 pub mod fallback;
 pub mod login_pools;
@@ -10,7 +11,7 @@ pub mod verify;
 use crate::errors::{PlatformError, PlatformResult};
 use crate::policy::config::DbRolesConfig;
 use crate::policy::{PolicyKey, PolicyMode, PolicySet};
-use crate::repo::service_db_roles::{self, Binding};
+use crate::repo::service_db_roles::{self, Binding, Origin};
 use crate::repo::services::Service;
 use crate::repo::tenant_policies::PolicyRow;
 use crate::repo::tenants;
@@ -73,6 +74,7 @@ pub async fn bind(
             password: request.password,
             read_only_role: request.read_only_role,
             rotate: false,
+            origin: Some(Origin::Admin),
         },
     )
     .await?;
@@ -105,7 +107,8 @@ async fn audit(
         resource_id: Some(&service.name),
         details: Some(json!({
             "role": binding.role_name,
-            "managed": binding.managed,
+            "managed": binding.managed(),
+            "origin": binding.origin,
             "login": binding.login,
             "read_only_role": binding.read_only_role,
         })),

@@ -22,7 +22,8 @@ pub struct SetDbRoleRequest {
 fn binding_body(binding: &Binding) -> Value {
     json!({
         "role": binding.role_name,
-        "managed": binding.managed,
+        "managed": binding.managed(),
+        "origin": binding.origin,
         "login": binding.login,
         "read_only_role": binding.read_only_role,
         "verified_at": binding.verified_at.map(|at| at.to_rfc3339()),
