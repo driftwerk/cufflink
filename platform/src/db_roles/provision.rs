@@ -1,3 +1,4 @@
+use crate::db_roles::declared::{self, Declaration, Gate, Refusal, Taking};
 use crate::db_roles::enqueue::{self, Enqueue, CUFFLINK_SCHEMA};
 use crate::db_roles::names;
 use crate::db_roles::turns::Turns;
@@ -86,7 +87,7 @@ pub enum ProvisionError {
     )]
     MissingRole(String),
     #[error(
-        "schema {schema} belongs to {owner}, not to the platform: bind the service to the role that owns it with `cufflink services db-role set <tenant> <service> --role {owner} --password-stdin`, or hand the schema to the platform with `REASSIGN OWNED BY {owner} TO {platform}`"
+        "schema {schema} belongs to {owner}, not to the platform: bind the service to the role that owns it with `cufflink services db-role set <tenant> <service> --role {owner} --password-stdin` or declare it: `[environments.<env>.db_role] role = \"{owner}\"`, or hand the schema to the platform with `REASSIGN OWNED BY {owner} TO {platform}`"
     )]
     ForeignSchema {
         schema: String,
@@ -608,6 +609,16 @@ pub struct Provisioning<'a> {
     /// when it or the version the service runs is one the platform
     /// enqueues for ([`enqueue::in_session`]).
     pub deploying: Option<&'a ServiceManifest>,
+    /// The role the deploy declares, taken through [`declared::gates`].
+    pub declaration: Option<&'a Declaration>,
+    /// No binding is written that does not verify.
+    pub require_verified: bool,
+}
+
+pub struct Provisioned {
+    pub binding: Binding,
+    pub report: VerifyReport,
+    pub taking: Option<Taking>,
 }
 
 pub async fn apply(
@@ -615,10 +626,97 @@ pub async fn apply(
     provisioning: &Provisioning<'_>,
     change: Change<'_>,
 ) -> PlatformResult<(Binding, VerifyReport)> {
+    match declare(state, provisioning, change).await? {
+        Ok(provisioned) => Ok((provisioned.binding, provisioned.report)),
+        Err(refusal) => Err(refusal.into_error(
+            provisioning
+                .declaration
+                .map_or("", |declaration| declaration.role.as_str()),
+        )),
+    }
+}
+
+pub async fn declare(
+    state: &AppState,
+    provisioning: &Provisioning<'_>,
+    change: Change<'_>,
+) -> PlatformResult<Result<Provisioned, Refusal>> {
     in_turn(state, provisioning.tenant, async |platform| {
         apply_locked(state, platform, provisioning, change).await
     })
     .await
+}
+
+/// Whether the platform enqueues in the service's session, and runs DDL as
+/// its role, for the version it runs or the one `deploying`.
+pub async fn needs(
+    platform: &impl GenericClient,
+    service_id: Uuid,
+    deploying: Option<&ServiceManifest>,
+) -> PlatformResult<(bool, bool)> {
+    let active = verify::active_manifest(platform, service_id).await?;
+    Ok((
+        active.iter().chain(deploying).any(enqueue::in_session),
+        verify::creates_any(active.iter().chain(deploying)),
+    ))
+}
+
+async fn relinquish(
+    state: &AppState,
+    tenant: &Tenant,
+    role: &str,
+    service: &str,
+) -> PlatformResult<()> {
+    let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
+    enqueue::relinquish(&tenant_db, role, service).await?;
+    info!(tenant = %tenant.slug, service = %service, role = %role, "A declared role that was not taken holds no more of what the platform granted it");
+    Ok(())
+}
+
+const DECLARED_GRANTS_FAILPOINT: &str = "CUFFLINK_TEST_FAIL_AFTER_DECLARED_GRANTS";
+
+async fn after_declared_grants(tenant_db: &impl GenericClient, role: &str) -> PlatformResult<()> {
+    match std::env::var(DECLARED_GRANTS_FAILPOINT).as_deref() {
+        Ok("1") => Err(PlatformError::Internal(format!(
+            "deploy failed by {DECLARED_GRANTS_FAILPOINT}"
+        ))),
+        Ok("revoke") => Ok(tenant_db
+            .batch_execute(&format!(
+                "REVOKE USAGE ON SCHEMA {CUFFLINK_SCHEMA} FROM {}",
+                quote_ident(role)
+            ))
+            .await?),
+        _ => Ok(()),
+    }
+}
+
+fn stored_report(binding: &Binding) -> PlatformResult<VerifyReport> {
+    binding
+        .verify_report
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()?
+        .ok_or_else(|| {
+            PlatformError::Internal(format!(
+                "the verified binding of role {} holds no report",
+                binding.role_name
+            ))
+        })
+}
+
+fn unverified(service: &Service, report: &VerifyReport, verdict: Verdict) -> PlatformError {
+    let told = format!(
+        "service {} has no verified database role, which its tenant's db_roles policy (enforce) needs before its first version runs: {}",
+        service.name,
+        match report.remediation.is_empty() {
+            true => report.failed().join(", "),
+            false => report.remediation.join(" "),
+        }
+    );
+    match verdict {
+        Verdict::Undetermined => PlatformError::Unavailable(told),
+        Verdict::Verified | Verdict::Refuted => PlatformError::Validation(told),
+    }
 }
 
 async fn in_turn<T>(
@@ -758,7 +856,7 @@ async fn apply_locked(
     platform: &deadpool_postgres::Client,
     provisioning: &Provisioning<'_>,
     change: Change<'_>,
-) -> PlatformResult<(Binding, VerifyReport)> {
+) -> PlatformResult<Result<Provisioned, Refusal>> {
     let Provisioning {
         tenant,
         service,
@@ -766,11 +864,52 @@ async fn apply_locked(
         config,
         actor,
         deploying,
+        declaration,
+        require_verified,
     } = *provisioning;
     let existing = service_db_roles::get(platform, service.id).await?;
-    let active = verify::active_manifest(platform, service.id).await?;
-    let enqueues = active.iter().chain(deploying).any(enqueue::in_session);
-    let creates = verify::creates_any(active.iter().chain(deploying));
+    let (enqueues, creates) = needs(platform, service.id, deploying).await?;
+    let newly = |role: &str| {
+        existing
+            .as_ref()
+            .is_none_or(|binding| binding.role_name != role)
+    };
+    let gated = match declaration {
+        Some(declaration) => {
+            let subject = declared::Subject {
+                tenant,
+                service,
+                config,
+                require_verified,
+                enqueues,
+                creates,
+            };
+            match declared::gates(state, platform, &subject, declaration, existing.as_ref()).await?
+            {
+                Ok(gated) => Some(gated),
+                Err(refusal) => {
+                    if refusal.gate == Gate::Readiness && newly(&declaration.role) {
+                        relinquish(state, tenant, &declaration.role, &service.name).await?;
+                    }
+                    return Ok(Err(refusal));
+                }
+            }
+        }
+        None => None,
+    };
+    if let (Some(gated), Some(binding)) = (&gated, &existing) {
+        if gated.taking == Taking::Unchanged {
+            return Ok(Ok(Provisioned {
+                report: stored_report(binding)?,
+                binding: binding.clone(),
+                taking: Some(Taking::Unchanged),
+            }));
+        }
+    }
+    let change = match (&gated, declaration) {
+        (Some(gated), Some(declaration)) => gated.change(declaration),
+        _ => change,
+    };
     let schema = service.schema();
     let target = target(existing.as_ref(), &change, policy, || {
         names::managed_role(&tenant.slug, &schema, tenant.id, service.id)
@@ -837,6 +976,9 @@ async fn apply_locked(
         statement_timeout: state.tenant_sessions.statement_timeout(),
     };
     let (_, steps) = run(&mut tenant_db, &spec).await?;
+    if gated.is_some() {
+        after_declared_grants(&tenant_db, &target.role).await?;
+    }
     drop(tenant_db);
     info!(
         tenant = %tenant.slug,
@@ -872,6 +1014,17 @@ async fn apply_locked(
     )
     .await?;
     let verdict = report.verdict();
+    if require_verified && verdict != Verdict::Verified {
+        return match &gated {
+            Some(_) => {
+                if newly(&target.role) {
+                    relinquish(state, tenant, &target.role, &service.name).await?;
+                }
+                Ok(Err(Refusal::unsettled(&report)))
+            }
+            None => Err(unverified(service, &report, verdict)),
+        };
+    }
     if verdict == Verdict::Undetermined {
         metrics::counter!("cufflink_db_role_verify_unanswered_total", "tenant" => tenant.slug.clone(), "service" => service.name.clone()).increment(1);
         warn!(
@@ -896,7 +1049,14 @@ async fn apply_locked(
             verify_report: &serde_json::to_value(&report)?,
         },
     )
-    .await?;
+    .await
+    .map_err(|e| match service_db_roles::role_taken(&e) {
+        true => PlatformError::Validation(format!(
+            "role '{}' is bound to another service; a role carries one service",
+            target.role
+        )),
+        false => PlatformError::from(e),
+    })?;
     state.tenant_sessions.forget_role(service.id);
     let tenant_db = state.tenant_sessions.platform(tenant.id, None).await?;
     enqueue::unmap_others(&tenant_db, &target.role, &service.name).await?;
@@ -921,7 +1081,11 @@ async fn apply_locked(
         ip_address: None,
     })
     .await?;
-    Ok((binding, report))
+    Ok(Ok(Provisioned {
+        binding,
+        report,
+        taking: gated.map(|gated| gated.taking),
+    }))
 }
 
 const ADMINISTRATOR: &str = "postgres";
@@ -967,6 +1131,7 @@ async fn refresh(
     entry: &TenantEntry,
     service_id: Uuid,
     deploying: Option<&ServiceManifest>,
+    require_verified: bool,
 ) -> PlatformResult<()> {
     let service = crate::repo::services::get_by_id(&state.platform_db, service_id)
         .await?
@@ -980,6 +1145,8 @@ async fn refresh(
             config: entry.config::<DbRolesConfig>(),
             actor: PLATFORM_ACTOR,
             deploying,
+            declaration: None,
+            require_verified,
         },
         Change::default(),
     )
@@ -1030,7 +1197,9 @@ async fn verified_or_not(state: &AppState, service_id: Uuid) -> bool {
 /// again for the coming version when the policy asks, so a role that may
 /// not create in the schema loses its verification before the deploy runs
 /// any statement as it. Otherwise a binding not yet verified is
-/// provisioned, when the policy asks, as before, and a failure is logged.
+/// provisioned, when the policy asks, and a failure is logged; under
+/// `enforce` the first version of a service is refused while it has no
+/// verified binding, with the reason provisioning gave.
 pub async fn before_deploy(
     state: &AppState,
     tenant_id: Uuid,
@@ -1055,17 +1224,22 @@ pub async fn before_deploy(
             })
             .await =>
         {
-            refresh(state, &entry, service_id, Some(deploying)).await
+            refresh(state, &entry, service_id, Some(deploying), false).await
         }
         (_, true, true)
             if verify::creates(deploying)
                 && !running_is(state, service_id, |active| verify::creates_any(active)).await =>
         {
-            refresh(state, &entry, service_id, Some(deploying)).await
+            refresh(state, &entry, service_id, Some(deploying), false).await
         }
         (_, false, true) => {
-            let _ = refresh(state, &entry, service_id, Some(deploying)).await;
-            Ok(())
+            let first = entry.mode(PolicyKey::DbRoles) == PolicyMode::Enforce
+                && !running_is(state, service_id, |active| active.is_some()).await;
+            let refreshed = refresh(state, &entry, service_id, Some(deploying), first).await;
+            match first {
+                true => refreshed,
+                false => Ok(()),
+            }
         }
         _ => Ok(()),
     }
@@ -1075,7 +1249,7 @@ pub async fn before_deploy(
 /// grant the service no longer needs is not taken back; verify reports it.
 pub async fn after_deploy(state: &AppState, tenant_id: Uuid, service_id: Uuid) {
     if let Some(entry) = asking(state, tenant_id).await {
-        let _ = refresh(state, &entry, service_id, None).await;
+        let _ = refresh(state, &entry, service_id, None, false).await;
     }
 }
 

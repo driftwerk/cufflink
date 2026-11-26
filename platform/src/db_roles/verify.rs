@@ -688,7 +688,7 @@ pub async fn role_facts(
     }))
 }
 
-async fn login(
+pub(crate) async fn login(
     sessions: &TenantSessions,
     tenant_id: Uuid,
     role: &str,

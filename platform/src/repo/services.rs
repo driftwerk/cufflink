@@ -188,6 +188,22 @@ pub async fn sharing_a_schema(
         .collect())
 }
 
+/// Whether a version of the service was ever activated: a service recorded
+/// by a first deploy that failed has none.
+pub async fn ever_deployed(pool: &deadpool_postgres::Pool, id: Uuid) -> PlatformResult<bool> {
+    Ok(pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM deployments WHERE service_id = $1)",
+            &[&id],
+        )
+        .await?
+        .get(0))
+}
+
+/// The services of the tenant that a version ran for and that have no
+/// verified database role: a service that never ran runs nothing.
 pub async fn without_verified_role(
     pool: &deadpool_postgres::Pool,
     tenant_id: Uuid,
@@ -200,6 +216,7 @@ pub async fn without_verified_role(
              LEFT JOIN service_db_roles r ON r.service_id = s.id
              LEFT JOIN deployments d ON d.service_id = s.id AND d.version = s.current_version
              WHERE s.tenant_id = $1 AND r.verified_at IS NULL
+               AND EXISTS (SELECT 1 FROM deployments e WHERE e.service_id = s.id)
                AND COALESCE(d.manifest->>'mode', '') NOT IN ('web', 'native')
              ORDER BY s.name",
             &[&tenant_id],

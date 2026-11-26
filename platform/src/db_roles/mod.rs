@@ -135,6 +135,8 @@ async fn apply(
             config: policies.config::<DbRolesConfig>(),
             actor,
             deploying: None,
+            declaration: None,
+            require_verified: false,
         },
         change,
     )

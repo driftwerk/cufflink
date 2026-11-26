@@ -1,4 +1,5 @@
 use crate::auth::DeployAuth;
+use crate::db_roles::declared::{self, Declaration};
 use crate::deployer::eventing::{self, EventingPlan};
 use crate::deployer::job::{self, detached, Job};
 use crate::deployer::manifest::ServiceManifest;
@@ -53,11 +54,16 @@ pub struct DeployRequest {
     pub cli_version: Option<String>,
     #[serde(default)]
     pub api_version: Option<u32>,
+    #[serde(default)]
+    pub db_role: Option<Declaration>,
 }
 
 pub const DEPLOY_API_VERSION: u32 = 1;
 
-pub(crate) const FEATURES: &[&str] = &[cufflink_types::features::INACTIVE_DEPLOY];
+pub(crate) const FEATURES: &[&str] = &[
+    cufflink_types::features::INACTIVE_DEPLOY,
+    cufflink_types::features::DB_ROLE_DECLARATIONS,
+];
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DeployQuery {
@@ -137,9 +143,46 @@ async fn claim(
         admitted.status(None)?,
     )
     .await?;
-    admitted.status(Some(service.status))?;
     let lock = acquire_deploy_lock(state, service.id, "deployment").await?;
-    Ok(Claim { service, lock })
+    match settled(state, admitted, service).await {
+        Ok(service) => Ok(Claim { service, lock }),
+        Err(e) => {
+            lock.release().await;
+            Err(e)
+        }
+    }
+}
+
+/// The status a deploy keeps: an active service that has never run (one
+/// whose first deploy failed) stops nothing, so its first deploy may ask
+/// for `inactive`. An inactive one stays inactive, as any inactive service
+/// does.
+fn kept_status(status: Status, ever_deployed: bool) -> Option<Status> {
+    match (status, ever_deployed) {
+        (Status::Active, false) => None,
+        (status, _) => Some(status),
+    }
+}
+
+async fn standing(
+    state: &AppState,
+    service: &crate::repo::services::Service,
+) -> PlatformResult<Option<Status>> {
+    let ever_deployed =
+        crate::repo::services::ever_deployed(&state.platform_db, service.id).await?;
+    Ok(kept_status(service.status, ever_deployed))
+}
+
+async fn settled(
+    state: &AppState,
+    admitted: &Admitted,
+    service: crate::repo::services::Service,
+) -> PlatformResult<crate::repo::services::Service> {
+    let status = admitted.status(standing(state, &service).await?)?;
+    if status != service.status {
+        crate::repo::services::update_status(&state.platform_db, service.id, status).await?;
+    }
+    Ok(crate::repo::services::Service { status, ..service })
 }
 
 struct Admitted {
@@ -154,6 +197,7 @@ struct Admitted {
     accept_drift: bool,
     purge: bool,
     inactive: bool,
+    declaration: Option<Declaration>,
 }
 
 impl Admitted {
@@ -206,7 +250,32 @@ impl Admitted {
             "accept_drift": self.accept_drift,
             "purge": self.purge,
             "status": status,
+            "db_role": self.declaration.as_ref().map(|declared| json!({ "role": declared.role })),
         })
+    }
+
+    fn context<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        identity: ServiceIdentity,
+        actor: &'a str,
+        commit_hash: Option<&'a str>,
+        schema: Options,
+    ) -> DeployContext<'a> {
+        DeployContext {
+            state,
+            identity,
+            manifest: &self.manifest,
+            manifest_hash: &self.manifest_hash,
+            wasm_bytes: self.wasm_bytes.as_deref(),
+            wasm_hash: self.wasm_hash.as_deref(),
+            native: self.native.as_ref(),
+            web_artifact: self.web_artifact.as_ref(),
+            commit_hash,
+            actor,
+            schema,
+            declaration: self.declaration.as_ref(),
+        }
     }
 }
 
@@ -243,6 +312,9 @@ async fn admit(
     .increment(1);
 
     validate_manifest(&manifest)?;
+    if let Some(declaration) = &req.db_role {
+        admit_declaration(state, &manifest.mode, declaration)?;
+    }
     let extensions = &state.config.extensions;
     native::allowed(extensions, &manifest.mode)?;
     let native = native::binary(
@@ -299,7 +371,43 @@ async fn admit(
         accept_drift: req.accept_drift,
         purge: req.purge,
         inactive,
+        declaration: req.db_role,
     })
+}
+
+fn admit_declaration(
+    state: &AppState,
+    mode: &ServiceMode,
+    declaration: &Declaration,
+) -> PlatformResult<()> {
+    if !mode.runs_on_platform() {
+        return Err(PlatformError::Validation(format!(
+            "db_role is declared for a service whose code runs on the platform; mode {} keeps no database role",
+            mode.as_str()
+        )));
+    }
+    declaration.admission().map_err(PlatformError::Validation)?;
+    match state.secrets.ring().has_key() {
+        true => Ok(()),
+        false => Err(PlatformError::Validation(
+            "db_role needs secret storage that seals: the platform has no key-encryption key to keep the role's password with".into(),
+        )),
+    }
+}
+
+async fn with_db_role(
+    state: &AppState,
+    service_id: Uuid,
+    mut answer: Value,
+) -> PlatformResult<Value> {
+    let binding =
+        crate::repo::service_db_roles::get(&state.platform_db.get().await?, service_id).await?;
+    answer["db_role"] = json!(binding.map(|binding| json!({
+        "role": binding.role_name,
+        "origin": binding.origin,
+        "verified": binding.verified_at.is_some(),
+    })));
+    Ok(answer)
 }
 
 fn admit_web_artifact(
@@ -355,7 +463,11 @@ async fn plan(
     let manifest = &admitted.manifest;
     let existing =
         crate::repo::services::find(&state.platform_db, user.tenant_id, &manifest.name).await?;
-    let status = admitted.status(existing.as_ref().map(|service| service.status))?;
+    let standing = match &existing {
+        Some(service) => standing(&state, service).await?,
+        None => None,
+    };
+    let status = admitted.status(standing)?;
     let (manifest_hash, wasm_hash) = (&admitted.manifest_hash, admitted.wasm_hash.as_deref());
     let (identity, version) = match &existing {
         Some(service) => (service.identity(&user.tenant_slug), service.current_version),
@@ -370,29 +482,33 @@ async fn plan(
             0,
         ),
     };
-    let ctx = DeployContext {
-        state: &state,
+    let ctx = admitted.context(
+        &state,
         identity,
-        manifest,
-        manifest_hash,
-        wasm_bytes: admitted.wasm_bytes.as_deref(),
-        wasm_hash,
-        native: admitted.native.as_ref(),
-        web_artifact: admitted.web_artifact.as_ref(),
-        commit_hash: None,
-        actor: &user.subject,
-        schema: admitted.options(true, Progress::default()),
-    };
-    let (schema, eventing, skipped) = match &existing {
+        &user.subject,
+        None,
+        admitted.options(true, Progress::default()),
+    );
+    let (schema, eventing, skipped, db_role) = match &existing {
         Some(service) => {
             let lock = acquire_deploy_lock(&state, service.id, OPERATION).await?;
-            let outcome = pipeline::run_locked(&ctx, &UploadTracker::default()).await;
+            let previewed = previewed(&state, &user, &admitted, service).await;
+            let outcome = match previewed {
+                Ok(previewed) => pipeline::run_locked(&ctx, &UploadTracker::default())
+                    .await
+                    .map(|outcome| (outcome, previewed)),
+                Err(e) => Err(e),
+            };
             lock.release().await;
-            match outcome? {
-                DeployOutcome::Planned { schema, eventing } => (*schema, eventing, false),
-                DeployOutcome::Skipped { .. } => {
-                    (SchemaReport::default(), EventingPlan::default(), true)
-                }
+            let (outcome, db_role) = outcome?;
+            match outcome {
+                DeployOutcome::Planned { schema, eventing } => (*schema, eventing, false, db_role),
+                DeployOutcome::Skipped { .. } => (
+                    SchemaReport::default(),
+                    EventingPlan::default(),
+                    true,
+                    db_role,
+                ),
                 DeployOutcome::Deployed { .. } => {
                     return Err(PlatformError::Internal(
                         "a plan deployed; nothing should have".into(),
@@ -401,11 +517,13 @@ async fn plan(
             }
         }
         None => {
+            let db_role = previewed(&state, &user, &admitted, &unrecorded(&user, manifest)).await?;
             let eventing = eventing::prepare_version(&state, manifest, &ctx.identity, 1).await?;
             (
                 crate::deployer::schema::plan(&ctx, 0, &Snapshot::default()).await?,
                 eventing,
                 false,
+                db_role,
             )
         }
     };
@@ -421,7 +539,51 @@ async fn plan(
         "native_hash": admitted.native_hash(),
         "plan": pipeline::deploy_plan(&schema, &eventing)?,
         "api_version": DEPLOY_API_VERSION,
+        "db_role": db_role,
     }))
+}
+
+/// The service a plan stands for before its first deploy records it.
+fn unrecorded(
+    user: &crate::auth::AuthUser,
+    manifest: &ServiceManifest,
+) -> crate::repo::services::Service {
+    let now = chrono::Utc::now();
+    crate::repo::services::Service {
+        id: Uuid::nil(),
+        tenant_id: user.tenant_id,
+        name: manifest.name.clone(),
+        schema_name: manifest.schema_name.clone(),
+        current_version: 0,
+        status: Status::Active,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+async fn previewed(
+    state: &AppState,
+    user: &crate::auth::AuthUser,
+    admitted: &Admitted,
+    service: &crate::repo::services::Service,
+) -> PlatformResult<Option<Value>> {
+    let Some(declaration) = &admitted.declaration else {
+        return Ok(None);
+    };
+    let previewed = declared::preview(
+        state,
+        service,
+        &user.subject,
+        &admitted.manifest,
+        declaration,
+    )
+    .await?;
+    Ok(Some(json!({
+        "role": declaration.role,
+        "taking": previewed.taking,
+        "refusals": [],
+        "failed": previewed.unready,
+    })))
 }
 
 async fn begin(
@@ -500,28 +662,18 @@ async fn perform(
 ) -> PlatformResult<Value> {
     let uploads = UploadTracker::default();
     let mode_label = admitted.mode_label();
-    let (manifest, wasm_bytes, commit_hash) = (
-        &admitted.manifest,
-        admitted.wasm_bytes.as_deref(),
-        admitted.commit_hash.as_deref(),
-    );
+    let (manifest, commit_hash) = (&admitted.manifest, admitted.commit_hash.as_deref());
     let tenant_id = user.tenant_id;
     let tenant_slug = user.tenant_slug.clone();
     let (manifest_hash, wasm_hash) = (&admitted.manifest_hash, admitted.wasm_hash.as_deref());
     let native_hash = admitted.native_hash();
-    let ctx = DeployContext {
-        state: &state,
-        identity: service.identity(&tenant_slug),
-        manifest,
-        manifest_hash,
-        wasm_bytes,
-        wasm_hash,
-        native: admitted.native.as_ref(),
-        web_artifact: admitted.web_artifact.as_ref(),
+    let ctx = admitted.context(
+        &state,
+        service.identity(&tenant_slug),
+        &user.subject,
         commit_hash,
-        actor: &user.subject,
-        schema: admitted.options(false, progress.clone()),
-    };
+        admitted.options(false, progress.clone()),
+    );
     if admitted.registers_before_building() {
         metrics::counter!("cufflink_web_legacy_deploys_total").increment(1);
     }
@@ -569,6 +721,7 @@ async fn perform(
                 "message": "No changes detected, deploy skipped",
                 "api_version": DEPLOY_API_VERSION,
             });
+            let answer = with_db_role(&state, service.id, answer).await?;
             return Ok(with_web_release(answer, &admitted, &latest, runners_told));
         }
         Ok(DeployOutcome::Deployed {
@@ -645,7 +798,7 @@ async fn perform(
         "plan": pipeline::deploy_plan(&schema, &eventing)?,
     });
     Ok(with_web_release(
-        answer,
+        with_db_role(&state, service.id, answer).await?,
         &admitted,
         &deployment,
         runners_told,
@@ -1203,6 +1356,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_active_service_that_never_ran_takes_the_status_its_first_deploy_asks_for() {
+        use ServiceMode::Wasm;
+        let first = |status, inactive| admitted_status(kept_status(status, false), &Wasm, inactive);
+        assert_eq!(first(Status::Active, true), Ok(Status::Inactive));
+        assert_eq!(first(Status::Active, false), Ok(Status::Active));
+        assert_eq!(
+            first(Status::Inactive, false),
+            Ok(Status::Inactive),
+            "an inactive one stays so until it is enabled"
+        );
+        assert_eq!(kept_status(Status::Active, true), Some(Status::Active));
+        assert_eq!(kept_status(Status::Inactive, true), Some(Status::Inactive));
+    }
+
+    #[test]
+    fn a_deploy_job_keeps_the_declared_role_and_never_its_password() {
+        let declared = Admitted {
+            declaration: Some(
+                serde_json::from_value(
+                    json!({"role": "catalog_service_user", "password": "hunter2"}),
+                )
+                .expect("a declaration"),
+            ),
+            ..admitted(None)
+        };
+        let request = declared.request(Status::Active);
+        assert_eq!(request["db_role"], json!({"role": "catalog_service_user"}));
+        assert!(!request.to_string().contains("hunter2"));
+        assert_eq!(
+            admitted(None).request(Status::Active)["db_role"],
+            Value::Null
+        );
+    }
+
     fn admitted_status(
         existing: Option<Status>,
         mode: &ServiceMode,
@@ -1428,6 +1616,7 @@ mod tests {
             accept_drift: false,
             purge: false,
             inactive: false,
+            declaration: None,
         }
     }
 
