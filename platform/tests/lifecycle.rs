@@ -602,6 +602,7 @@ fn all_migrations() -> Vec<(i32, String)> {
         (8, "tenant_buckets".to_string()),
         (9, "web_uploads".to_string()),
         (10, "web_upload_parts".to_string()),
+        (11, "declared_db_roles".to_string()),
     ]
 }
 
