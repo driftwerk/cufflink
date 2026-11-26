@@ -863,7 +863,7 @@ async fn apply_locked(
         service,
         &Candidate {
             role: &target.role,
-            managed: target.origin.managed(),
+            origin: target.origin,
             enqueues,
             creates,
             read_only_role: target.read_only_role.as_deref(),

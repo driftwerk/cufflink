@@ -2,7 +2,7 @@ use crate::db_roles::enqueue::{self, Enqueue, CUFFLINK_SCHEMA};
 use crate::db_roles::login_pools;
 use crate::deployer::manifest::{ServiceManifest, TableDefinition};
 use crate::errors::PlatformResult;
-use crate::repo::service_db_roles::Binding;
+use crate::repo::service_db_roles::{Binding, Origin};
 use crate::repo::services::Service;
 use crate::repo::tenants;
 use crate::secrets::{SecretBox, SecretString, DB_ROLE_PASSWORD};
@@ -201,12 +201,118 @@ pub struct Facts {
     pub tables: Vec<(String, bool, bool)>,
     pub read_only: Option<(bool, bool)>,
     pub cufflink: Option<(bool, Enqueue)>,
+    pub reach: Option<Reach>,
+}
+
+/// Whose objects and memberships a role reaches beyond its service's
+/// schema, read for a role the platform did not make.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reach {
+    pub memberships: Vec<String>,
+    pub objects: Vec<Reached>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reached {
+    pub here: bool,
+    pub place: String,
+    pub kind: Option<String>,
+    pub identity: Option<String>,
+}
+
+/// The checks that do not depend on what the platform grants the role
+/// itself: those a role must pass before it is granted anything.
+pub const READINESS: [&str; 6] = [
+    "platform_membership",
+    "database_connect",
+    "schema",
+    "public_schema",
+    "table",
+    "read_only_role",
+];
+
+const NAMED_OBJECTS: usize = 20;
+
+impl Reach {
+    pub fn named(&self) -> impl Iterator<Item = String> + '_ {
+        self.objects
+            .iter()
+            .filter(|object| object.here)
+            .filter_map(|object| {
+                Some(format!(
+                    "{} {}",
+                    object.kind.as_deref()?,
+                    object.identity.as_deref()?
+                ))
+            })
+    }
+
+    pub fn elsewhere(&self) -> usize {
+        self.objects.iter().filter(|object| !object.here).count()
+    }
+
+    /// What the role reaches, naming the session database's objects, up to
+    /// [`NAMED_OBJECTS`], and counting the rest.
+    pub fn described(&self) -> Option<String> {
+        let named: Vec<String> = self.named().collect();
+        let unnamed = named.len().saturating_sub(NAMED_OBJECTS);
+        let parts: Vec<String> = named
+            .iter()
+            .take(NAMED_OBJECTS)
+            .cloned()
+            .chain((unnamed > 0).then(|| format!("{unnamed} more")))
+            .chain(
+                (self.elsewhere() > 0)
+                    .then(|| format!("{} objects outside this database", self.elsewhere())),
+            )
+            .collect();
+        (!parts.is_empty()).then(|| format!("the role reaches {}", parts.join(", ")))
+    }
+}
+
+fn beyond(check: &str, origin: Origin, found: Option<(String, Option<String>)>) -> Check {
+    match (found, origin) {
+        (None, _) => Check::passed(check),
+        (Some((detail, remedy)), Origin::Declared) => Check::failed(check, detail, remedy),
+        (Some((detail, remedy)), Origin::Admin | Origin::Platform) => Check {
+            excess: true,
+            detail: Some(detail),
+            remedy,
+            ..Check::passed(check)
+        },
+    }
+}
+
+pub fn reach_checks(expected: &Expected<'_>, reach: &Reach) -> [Check; 2] {
+    let role = quote_ident(expected.role);
+    let memberships = (!reach.memberships.is_empty()).then(|| {
+        (
+            format!("the role is a member of {}", reach.memberships.join(", ")),
+            Some(format!(
+                "REVOKE {} FROM {role};",
+                reach
+                    .memberships
+                    .iter()
+                    .map(|held| quote_ident(held))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        )
+    });
+    [
+        beyond("declared_memberships", expected.origin, memberships),
+        beyond(
+            "confined",
+            expected.origin,
+            reach.described().map(|detail| (detail, None)),
+        ),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected<'a> {
     pub role: &'a str,
-    pub managed: bool,
+    pub origin: Origin,
     pub enqueues: bool,
     /// Whether the platform may run DDL in the service's schema as the
     /// role ([`creates`]); when it never does, USAGE is all the role needs.
@@ -302,7 +408,7 @@ fn role_checks(expected: &Expected<'_>, facts: &RoleFacts) -> [Check; 4] {
 fn credentials_check(expected: &Expected<'_>, login: Option<&Probe>) -> Check {
     let new_password = || {
         Some(
-            match expected.managed {
+            match expected.origin.managed() {
                 true => "cufflink services db-role rotate <tenant> <service>",
                 false => "cufflink services db-role set <tenant> <service> --password-stdin",
             }
@@ -390,7 +496,7 @@ fn schema_checks(expected: &Expected<'_>, held: Option<(bool, bool)>) -> Vec<Che
                 Some(format!("GRANT USAGE ON SCHEMA {schema} TO {role};")),
             )
         }))
-        .chain((!expected.managed).then(|| {
+        .chain((!expected.origin.managed()).then(|| {
             Check::excess("schema_create_unneeded", create, || {
                 (
                     format!(
@@ -486,6 +592,12 @@ pub fn report(expected: &Expected<'_>, facts: &Facts, now: DateTime<Utc>) -> Ver
         .cufflink
         .map(|granted| cufflink_checks(expected, granted))
         .unwrap_or_default();
+    let beyond_schema = facts
+        .reach
+        .as_ref()
+        .map(|reach| reach_checks(expected, reach))
+        .into_iter()
+        .flatten();
     VerifyReport::of(
         expected.role,
         facts.server_version_num,
@@ -498,6 +610,7 @@ pub fn report(expected: &Expected<'_>, facts: &Facts, now: DateTime<Utc>) -> Ver
             .chain(tables)
             .chain(read_only)
             .chain(cufflink)
+            .chain(beyond_schema)
             .collect(),
     )
 }
@@ -635,6 +748,7 @@ pub async fn facts(
                 .collect(),
             read_only: read_only_role.map(|_| (false, false)),
             cufflink: None,
+            reach: None,
         });
     };
     let folded = folded(schema);
@@ -723,6 +837,57 @@ pub async fn facts(
             )),
             false => None,
         },
+        reach: match expected.origin {
+            Origin::Platform => None,
+            Origin::Admin | Origin::Declared => {
+                Some(reach(client, role, &folded, read_only_role).await?)
+            }
+        },
+    })
+}
+
+pub async fn reach(
+    client: &impl GenericClient,
+    role: &str,
+    schema: &str,
+    read_only_role: Option<&str>,
+) -> Result<Reach, tokio_postgres::Error> {
+    let memberships = client
+        .query(
+            "WITH RECURSIVE held(oid) AS (
+                 SELECT m.roleid FROM pg_auth_members m
+                 JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = $1
+                 UNION
+                 SELECT m.roleid FROM pg_auth_members m JOIN held ON m.member = held.oid)
+             SELECT r.rolname::text FROM held JOIN pg_roles r ON r.oid = held.oid
+             WHERE r.rolname IS DISTINCT FROM $2::name
+             ORDER BY 1",
+            &[&role, &read_only_role],
+        )
+        .await?;
+    let objects = client
+        .query(
+            cufflink_pgcodec::roles::REACH_OF_THE_ROLE,
+            &[
+                &role,
+                &schema,
+                &enqueue::OWN,
+                &enqueue::SHARED,
+                &CUFFLINK_SCHEMA,
+            ],
+        )
+        .await?;
+    Ok(Reach {
+        memberships: memberships.iter().map(|row| row.get(0)).collect(),
+        objects: objects
+            .iter()
+            .map(|row| Reached {
+                here: row.get(0),
+                place: row.get(1),
+                kind: row.get(2),
+                identity: row.get(3),
+            })
+            .collect(),
     })
 }
 
@@ -794,7 +959,7 @@ pub async fn inspect(
     let schema = service.schema();
     let expected = Expected {
         role: binding.role,
-        managed: binding.managed,
+        origin: binding.origin,
         enqueues: binding.enqueues,
         creates: binding.creates,
         service: &service.name,
@@ -827,7 +992,7 @@ pub async fn inspect(
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate<'a> {
     pub role: &'a str,
-    pub managed: bool,
+    pub origin: Origin,
     pub enqueues: bool,
     pub creates: bool,
     pub read_only_role: Option<&'a str>,
@@ -863,13 +1028,14 @@ mod tests {
             tables: vec![("loans".into(), true, true)],
             read_only: Some((true, true)),
             cufflink: Some((true, Enqueue::Shared { execute: true })),
+            reach: None,
         }
     }
 
     fn expected() -> Expected<'static> {
         Expected {
             role: "loan_service_user",
-            managed: false,
+            origin: Origin::Admin,
             enqueues: true,
             creates: true,
             service: "loan-service",
@@ -1040,7 +1206,7 @@ mod tests {
         );
         let owned = report(
             &Expected {
-                managed: true,
+                origin: Origin::Platform,
                 ..reader
             },
             &all_good(),
@@ -1218,7 +1384,7 @@ mod tests {
                 == Some("cufflink services db-role set <tenant> <service> --password-stdin")));
         let managed = super::report(
             &Expected {
-                managed: true,
+                origin: Origin::Platform,
                 ..expected()
             },
             &facts,
@@ -1431,5 +1597,115 @@ mod tests {
             now(),
         );
         assert_eq!(served.failed(), ["table"], "the served table is refuted");
+    }
+
+    fn reaching() -> Reach {
+        let here = |kind: &str, identity: &str| Reached {
+            here: true,
+            place: "tenant_harbor".into(),
+            kind: Some(kind.into()),
+            identity: Some(identity.into()),
+        };
+        Reach {
+            memberships: vec!["pg_read_all_data".into()],
+            objects: vec![
+                here("table", "catalog_service.items"),
+                here("function", "public.f()"),
+                Reached {
+                    here: false,
+                    place: "tenant_orchard".into(),
+                    kind: None,
+                    identity: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn what_a_declared_role_reaches_beyond_its_schema_fails_it() {
+        let declared = report(
+            &Expected {
+                origin: Origin::Declared,
+                ..expected()
+            },
+            &Facts {
+                reach: Some(reaching()),
+                ..all_good()
+            },
+            now(),
+        );
+        assert!(!declared.verified);
+        assert_eq!(declared.failed(), ["declared_memberships", "confined"]);
+        let confined = &declared.checks[declared.checks.len() - 1];
+        assert_eq!(
+            confined.detail.as_deref(),
+            Some(
+                "the role reaches table catalog_service.items, function public.f(), \
+                 1 objects outside this database"
+            )
+        );
+        assert!(
+            !confined
+                .detail
+                .iter()
+                .any(|detail| detail.contains("tenant_orchard")),
+            "another database is counted, never named"
+        );
+        assert_eq!(
+            declared.checks[declared.checks.len() - 2].remedy.as_deref(),
+            Some("REVOKE \"pg_read_all_data\" FROM \"loan_service_user\";")
+        );
+    }
+
+    #[test]
+    fn what_an_admins_role_reaches_beyond_its_schema_is_excess() {
+        let admin = report(
+            &expected(),
+            &Facts {
+                reach: Some(reaching()),
+                ..all_good()
+            },
+            now(),
+        );
+        assert!(admin.verified, "{admin:?}");
+        assert!(admin
+            .checks
+            .iter()
+            .filter(|c| ["declared_memberships", "confined"].contains(&c.check.as_str()))
+            .all(|c| c.ok && c.excess));
+        assert!(!admin
+            .remediation
+            .iter()
+            .any(|r| r.contains("pg_read_all_data")));
+        let nothing = report(
+            &Expected {
+                origin: Origin::Declared,
+                ..expected()
+            },
+            &Facts {
+                reach: Some(Reach::default()),
+                ..all_good()
+            },
+            now(),
+        );
+        assert!(nothing.verified, "{nothing:?}");
+    }
+
+    #[test]
+    fn past_twenty_objects_the_rest_are_counted() {
+        let many = Reach {
+            memberships: vec![],
+            objects: (0..23)
+                .map(|n| Reached {
+                    here: true,
+                    place: "tenant_harbor".into(),
+                    kind: Some("table".into()),
+                    identity: Some(format!("public.t{n}")),
+                })
+                .collect(),
+        };
+        let described = many.described().unwrap_or_default();
+        assert!(described.contains("public.t19") && !described.contains("public.t20"));
+        assert!(described.ends_with("3 more"), "{described}");
     }
 }
