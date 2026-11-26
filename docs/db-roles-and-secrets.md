@@ -360,14 +360,24 @@ the binding's alone: `[secrets]` may not map it, since the guest reads its
 config, and `config apply` counts it as referenced. A CLI of v0.41.0 or
 later is needed; an older one ignores the table.
 
-`cufflink deploy` and `cufflink deploy --bundle` refuse the declaration
-before building or sending anything when `[service].name` differs, when the
-manifest's mode keeps no database role (`native`, `web`), when the platform
-does not advertise `db_role_declarations`, or when the vault holds no such
-entry. The password goes from the vault into the request's bytes alone and
-is wiped once they are sent; the copy the HTTP client makes is beyond the
-CLI's reach. The deploy prints the role it is bound to, and `--plan` what
-the deploy would take and which checks would fail:
+`cufflink deploy` and `cufflink deploy --bundle` check the declaration in
+this order, and send nothing while one check refuses it:
+
+1. Once the platform has answered its version, before anything is built:
+   `[service].name` is set, and the platform advertises
+   `db_role_declarations`.
+2. Once the manifest is known, before the module is built: `[service].name`
+   is the manifest's name, and its mode keeps a database role (`native` and
+   `web` do not; a web app is refused before anything is asked).
+3. Once the module is built, just before the request: the vault holds the
+   entry and it can be read.
+
+The password goes from the vault into the request's body alone, written
+once into a buffer of its exact length, and that buffer is handed to the
+HTTP client without a copy and wiped once the request is done with. What
+the HTTP client and the operating system copy of it while sending is
+beyond the CLI's reach. The deploy prints the role it is bound to, and
+`--plan` what the deploy would take and which checks would fail:
 
 ```text
   Database role:  catalog_service_user (declared by the service, verified)
