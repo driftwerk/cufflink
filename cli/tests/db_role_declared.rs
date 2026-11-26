@@ -35,6 +35,7 @@ struct World {
     db: TestDb,
     platform: PlatformProcess,
     tenant: Tenant,
+    admin: String,
     role: String,
     root: tempfile::TempDir,
 }
@@ -56,12 +57,14 @@ impl World {
         .await;
         platform.wait_ready().await;
         let tenant = db.mint_tenant().await;
+        let admin = db.mint_admin_key().await;
         let role = db.role("loan_service_user");
         let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory");
         let world = Self {
             db,
             platform,
             tenant,
+            admin,
             role,
             root,
         };
@@ -99,13 +102,12 @@ impl World {
     }
 
     async fn allow(&self) {
-        let admin = format!("ApiKey {}", self.db.mint_admin_key().await);
         let (status, body) = self
             .platform
             .send(
                 Method::PUT,
                 &format!("/api/tenants/{}/policies", self.tenant.slug),
-                &admin,
+                &format!("ApiKey {}", self.admin),
                 Some(&json!({"policies": {"db_roles": {
                     "mode": "enforce",
                     "config": {"declared_roles": [self.role]},
@@ -177,7 +179,19 @@ impl World {
         std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).expect("mode");
     }
 
+    fn bundle(&self) -> String {
+        self.root
+            .path()
+            .join("loan-service.bundle")
+            .display()
+            .to_string()
+    }
+
     fn run(&self, arguments: &[&str]) -> Ran {
+        self.run_in(&self.project(), arguments)
+    }
+
+    fn run_in(&self, dir: &std::path::Path, arguments: &[&str]) -> Ran {
         let path = format!(
             "{}:{}",
             self.tools().display(),
@@ -185,10 +199,11 @@ impl World {
         );
         let output = Command::new(env!("CARGO_BIN_EXE_cufflink"))
             .args(arguments)
-            .current_dir(self.project())
+            .current_dir(dir)
             .env("PATH", path)
             .env("HOME", self.root.path())
             .env("CUFFLINK_API_KEY", &self.tenant.api_key)
+            .env_remove("CUFFLINK_PLATFORM_API_KEY")
             .env_remove("CUFFLINK_SECRETS_KEY")
             .output()
             .expect("the cufflink binary runs");
@@ -210,6 +225,40 @@ impl World {
         let (status, body) = self.platform.api_get(&self.tenant, "/api/services").await;
         assert_eq!(status, 200, "{body}");
         body["services"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn shown(&self) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_cufflink"))
+            .args([
+                "services",
+                "db-role",
+                "--api-url",
+                &self.platform.base_url,
+                "show",
+            ])
+            .args([self.tenant.slug.as_str(), SERVICE])
+            .current_dir(self.root.path())
+            .env("HOME", self.root.path())
+            .env("CUFFLINK_PLATFORM_API_KEY", &self.admin)
+            .output()
+            .expect("the cufflink binary runs");
+        assert!(output.status.success(), "db-role show: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    async fn audited(&self, action: &str) -> i64 {
+        self.db
+            .pool()
+            .get()
+            .await
+            .expect("checkout")
+            .query_one(
+                "SELECT count(*) FROM audit_log WHERE action = $1",
+                &[&action],
+            )
+            .await
+            .expect("audit")
+            .get(0)
     }
 
     async fn declared_bindings(&self) -> i64 {
@@ -259,23 +308,61 @@ async fn a_deploy_declares_the_role_its_environment_names_with_the_vaults_passwo
     );
     assert_eq!(world.declared_bindings().await, 0, "a plan binds nothing");
 
-    let deployed = world.run(&["deploy"]).ok("deploy");
+    let bundle = world.bundle();
+    world
+        .run(&["build", "--bundle", &bundle])
+        .ok("build --bundle");
+    let bound = format!(
+        "  Database role:  {} (declared by the service, verified)",
+        world.role
+    );
+    let deployed = world
+        .run(&["deploy", "--bundle", &bundle])
+        .ok("deploy --bundle");
     assert_eq!(
         line_of(&deployed, "  Database role:"),
-        Some(
-            format!(
-                "  Database role:  {} (declared by the service, verified)",
-                world.role
-            )
-            .as_str()
-        ),
+        Some(bound.as_str()),
         "{deployed}"
     );
-    assert_eq!(world.declared_bindings().await, 1);
     assert!(!deployed.contains("note:"), "{deployed}");
+    assert_eq!(world.declared_bindings().await, 1);
+    let shown = world.shown();
+    assert!(
+        shown.starts_with(&format!(
+            "{}/{SERVICE}: role {} (declared by the service, password stored)\n  verified at ",
+            world.tenant.slug, world.role
+        )),
+        "{shown}"
+    );
+    let (status, body) = world
+        .platform
+        .send(
+            Method::POST,
+            &format!("/svc/{}/{SERVICE}/loans", world.tenant.slug),
+            &format!("ApiKey {}", world.tenant.api_key),
+            Some(&json!({"amount": "1200"})),
+        )
+        .await;
+    assert!(status < 300, "the declared role serves: {status} {body}");
+
+    let again = world
+        .run(&["deploy", "--bundle", &bundle])
+        .ok("a second deploy");
+    assert_eq!(
+        line_of(&again, "  Database role:"),
+        Some(bound.as_str()),
+        "{again}"
+    );
+    assert_eq!(
+        world.audited("db_role.declare").await,
+        1,
+        "the same role and password are taken as they are"
+    );
 
     world.write_project(false);
-    let undeclared = world.run(&["deploy"]).ok("a deploy that declares no role");
+    let undeclared = world
+        .run(&["deploy", "--bundle", &bundle])
+        .ok("a deploy that declares no role");
     assert_eq!(
         line_of(&undeclared, "  note:"),
         Some(
@@ -305,6 +392,23 @@ async fn a_declared_role_is_never_sent_for_another_service_or_handed_to_its_code
             "[environments.test.db_role] needs [service].name = \"{SERVICE}\""
         )),
         "{foreign}"
+    );
+
+    std::fs::write(
+        &toml,
+        declaring.replace(&format!("name = \"{SERVICE}\"\n"), ""),
+    )
+    .expect("Cufflink.toml");
+    let nested = world.project().join("nested");
+    std::fs::create_dir_all(&nested).expect("directory");
+    let unnamed = world
+        .run_in(&nested, &["deploy"])
+        .failed("a parent's Cufflink.toml that names no service");
+    assert!(
+        unnamed.contains(&format!(
+            "[environments.test.db_role] needs [service].name = \"{SERVICE}\""
+        )),
+        "{unnamed}"
     );
 
     std::fs::write(
