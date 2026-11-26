@@ -192,6 +192,60 @@ by the tenant, which a platform administrator grants
 or `PUT /api/tenants/{slug}/nats-claims`). A subject another tenant claims
 cannot be subscribed to or published on.
 
+### Claiming streams by prefix
+
+A stream claim is either a name or a stem followed by `*`:
+
+```sh
+cufflink tenants nats-claims set harbor --subject 'catalog.>' --stream 'CATALOG_*' --stream CATALOG_LEGACY
+```
+
+- **A name is an adoption.** `CATALOG_LEGACY` is the tenant's, whoever made
+  it, as every stream claim was before prefixes.
+- **A prefix is an allocation.** `CATALOG_*` admits a stream only once the
+  current version of one of the tenant's services declares it in `streams`,
+  whatever that service's status. A service that declares `CATALOG_EVENTS`
+  deploys and creates it without a claim of its own. A stream made under
+  the prefix in any other way cannot be bound until such a service
+  declares it, or the administrator claims it by name.
+- **Order of deploys.** A subscriber of a stream held through a prefix alone
+  is refused until the service declaring the stream deploys: `stream
+  'CATALOG_EVENTS' is claimed only through 'CATALOG_*' and no service of
+  this tenant declares it yet; deploy the service that declares it first,
+  or claim it by name`. An inactive declaring service counts.
+- **A version that stops declaring a stream** leaves it on the server, and
+  running subscribers keep their consumers. Once no current version
+  declares it, a subscriber holding it through a prefix alone is refused at
+  its next deploy. A subscriber holding it by name is not.
+
+The rules for a prefix:
+
+- The stem is a stream name (`A-Z`, `0-9`, `_`) of at most 63 characters.
+- A stem may neither begin nor be begun by `DW_`, `CUFFLINK_` (the
+  platform's streams), `KV_` or `OBJ_` (JetStream's key-value and object
+  stores), so `K*` and `O*` are refused too.
+- Across tenants, two stream claims collide when either admits the other's
+  name, or when one stem begins the other: `CATALOG_*` is refused while
+  another tenant claims `CATALOG_EVENTS` or `CATALOG_X*`, and the other way
+  round (409).
+- Within one tenant, a prefix that another of its prefixes covers is
+  refused (`streams: 'CATALOG_X*' is covered by 'CATALOG_*'`, 422). A name
+  beside the prefix that covers it is not: it adopts a stream no service
+  declares.
+- Setting a prefix checks the streams that exist under it, whether the
+  prefix is new or already held. Each must be declared by one of the
+  tenant's services or claimed by name in the same request. Otherwise the
+  put is refused with 409, naming those streams. Adopt each by naming it,
+  or have its owner claim or remove it. When JetStream cannot be reached
+  the put answers 503 and changes nothing.
+- A put that would leave a running service bound to a stream it no longer
+  holds is refused with 409, as for any claim. Replacing names with a
+  prefix strands a subscriber of a stream that no service declares unless
+  the name is kept beside the prefix.
+
+A platform older than v0.41.0 refuses `CATALOG_*` as an invalid stream
+name, so no feature is advertised for prefixes.
+
 ## Publishing with acknowledgements
 
 `nats::publish` is fire-and-forget. With the `nats-publish-v2` feature a

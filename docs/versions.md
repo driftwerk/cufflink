@@ -1460,6 +1460,24 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   `strict_filters` policy), `CUFFLINK_HTTP_PROFILE=hardened`, scoped tables,
   partner keys, `db-v2`, the cache, service calls, `TENANT_DB_POOLER`.
 
+## Changes in v0.41.0
+
+- **Stream claims by prefix.** An administrator may claim `CATALOG_*`,
+  which admits the streams the tenant's services declare under it
+  ([claiming streams by prefix](subscriptions.md#claiming-streams-by-prefix)).
+  Setting one checks the live streams under it and answers 503 while
+  JetStream cannot be reached. A deploy reads the declared streams from the
+  platform database while its tenant holds a prefix; tenants without one see
+  no change. An older platform refuses `CATALOG_*` as an invalid stream
+  name, and the deploy credential still cannot write claims.
+- **Rolling back below v0.41.0 with a prefix claimed.** An older platform
+  reads `CATALOG_*` as a stream named so, which admits nothing: a subscriber
+  held through it is refused at its next deploy, and the older platform
+  does not hold other tenants' names clear of the stem. Before rolling any
+  replica back, replace each prefix with the names of the streams it admits
+  (`cufflink tenants nats-claims show <slug>` lists the claims, and the
+  tenant's manifests their streams).
+
 ## Changes in v0.40.6
 
 The platform streams the single web upload into object storage as it
