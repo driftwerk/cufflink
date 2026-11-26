@@ -191,7 +191,10 @@ async fn a_prefix_admits_the_streams_the_tenants_services_declare() {
 
     let outside = format!("RECEIPTS{}", &test.stem["CATALOG".len()..]);
     let (status, body) = test
-        .deploy(&test.declaring("receipt-service", &outside, "receipts"), false)
+        .deploy(
+            &test.declaring("receipt-service", &outside, "receipts"),
+            false,
+        )
         .await;
     assert_eq!(status, 422, "a stream outside the prefix: {body}");
     assert!(!test.exists(&outside).await);
@@ -201,8 +204,11 @@ async fn a_prefix_admits_the_streams_the_tenants_services_declare() {
         .await;
     assert_eq!(status, 422, "{body}");
     assert!(
-        body.to_string()
-            .contains(&format!("'{}X*' is covered by '{}'", test.stem, test.prefix())),
+        body.to_string().contains(&format!(
+            "'{}X*' is covered by '{}'",
+            test.stem,
+            test.prefix()
+        )),
         "{body}"
     );
     assert_eq!(test.claimed().await, json!([test.prefix()]));
@@ -218,7 +224,10 @@ async fn a_prefix_is_refused_over_streams_that_are_not_the_tenants() {
     let (status, body) = test.put(&orchard, std::slice::from_ref(&events)).await;
     assert_eq!(status, 200, "{body}");
     let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
-    assert_eq!(status, 409, "another tenant's stream under the prefix: {body}");
+    assert_eq!(
+        status, 409,
+        "another tenant's stream under the prefix: {body}"
+    );
     assert!(
         body.to_string().contains(&orchard.slug),
         "an administrator is told whose: {body}"
@@ -234,7 +243,11 @@ async fn a_prefix_is_refused_over_streams_that_are_not_the_tenants() {
         body.to_string().contains(&format!("'{old}'")),
         "the stream is named: {body}"
     );
-    assert_eq!(test.claimed().await, json!([]), "a refused put changes nothing");
+    assert_eq!(
+        test.claimed().await,
+        json!([]),
+        "a refused put changes nothing"
+    );
 
     let (status, body) = test.put(&test.harbor, &[test.prefix(), old.clone()]).await;
     assert_eq!(status, 200, "adopted by name beside the prefix: {body}");
@@ -264,11 +277,17 @@ async fn a_put_that_swaps_names_for_a_prefix_strands_what_no_manifest_declares()
     let (status, body) = test
         .put(&test.harbor, &[test.prefix(), legacy.clone()])
         .await;
-    assert_eq!(status, 200, "a live stream adopted beside the prefix: {body}");
+    assert_eq!(
+        status, 200,
+        "a live stream adopted beside the prefix: {body}"
+    );
     let (status, body) = test
         .deploy(&test.subscriber("loan-service", &legacy, "legacy"), false)
         .await;
-    assert_eq!(status, 200, "a subscription binds the adopted stream: {body}");
+    assert_eq!(
+        status, 200,
+        "a subscription binds the adopted stream: {body}"
+    );
 
     let (status, body) = test
         .put(&test.harbor, &[events.clone(), legacy.clone()])
@@ -282,8 +301,7 @@ async fn a_put_that_swaps_names_for_a_prefix_strands_what_no_manifest_declares()
     let (status, body) = test.put(&test.harbor, &[test.prefix()]).await;
     assert_eq!(status, 409, "{body}");
     assert!(
-        body.to_string().contains("service 'loan-service'")
-            && body.to_string().contains(&legacy),
+        body.to_string().contains("service 'loan-service'") && body.to_string().contains(&legacy),
         "the subscriber of the stream no manifest declares is stranded: {body}"
     );
     let (status, body) = test
