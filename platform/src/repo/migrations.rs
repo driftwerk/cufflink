@@ -215,6 +215,7 @@ mod tests {
                 (8, "tenant_buckets"),
                 (9, "web_uploads"),
                 (10, "web_upload_parts"),
+                (11, "declared_db_roles"),
             ]
         );
     }

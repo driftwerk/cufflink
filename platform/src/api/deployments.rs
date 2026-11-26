@@ -382,7 +382,7 @@ fn admit_declaration(
 ) -> PlatformResult<()> {
     if !mode.runs_on_platform() {
         return Err(PlatformError::Validation(format!(
-            "db_role is declared for a service whose code runs on the platform; mode {} keeps no database role",
+            "db_role is for a service whose code runs on the platform; mode {} keeps no database role",
             mode.as_str()
         )));
     }
