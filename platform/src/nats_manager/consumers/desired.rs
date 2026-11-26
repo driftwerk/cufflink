@@ -6,7 +6,7 @@ use super::plan::{
 use super::LoopKey;
 use crate::deployer::manifest::{ServiceManifest, SubscriptionDefinition};
 use crate::deployer::validator::{subscription_scope_violation, SHARED_STREAMS};
-use crate::errors::PlatformError;
+use crate::errors::{PlatformError, PlatformResult};
 use crate::nats_manager::events::SCHEDULES_STREAM;
 use crate::nats_manager::stream_index::{StreamEntry, StreamSnapshot};
 use crate::nats_manager::subjects::{resolve_subject, tenant_stream_config, Namespace};
@@ -351,14 +351,9 @@ pub async fn deploying(
     tenant_id: Uuid,
     tenant_slug: &str,
     manifest: &ServiceManifest,
-) -> Result<Namespace, WantsError> {
+) -> PlatformResult<Namespace> {
     let claimed = claimed(state, tenant_id, tenant_slug).await?;
-    crate::repo::deployments::declaring(&state.platform_db, tenant_id, claimed, manifest)
-        .await
-        .map_err(|e| WantsError::ClaimsUnread {
-            tenant: tenant_slug.to_string(),
-            reason: e.to_string(),
-        })
+    crate::repo::deployments::declaring(&state.platform_db, tenant_id, claimed, manifest).await
 }
 
 fn placements_of_service(

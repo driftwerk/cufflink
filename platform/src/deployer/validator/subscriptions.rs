@@ -92,14 +92,13 @@ pub fn subscription_scope_violation(
     }
     sub.stream
         .as_deref()
-        .filter(|stream| {
-!namespace.binds_stream(stream) && !SHARED_STREAMS.contains(stream)
-        })
+        .filter(|stream| !namespace.binds_stream(stream) && !SHARED_STREAMS.contains(stream))
         .map(|stream| {
             undeclared(namespace, stream).map_or_else(
                 || {
                     format!(
-                        "Subscription '{}': stream '{stream}' belongs to another tenant (this tenant's is {})",
+                        "Subscription '{}': stream '{stream}' belongs to another tenant \
+                         (this tenant's is {})",
                         sub.handler,
                         namespace.own_stream()
                     )
