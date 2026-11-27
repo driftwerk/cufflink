@@ -27,7 +27,14 @@ pub async fn list(
         .refresh(&state.jetstream)
         .await
         .map_err(|e| PlatformError::Unavailable(format!("JetStream is not reachable: {e}")))?;
-    let wanted = desired::of_service(&state, &identity, &registered.manifest, &streams).await?;
+    let namespace = desired::namespace_of(&state, &identity).await?;
+    let wanted = desired::of_service(
+        &state,
+        &identity,
+        &registered.manifest,
+        &namespace,
+        &streams,
+    )?;
     let running = state.subscription_tasks.running();
 
     let mut consumers = Vec::with_capacity(wanted.len());

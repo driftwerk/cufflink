@@ -3,7 +3,7 @@ use crate::deployer::manifest::{ServiceManifest, SubscriptionDefinition};
 use crate::errors::PlatformError;
 use crate::nats_manager::consumers::naming::legacy;
 use crate::nats_manager::subjects::{
-    patterns_overlap, resolve_subject, subject_matches, Claim, Namespace,
+    patterns_overlap, resolve_subject, subject_matches, Namespace,
 };
 use cufflink_types::manifest::validate::validate_subscription_delivery;
 use cufflink_types::HandlerType;
@@ -92,14 +92,29 @@ pub fn subscription_scope_violation(
     }
     sub.stream
         .as_deref()
-        .filter(|stream| !namespace.has_stream(stream) && !SHARED_STREAMS.contains(stream))
+        .filter(|stream| !namespace.binds_stream(stream) && !SHARED_STREAMS.contains(stream))
         .map(|stream| {
-            format!(
-                "Subscription '{}': stream '{stream}' belongs to another tenant (this tenant's is {})",
-                sub.handler,
-                namespace.own_stream()
+            undeclared(namespace, stream).map_or_else(
+                || {
+                    format!(
+                        "Subscription '{}': stream '{stream}' belongs to another tenant \
+                         (this tenant's is {})",
+                        sub.handler,
+                        namespace.own_stream()
+                    )
+                },
+                |why| format!("Subscription '{}': {why}", sub.handler),
             )
         })
+}
+
+fn undeclared(namespace: &Namespace, stream: &str) -> Option<String> {
+    namespace.undeclared_under(stream).map(|prefix| {
+        format!(
+            "stream '{stream}' is claimed only through '{prefix}' and no service of this tenant \
+             declares it yet; deploy the service that declares it first, or claim it by name"
+        )
+    })
 }
 
 fn shared_binding_violation(service_name: &str, sub: &SubscriptionDefinition) -> Option<String> {
@@ -123,13 +138,15 @@ fn stream_scope_violation(
     stream: &StreamDefinition,
     namespace: &Namespace,
 ) -> Option<String> {
-    let claimed = namespace
-        .claims()
-        .any(|claim| claim == Claim::stream(stream.name.as_str()));
-    if !claimed {
-        return Some(format!(
-            "streams[{index}].name: '{}' is not a stream this tenant claims",
-            stream.name
+    if !namespace.admits_stream(&stream.name) {
+        return Some(undeclared(namespace, &stream.name).map_or_else(
+            || {
+                format!(
+                    "streams[{index}].name: '{}' is not a stream this tenant claims",
+                    stream.name
+                )
+            },
+            |why| format!("streams[{index}].name: {why}"),
         ));
     }
     stream
@@ -250,6 +267,7 @@ fn is_safe_set_value(s: &str) -> bool {
 #[cfg(test)]
 mod tenant_scope_tests {
     use super::*;
+    use crate::nats_manager::subjects::Claim;
 
     fn manifest(subscriptions: &[(&str, Option<&str>)]) -> ServiceManifest {
         serde_json::from_value(serde_json::json!({
@@ -453,6 +471,61 @@ mod tenant_scope_tests {
             let error = refused(&declaring(name, &subjects), &harbor());
             assert!(error.contains(reason), "{name} {subjects:?}: {error}");
         }
+    }
+
+    #[test]
+    fn a_prefix_admits_only_the_streams_the_tenants_services_declare() {
+        let catalog = |declared: &[&str]| {
+            Namespace::new(
+                "harbor",
+                [
+                    Claim::subject("catalog.>"),
+                    Claim::stream("CATALOG_*"),
+                    Claim::stream("CATALOG_LEGACY"),
+                ],
+            )
+            .declaring(declared.iter().map(|name| name.to_string()).collect())
+        };
+        let subscriber = |stream: &str| manifest(&[("catalog.items.created", Some(stream))]);
+        assert_eq!(
+            refused(&subscriber("CATALOG_EVENTS"), &catalog(&[])),
+            "Validation error: Subscription 'h': stream 'CATALOG_EVENTS' is claimed only through \
+             'CATALOG_*' and no service of this tenant declares it yet; deploy the service that \
+             declares it first, or claim it by name"
+        );
+        assert!(validate_tenant_scope(
+            &subscriber("CATALOG_EVENTS"),
+            &catalog(&["CATALOG_EVENTS"]),
+            &[]
+        )
+        .is_ok());
+        assert!(
+            validate_tenant_scope(&subscriber("CATALOG_LEGACY"), &catalog(&[]), &[]).is_ok(),
+            "a claim by name adopts the stream"
+        );
+        assert!(refused(&subscriber("RECEIPTS"), &catalog(&["RECEIPTS"]))
+            .contains("stream 'RECEIPTS' belongs to another tenant"));
+
+        let mut declaring = manifest(&[]);
+        declaring.streams = vec![cufflink_types::StreamDefinition {
+            name: "CATALOG_EVENTS".into(),
+            subjects: vec!["catalog.items.>".into()],
+            retention: cufflink_types::StreamRetention::Limits,
+            max_age_secs: None,
+            max_msgs: None,
+            max_bytes: None,
+            storage: Default::default(),
+            duplicate_window_secs: None,
+            discard: Default::default(),
+            description: None,
+        }];
+        assert!(validate_tenant_scope(&declaring, &catalog(&["CATALOG_EVENTS"]), &[]).is_ok());
+        assert_eq!(
+            refused(&declaring, &catalog(&[])),
+            "Validation error: streams[0].name: stream 'CATALOG_EVENTS' is claimed only through \
+             'CATALOG_*' and no service of this tenant declares it yet; deploy the service that \
+             declares it first, or claim it by name"
+        );
     }
 
     #[test]

@@ -492,7 +492,7 @@ pub(crate) mod tests {
         );
         let namespace = |tenant: &Tenant| snapshot.get(tenant.id).expect("entry").namespace.clone();
         assert!(namespace(&harbor).contains("books.created"));
-        assert!(namespace(&harbor).has_stream("BOOKS"));
+        assert!(namespace(&harbor).admits_stream("BOOKS"));
         assert!(!namespace(&acme).contains("books.created"));
         assert_eq!(namespace(&plain), Namespace::own("plain"));
         assert_eq!(

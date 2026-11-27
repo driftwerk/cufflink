@@ -1,4 +1,5 @@
 use async_nats::jetstream::stream::{self, RetentionPolicy};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub const FEATURES: &[&str] = &[cufflink_types::features::NAMESPACE_CLAIMS];
@@ -40,6 +41,7 @@ pub fn subject_covers(outer: &str, inner: &str) -> bool {
 }
 
 pub use cufflink_types::nats_names::is_valid_subject as is_valid_publish_subject;
+use cufflink_types::nats_names::{is_valid_stream_name, STREAM_NAME_MAX};
 
 pub fn is_reserved_for_guest(subject: &str, own_tenant_slug: &str) -> bool {
     let own = format!("dw.{own_tenant_slug}");
@@ -105,6 +107,19 @@ fn unclaimable_namespace(pattern: &str) -> Option<String> {
 
 pub const UNCLAIMABLE_STREAM_PREFIXES: [&str; 2] = ["DW_", "CUFFLINK_"];
 
+/// What a stream prefix may neither begin nor be begun by: the platform's
+/// streams, and JetStream's key-value and object stores.
+pub const UNCLAIMABLE_STREAM_STEMS: [&str; 4] = ["DW_", "CUFFLINK_", "KV_", "OBJ_"];
+
+const STEM_MARK: char = '*';
+
+fn maker_of(prefix: &str) -> &'static str {
+    match prefix {
+        "KV_" | "OBJ_" => "JetStream",
+        _ => "the platform",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ClaimKind {
     Subject,
@@ -153,12 +168,39 @@ impl Claim {
         }
     }
 
+    /// The stem of a stream claim made by prefix (`CATALOG_` of
+    /// `CATALOG_*`).
+    pub fn stem(&self) -> Option<&str> {
+        match self.kind {
+            ClaimKind::Stream => self.pattern.strip_suffix(STEM_MARK),
+            ClaimKind::Subject => None,
+        }
+    }
+
+    pub fn matches_stream(&self, name: &str) -> bool {
+        self.kind == ClaimKind::Stream
+            && self
+                .stem()
+                .map_or(self.pattern == name, |stem| name.starts_with(stem))
+    }
+
+    fn covered_by(&self, other: &Claim) -> bool {
+        match (self.stem(), other.stem()) {
+            (Some(inner), Some(outer)) => inner != outer && inner.starts_with(outer),
+            _ => false,
+        }
+    }
+
     fn collides_with(&self, other: &Claim) -> bool {
         match (self.kind, other.kind) {
             (ClaimKind::Subject, ClaimKind::Subject) => {
                 patterns_overlap(&self.pattern, &other.pattern)
             }
-            (ClaimKind::Stream, ClaimKind::Stream) => self.pattern == other.pattern,
+            (ClaimKind::Stream, ClaimKind::Stream) => match (self.stem(), other.stem()) {
+                (Some(ours), Some(theirs)) => ours.starts_with(theirs) || theirs.starts_with(ours),
+                (Some(_), None) => self.matches_stream(&other.pattern),
+                (None, _) => other.matches_stream(&self.pattern),
+            },
             _ => false,
         }
     }
@@ -170,12 +212,20 @@ pub enum ClaimError {
     InvalidSubject(String),
     #[error("subjects: '{pattern}' reaches into '{namespace}.>', which no tenant claims")]
     ReservedSubject { pattern: String, namespace: String },
-    #[error("streams: '{0}' is not a stream name (A-Z, 0-9 and '_', at most 64 characters)")]
+    #[error(
+        "streams: '{0}' is neither a stream name (A-Z, 0-9 and '_', at most 64 characters) \
+         nor a prefix (such a name of at most 63 characters, then '*')"
+    )]
     InvalidStream(String),
-    #[error("streams: '{name}' is named like the streams the platform creates ({prefix}*)")]
+    #[error(
+        "streams: '{name}' is named like the streams {} creates ({prefix}*)",
+        maker_of(prefix)
+    )]
     ReservedStream { name: String, prefix: &'static str },
     #[error("{}s: '{pattern}' is claimed twice", kind.as_str())]
     Repeated { kind: ClaimKind, pattern: String },
+    #[error("streams: '{pattern}' is covered by '{by}'")]
+    Covered { pattern: String, by: String },
     #[error(
         "{}s: '{pattern}' overlaps '{theirs}', which tenant '{tenant}' claims",
         kind.as_str()
@@ -203,18 +253,25 @@ fn validate_claim(claim: &Claim) -> Result<(), ClaimError> {
         ClaimKind::Subject => unclaimable_namespace(&pattern).map_or(Ok(()), |namespace| {
             Err(ClaimError::ReservedSubject { pattern, namespace })
         }),
-        ClaimKind::Stream if !cufflink_types::nats_names::is_valid_stream_name(&pattern) => {
-            Err(ClaimError::InvalidStream(pattern))
-        }
-        ClaimKind::Stream => UNCLAIMABLE_STREAM_PREFIXES
-            .into_iter()
-            .find(|prefix| pattern.starts_with(prefix))
-            .map_or(Ok(()), |prefix| {
+        ClaimKind::Stream => {
+            let reserved = match claim.stem() {
+                Some(stem) if stem.len() < STREAM_NAME_MAX && is_valid_stream_name(stem) => {
+                    UNCLAIMABLE_STREAM_STEMS
+                        .into_iter()
+                        .find(|prefix| stem.starts_with(prefix) || prefix.starts_with(stem))
+                }
+                None if is_valid_stream_name(&pattern) => UNCLAIMABLE_STREAM_PREFIXES
+                    .into_iter()
+                    .find(|prefix| pattern.starts_with(prefix)),
+                _ => return Err(ClaimError::InvalidStream(pattern)),
+            };
+            reserved.map_or(Ok(()), |prefix| {
                 Err(ClaimError::ReservedStream {
                     name: pattern,
                     prefix,
                 })
-            }),
+            })
+        }
     }
 }
 
@@ -225,6 +282,12 @@ pub fn validate_claims(new: &[Claim], others: &[(String, Claim)]) -> Result<(), 
             return Err(ClaimError::Repeated {
                 kind: claim.kind,
                 pattern: claim.pattern.clone(),
+            });
+        }
+        if let Some(outer) = new.iter().find(|other| claim.covered_by(other)) {
+            return Err(ClaimError::Covered {
+                pattern: claim.pattern.clone(),
+                by: outer.pattern.clone(),
             });
         }
         others
@@ -268,7 +331,14 @@ pub struct Namespace {
     tenant_slug: String,
     own_stream: String,
     subjects: Vec<String>,
-    stream_claims: Vec<String>,
+    stream_claims: Vec<Claim>,
+    declared: Declared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Declared {
+    Streams(BTreeSet<String>),
+    Admitted,
 }
 
 impl Namespace {
@@ -276,15 +346,40 @@ impl Namespace {
         let (subjects, streams): (Vec<Claim>, Vec<Claim>) = claims
             .into_iter()
             .partition(|claim| claim.kind == ClaimKind::Subject);
-        let patterns = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.pattern);
         Self {
             tenant_slug: tenant_slug.to_string(),
             own_stream: tenant_stream_name(tenant_slug),
             subjects: std::iter::once(tenant_subjects(tenant_slug))
-                .chain(patterns(subjects))
+                .chain(subjects.into_iter().map(|claim| claim.pattern))
                 .collect(),
-            stream_claims: patterns(streams).collect(),
+            stream_claims: streams,
+            declared: Declared::Streams(BTreeSet::new()),
         }
+    }
+
+    /// The namespace with the streams the tenant's services declare, which
+    /// a prefix claim admits.
+    pub fn declaring(self, declared: BTreeSet<String>) -> Self {
+        Self {
+            declared: Declared::Streams(declared),
+            ..self
+        }
+    }
+
+    /// The namespace a deployed version runs in: its deploy checked the
+    /// declarations, so a prefix holds every stream under it until the
+    /// version is replaced.
+    pub fn admitted(self) -> Self {
+        Self {
+            declared: Declared::Admitted,
+            ..self
+        }
+    }
+
+    pub fn claims_by_prefix(&self) -> bool {
+        self.stream_claims
+            .iter()
+            .any(|claim| claim.stem().is_some())
     }
 
     pub fn own(tenant_slug: &str) -> Self {
@@ -297,8 +392,7 @@ impl Namespace {
 
     pub fn claims(&self) -> impl Iterator<Item = Claim> + '_ {
         let subjects = self.subjects.iter().skip(1).cloned().map(Claim::subject);
-        let streams = self.stream_claims.iter().cloned().map(Claim::stream);
-        subjects.chain(streams)
+        subjects.chain(self.stream_claims.iter().cloned())
     }
 
     pub fn contains(&self, subject: &str) -> bool {
@@ -313,8 +407,33 @@ impl Namespace {
             .any(|claim| subject_covers(claim, pattern))
     }
 
-    pub fn has_stream(&self, stream: &str) -> bool {
-        self.own_stream == stream || self.stream_claims.iter().any(|name| name == stream)
+    /// Whether the tenant's claims admit the stream: a claim of its name, or
+    /// a prefix under which one of the tenant's services declares it.
+    pub fn admits_stream(&self, name: &str) -> bool {
+        self.stream_claims.iter().any(|claim| {
+            claim.matches_stream(name)
+                && (claim.stem().is_none()
+                    || match &self.declared {
+                        Declared::Streams(declared) => declared.contains(name),
+                        Declared::Admitted => true,
+                    })
+        })
+    }
+
+    /// Whether a subscription may bind the stream: the tenant's own, or one
+    /// its claims admit.
+    pub fn binds_stream(&self, name: &str) -> bool {
+        name == self.own_stream || self.admits_stream(name)
+    }
+
+    /// The prefix that claims a stream the namespace does not admit because
+    /// no service of the tenant declares it.
+    pub fn undeclared_under(&self, name: &str) -> Option<&str> {
+        self.stream_claims
+            .iter()
+            .find(|claim| claim.matches_stream(name))
+            .filter(|_| !self.admits_stream(name))
+            .map(|claim| claim.pattern.as_str())
     }
 
     pub fn own_stream(&self) -> &str {
@@ -432,8 +551,7 @@ mod tests {
         assert!(!own.covers("dw.*.loans.created"));
         assert!(!own.contains("dw.other.loans.created"));
         assert!(!own.contains("books.created"));
-        assert!(own.has_stream("DW_ACME"));
-        assert!(!own.has_stream("BOOKS"));
+        assert!(!own.admits_stream("BOOKS"));
         assert_eq!(own.own_stream(), "DW_ACME");
         assert_eq!(own.claims().count(), 0);
 
@@ -457,8 +575,8 @@ mod tests {
         assert!(!harbor.covers("*.created"));
         assert!(!harbor.covers(">"));
         assert!(!harbor.covers("audit.*"));
-        assert!(harbor.has_stream("BOOKS") && harbor.has_stream("DW_HARBOR"));
-        assert!(!harbor.has_stream("RECEIPTS"));
+        assert!(harbor.admits_stream("BOOKS"));
+        assert!(!harbor.admits_stream("RECEIPTS") && !harbor.admits_stream("DW_HARBOR"));
     }
 
     #[test]
@@ -583,6 +701,192 @@ mod tests {
         assert_eq!(
             reserved("*.created", "dw").to_string(),
             "subjects: '*.created' reaches into 'dw.>', which no tenant claims"
+        );
+    }
+
+    #[test]
+    fn a_stream_claim_is_a_name_or_a_stem_and_a_stem_matches_what_begins_with_it() {
+        let prefix = Claim::stream("CATALOG_*");
+        assert_eq!(prefix.stem(), Some("CATALOG_"));
+        assert_eq!(Claim::stream("CATALOG").stem(), None);
+        assert_eq!(Claim::subject("catalog.*").stem(), None);
+        for name in ["CATALOG_", "CATALOG_EVENTS", "CATALOG_X_Y"] {
+            assert!(prefix.matches_stream(name), "{name}");
+        }
+        for name in ["CATALOG", "XCATALOG_EVENTS", "catalog_events"] {
+            assert!(!prefix.matches_stream(name), "{name}");
+        }
+        assert!(Claim::stream("BOOKS").matches_stream("BOOKS"));
+        assert!(!Claim::stream("BOOKS").matches_stream("BOOKS_2"));
+        assert!(!Claim::subject("BOOKS").matches_stream("BOOKS"));
+    }
+
+    #[test]
+    fn stream_prefixes_collide_across_tenants_and_are_never_covered_within_one() {
+        let held = |claims: &[&str]| -> Vec<(String, Claim)> {
+            claims
+                .iter()
+                .map(|claim| ("orchard".to_string(), Claim::stream(*claim)))
+                .collect()
+        };
+        let taken = |pattern: &str, theirs: &str| {
+            Err(ClaimError::Taken {
+                kind: ClaimKind::Stream,
+                pattern: pattern.into(),
+                tenant: "orchard".into(),
+                theirs: theirs.into(),
+            })
+        };
+        for (ours, theirs) in [
+            ("CATALOG_*", "CATALOG_EVENTS"),
+            ("CATALOG_EVENTS", "CATALOG_*"),
+            ("CATALOG_*", "CATALOG_X*"),
+            ("CATALOG_X*", "CATALOG_*"),
+            ("CATALOG_*", "CATALOG_*"),
+        ] {
+            assert_eq!(
+                validate_claims(&[Claim::stream(ours)], &held(&[theirs])),
+                taken(ours, theirs),
+                "{ours} / {theirs}"
+            );
+        }
+        for (ours, theirs) in [("CATALOG_*", "CATALO"), ("CATALOG_*", "LOANS_*")] {
+            assert_eq!(
+                validate_claims(&[Claim::stream(ours)], &held(&[theirs])),
+                Ok(()),
+                "{ours} / {theirs}"
+            );
+        }
+        assert_eq!(
+            validate_claims(
+                &[Claim::stream("CATALOG_X*"), Claim::stream("CATALOG_*")],
+                &[]
+            ),
+            Err(ClaimError::Covered {
+                pattern: "CATALOG_X*".into(),
+                by: "CATALOG_*".into()
+            })
+        );
+        assert_eq!(
+            ClaimError::Covered {
+                pattern: "CATALOG_X*".into(),
+                by: "CATALOG_*".into()
+            }
+            .to_string(),
+            "streams: 'CATALOG_X*' is covered by 'CATALOG_*'"
+        );
+        assert_eq!(
+            validate_claims(
+                &[Claim::stream("CATALOG_*"), Claim::stream("CATALOG_*")],
+                &[]
+            ),
+            Err(ClaimError::Repeated {
+                kind: ClaimKind::Stream,
+                pattern: "CATALOG_*".into()
+            })
+        );
+        assert_eq!(
+            validate_claims(
+                &[Claim::stream("CATALOG_*"), Claim::stream("CATALOG_LEGACY")],
+                &[]
+            ),
+            Ok(()),
+            "a name beside the prefix that covers it adopts a stream no service declares"
+        );
+    }
+
+    #[test]
+    fn a_stem_is_well_formed_and_clear_of_the_platforms_and_jetstreams_streams() {
+        let longest = format!("{}*", "A".repeat(63));
+        assert_eq!(
+            validate_claims(&[Claim::stream(longest.as_str())], &[]),
+            Ok(())
+        );
+        for invalid in [
+            "*".to_string(),
+            "catalog_*".to_string(),
+            "CATALOG**".to_string(),
+            "CATALOG*_".to_string(),
+            format!("{}*", "A".repeat(64)),
+        ] {
+            assert_eq!(
+                validate_claims(&[Claim::stream(invalid.as_str())], &[]),
+                Err(ClaimError::InvalidStream(invalid.clone())),
+                "{invalid}"
+            );
+        }
+        for (stem, prefix) in [
+            ("DW_ACME*", "DW_"),
+            ("D*", "DW_"),
+            ("CUFFLINK_*", "CUFFLINK_"),
+            ("CUFF*", "CUFFLINK_"),
+            ("KV_*", "KV_"),
+            ("K*", "KV_"),
+            ("KV_FLAGS*", "KV_"),
+            ("OBJ_*", "OBJ_"),
+            ("O*", "OBJ_"),
+        ] {
+            assert_eq!(
+                validate_claims(&[Claim::stream(stem)], &[]),
+                Err(ClaimError::ReservedStream {
+                    name: stem.into(),
+                    prefix
+                }),
+                "{stem}"
+            );
+        }
+        assert_eq!(
+            validate_claims(&[Claim::stream("KV_FLAGS")], &[]),
+            Ok(()),
+            "a name keeps the rule it had"
+        );
+        assert_eq!(
+            ClaimError::ReservedStream {
+                name: "K*".into(),
+                prefix: "KV_"
+            }
+            .to_string(),
+            "streams: 'K*' is named like the streams JetStream creates (KV_*)"
+        );
+    }
+
+    #[test]
+    fn a_namespace_admits_a_stream_by_name_or_under_a_prefix_its_services_declare() {
+        let catalog = Namespace::new(
+            "harbor",
+            [Claim::stream("CATALOG_*"), Claim::stream("CATALOG_LEGACY")],
+        );
+        assert!(catalog.claims_by_prefix());
+        assert!(!Namespace::new("harbor", [Claim::stream("BOOKS")]).claims_by_prefix());
+        assert!(catalog.admits_stream("CATALOG_LEGACY"));
+        assert!(!catalog.admits_stream("CATALOG_EVENTS"));
+        assert_eq!(
+            catalog.undeclared_under("CATALOG_EVENTS"),
+            Some("CATALOG_*")
+        );
+        assert_eq!(catalog.undeclared_under("CATALOG_LEGACY"), None);
+        assert_eq!(catalog.undeclared_under("RECEIPTS"), None);
+        let declaring =
+            catalog.declaring(["CATALOG_EVENTS".to_string(), "RECEIPTS".to_string()].into());
+        assert!(declaring.admits_stream("CATALOG_EVENTS"));
+        assert_eq!(declaring.undeclared_under("CATALOG_EVENTS"), None);
+        assert!(
+            !declaring.admits_stream("RECEIPTS"),
+            "what a service declares is admitted only under a claim"
+        );
+        assert_eq!(declaring.claims().count(), 2);
+    }
+
+    #[test]
+    fn an_admitted_namespace_holds_every_stream_under_its_prefixes_and_binds_its_own() {
+        let admitted = Namespace::new("harbor", [Claim::stream("CATALOG_*")]).admitted();
+        assert!(admitted.admits_stream("CATALOG_EVENTS"));
+        assert_eq!(admitted.undeclared_under("CATALOG_EVENTS"), None);
+        assert!(!admitted.admits_stream("RECEIPTS"));
+        assert!(admitted.binds_stream("DW_HARBOR") && admitted.binds_stream("CATALOG_EVENTS"));
+        assert!(!admitted.binds_stream("DW_ACME"));
+        assert!(
+            !Namespace::new("harbor", [Claim::stream("CATALOG_*")]).binds_stream("CATALOG_EVENTS")
         );
     }
 
