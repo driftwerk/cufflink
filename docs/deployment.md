@@ -296,6 +296,7 @@ A deploy never changes the status of a service that exists:
 | does not exist | created inactive and deployed; nothing starts | created active and deployed |
 | is inactive | deployed, stays inactive | deployed, stays inactive |
 | is active | refused (409): disable it first, or deploy without the flag | deployed |
+| is active and has never run (its first deploy failed) | deployed, made inactive | deployed |
 
 What a deploy does for an inactive service, it does here: the schema
 changes, the SQL migrations and `on_migrate` run, and the deploy plans and
@@ -661,6 +662,31 @@ database must then provide:
 Guest statements that need a session of their own (`SET` + DDL through the
 legacy host functions) are refused under the pooler; such DDL belongs in
 deploy-time migrations.
+
+### A declared database role
+
+A deploy request may carry the service's own database role, to a platform
+that advertises `db_role_declarations`. The CLI sends the role that
+`[environments.<env>.db_role]` in `Cufflink.toml` declares, and only to such
+a platform:
+
+```json
+{ "manifest": { … }, "db_role": { "role": "catalog_service_user", "password": "…" } }
+```
+
+The platform takes it under the deploy lock, before anything runs as any
+role and before the skip check, so a deploy with nothing else to do still
+takes a new password ([declaring a role](db-roles-and-secrets.md#declaring-a-role-with-the-service)).
+The password is kept only sealed: a job's `request`, `result` and `error`,
+the plan, the answer, logs and audit rows carry the role alone. The plan
+gains `"db_role": {"role", "taking", "failed"}`, where `taking`
+is `bind`, `refresh` or `unchanged` and `failed` the checks that would not
+pass under `warn`; a refusal makes the plan a 422. Every deploy answer of a
+bound service carries `"db_role": {"role", "origin", "verified"}`.
+
+Under `enforce`, the first version of a service is refused (422) while it
+has no verified role, with what it lacks; a running service's redeploy is
+never refused this way.
 
 Under `db_roles: enforce` a service's statements run on logins as its own
 role, and those never go through the pooler: the pooler would have to

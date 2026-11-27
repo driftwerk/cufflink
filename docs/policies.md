@@ -110,8 +110,28 @@ Once the policy leaves `off`, each service has a role of its own:
   `_cufflink.outbox_enqueue_own`, which takes the service from the role
   that calls it, never from an argument; it may not call
   `outbox_enqueue_many` nor touch the outbox's tables.
+- A service may instead declare its role in its deploy, once its
+  tenant's config lists the name in `declared_roles` (exact names, or a
+  stem of at least three characters followed by `*`; an entry that would
+  admit an `svc_`, `pg_` or `postgres` name is refused). The deploy proves the role's password and binds it only when it
+  owns the service's schema and reaches nothing else
+  ([declaring a role](db-roles-and-secrets.md#declaring-a-role-with-the-service)).
+- A role the platform did not make is also checked for what it reaches
+  beyond the service's schema: `declared_memberships`, every role it is a
+  member of (its own `read_only_role` aside), and `confined`, every object
+  outside the schema it owns in any database, and every privilege it holds
+  or policy naming it outside the schema in its own database,
+  `USAGE` alone on `public`, what the platform grants it of `_cufflink` and
+  `CONNECT` or `TEMPORARY` on its own database aside, each without grant
+  option. They fail a declared role, and are reported `EXCESS` for one an
+  administrator bound. Privileges granted to the role in other databases,
+  and policies there naming it, are their owners' doing, and are reported
+  `EXCESS` alone
+  (`granted_elsewhere`), as is another role still mapped to the service
+  (`outbox_mapped_elsewhere`).
 - Deleting a service makes the role the platform made for it `NOLOGIN`;
-  the role keeps what it owns, since the schema stays.
+  the role keeps what it owns, since the schema stays. Any other role keeps
+  its login and loses what the platform granted it of `_cufflink`.
 
 ```sh
 cufflink services db-role set harbor catalog-service --role catalog_service_user --password-stdin

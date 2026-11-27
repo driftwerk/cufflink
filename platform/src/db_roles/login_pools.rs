@@ -38,6 +38,23 @@ fn refusal(error: &tokio_postgres::Error) -> bool {
         .is_some_and(|code| code.code().starts_with(INVALID_AUTHORIZATION))
 }
 
+fn authenticated(error: &tokio_postgres::Error) -> bool {
+    error.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+}
+
+fn judged(outcome: eyre::Result<()>) -> Probe {
+    match outcome {
+        Ok(()) => Probe::Accepted,
+        Err(e) => match e.downcast_ref::<tokio_postgres::Error>() {
+            Some(error) if authenticated(error) => Probe::Accepted,
+            Some(error) if refusal(error) => {
+                Probe::Refused(crate::db_error::from_pg(error).message.clone())
+            }
+            _ => Probe::Unanswered(format!("{e:#}")),
+        },
+    }
+}
+
 pub async fn probe(config: tokio_postgres::Config, settings: &PoolSettings) -> Probe {
     let attempt = async {
         cufflink_db::connect_single(config, settings)
@@ -46,15 +63,7 @@ pub async fn probe(config: tokio_postgres::Config, settings: &PoolSettings) -> P
             .await
             .map_err(eyre::Report::from)
     };
-    match attempt.await {
-        Ok(_) => Probe::Accepted,
-        Err(e) => match e.downcast_ref::<tokio_postgres::Error>() {
-            Some(error) if refusal(error) => {
-                Probe::Refused(crate::db_error::from_pg(error).message.clone())
-            }
-            _ => Probe::Unanswered(format!("{e:#}")),
-        },
-    }
+    judged(attempt.await.map(drop))
 }
 
 pub fn login_refused(error: &PoolError) -> bool {

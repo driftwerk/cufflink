@@ -49,6 +49,11 @@ and dropped when a later manifest leaves it out; the deploy plan warns of it.
 A rollback to a version that adopted checks the adoption again and is
 refused, like a deploy, when the database no longer holds it.
 
+Under `db_roles`, a schema that a role of its own owns (one a migration tool
+runs as, say) is the service's when the service is bound to that role. The
+service can declare it, and its first deploy binds it
+([declaring a role](db-roles-and-secrets.md#declaring-a-role-with-the-service)).
+
 ## Private tables
 
 A table only the service's own SQL reaches is declared in `private_tables`:

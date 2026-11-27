@@ -3,7 +3,7 @@ use cufflink_testkit as common;
 use common::TestDb;
 use cufflink_platform::policy::PolicySet;
 use cufflink_platform::registry::ServiceIdentity;
-use cufflink_platform::repo::service_db_roles::{self, NewBinding, Verification};
+use cufflink_platform::repo::service_db_roles::{self, NewBinding, Origin, Verification};
 use cufflink_platform::secrets::{KeyRing, SecretBox, StorageMode};
 use cufflink_platform::tenant_catalog::TenantCatalog;
 use cufflink_platform::tenant_db::TenantPoolManager;
@@ -49,7 +49,7 @@ async fn bound(connections: usize) -> Option<Bound> {
         &NewBinding {
             service_id,
             role_name: &role,
-            managed: false,
+            origin: Origin::Admin,
             password_enc: None,
             read_only_role: None,
             updated_by: "test",

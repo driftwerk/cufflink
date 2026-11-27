@@ -201,6 +201,7 @@ pub fn environment() -> EnvironmentConfig {
         keycloak_client_id: Some(CLIENT.to_string()),
         config: Default::default(),
         secrets: Default::default(),
+        db_role: None,
     }
 }
 

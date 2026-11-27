@@ -247,7 +247,7 @@ The rules for a prefix:
   prefix strands a subscriber of a stream that no service declares unless
   the name is kept beside the prefix.
 
-A platform older than v0.41.0 refuses `CATALOG_*` as an invalid stream
+A platform older than v0.41.1 refuses `CATALOG_*` as an invalid stream
 name, so no feature is advertised for prefixes.
 
 ## Publishing with acknowledgements
