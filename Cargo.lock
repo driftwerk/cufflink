@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "chrono",
  "cufflink-sdk-macros",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-cli"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-fn"
-version = "0.41.0"
+version = "0.41.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-migrate"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "chrono",
  "cufflink-types",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-model"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "serde",
  "serde_json",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-native"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-nats",
  "axum",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-nats"
-version = "0.9.12"
+version = "0.9.13"
 dependencies = [
  "async-nats",
  "eyre",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-pgcodec"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-sdk-macros"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "cufflink-migrate",
  "cufflink-types",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-sql-parse"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cufflink-types",
  "hex",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "cufflink-types"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
