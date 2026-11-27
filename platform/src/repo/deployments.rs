@@ -1,10 +1,12 @@
 use crate::errors::{PlatformError, PlatformResult};
+use crate::nats_manager::subjects::Namespace;
 use crate::registry::ServiceIdentity;
 use crate::schema_manager::adopt::AdoptedSchema;
 use chrono::{DateTime, Utc};
 use cufflink_types::{ServiceManifest, ServiceMode, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +313,67 @@ pub async fn current(
         )
         .await?;
     Ok(row.as_ref().map(row_to_deployment))
+}
+
+/// The streams the current version of each of the tenants' services
+/// declares, whatever its status, but those of a service named `except`.
+pub async fn declared_streams(
+    client: &impl deadpool_postgres::GenericClient,
+    tenants: &[Uuid],
+    except: Option<&str>,
+) -> PlatformResult<BTreeMap<Uuid, BTreeSet<String>>> {
+    Ok(client
+        .query(
+            "SELECT DISTINCT s.tenant_id, stream->>'name' AS name
+             FROM services s
+             JOIN deployments d ON d.service_id = s.id AND d.version = s.current_version
+             CROSS JOIN LATERAL jsonb_array_elements(
+                 CASE jsonb_typeof(d.manifest->'streams')
+                     WHEN 'array' THEN d.manifest->'streams'
+                     ELSE '[]'::jsonb
+                 END
+             ) AS stream
+             WHERE s.tenant_id = ANY($1)
+               AND s.name IS DISTINCT FROM $2::text
+               AND stream->>'name' IS NOT NULL",
+            &[&tenants, &except],
+        )
+        .await?
+        .iter()
+        .fold(
+            BTreeMap::new(),
+            |mut by_tenant: BTreeMap<_, BTreeSet<_>>, row| {
+                by_tenant
+                    .entry(row.get("tenant_id"))
+                    .or_default()
+                    .insert(row.get("name"));
+                by_tenant
+            },
+        ))
+}
+
+/// The namespace a deploy is checked in: the streams the tenant's services
+/// declare, with the deploying manifest's standing in for the version it
+/// replaces, read only when a claim by prefix needs them.
+pub async fn declaring(
+    pool: &deadpool_postgres::Pool,
+    tenant_id: Uuid,
+    namespace: Namespace,
+    deploying: &ServiceManifest,
+) -> PlatformResult<Namespace> {
+    if !namespace.claims_by_prefix() {
+        return Ok(namespace);
+    }
+    let stored = declared_streams(
+        &pool.get().await?,
+        &[tenant_id],
+        Some(deploying.name.as_str()),
+    )
+    .await?
+    .remove(&tenant_id)
+    .unwrap_or_default();
+    let deployed = deploying.streams.iter().map(|stream| stream.name.clone());
+    Ok(namespace.declaring(stored.into_iter().chain(deployed).collect()))
 }
 
 pub async fn current_mode(

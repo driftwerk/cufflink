@@ -16,6 +16,7 @@ use axum::{
 use cufflink_types::ServiceMode;
 use deadpool_postgres::GenericClient;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -453,13 +454,14 @@ pub async fn get_nats_claims(
     Ok(Json(claims_body(&slug, &claims)))
 }
 
-fn stranded_by(
-    services: &[Arc<RegisteredService>],
-    every_claim: &[ClaimRow],
-    tenant: &Tenant,
-    claims: &[Claim],
-) -> Option<String> {
-    let after: Vec<(uuid::Uuid, &str, &Claim)> = every_claim
+type Held<'a> = (Uuid, &'a str, &'a Claim);
+
+fn held_after<'a>(
+    every_claim: &'a [ClaimRow],
+    tenant: &'a Tenant,
+    claims: &'a [Claim],
+) -> Vec<Held<'a>> {
+    every_claim
         .iter()
         .filter(|row| row.tenant_id != tenant.id)
         .map(|row| (row.tenant_id, row.tenant_slug.as_str(), &row.claim))
@@ -468,12 +470,53 @@ fn stranded_by(
                 .iter()
                 .map(|claim| (tenant.id, tenant.slug.as_str(), claim)),
         )
+        .collect()
+}
+
+async fn namespaces_after(
+    pool: &deadpool_postgres::Pool,
+    services: &[Arc<RegisteredService>],
+    after: &[Held<'_>],
+) -> PlatformResult<HashMap<Uuid, Namespace>> {
+    let claimed: Vec<(Uuid, Namespace)> = services
+        .iter()
+        .map(|service| (service.tenant_id, service.tenant_slug.as_str()))
+        .collect::<BTreeMap<Uuid, &str>>()
+        .into_iter()
+        .map(|(tenant_id, slug)| {
+            let own = after
+                .iter()
+                .filter(|(owner, _, _)| *owner == tenant_id)
+                .map(|(_, _, claim)| (*claim).clone());
+            (tenant_id, Namespace::new(slug, own))
+        })
         .collect();
+    let by_prefix: Vec<Uuid> = claimed
+        .iter()
+        .filter(|(_, namespace)| namespace.claims_by_prefix())
+        .map(|(tenant_id, _)| *tenant_id)
+        .collect();
+    let mut declared = match by_prefix.as_slice() {
+        [] => BTreeMap::new(),
+        tenants => {
+            crate::repo::deployments::declared_streams(&pool.get().await?, tenants, None).await?
+        }
+    };
+    Ok(claimed
+        .into_iter()
+        .map(|(tenant_id, namespace)| {
+            let declared = declared.remove(&tenant_id).unwrap_or_default();
+            (tenant_id, namespace.declaring(declared))
+        })
+        .collect())
+}
+
+fn stranded_by(
+    services: &[Arc<RegisteredService>],
+    namespaces: &HashMap<Uuid, Namespace>,
+    after: &[Held<'_>],
+) -> Option<String> {
     services.iter().find_map(|service| {
-        let own = after
-            .iter()
-            .filter(|(owner, _, _)| *owner == service.tenant_id)
-            .map(|(_, _, claim)| (*claim).clone());
         let foreign: Vec<(String, String)> = after
             .iter()
             .filter(|(owner, _, claim)| {
@@ -481,24 +524,79 @@ fn stranded_by(
             })
             .map(|(_, slug, claim)| (slug.to_string(), claim.pattern.clone()))
             .collect();
-        validate_tenant_scope(
-            &service.manifest,
-            &Namespace::new(&service.tenant_slug, own),
-            &foreign,
-        )
-        .err()
-        .map(|refusal| match refusal {
-            PlatformError::Validation(reason) => reason,
-            other => other.to_string(),
-        })
-        .map(|reason| {
-            format!(
-                "service '{}' of tenant '{}' is deployed with what these claims take from it: \
-                 {reason}",
-                service.name, service.tenant_slug
-            )
-        })
+        let namespace = namespaces.get(&service.tenant_id)?;
+        validate_tenant_scope(&service.manifest, namespace, &foreign)
+            .err()
+            .map(|refusal| match refusal {
+                PlatformError::Validation(reason) => reason,
+                other => other.to_string(),
+            })
+            .map(|reason| {
+                format!(
+                    "service '{}' of tenant '{}' is deployed with what these claims take from it: \
+                     {reason}",
+                    service.name, service.tenant_slug
+                )
+            })
     })
+}
+
+/// The live streams a prefix of the request admits that are not the
+/// tenant's: none of its services declares them, and the request does not
+/// claim them by name.
+fn unowned_under<'a>(
+    claims: &[Claim],
+    namespace: &Namespace,
+    live: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let prefixes: Vec<&Claim> = claims
+        .iter()
+        .filter(|claim| claim.stem().is_some())
+        .collect();
+    let unowned: Vec<&str> = live
+        .into_iter()
+        .filter(|name| prefixes.iter().any(|prefix| prefix.matches_stream(name)))
+        .filter(|name| !namespace.admits_stream(name))
+        .collect();
+    let (exist, is, declares, each) = match unowned.as_slice() {
+        [_] => ("exists", "is", "it", "it"),
+        _ => ("exist", "are", "them", "each"),
+    };
+    (!unowned.is_empty()).then(|| {
+        format!(
+            "streams: {} already {exist} under {} and {is} not this tenant's: no service of tenant \
+             '{}' declares {declares}. Claim {each} by name in the same request to adopt it, or \
+             have its owner claim or remove it",
+            quoted(&unowned),
+            quoted(
+                &prefixes
+                    .iter()
+                    .map(|prefix| prefix.pattern.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            namespace.tenant_slug()
+        )
+    })
+}
+
+fn quoted(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn live_streams(state: &AppState, claims: &[Claim]) -> PlatformResult<Vec<String>> {
+    if !claims.iter().any(|claim| claim.stem().is_some()) {
+        return Ok(Vec::new());
+    }
+    state
+        .stream_index
+        .refresh(&state.jetstream)
+        .await
+        .map(|live| live.iter().map(|stream| stream.name.clone()).collect())
+        .map_err(|e| PlatformError::Unavailable(format!("JetStream is not reachable: {e}")))
 }
 
 pub async fn put_nats_claims(
@@ -509,17 +607,29 @@ pub async fn put_nats_claims(
 ) -> PlatformResult<Json<serde_json::Value>> {
     let tenant = crate::repo::tenants::require_by_slug(&state.platform_db, &slug).await?;
     let claims = request.claims();
+    nats_claims::well_formed(&claims)?;
     let every_claim = nats_claims::list_all(&state.platform_db.get().await?).await?;
-    if let Some(stranded) = stranded_by(
-        &state.registry.all_services().await,
-        &every_claim,
-        &tenant,
-        &claims,
-    ) {
+    nats_claims::not_taken(&claims, &every_claim, tenant.id)?;
+    let services = state.registry.all_services().await;
+    let after = held_after(&every_claim, &tenant, &claims);
+    let namespaces = namespaces_after(&state.platform_db, &services, &after).await?;
+    if let Some(stranded) = stranded_by(&services, &namespaces, &after) {
         return Err(PlatformError::Conflict(stranded));
     }
-    let stored =
-        nats_claims::replace(&state.platform_db, tenant.id, &claims, &admin.subject).await?;
+    let live = live_streams(&state, &claims).await?;
+    let owned = |declared| {
+        let namespace = Namespace::new(&tenant.slug, claims.iter().cloned()).declaring(declared);
+        unowned_under(&claims, &namespace, live.iter().map(String::as_str))
+            .map_or(Ok(()), |unowned| Err(PlatformError::Conflict(unowned)))
+    };
+    let stored = nats_claims::replace(
+        &state.platform_db,
+        tenant.id,
+        &claims,
+        &admin.subject,
+        owned,
+    )
+    .await?;
     info!(
         tenant = %slug,
         subjects = claims.iter().filter(|c| c.kind == ClaimKind::Subject).count(),
@@ -677,6 +787,44 @@ fn validate_issuer(issuer: &str) -> PlatformResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prefix_is_refused_over_a_live_stream_the_tenant_neither_declares_nor_names() {
+        let claims = [Claim::subject("catalog.>"), Claim::stream("CATALOG_*")];
+        let namespace = |claims: &[Claim], declared: &[&str]| {
+            Namespace::new("harbor", claims.iter().cloned())
+                .declaring(declared.iter().map(|name| name.to_string()).collect())
+        };
+        let live = ["CATALOG_EVENTS", "CATALOG_OLD", "RECEIPTS", "DW_HARBOR"];
+        assert_eq!(
+            unowned_under(&claims, &namespace(&claims, &["CATALOG_EVENTS"]), live),
+            Some(
+                "streams: 'CATALOG_OLD' already exists under 'CATALOG_*' and is not this \
+                 tenant's: no service of tenant 'harbor' declares it. Claim it by name in the \
+                 same request to adopt it, or have its owner claim or remove it"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            unowned_under(&claims, &namespace(&claims, &[]), live),
+            Some(
+                "streams: 'CATALOG_EVENTS', 'CATALOG_OLD' already exist under 'CATALOG_*' and are \
+                 not this tenant's: no service of tenant 'harbor' declares them. Claim each by \
+                 name in the same request to adopt it, or have its owner claim or remove it"
+                    .to_string()
+            )
+        );
+        let adopting = [Claim::stream("CATALOG_*"), Claim::stream("CATALOG_OLD")];
+        assert_eq!(
+            unowned_under(&adopting, &namespace(&adopting, &["CATALOG_EVENTS"]), live),
+            None
+        );
+        assert_eq!(
+            unowned_under(&[Claim::stream("BOOKS")], &namespace(&[], &[]), live),
+            None,
+            "a claim by name is checked against no live stream"
+        );
+    }
 
     #[test]
     fn claims_are_read_and_answered_by_kind() {

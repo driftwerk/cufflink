@@ -774,7 +774,10 @@ enum NatsClaimsAction {
             required_unless_present_any = ["streams", "clear"]
         )]
         subjects: Vec<String>,
-        /// A stream the tenant claims (repeatable)
+        /// A stream the tenant claims (repeatable): a name (`CATALOG_EVENTS`)
+        /// adopts that stream, whoever made it; a stem then `*`
+        /// (`CATALOG_*`) admits the streams under it that the tenant's own
+        /// services declare. Quote a prefix from the shell
         #[arg(long = "stream")]
         streams: Vec<String>,
         /// Leave the tenant with no claim

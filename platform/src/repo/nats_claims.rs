@@ -1,6 +1,8 @@
 use crate::errors::{PlatformError, PlatformResult};
 use crate::nats_manager::subjects::{validate_claims, Claim, ClaimError, ClaimKind};
+use crate::repo::deployments;
 use deadpool_postgres::GenericClient;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,23 +59,46 @@ fn refused(error: ClaimError) -> PlatformError {
     }
 }
 
+pub fn well_formed(claims: &[Claim]) -> PlatformResult<()> {
+    validate_claims(claims, &[]).map_err(refused)
+}
+
+pub fn not_taken(
+    claims: &[Claim],
+    every_claim: &[ClaimRow],
+    tenant_id: Uuid,
+) -> PlatformResult<()> {
+    let others: Vec<(String, Claim)> = every_claim
+        .iter()
+        .filter(|row| row.tenant_id != tenant_id)
+        .map(|row| (row.tenant_slug.clone(), row.claim.clone()))
+        .collect();
+    validate_claims(claims, &others).map_err(refused)
+}
+
+/// Replaces the tenant's claims under a lock on every tenant's. A request
+/// claiming by prefix is checked by `owned` against the streams the
+/// tenant's services declare, read in the same transaction.
 pub async fn replace(
     pool: &deadpool_postgres::Pool,
     tenant_id: Uuid,
     claims: &[Claim],
     actor: &str,
+    owned: impl FnOnce(BTreeSet<String>) -> PlatformResult<()>,
 ) -> PlatformResult<Vec<Claim>> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
     tx.batch_execute("LOCK TABLE tenant_nats_claims IN SHARE ROW EXCLUSIVE MODE")
         .await?;
-    let others: Vec<(String, Claim)> = list_all(&tx)
-        .await?
-        .into_iter()
-        .filter(|row| row.tenant_id != tenant_id)
-        .map(|row| (row.tenant_slug, row.claim))
-        .collect();
-    validate_claims(claims, &others).map_err(refused)?;
+    not_taken(claims, &list_all(&tx).await?, tenant_id)?;
+    if claims.iter().any(|claim| claim.stem().is_some()) {
+        owned(
+            deployments::declared_streams(&tx, &[tenant_id], None)
+                .await?
+                .remove(&tenant_id)
+                .unwrap_or_default(),
+        )?;
+    }
     tx.execute(
         "DELETE FROM tenant_nats_claims WHERE tenant_id = $1",
         &[&tenant_id],
