@@ -10,7 +10,7 @@ categories = ["wasm", "text-processing", "science"]
 readme = "../README.md"
 
 [dependencies]
-serde_json = "1"
+serde_json = "1.0.154"
 
 [dev-dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
