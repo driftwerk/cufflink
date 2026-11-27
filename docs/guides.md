@@ -1921,7 +1921,7 @@ Move beyond auto-generated CRUD by writing custom handlers in Rust that compile 
 
 The `cufflink-fn` crate provides a clean Rust SDK for writing WASM handlers. You write normal Rust code with access to database queries, NATS messaging, and structured logging — no raw pointer manipulation required.
 
-`cufflink init <name> --mode wasm` scaffolds a project with the right dependencies (`cufflink = "0.24"` for the manifest in `src/main.rs`, `cufflink-fn = "0.40"` for the handlers in `src/lib.rs`, plus a `[lib] crate-type = ["cdylib", "rlib"]` section) and the `wasm32-unknown-unknown` target is used by `cufflink deploy`.
+`cufflink init <name> --mode wasm` scaffolds a project with the right dependencies (`cufflink = "0.25"` for the manifest in `src/main.rs`, `cufflink-fn = "0.41"` for the handlers in `src/lib.rs`, plus a `[lib] crate-type = ["cdylib", "rlib"]` section) and the `wasm32-unknown-unknown` target is used by `cufflink deploy`.
 
 ```rust
 use cufflink_fn::handler;

@@ -572,6 +572,15 @@ Rolling a platform back from v0.40.0 to v0.39.0:
 | `ObjectStorage::upload_stream` | Nothing: only assembly calls it |
 | The database | Nothing to undo: `V10__web_upload_parts` adds a table v0.39.0 never reads |
 
+Rolling a platform back from v0.41.0 to v0.40.6:
+
+| What v0.41.0 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| `declared_roles` | Remove it from every tenant's `db_roles` config first: a replica older than v0.41.0 reads a config holding it as the default config, losing `readers` and `login_pool_max` |
+| Declared bindings (`db_role_declarations`) | Nothing to undo: v0.40.6 reads a declared binding as an administrator's and keeps serving with its stored password. v0.40.6 does not offer `db_role_declarations`, so a CLI of v0.41.0 refuses a declaration before building and sends nothing; change a role or its password with `db-role set` until the platform is on v0.41.0 again |
+| The first-version gate | Nothing: v0.40.6 activates a first version with no verified role again, which answers `503` until one is bound |
+| The database | Nothing to undo: `V11__declared_db_roles` adds a column v0.40.6 never reads and a unique index on `service_db_roles.role_name`, under which a `db-role set` of a role another service already holds is answered with an error, its write refused by the index, instead of binding the role twice |
+
 Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone: a
 bundle the single upload streamed into storage reads back as any other,
 and v0.40.5 receives that upload whole again before it writes it, holding
@@ -644,7 +653,7 @@ Rolling the platform back after a later release has migrated the database
 logs an ERROR at every start that the later release's migration is missing
 from the filesystem (`V3__r2` on v0.26.0, `V4__r3` on v0.27.0,
 `V5__extensions` and `V6__runner_keys` on v0.28.0, `V7__capacity_deferrals` on
-v0.35.0, `V8__tenant_buckets` on v0.36.0, `V9__web_uploads` on v0.38.0, `V10__web_upload_parts` on v0.40.0): expected and harmless, as migrations are
+v0.35.0, `V8__tenant_buckets` on v0.36.0, `V9__web_uploads` on v0.38.0, `V10__web_upload_parts` on v0.40.0, `V11__declared_db_roles` on v0.41.0): expected and harmless, as migrations are
 additive and the older binary does not abort on a newer schema. It serves `_fn`, CRUD and API keys as before.
 
 ## Release checklist
@@ -1519,6 +1528,26 @@ Migration `V11` adds `service_db_roles.declared` and a unique index on
 - **CLI.** Declarations need a CLI of v0.41.0 or later; an older one ignores
   `[environments.<env>.db_role]` and sends nothing, a rotated password
   included. Pin the CLI in CI wherever a declaration is used.
+
+**Rollout order.** Upgrade every platform, worker, web-runner and
+ext-runner replica first, then the CLIs that deploy declaring services,
+and only then set `declared_roles` on a tenant.
+
+Crates: a minor release for the new feature and the CLI's declarations,
+so the crate set moves minor as it did at v0.40.0. cufflink-types 0.25.0,
+which gains `features::DB_ROLE_DECLARATIONS`, and cufflink-pgcodec 0.25.0,
+which gains `REACH_OF_THE_ROLE`, with cufflink-migrate,
+cufflink-sdk-macros and cufflink at 0.25.0 beside them; cufflink-fn
+0.41.0; cufflink-cli 0.32.0, which sends the role that
+`[environments.<env>.db_role]` declares; cufflink-native 0.13.0 and
+cufflink-sql-parse 0.5.0, unchanged but exposing cufflink-types items in
+their public API; cufflink-nats 0.9.12 and cufflink-model 0.1.14,
+unchanged. `cufflink init` scaffolds `cufflink = "0.25"` and `cufflink-fn
+= "0.41"`.
+
+Rolling a platform back from v0.41.0 to v0.40.6 needs `declared_roles`
+removed from every tenant first
+([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.40.6
 
