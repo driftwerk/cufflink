@@ -581,6 +581,15 @@ Rolling a platform back from v0.41.0 to v0.40.6:
 | The first-version gate | Nothing: v0.40.6 activates a first version with no verified role again, which answers `503` until one is bound |
 | The database | Nothing to undo: `V11__declared_db_roles` adds a column v0.40.6 never reads and a unique index on `service_db_roles.role_name`, under which a `db-role set` of a role another service already holds is answered with an error, its write refused by the index, instead of binding the role twice |
 
+Rolling a platform back from v0.41.1 to v0.41.0:
+
+| What v0.41.1 changed | Before rolling the platform back |
+|----------------------|----------------------------------|
+| Stream claims by prefix | Replace each prefix with the names of the streams it admits first (`cufflink tenants nats-claims show <slug>` lists the claims, and the tenant's manifests their streams): v0.41.0 reads `CATALOG_*` as a stream named so, which admits nothing, so a subscriber held through it is refused at its next deploy, and v0.41.0 does not hold other tenants' claims clear of the stem |
+| The deploy's read of declared streams | Nothing: v0.41.0 checks a deploy against the tenant's claims alone again, as v0.41.1 does for a tenant that holds no prefix |
+| `nats-claims set --stream` | Nothing: only its help changed, and a CLI of v0.41.1 sends a claim to v0.41.0 as a CLI of v0.41.0 does, a prefix being refused there as an invalid stream name |
+| The database | Nothing: v0.41.1 has no migration |
+
 Rolling a platform back from v0.40.6 to v0.40.5 needs nothing undone: a
 bundle the single upload streamed into storage reads back as any other,
 and v0.40.5 receives that upload whole again before it writes it, holding
@@ -1492,6 +1501,19 @@ them builds unchanged. `cufflink init` scaffolds `cufflink = "0.11"` and
   replica back, replace each prefix with the names of the streams it admits
   (`cufflink tenants nats-claims show <slug>` lists the claims, and the
   tenant's manifests their streams).
+
+Crates: a patch release of every published crate, of which only
+`cufflink-cli` changes, in the help of `nats-claims set --stream`.
+cufflink-types, cufflink-migrate, cufflink-pgcodec, cufflink-sdk-macros
+and cufflink 0.25.1, cufflink-fn 0.41.1, cufflink-cli 0.32.1,
+cufflink-nats 0.9.13, cufflink-native 0.13.1, cufflink-model 0.1.15 and
+cufflink-sql-parse 0.5.1 are bumped so the tagged commit publishes them.
+`cufflink init` still scaffolds `cufflink = "0.25"` and `cufflink-fn =
+"0.41"`.
+
+Rolling a platform back from v0.41.1 to v0.41.0 needs each stream prefix
+replaced with the names it admits first
+([rolling a platform back](#rolling-a-platform-back)).
 
 ## Changes in v0.41.0
 
